@@ -472,14 +472,14 @@ fn draw_gta_sa_setup(font: &Font, status: &str, choosing: bool) {
     draw_panel_rect(font, panel, Some("GTA: San Andreas Setup"));
     ui_text(
         font,
-        "Eagle Editor needs your GTA:SA installation folder.",
+        "A GTA:SA installation folder is optional.",
         panel.x + 32.0,
         panel.y + 82.0,
         WHITE,
     );
     ui_text(
         font,
-        "Choose the folder that contains the data and models directories.",
+        "Choose it for stock game assets, or continue using resource assets only.",
         panel.x + 32.0,
         panel.y + 112.0,
         ui_dim(),
@@ -513,10 +513,12 @@ fn draw_gta_sa_setup(font: &Font, status: &str, choosing: bool) {
         },
         true,
     );
+    let skip = Rect::new(panel.x + panel.w - 272.0, panel.y + 238.0, 240.0, 42.0);
+    draw_dialog_button(font, skip, "Continue Without GTA:SA", !choosing);
 }
 
 pub(crate) async fn ensure_gta_sa_dir_configured(font: &Font) -> bool {
-    if load_configured_gta_sa_dir().is_some() {
+    if load_configured_gta_sa_dir().is_some() || gta_sa_setup_bypassed() {
         return true;
     }
 
@@ -524,8 +526,9 @@ pub(crate) async fn ensure_gta_sa_dir_configured(font: &Font) -> bool {
     if !start.is_dir() {
         start = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     }
-    let mut picker_rx = Some(start_gta_sa_folder_picker(start.clone()));
-    let mut status = format!("Select the game folder containing {GTA_SA_MARKER_FILE}.");
+    let mut picker_rx: Option<mpsc::Receiver<Result<Option<PathBuf>, String>>> = None;
+    let mut status =
+        format!("Select the folder containing {GTA_SA_MARKER_FILE}, or continue without it.");
 
     loop {
         if is_quit_requested() {
@@ -572,12 +575,64 @@ pub(crate) async fn ensure_gta_sa_dir_configured(font: &Font) -> bool {
             240.0,
             42.0,
         );
+        let skip = Rect::new(
+            (screen_width() - 640.0_f32.min(screen_width() - 48.0)) * 0.5 + 368.0,
+            (screen_height() - 330.0) * 0.5 + 238.0,
+            240.0,
+            42.0,
+        );
+        if picker_rx.is_none()
+            && is_mouse_button_pressed(MouseButton::Left)
+            && skip.contains(mouse_position().into())
+        {
+            save_gta_sa_setup_bypassed();
+            return true;
+        }
         if picker_rx.is_none()
             && is_mouse_button_pressed(MouseButton::Left)
             && choose.contains(mouse_position().into())
         {
             picker_rx = Some(start_gta_sa_folder_picker(start.clone()));
             status = "Choose your GTA:SA installation folder...".to_string();
+        }
+        macroquad::miniquad::window::schedule_update();
+        next_frame().await;
+    }
+}
+
+pub(crate) async fn show_graphics_startup_error(font: &Font, error: &str) {
+    loop {
+        clear_background(Color::new(0.025, 0.030, 0.040, 1.0));
+        let width = 760.0_f32.min(screen_width() - 48.0);
+        let panel = Rect::new(
+            (screen_width() - width) * 0.5,
+            (screen_height() - 300.0) * 0.5,
+            width,
+            300.0,
+        );
+        draw_panel_rect(font, panel, Some("OpenGL Compatibility Error"));
+        ui_text(
+            font,
+            "Eagle Editor could not start its legacy-compatible 3D renderer.",
+            panel.x + 32.0,
+            panel.y + 82.0,
+            Color::new(1.0, 0.50, 0.42, 1.0),
+        );
+        let mut y = panel.y + 120.0;
+        for line in wrap_text_width(error, 15, panel.w - 64.0) {
+            ui_text(font, &line, panel.x + 32.0, y, ui_dim());
+            y += 24.0;
+        }
+        ui_text(
+            font,
+            "Update the graphics driver or report this message with your GPU model.",
+            panel.x + 32.0,
+            panel.y + 246.0,
+            ui_muted(),
+        );
+        if is_quit_requested() || is_key_pressed(KeyCode::Escape) {
+            macroquad::miniquad::window::quit();
+            return;
         }
         macroquad::miniquad::window::schedule_update();
         next_frame().await;

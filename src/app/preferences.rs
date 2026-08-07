@@ -708,6 +708,7 @@ pub(crate) fn save_camera_speed_preference(speed: f32) {
 }
 
 pub(crate) const GTA_SA_MARKER_FILE: &str = "models/gta3.img";
+const GTA_SA_SETUP_BYPASSED_KEY: &str = "gta_sa_setup_bypassed";
 
 pub(crate) fn validate_gta_sa_dir(path: &Path) -> Result<(), String> {
     if !path.is_dir() {
@@ -730,6 +731,12 @@ pub(crate) fn load_configured_gta_sa_dir() -> Option<PathBuf> {
         .filter(|path| validate_gta_sa_dir(path).is_ok())
 }
 
+pub(crate) fn gta_sa_setup_bypassed() -> bool {
+    load_preferences()
+        .get(GTA_SA_SETUP_BYPASSED_KEY)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
 pub(crate) fn load_gta_sa_dir_candidate() -> PathBuf {
     load_preferences()
         .get("gta_sa_dir")
@@ -743,10 +750,17 @@ pub(crate) fn load_gta_sa_dir_preference() -> PathBuf {
 
 pub(crate) fn save_gta_sa_dir_preference(path: &Path) {
     let mut values = load_preferences();
+    values.remove(GTA_SA_SETUP_BYPASSED_KEY);
     values.insert(
         "gta_sa_dir".to_string(),
         path.to_string_lossy().trim().to_string(),
     );
+    save_preferences(&values);
+}
+
+pub(crate) fn save_gta_sa_setup_bypassed() {
+    let mut values = load_preferences();
+    values.insert(GTA_SA_SETUP_BYPASSED_KEY.to_string(), "true".to_string());
     save_preferences(&values);
 }
 

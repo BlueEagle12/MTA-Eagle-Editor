@@ -390,7 +390,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "eagle-editor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "fontdue",
@@ -990,8 +990,6 @@ dependencies = [
 [[package]]
 name = "miniquad"
 version = "0.4.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f64fd94ff70fdc425766c78a3fa9f263d02cb25725a49f255f6a66d8a186c3f"
 dependencies = [
  "libc",
  "ndk-sys",

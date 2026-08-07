@@ -4555,6 +4555,11 @@ async fn main() {
         eprintln!("Warning: failed to build bold font");
     }
     let ui_font = Font::default();
+    if let Err(error) = validate_legacy_gl_context() {
+        eprintln!("{error}");
+        show_graphics_startup_error(&ui_font, &error).await;
+        return;
+    }
     let options = parse_options();
     UI_TEXT_ENABLED.store(options.text, Ordering::Relaxed);
     if !ensure_gta_sa_dir_configured(&ui_font).await {

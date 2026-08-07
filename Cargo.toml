@@ -1,6 +1,6 @@
 [package]
 name = "eagle-editor"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Native 3D world and asset editor for Multi Theft Auto: San Andreas"
@@ -27,3 +27,8 @@ rfd = "0.15.4"
 [build-dependencies]
 gl_generator = "0.14.0"
 image = { version = "0.25.8", default-features = false, features = ["png"] }
+
+[patch.crates-io]
+# Miniquad 0.4.10 requests a forward-compatible core profile on Windows,
+# which removes the fixed-function OpenGL API used by Eagle's 3D renderer.
+miniquad = { path = "vendor/miniquad" }

@@ -107,6 +107,42 @@ pub(crate) fn init_raw_gl() -> u32 {
     0
 }
 
+fn current_gl_string(name: u32) -> String {
+    let value = unsafe { gl::GetString(name) };
+    if value.is_null() {
+        return "unknown".to_string();
+    }
+    unsafe { std::ffi::CStr::from_ptr(value.cast()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub(crate) fn validate_legacy_gl_context() -> Result<(), String> {
+    let version = current_gl_string(gl::VERSION);
+    let renderer = current_gl_string(gl::RENDERER);
+    let vendor = current_gl_string(gl::VENDOR);
+
+    unsafe {
+        for _ in 0..16 {
+            if gl::GetError() == gl::NO_ERROR {
+                break;
+            }
+        }
+        // MatrixMode is removed from core profiles and is a harmless, direct
+        // capability probe for the fixed-function API Eagle actually uses.
+        gl::MatrixMode(gl::MODELVIEW);
+        let error = gl::GetError();
+        if error != gl::NO_ERROR {
+            return Err(format!(
+                "Eagle Editor requires an OpenGL compatibility context, but the driver supplied an incompatible context (OpenGL {version}, renderer {renderer}, vendor {vendor}, glMatrixMode error 0x{error:04x})."
+            ));
+        }
+    }
+
+    eprintln!("OpenGL compatibility context: {version} | {renderer} | {vendor}");
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn raw_gl_proc_address(name: *const u8) -> *const c_void {
     unsafe { glXGetProcAddress(name) }
