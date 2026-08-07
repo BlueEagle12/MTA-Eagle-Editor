@@ -1,0 +1,2 @@
+edcb19579c4510771ae10fa438967fa6a83ec7d9ca4e3921c0fc3cc465a6f338  EagleEditor-v0.1.0-linux-x86_64.tar.gz
+1a381004e6d9d3848365c6245afe1d6a44f7ac56e9e66fef303b278d20b85775  EagleEditor-v0.1.0-windows-x86_64.zip
