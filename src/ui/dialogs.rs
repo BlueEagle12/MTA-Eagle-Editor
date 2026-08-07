@@ -1,0 +1,1671 @@
+use super::super::*;
+
+pub(crate) fn draw_context_menu(app: &AppState) {
+    let Some(rect) = context_menu_rect(app) else {
+        return;
+    };
+    let mouse: Vec2 = mouse_position().into();
+    draw_rrect_bordered(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        10.0,
+        1.0,
+        Color::new(0.052, 0.055, 0.061, 0.99),
+        ui_border(),
+    );
+    let row_h = 26.0;
+    for (row, (_, label, enabled)) in context_menu_items(app).iter().enumerate() {
+        let y = rect.y + 6.0 + row as f32 * row_h;
+        let row_rect = Rect::new(rect.x + 6.0, y, rect.w - 12.0, row_h);
+        if *enabled && row_rect.contains(mouse) {
+            draw_rrect(
+                row_rect.x,
+                row_rect.y + 2.0,
+                row_rect.w,
+                row_rect.h - 4.0,
+                5.0,
+                ui_accent_soft(),
+            );
+        }
+        let color = if *enabled { WHITE } else { ui_muted() };
+        ui_text(&app.ui_font, label, row_rect.x + 8.0, y + 18.0, color);
+    }
+}
+
+pub(crate) fn draw_modal_backdrop() {
+    draw_rectangle(
+        0.0,
+        0.0,
+        screen_width(),
+        screen_height(),
+        Color::new(0.0, 0.0, 0.0, 0.58),
+    );
+}
+
+pub(crate) fn draw_dialog_button(font: &Font, rect: Rect, label: &str, primary: bool) {
+    let hovered = rect.contains(mouse_position().into());
+    let bg = if primary {
+        if hovered {
+            Color::new(0.27, 0.29, 0.32, 1.0)
+        } else {
+            Color::new(0.19, 0.21, 0.24, 1.0)
+        }
+    } else if hovered {
+        ui_surface_hover()
+    } else {
+        ui_surface()
+    };
+    draw_rrect(rect.x + 1.0, rect.y + 2.0, rect.w, rect.h, 9.0, ui_shadow());
+    draw_rrect_bordered(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        9.0,
+        1.0,
+        bg,
+        if primary { ui_accent() } else { ui_border() },
+    );
+    let tw = ui_text_width(label, 16);
+    ui_text(
+        font,
+        label,
+        rect.x + (rect.w - tw) * 0.5,
+        rect.y + 22.0,
+        WHITE,
+    );
+}
+
+pub(crate) fn draw_save_as_dialog(app: &AppState) {
+    let Some(dialog) = app.save_as_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = save_as_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Save As"));
+    ui_text(
+        &app.ui_font,
+        "Write a new MTA resource folder using the loaded meta/resource files.",
+        rect.x + 24.0,
+        rect.y + 58.0,
+        LIGHTGRAY,
+    );
+    let input = save_as_input_rect();
+    draw_rrect_bordered(
+        input.x,
+        input.y,
+        input.w,
+        input.h,
+        7.0,
+        1.0,
+        ui_input_bg(),
+        ui_accent(),
+    );
+    let max_chars = ((input.w - 20.0) / 8.5).max(1.0) as usize;
+    let cursor = clamp_char_boundary(&dialog.path, dialog.cursor);
+    let cursor_char = dialog.path[..cursor].chars().count();
+    let total_chars = dialog.path.chars().count();
+    let start_char = cursor_char.saturating_sub(max_chars.saturating_sub(1));
+    let end_char = (start_char + max_chars).min(total_chars);
+    let visible: String = dialog
+        .path
+        .chars()
+        .skip(start_char)
+        .take(end_char - start_char)
+        .collect();
+    let caret_prefix: String = visible
+        .chars()
+        .take(cursor_char.saturating_sub(start_char))
+        .collect();
+    let text_x = input.x + 10.0;
+    draw_visible_text_selection(
+        &dialog.path,
+        cursor,
+        dialog.selection_anchor,
+        start_char,
+        &visible,
+        text_x,
+        input,
+    );
+    ui_text(&app.ui_font, &visible, text_x, input.y + 21.0, WHITE);
+    if (get_time() * 2.0) as i32 % 2 == 0 {
+        let caret_x = text_x + ui_text_width(&caret_prefix, 16).round();
+        draw_line(
+            caret_x,
+            input.y + 7.0,
+            caret_x,
+            input.y + input.h - 7.0,
+            1.0,
+            WHITE,
+        );
+    }
+    ui_text(
+        &app.ui_font,
+        "Enter saves   Esc cancels   Existing IMG files are copied",
+        rect.x + 24.0,
+        rect.y + 128.0,
+        ui_muted(),
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 216.0, rect.y + rect.h - 50.0, 88.0, 32.0),
+        "Save As",
+        true,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 116.0, rect.y + rect.h - 50.0, 88.0, 32.0),
+        "Cancel",
+        false,
+    );
+}
+
+pub(crate) fn draw_save_log_dialog(app: &AppState) {
+    if !app.save_log_open {
+        return;
+    }
+    draw_modal_backdrop();
+    let rect = save_log_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Activity Console"));
+    ui_text(
+        &app.ui_font,
+        "Live session messages   Mouse wheel scrolls   Home/End jumps   Esc closes",
+        rect.x + 24.0,
+        rect.y + 58.0,
+        ui_muted(),
+    );
+
+    let list = Rect::new(rect.x + 24.0, rect.y + 78.0, rect.w - 48.0, rect.h - 142.0);
+    draw_rrect_bordered(
+        list.x,
+        list.y,
+        list.w,
+        list.h,
+        7.0,
+        1.0,
+        ui_input_bg(),
+        ui_border(),
+    );
+    let rows = save_log_display_rows(app, list.w);
+    let visible_rows = (list.h / 22.0).max(1.0) as usize;
+    let max_scroll = rows.len().saturating_sub(visible_rows) as f32;
+    let scroll = app.save_log_scroll.clamp(0.0, max_scroll);
+    let start = scroll.floor() as usize;
+    if rows.is_empty() {
+        ui_text(
+            &app.ui_font,
+            "No activity recorded yet.",
+            list.x + 14.0,
+            list.y + 26.0,
+            LIGHTGRAY,
+        );
+    } else {
+        for row in 0..visible_rows {
+            let idx = start + row;
+            let Some(line) = rows.get(idx) else {
+                break;
+            };
+            let y = list.y + 24.0 + row as f32 * 22.0;
+            ui_text(&app.ui_font, line, list.x + 14.0, y, LIGHTGRAY);
+        }
+    }
+    if rows.len() > visible_rows {
+        let track = Rect::new(list.x + list.w - 10.0, list.y + 8.0, 4.0, list.h - 16.0);
+        draw_rrect(
+            track.x,
+            track.y,
+            track.w,
+            track.h,
+            2.0,
+            Color::new(0.12, 0.14, 0.17, 1.0),
+        );
+        let max_scroll = max_scroll.max(1.0);
+        let thumb_h = (track.h * (visible_rows as f32 / rows.len() as f32)).clamp(24.0, track.h);
+        let thumb_y = track.y + (track.h - thumb_h) * (scroll / max_scroll);
+        draw_rrect(track.x, thumb_y, track.w, thumb_h, 2.0, ui_accent());
+    }
+    draw_dialog_button(&app.ui_font, activity_console_clear_rect(), "Clear", false);
+    draw_dialog_button(&app.ui_font, save_log_close_rect(), "Close", false);
+}
+
+fn wrap_save_log_line(line: &str, max_chars: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for source in line.split('\n') {
+        if source.is_empty() {
+            rows.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in source.split_whitespace() {
+            let extra = if current.is_empty() { 0 } else { 1 };
+            if !current.is_empty() && current.len() + extra + word.len() > max_chars {
+                rows.push(current);
+                current = format!("  {word}");
+            } else {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(word);
+            }
+        }
+        if !current.is_empty() {
+            rows.push(current);
+        }
+    }
+    rows
+}
+
+pub(crate) fn save_log_display_rows(app: &AppState, list_width: f32) -> Vec<String> {
+    let max_chars = ((list_width - 32.0) / 8.0).max(16.0) as usize;
+    let mut rows = Vec::new();
+    for entry in &app.activity_log {
+        rows.extend(wrap_save_log_line(entry, max_chars));
+    }
+    rows
+}
+
+pub(crate) fn draw_load_dialog(app: &AppState) {
+    let Some(dialog) = app.load_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = load_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Load Resource"));
+    ui_text(
+        &app.ui_font,
+        "Load another Eagle resource folder into the editor.",
+        rect.x + 24.0,
+        rect.y + 58.0,
+        LIGHTGRAY,
+    );
+    let input = load_input_rect();
+    draw_rrect_bordered(
+        input.x,
+        input.y,
+        input.w,
+        input.h,
+        7.0,
+        1.0,
+        Color::new(0.055, 0.064, 0.078, 1.0),
+        ui_accent(),
+    );
+    let max_chars = ((input.w - 20.0) / 8.5).max(1.0) as usize;
+    let cursor = clamp_char_boundary(&dialog.path, dialog.cursor);
+    let cursor_char = dialog.path[..cursor].chars().count();
+    let total_chars = dialog.path.chars().count();
+    let start_char = cursor_char.saturating_sub(max_chars.saturating_sub(1));
+    let end_char = (start_char + max_chars).min(total_chars);
+    let visible: String = dialog
+        .path
+        .chars()
+        .skip(start_char)
+        .take(end_char - start_char)
+        .collect();
+    let caret_prefix: String = visible
+        .chars()
+        .take(cursor_char.saturating_sub(start_char))
+        .collect();
+    let text_x = input.x + 10.0;
+    draw_visible_text_selection(
+        &dialog.path,
+        cursor,
+        dialog.selection_anchor,
+        start_char,
+        &visible,
+        text_x,
+        input,
+    );
+    ui_text(&app.ui_font, &visible, text_x, input.y + 21.0, WHITE);
+    if (get_time() * 2.0) as i32 % 2 == 0 {
+        let caret_x = text_x + ui_text_width(&caret_prefix, 16).round();
+        draw_line(
+            caret_x,
+            input.y + 7.0,
+            caret_x,
+            input.y + input.h - 7.0,
+            1.0,
+            WHITE,
+        );
+    }
+    ui_text(
+        &app.ui_font,
+        "Enter loads   Esc cancels   Relative paths start at the current directory",
+        rect.x + 24.0,
+        rect.y + 128.0,
+        ui_muted(),
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 216.0, rect.y + rect.h - 50.0, 88.0, 32.0),
+        "Load",
+        true,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 116.0, rect.y + rect.h - 50.0, 88.0, 32.0),
+        "Cancel",
+        false,
+    );
+}
+
+pub(crate) fn draw_preferences_dialog(app: &AppState) {
+    let Some(dialog) = app.preferences_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = preferences_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Preferences"));
+    ui_text(
+        &app.ui_font,
+        "GTA:SA Install Directory",
+        rect.x + 24.0,
+        rect.y + 78.0,
+        ui_dim(),
+    );
+    let input = preferences_input_rect();
+    draw_rrect_bordered(
+        input.x,
+        input.y,
+        input.w,
+        input.h,
+        7.0,
+        1.0,
+        Color::new(0.055, 0.064, 0.078, 1.0),
+        ui_accent(),
+    );
+    let max_chars = ((input.w - 20.0) / 8.5).max(1.0) as usize;
+    let cursor = clamp_char_boundary(&dialog.gta_sa_dir, dialog.cursor);
+    let cursor_char = dialog.gta_sa_dir[..cursor].chars().count();
+    let total_chars = dialog.gta_sa_dir.chars().count();
+    let start_char = cursor_char.saturating_sub(max_chars.saturating_sub(1));
+    let end_char = (start_char + max_chars).min(total_chars);
+    let visible: String = dialog
+        .gta_sa_dir
+        .chars()
+        .skip(start_char)
+        .take(end_char - start_char)
+        .collect();
+    let caret_prefix: String = visible
+        .chars()
+        .take(cursor_char.saturating_sub(start_char))
+        .collect();
+    let text_x = input.x + 10.0;
+    draw_visible_text_selection(
+        &dialog.gta_sa_dir,
+        cursor,
+        dialog.selection_anchor,
+        start_char,
+        &visible,
+        text_x,
+        input,
+    );
+    ui_text(&app.ui_font, &visible, text_x, input.y + 21.0, WHITE);
+    if (get_time() * 2.0) as i32 % 2 == 0 {
+        let caret_x = text_x + ui_text_width(&caret_prefix, 16).round();
+        draw_line(
+            caret_x,
+            input.y + 7.0,
+            caret_x,
+            input.y + input.h - 7.0,
+            1.0,
+            WHITE,
+        );
+    }
+    let ide_count = app.readonly_definition_ids.len();
+    let has_models = app.gta_sa_dir.join("models").is_dir();
+    let has_ide = app.gta_sa_dir.join("data").join("maps").is_dir();
+    let status = if has_models && has_ide {
+        format!("{ide_count} fallback IDE definition(s) loaded")
+    } else {
+        "Folder should contain data/maps and models".to_string()
+    };
+    ui_text(
+        &app.ui_font,
+        &status,
+        rect.x + 24.0,
+        rect.y + 160.0,
+        ui_muted(),
+    );
+    ui_text(
+        &app.ui_font,
+        "Enter saves   Esc cancels   Reload the resource after changing this path",
+        rect.x + 24.0,
+        rect.y + 188.0,
+        ui_muted(),
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        preferences_cleanup_autosaves_rect(),
+        "Clean Up Autosaves",
+        app.autosave_cleanup_rx.is_none() && app.autosave_rx.is_none(),
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 216.0, rect.y + rect.h - 50.0, 88.0, 32.0),
+        "Save",
+        true,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 116.0, rect.y + rect.h - 50.0, 88.0, 32.0),
+        "Cancel",
+        false,
+    );
+}
+
+pub(crate) fn draw_dff_replace_choice_dialog(app: &AppState) {
+    let Some(dialog) = app.dff_replace_choice_dialog.as_ref() else {
+        return;
+    };
+    let label = match dialog.kind {
+        ReplacementAssetKind::Dff => "DFF",
+        ReplacementAssetKind::Col => "COL",
+    };
+    let title = format!("Replace {label}");
+    draw_modal_backdrop();
+    let rect = dff_replace_choice_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some(&title));
+    ui_text(
+        &app.ui_font,
+        "Replace every instance of this model, or make the selected element unique?",
+        rect.x + 24.0,
+        rect.y + 58.0,
+        WHITE,
+    );
+    ui_text(
+        &app.ui_font,
+        &ellipsize(dialog.path.to_string_lossy().as_ref(), 66),
+        rect.x + 24.0,
+        rect.y + 86.0,
+        LIGHTGRAY,
+    );
+    ui_text(
+        &app.ui_font,
+        "Instance updates the shared definition. Unique creates a new definition for this element.",
+        rect.x + 24.0,
+        rect.y + 112.0,
+        ui_muted(),
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 358.0, rect.y + rect.h - 50.0, 110.0, 32.0),
+        "Instance",
+        true,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 236.0, rect.y + rect.h - 50.0, 120.0, 32.0),
+        "Make Unique",
+        false,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 104.0, rect.y + rect.h - 50.0, 76.0, 32.0),
+        "Cancel",
+        false,
+    );
+}
+
+pub(crate) fn draw_element_id_rename_dialog(app: &AppState) {
+    let Some(dialog) = app.element_id_rename_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = element_id_rename_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Change Element ID"));
+    ui_text(
+        &app.ui_font,
+        &format!("Change ID {} -> {}", dialog.old_id, dialog.new_id),
+        rect.x + 24.0,
+        rect.y + 58.0,
+        WHITE,
+    );
+    ui_text(
+        &app.ui_font,
+        "Choose how DFF/COL references should behave after the ID changes.",
+        rect.x + 24.0,
+        rect.y + 86.0,
+        LIGHTGRAY,
+    );
+    ui_text(
+        &app.ui_font,
+        if dialog.selected_indices.len() > 1 {
+            "Rename/keep updates the shared model. Unique changes only the selected elements."
+        } else {
+            "Rename assets points DFF/COL at the new ID. Keep old assets points them at the old ID. Unique changes only this element."
+        },
+        rect.x + 24.0,
+        rect.y + 114.0,
+        ui_muted(),
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 496.0, rect.y + rect.h - 50.0, 128.0, 32.0),
+        "Rename assets",
+        true,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 356.0, rect.y + rect.h - 50.0, 128.0, 32.0),
+        "Keep old assets",
+        false,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 216.0, rect.y + rect.h - 50.0, 116.0, 32.0),
+        "Make unique",
+        false,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 88.0, rect.y + rect.h - 50.0, 64.0, 32.0),
+        "Cancel",
+        false,
+    );
+}
+
+pub(crate) fn draw_missing_texture_dialog(app: &AppState) {
+    let Some(dialog) = app.missing_texture_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = missing_texture_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Find Missing Textures"));
+    ui_text(
+        &app.ui_font,
+        &format!(
+            "{} is missing on {}",
+            dialog.choice.texture_name, dialog.choice.definition_id
+        ),
+        rect.x + 24.0,
+        rect.y + 58.0,
+        LIGHTGRAY,
+    );
+    ui_text(
+        &app.ui_font,
+        "Choose which TXD should supply this texture.",
+        rect.x + 24.0,
+        rect.y + 84.0,
+        ui_muted(),
+    );
+    for (idx, candidate) in dialog.candidates.iter().take(5).enumerate() {
+        let row = missing_texture_candidate_rect(idx);
+        let hovered = row.contains(mouse_position().into());
+        draw_rrect_bordered(
+            row.x,
+            row.y,
+            row.w,
+            row.h,
+            7.0,
+            1.0,
+            if hovered {
+                ui_surface_hover()
+            } else {
+                Color::new(0.070, 0.082, 0.100, 1.0)
+            },
+            if hovered { ui_accent() } else { ui_border() },
+        );
+        let thumb = Rect::new(row.x + 8.0, row.y + 5.0, 40.0, 40.0);
+        draw_rrect_bordered(
+            thumb.x,
+            thumb.y,
+            thumb.w,
+            thumb.h,
+            5.0,
+            1.0,
+            Color::new(0.035, 0.040, 0.050, 1.0),
+            ui_border(),
+        );
+        if let Some(texture) = candidate.thumbnail.as_ref() {
+            let size = texture.size();
+            let scale = (thumb.w / size.x).min(thumb.h / size.y).min(1.0);
+            let w = (size.x * scale).max(1.0);
+            let h = (size.y * scale).max(1.0);
+            draw_texture_ex(
+                texture,
+                thumb.x + (thumb.w - w) * 0.5,
+                thumb.y + (thumb.h - h) * 0.5,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(w, h)),
+                    ..Default::default()
+                },
+            );
+        }
+        ui_text(
+            &app.ui_font,
+            &ellipsize_width(
+                &if !candidate
+                    .source_texture_name
+                    .eq_ignore_ascii_case(&dialog.choice.texture_name)
+                {
+                    format!(
+                        "{}  ·  source '{}'{}",
+                        candidate.txd_name,
+                        candidate.source_texture_name,
+                        if candidate.duplicate_count > 1 {
+                            format!("  (+{} identical matches)", candidate.duplicate_count - 1)
+                        } else {
+                            String::new()
+                        }
+                    )
+                } else if candidate.duplicate_count > 1 {
+                    format!(
+                        "{}  (+{} identical matches)",
+                        candidate.txd_name,
+                        candidate.duplicate_count - 1
+                    )
+                } else {
+                    candidate.txd_name.clone()
+                },
+                16,
+                row.w - 220.0,
+            ),
+            row.x + 60.0,
+            row.y + 22.0,
+            WHITE,
+        );
+        ui_text(
+            &app.ui_font,
+            &format!(
+                "{}x{}  {}",
+                candidate.width,
+                candidate.height,
+                tx_format_label(candidate.format)
+            ),
+            row.x + 60.0,
+            row.y + 42.0,
+            ui_muted(),
+        );
+    }
+    if dialog.candidates.len() > 5 {
+        ui_text(
+            &app.ui_font,
+            &format!("{} more candidate(s) omitted", dialog.candidates.len() - 5),
+            rect.x + 24.0,
+            rect.y + 112.0 + 5.0 * 56.0 + 24.0,
+            ui_muted(),
+        );
+    }
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 116.0, rect.y + rect.h - 50.0, 88.0, 32.0),
+        "Cancel",
+        false,
+    );
+}
+
+pub(crate) fn draw_texture_archive_dialog(app: &AppState) {
+    let Some(dialog) = app.texture_archive_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = texture_archive_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Texture Archive"));
+    ui_text(
+        &app.ui_font,
+        &format!("{} linked to {}", dialog.txd_name, dialog.definition_id),
+        rect.x + 24.0,
+        rect.y + 58.0,
+        LIGHTGRAY,
+    );
+    ui_text(
+        &app.ui_font,
+        &format!("{} texture(s)", dialog.textures.len()),
+        rect.x + 24.0,
+        rect.y + 84.0,
+        ui_muted(),
+    );
+
+    let visible_rows = ((rect.h - 180.0) / 38.0).floor().max(1.0) as usize;
+    let start = dialog.scroll.floor() as usize;
+    if dialog.textures.is_empty() {
+        ui_text(
+            &app.ui_font,
+            "No textures were indexed in this TXD.",
+            rect.x + 24.0,
+            rect.y + 132.0,
+            ui_muted(),
+        );
+    } else {
+        for row in 0..visible_rows {
+            let idx = start + row;
+            let Some(entry) = dialog.textures.get(idx) else {
+                break;
+            };
+            let row_rect = texture_archive_row_rect(row);
+            let selected = idx == dialog.selected;
+            let hovered = row_rect.contains(mouse_position().into());
+            if selected || hovered {
+                draw_rrect(
+                    row_rect.x,
+                    row_rect.y,
+                    row_rect.w,
+                    row_rect.h,
+                    6.0,
+                    if selected {
+                        ui_surface_active()
+                    } else {
+                        ui_surface_hover()
+                    },
+                );
+            }
+            let thumb_rect = Rect::new(row_rect.x + 6.0, row_rect.y + 4.0, 26.0, 26.0);
+            draw_rrect_bordered(
+                thumb_rect.x,
+                thumb_rect.y,
+                thumb_rect.w,
+                thumb_rect.h,
+                4.0,
+                1.0,
+                Color::new(0.035, 0.040, 0.050, 1.0),
+                ui_border(),
+            );
+            if let Some(texture) = entry.thumbnail.as_ref() {
+                let size = texture.size();
+                let scale = (thumb_rect.w / size.x).min(thumb_rect.h / size.y).min(1.0);
+                let w = (size.x * scale).max(1.0);
+                let h = (size.y * scale).max(1.0);
+                draw_texture_ex(
+                    texture,
+                    thumb_rect.x + (thumb_rect.w - w) * 0.5,
+                    thumb_rect.y + (thumb_rect.h - h) * 0.5,
+                    WHITE,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(w, h)),
+                        ..Default::default()
+                    },
+                );
+            }
+            ui_text(
+                &app.ui_font,
+                &ellipsize_width(&entry.name, 16, row_rect.w - 152.0),
+                row_rect.x + 42.0,
+                row_rect.y + 22.0,
+                if selected { ui_accent() } else { WHITE },
+            );
+            ui_text(
+                &app.ui_font,
+                &format!("{}x{}", entry.width, entry.height),
+                row_rect.x + row_rect.w - 86.0,
+                row_rect.y + 22.0,
+                ui_muted(),
+            );
+        }
+    }
+
+    let preview = texture_archive_preview_rect();
+    draw_rrect_bordered(
+        preview.x,
+        preview.y,
+        preview.w,
+        preview.h,
+        8.0,
+        1.0,
+        Color::new(0.045, 0.052, 0.064, 1.0),
+        ui_border(),
+    );
+    if let Some(texture) = dialog.preview_texture.as_ref() {
+        let size = texture.size();
+        let scale = (preview.w / size.x).min(preview.h / size.y).min(1.0);
+        let w = (size.x * scale).max(1.0);
+        let h = (size.y * scale).max(1.0);
+        draw_texture_ex(
+            texture,
+            preview.x + (preview.w - w) * 0.5,
+            preview.y + (preview.h - h) * 0.5,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(w, h)),
+                ..Default::default()
+            },
+        );
+    } else {
+        ui_text(
+            &app.ui_font,
+            "No preview",
+            preview.x + 70.0,
+            preview.y + 116.0,
+            ui_muted(),
+        );
+    }
+    if let Some(entry) = dialog.textures.get(dialog.selected) {
+        let details_y = preview.y + preview.h + 28.0;
+        ui_text_bold(
+            &ellipsize_width(&entry.name, 18, preview.w),
+            preview.x,
+            details_y,
+            18,
+            WHITE,
+        );
+        ui_text(
+            &app.ui_font,
+            &format!("Size  {} x {}", entry.width, entry.height),
+            preview.x,
+            details_y + 28.0,
+            LIGHTGRAY,
+        );
+        ui_text(
+            &app.ui_font,
+            &format!("Format  {}", tx_format_label(entry.format)),
+            preview.x,
+            details_y + 52.0,
+            LIGHTGRAY,
+        );
+        ui_text(
+            &app.ui_font,
+            &format!("TXD  {}", ellipsize(&dialog.txd_name, 26)),
+            preview.x,
+            details_y + 76.0,
+            ui_muted(),
+        );
+    }
+
+    draw_dialog_button(
+        &app.ui_font,
+        texture_archive_add_rect(),
+        "Add Texture",
+        true,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        texture_archive_replace_rect(),
+        "Replace Selected",
+        !dialog.textures.is_empty(),
+    );
+    if dialog.textures.is_empty() {
+        draw_rectangle(
+            texture_archive_replace_rect().x,
+            texture_archive_replace_rect().y,
+            texture_archive_replace_rect().w,
+            texture_archive_replace_rect().h,
+            Color::new(0.0, 0.0, 0.0, 0.36),
+        );
+    }
+    draw_dialog_button(&app.ui_font, texture_archive_close_rect(), "Close", false);
+}
+
+pub(crate) fn draw_dff_prelight_import_dialog(app: &AppState) {
+    let Some(dialog) = app.dff_prelight_import_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = dff_prelight_import_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Import Lighting From DFF"));
+    let archive = dialog
+        .img_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("IMG archive");
+    ui_text(
+        &app.ui_font,
+        &format!(
+            "{} DFF source(s) in {}",
+            dialog.entries.len(),
+            ellipsize(archive, 42)
+        ),
+        rect.x + 24.0,
+        rect.y + 58.0,
+        LIGHTGRAY,
+    );
+    ui_text(
+        &app.ui_font,
+        &format!(
+            "Target stream: {} prelight   Mouse wheel scrolls   Enter imports   Esc cancels",
+            bake_light_mode_label(app.bake_settings.light_mode)
+        ),
+        rect.x + 24.0,
+        rect.y + 82.0,
+        ui_muted(),
+    );
+
+    let list_rect = Rect::new(rect.x + 24.0, rect.y + 108.0, rect.w - 48.0, rect.h - 176.0);
+    draw_rrect_bordered(
+        list_rect.x,
+        list_rect.y,
+        list_rect.w,
+        list_rect.h,
+        7.0,
+        1.0,
+        Color::new(0.045, 0.052, 0.064, 1.0),
+        ui_border(),
+    );
+    let visible_rows = ((list_rect.h - 8.0) / 34.0).max(1.0) as usize;
+    let start = dialog.scroll.floor() as usize;
+    let max_chars = ((list_rect.w - 48.0) / 8.0).max(12.0) as usize;
+    let mouse: Vec2 = mouse_position().into();
+    for row in 0..visible_rows {
+        let idx = start + row;
+        let Some(entry) = dialog.entries.get(idx) else {
+            break;
+        };
+        let row_rect = dff_prelight_import_row_rect(row);
+        let selected = idx == dialog.selected;
+        let hovered = row_rect.contains(mouse);
+        if selected || hovered {
+            draw_rrect(
+                row_rect.x,
+                row_rect.y + 2.0,
+                row_rect.w,
+                row_rect.h - 4.0,
+                5.0,
+                if selected {
+                    ui_surface_active()
+                } else {
+                    ui_surface_hover()
+                },
+            );
+        }
+        let label = format!("{:>3}  {}", idx + 1, ellipsize(&entry.name, max_chars));
+        ui_text(
+            &app.ui_font,
+            &label,
+            row_rect.x + 10.0,
+            row_rect.y + 20.0,
+            if selected { ui_accent() } else { LIGHTGRAY },
+        );
+    }
+    if dialog.entries.len() > visible_rows {
+        let track = Rect::new(
+            list_rect.x + list_rect.w - 10.0,
+            list_rect.y + 8.0,
+            4.0,
+            list_rect.h - 16.0,
+        );
+        draw_rrect(
+            track.x,
+            track.y,
+            track.w,
+            track.h,
+            2.0,
+            Color::new(0.12, 0.14, 0.17, 1.0),
+        );
+        let max_scroll = dialog.entries.len().saturating_sub(visible_rows) as f32;
+        let thumb_h =
+            (track.h * visible_rows as f32 / dialog.entries.len() as f32).clamp(24.0, track.h);
+        let thumb_y = track.y
+            + if max_scroll > 0.0 {
+                (track.h - thumb_h) * (dialog.scroll / max_scroll).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+        draw_rrect(track.x, thumb_y, track.w, thumb_h, 2.0, ui_accent());
+    }
+
+    draw_dialog_button(
+        &app.ui_font,
+        dff_prelight_import_apply_rect(),
+        "Import Prelight",
+        true,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        dff_prelight_import_close_rect(),
+        "Close",
+        false,
+    );
+}
+
+pub(crate) fn draw_missing_col_dialog(app: &AppState) {
+    let Some(dialog) = app.missing_col_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = missing_col_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Missing COL Assignments"));
+    ui_text(
+        &app.ui_font,
+        &format!("{} definition(s) have no COL assigned.", dialog.missing),
+        rect.x + 24.0,
+        rect.y + 58.0,
+        WHITE,
+    );
+    ui_text(
+        &app.ui_font,
+        "Fill missing COL fields from DFF names before output?",
+        rect.x + 24.0,
+        rect.y + 84.0,
+        LIGHTGRAY,
+    );
+    ui_text(
+        &app.ui_font,
+        "This updates definitions and copies existing IMG files; it does not synthesize new COL geometry.",
+        rect.x + 24.0,
+        rect.y + 110.0,
+        ui_muted(),
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 294.0, rect.y + rect.h - 50.0, 164.0, 32.0),
+        "Fill and Save",
+        true,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        Rect::new(rect.x + rect.w - 116.0, rect.y + rect.h - 50.0, 88.0, 32.0),
+        "Cancel",
+        false,
+    );
+}
+
+pub(crate) fn draw_lod_batch_dialog(app: &AppState) {
+    let Some(dialog) = app.lod_batch_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = lod_batch_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Generate LODs"));
+    ui_text(
+        &app.ui_font,
+        &format!(
+            "{} selected elements. Elements smaller than the minimum are filtered out.",
+            dialog.candidates.len()
+        ),
+        rect.x + 24.0,
+        rect.y + 56.0,
+        LIGHTGRAY,
+    );
+    ui_text(
+        &app.ui_font,
+        "Minimum size",
+        rect.x + 24.0,
+        rect.y + 99.0,
+        WHITE,
+    );
+    let input = lod_batch_minimum_size_rect();
+    let valid_minimum = lod_batch_minimum_size(dialog);
+    draw_rrect_bordered(
+        input.x,
+        input.y,
+        input.w,
+        input.h,
+        7.0,
+        1.0,
+        Color::new(0.055, 0.064, 0.078, 1.0),
+        if valid_minimum.is_some() {
+            ui_accent()
+        } else {
+            Color::new(0.82, 0.25, 0.22, 1.0)
+        },
+    );
+    ui_text(
+        &app.ui_font,
+        &dialog.minimum_size,
+        input.x + 10.0,
+        input.y + 22.0,
+        WHITE,
+    );
+    if (get_time() * 2.0) as i32 % 2 == 0 {
+        let cursor = clamp_char_boundary(&dialog.minimum_size, dialog.cursor);
+        let prefix = &dialog.minimum_size[..cursor];
+        let caret_x = input.x + 10.0 + ui_text_width(prefix, 16);
+        draw_line(
+            caret_x,
+            input.y + 7.0,
+            caret_x,
+            input.y + input.h - 7.0,
+            1.0,
+            WHITE,
+        );
+    }
+    let included = lod_batch_included_count(dialog);
+    ui_text(
+        &app.ui_font,
+        &format!(
+            "{included} included   {} filtered/skipped",
+            dialog.candidates.len().saturating_sub(included)
+        ),
+        input.x + input.w + 18.0,
+        input.y + 22.0,
+        if valid_minimum.is_some() {
+            ui_accent()
+        } else {
+            Color::new(1.0, 0.42, 0.38, 1.0)
+        },
+    );
+
+    let list = lod_batch_list_rect();
+    draw_rrect_bordered(
+        list.x,
+        list.y,
+        list.w,
+        list.h,
+        7.0,
+        1.0,
+        Color::new(0.045, 0.052, 0.064, 1.0),
+        ui_border(),
+    );
+    let row_h = 30.0;
+    let visible_rows = (list.h / row_h).max(1.0) as usize;
+    let max_scroll = dialog.candidates.len().saturating_sub(visible_rows) as f32;
+    let scroll = dialog.scroll.clamp(0.0, max_scroll);
+    let start = scroll.floor() as usize;
+    let minimum_size = valid_minimum.unwrap_or(f32::INFINITY);
+    for slot in 0..visible_rows {
+        let index = start + slot;
+        let Some(candidate) = dialog.candidates.get(index) else {
+            break;
+        };
+        let row = Rect::new(
+            list.x + 6.0,
+            list.y + slot as f32 * row_h + 3.0,
+            list.w - 12.0,
+            row_h - 4.0,
+        );
+        if slot % 2 == 0 {
+            draw_rrect(
+                row.x,
+                row.y,
+                row.w,
+                row.h,
+                4.0,
+                Color::new(0.065, 0.074, 0.088, 1.0),
+            );
+        }
+        let (state, color) = if let Some(parent) = candidate.existing_lod.as_deref() {
+            (
+                format!("SKIP · LOD {parent}"),
+                Color::new(0.95, 0.68, 0.22, 1.0),
+            )
+        } else if lod_batch_candidate_included(candidate, minimum_size) {
+            ("INCLUDE".to_string(), Color::new(0.30, 0.85, 0.55, 1.0))
+        } else {
+            ("FILTERED".to_string(), ui_muted())
+        };
+        let label = format!(
+            "{}   {}   {:.2} units",
+            ellipsize(&candidate.id, 26),
+            ellipsize(&candidate.dff, 32),
+            candidate.size
+        );
+        ui_text(&app.ui_font, &label, row.x + 8.0, row.y + 19.0, LIGHTGRAY);
+        let state_w = ui_text_width(&state, 14);
+        ui_text(
+            &app.ui_font,
+            &state,
+            row.x + row.w - state_w - 10.0,
+            row.y + 19.0,
+            color,
+        );
+    }
+    if dialog.candidates.len() > visible_rows {
+        let track = Rect::new(list.x + list.w - 8.0, list.y + 7.0, 3.0, list.h - 14.0);
+        let thumb_h =
+            (track.h * visible_rows as f32 / dialog.candidates.len() as f32).clamp(24.0, track.h);
+        let thumb_y = track.y
+            + if max_scroll > 0.0 {
+                (track.h - thumb_h) * (scroll / max_scroll)
+            } else {
+                0.0
+            };
+        draw_rrect(track.x, track.y, track.w, track.h, 2.0, ui_border());
+        draw_rrect(track.x, thumb_y, track.w, thumb_h, 2.0, ui_accent());
+    }
+    ui_text(
+        &app.ui_font,
+        "Size is the longest rendered bounds dimension after element scale. Existing LODs are always skipped.",
+        rect.x + 24.0,
+        rect.y + rect.h - 58.0,
+        ui_muted(),
+    );
+    draw_dialog_button(&app.ui_font, lod_batch_continue_rect(), "Continue", true);
+    draw_dialog_button(&app.ui_font, lod_batch_cancel_rect(), "Cancel", false);
+}
+
+pub(crate) fn wrap_text_width(text: &str, size: u16, max_w: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if current.is_empty() || ui_text_width(&candidate, size) <= max_w {
+            current = candidate;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+pub(crate) struct ConfirmDialogLayout {
+    pub(crate) rect: Rect,
+    pub(crate) body_lines: Vec<String>,
+    pub(crate) detail_lines: Vec<String>,
+    pub(crate) body_top: f32,
+    pub(crate) detail_top: f32,
+    pub(crate) primary: Rect,
+    pub(crate) secondary: Option<Rect>,
+    pub(crate) cancel: Rect,
+}
+
+pub(crate) fn confirm_dialog_layout(dialog: &ConfirmDialog) -> ConfirmDialogLayout {
+    let w = 560.0_f32.min(screen_width() - 80.0);
+    let text_w = w - 48.0;
+    let body_lines = wrap_text_width(&dialog.body, 16, text_w);
+    let detail_lines = wrap_text_width(&dialog.detail, 16, text_w);
+    let body_h = body_lines.len() as f32 * 24.0;
+    let detail_h = detail_lines.len() as f32 * 22.0;
+    let btn_h = 38.0;
+    let h = 56.0 + body_h + 10.0 + detail_h + 22.0 + btn_h + 20.0;
+    let rect = Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - h) * 0.5,
+        w,
+        h,
+    );
+    let body_top = rect.y + 74.0;
+    let detail_top = body_top + body_h + 10.0;
+    let btn_y = rect.y + h - btn_h - 20.0;
+    let btn_w = |label: &str| (ui_text_width(label, 16) + 40.0).max(104.0);
+    let cancel_w = btn_w("Cancel");
+    let mut right = rect.x + rect.w - 20.0;
+    let cancel = Rect::new(right - cancel_w, btn_y, cancel_w, btn_h);
+    right -= cancel_w + 10.0;
+    let secondary = dialog.secondary_label.as_deref().map(|label| {
+        let w = btn_w(label);
+        let r = Rect::new(right - w, btn_y, w, btn_h);
+        right -= w + 10.0;
+        r
+    });
+    let primary_w = btn_w(&dialog.primary_label);
+    let primary = Rect::new(right - primary_w, btn_y, primary_w, btn_h);
+    ConfirmDialogLayout {
+        rect,
+        body_lines,
+        detail_lines,
+        body_top,
+        detail_top,
+        primary,
+        secondary,
+        cancel,
+    }
+}
+
+pub(crate) fn draw_confirm_dialog(app: &AppState) {
+    let Some(dialog) = app.confirm_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let layout = confirm_dialog_layout(dialog);
+    let rect = layout.rect;
+    draw_panel_rect(&app.ui_font, rect, Some(&dialog.title));
+    for (row, line) in layout.body_lines.iter().enumerate() {
+        ui_text(
+            &app.ui_font,
+            line,
+            rect.x + 24.0,
+            layout.body_top + row as f32 * 24.0,
+            WHITE,
+        );
+    }
+    for (row, line) in layout.detail_lines.iter().enumerate() {
+        ui_text(
+            &app.ui_font,
+            line,
+            rect.x + 24.0,
+            layout.detail_top + row as f32 * 22.0,
+            LIGHTGRAY,
+        );
+    }
+    draw_dialog_button(&app.ui_font, layout.primary, &dialog.primary_label, true);
+    if let (Some(rect), Some(label)) = (layout.secondary, dialog.secondary_label.as_deref()) {
+        draw_dialog_button(&app.ui_font, rect, label, false);
+    }
+    draw_dialog_button(&app.ui_font, layout.cancel, "Cancel", false);
+}
+
+pub(crate) struct DffMergeChoiceDialogLayout {
+    pub(crate) rect: Rect,
+    pub(crate) center: Rect,
+    pub(crate) first: Rect,
+    pub(crate) last: Rect,
+    pub(crate) cancel: Rect,
+}
+
+pub(crate) fn dff_merge_choice_dialog_layout() -> DffMergeChoiceDialogLayout {
+    let w = 520.0_f32.min(screen_width() - 80.0);
+    let h = 184.0;
+    let rect = Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - h) * 0.5,
+        w,
+        h,
+    );
+    let btn_h = 38.0;
+    let btn_y = rect.y + rect.h - btn_h - 20.0;
+    let gap = 10.0;
+    let cancel_w = 104.0;
+    let action_w = ((rect.w - 40.0 - cancel_w - gap * 3.0) / 3.0).max(88.0);
+    let center = Rect::new(rect.x + 20.0, btn_y, action_w, btn_h);
+    let first = Rect::new(center.x + action_w + gap, btn_y, action_w, btn_h);
+    let last = Rect::new(first.x + action_w + gap, btn_y, action_w, btn_h);
+    let cancel = Rect::new(rect.x + rect.w - 20.0 - cancel_w, btn_y, cancel_w, btn_h);
+    DffMergeChoiceDialogLayout {
+        rect,
+        center,
+        first,
+        last,
+        cancel,
+    }
+}
+
+pub(crate) fn draw_dff_merge_choice_dialog(app: &AppState) {
+    let Some(dialog) = app.dff_merge_choice_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let layout = dff_merge_choice_dialog_layout();
+    draw_panel_rect(&app.ui_font, layout.rect, Some("Merge Vertices"));
+    ui_text(
+        &app.ui_font,
+        &format!("Merge {} selected vertex(es) at:", dialog.selected_count),
+        layout.rect.x + 24.0,
+        layout.rect.y + 76.0,
+        WHITE,
+    );
+    ui_text(
+        &app.ui_font,
+        "UV seam groups stay separate when their coordinates differ.",
+        layout.rect.x + 24.0,
+        layout.rect.y + 104.0,
+        LIGHTGRAY,
+    );
+    draw_dialog_button(&app.ui_font, layout.center, "Center", true);
+    draw_dialog_button(&app.ui_font, layout.first, "First", false);
+    draw_dialog_button(&app.ui_font, layout.last, "Last", false);
+    draw_dialog_button(&app.ui_font, layout.cancel, "Cancel", false);
+}
+
+pub(crate) struct DffTextureDuplicateDialogLayout {
+    pub(crate) rect: Rect,
+    pub(crate) input: Rect,
+    pub(crate) duplicate: Rect,
+    pub(crate) cancel: Rect,
+}
+
+pub(crate) fn dff_texture_duplicate_dialog_layout() -> DffTextureDuplicateDialogLayout {
+    let w = 520.0_f32.min(screen_width() - 80.0);
+    let h = 224.0;
+    let rect = Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - h) * 0.5,
+        w,
+        h,
+    );
+    DffTextureDuplicateDialogLayout {
+        input: Rect::new(rect.x + 24.0, rect.y + 104.0, rect.w - 48.0, 36.0),
+        duplicate: Rect::new(rect.x + rect.w - 232.0, rect.y + rect.h - 52.0, 112.0, 32.0),
+        cancel: Rect::new(rect.x + rect.w - 108.0, rect.y + rect.h - 52.0, 84.0, 32.0),
+        rect,
+    }
+}
+
+pub(crate) fn draw_dff_texture_duplicate_dialog(app: &AppState) {
+    let Some(dialog) = app.dff_texture_duplicate_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let layout = dff_texture_duplicate_dialog_layout();
+    let separating = dialog.action == DffTextureNameAction::SeparateGeometry;
+    let renaming = matches!(
+        dialog.action,
+        DffTextureNameAction::RenameDff | DffTextureNameAction::RenameTxd
+    );
+    draw_panel_rect(
+        &app.ui_font,
+        layout.rect,
+        Some(if separating {
+            "Separate from Object"
+        } else if renaming {
+            "Rename Texture"
+        } else {
+            "Duplicate Texture"
+        }),
+    );
+    ui_text(
+        &app.ui_font,
+        &if separating {
+            format!(
+                "Move the selected faces out of '{}' into a separate map object.",
+                dialog.source_texture
+            )
+        } else if renaming {
+            format!(
+                "Rename texture '{}' in its TXD and every DFF that uses that TXD.",
+                dialog.source_texture
+            )
+        } else {
+            format!(
+                "Copy texture '{}' in the selected material's TXD.",
+                dialog.source_texture
+            )
+        },
+        layout.rect.x + 24.0,
+        layout.rect.y + 58.0,
+        WHITE,
+    );
+    ui_text(
+        &app.ui_font,
+        if separating {
+            "New object/DFF name (letters, numbers, underscores, and hyphens):"
+        } else if renaming {
+            "New texture name (the TXD and all affected DFFs are staged together):"
+        } else {
+            "New texture name (materials and faces will not be changed):"
+        },
+        layout.rect.x + 24.0,
+        layout.rect.y + 84.0,
+        LIGHTGRAY,
+    );
+    draw_rrect_bordered(
+        layout.input.x,
+        layout.input.y,
+        layout.input.w,
+        layout.input.h,
+        7.0,
+        1.0,
+        Color::new(0.055, 0.064, 0.078, 1.0),
+        ui_accent(),
+    );
+    let max_chars = ((layout.input.w - 20.0) / 8.5).max(1.0) as usize;
+    let cursor = clamp_char_boundary(&dialog.buffer, dialog.cursor);
+    let cursor_char = dialog.buffer[..cursor].chars().count();
+    let total_chars = dialog.buffer.chars().count();
+    let start_char = cursor_char.saturating_sub(max_chars.saturating_sub(1));
+    let end_char = (start_char + max_chars).min(total_chars);
+    let visible: String = dialog
+        .buffer
+        .chars()
+        .skip(start_char)
+        .take(end_char - start_char)
+        .collect();
+    let caret_prefix: String = visible
+        .chars()
+        .take(cursor_char.saturating_sub(start_char))
+        .collect();
+    let text_x = layout.input.x + 10.0;
+    draw_visible_text_selection(
+        &dialog.buffer,
+        cursor,
+        dialog.selection_anchor,
+        start_char,
+        &visible,
+        text_x,
+        layout.input,
+    );
+    ui_text(&app.ui_font, &visible, text_x, layout.input.y + 23.0, WHITE);
+    if (get_time() * 2.0) as i32 % 2 == 0 {
+        let caret_x = text_x + ui_text_width(&caret_prefix, 16).round();
+        draw_line(
+            caret_x,
+            layout.input.y + 7.0,
+            caret_x,
+            layout.input.y + layout.input.h - 7.0,
+            1.0,
+            WHITE,
+        );
+    }
+    draw_dialog_button(
+        &app.ui_font,
+        layout.duplicate,
+        if separating {
+            "Separate"
+        } else if renaming {
+            "Rename"
+        } else {
+            "Duplicate"
+        },
+        true,
+    );
+    draw_dialog_button(&app.ui_font, layout.cancel, "Cancel", false);
+}
+
+pub(crate) struct DffTextureViewDialogLayout {
+    pub(crate) rect: Rect,
+    pub(crate) image: Rect,
+    pub(crate) close: Rect,
+}
+
+pub(crate) fn dff_texture_view_dialog_layout(
+    dialog: &DffTextureViewDialog,
+) -> DffTextureViewDialogLayout {
+    let max_w = (screen_width() - 48.0).max(320.0);
+    let max_h = (screen_height() - 48.0).max(260.0);
+    let min_w = 420.0_f32.min(max_w);
+    let min_h = 300.0_f32.min(max_h);
+    let w = (dialog.width as f32 + 48.0).clamp(min_w, max_w);
+    let h = (dialog.height as f32 + 126.0).clamp(min_h, max_h);
+    let rect = Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - h) * 0.5,
+        w,
+        h,
+    );
+    DffTextureViewDialogLayout {
+        image: Rect::new(rect.x + 24.0, rect.y + 70.0, rect.w - 48.0, rect.h - 126.0),
+        close: Rect::new(rect.x + rect.w - 108.0, rect.y + rect.h - 44.0, 84.0, 30.0),
+        rect,
+    }
+}
+
+pub(crate) fn draw_dff_texture_view_dialog(app: &AppState) {
+    let Some(dialog) = app.dff_texture_view_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let layout = dff_texture_view_dialog_layout(dialog);
+    draw_panel_rect(&app.ui_font, layout.rect, Some("Full-size Texture"));
+    ui_text(
+        &app.ui_font,
+        &format!(
+            "{}   {} x {}   {}",
+            dialog.texture_name, dialog.width, dialog.height, dialog.txd_name
+        ),
+        layout.rect.x + 24.0,
+        layout.rect.y + 56.0,
+        LIGHTGRAY,
+    );
+    draw_rrect_bordered(
+        layout.image.x,
+        layout.image.y,
+        layout.image.w,
+        layout.image.h,
+        6.0,
+        1.0,
+        Color::new(0.025, 0.030, 0.038, 1.0),
+        ui_border(),
+    );
+    let scale = (layout.image.w / dialog.width as f32)
+        .min(layout.image.h / dialog.height as f32)
+        .min(1.0);
+    let width = (dialog.width as f32 * scale).max(1.0);
+    let height = (dialog.height as f32 * scale).max(1.0);
+    let destination = Rect::new(
+        layout.image.x + (layout.image.w - width) * 0.5,
+        layout.image.y + (layout.image.h - height) * 0.5,
+        width,
+        height,
+    );
+    if let Some(texture) = dialog.texture.as_ref() {
+        draw_texture_ex(
+            texture,
+            destination.x,
+            destination.y,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(destination.w, destination.h)),
+                ..Default::default()
+            },
+        );
+    } else if dialog.raw_texture != 0 {
+        draw_raw_texture_quads(&[(dialog.raw_texture, destination)]);
+    }
+    if scale < 1.0 {
+        ui_text_size(
+            &app.ui_font,
+            &format!("Scaled to {:.0}% to fit", scale * 100.0),
+            layout.image.x + 8.0,
+            layout.image.y + layout.image.h - 8.0,
+            13,
+            ui_muted(),
+        );
+    }
+    draw_dialog_button(&app.ui_font, layout.close, "Close", true);
+}
+
+pub(crate) fn draw_loading_resource(root: &Path, status: &str) {
+    reset_gl_for_ui();
+    draw_rectangle(
+        0.0,
+        0.0,
+        screen_width(),
+        screen_height(),
+        Color::new(0.050, 0.058, 0.070, 1.0),
+    );
+    let w = 620.0_f32.min(screen_width() - 80.0);
+    let rect = Rect::new(
+        (screen_width() - w) * 0.5,
+        screen_height() * 0.5 - 68.0,
+        w,
+        136.0,
+    );
+    draw_rrect_bordered(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        10.0,
+        1.0,
+        Color::new(0.070, 0.080, 0.096, 1.0),
+        ui_border(),
+    );
+    ui_text_bold("Loading Resource", rect.x + 24.0, rect.y + 40.0, 22, WHITE);
+    ui_text(
+        &Font::default(),
+        &ellipsize(root.to_string_lossy().as_ref(), 68),
+        rect.x + 24.0,
+        rect.y + 72.0,
+        LIGHTGRAY,
+    );
+    let status_line = if status.is_empty() {
+        "Parsing DFF/IMG/TXD data and rebuilding the scene."
+    } else {
+        status
+    };
+    ui_text(
+        &Font::default(),
+        status_line,
+        rect.x + 24.0,
+        rect.y + 104.0,
+        ui_muted(),
+    );
+}

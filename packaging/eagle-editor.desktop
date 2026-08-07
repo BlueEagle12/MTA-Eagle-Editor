@@ -1,0 +1,16 @@
+[Desktop Entry]
+Categories=Graphics;Development;
+Comment[en_US]=Eagle map and light editor
+Comment=Eagle map and light editor
+Exec=eagle-editor
+GenericName[en_US]=
+GenericName=
+Icon=eagle-editor
+MimeType=
+Name[en_US]=Eagle Editor
+Name=Eagle Editor
+StartupNotify=true
+Terminal=true
+Type=Application
+X-KDE-SubstituteUID=false
+X-KDE-Username=

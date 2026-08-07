@@ -1,0 +1,62 @@
+name: Release builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            binary: target/release/eagle-editor
+            rustflags: ""
+          - os: windows-latest
+            platform: windows-x86_64
+            binary: target/release/eagle-editor.exe
+            rustflags: -C target-feature=+crt-static
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked
+      - name: Stage portable release folder
+        run: python scripts/package_release.py --platform ${{ matrix.platform }} --binary ${{ matrix.binary }} --output release/staging
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: release/staging/EagleEditor-*
+          if-no-files-found: error
+
+  group:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release/github-upload
+          merge-multiple: true
+      - name: Create archives and checksums
+        run: python scripts/package_release.py --output release/github-upload --bundle-only
+      - uses: actions/upload-artifact@v4
+        with:
+          name: github-release-ready
+          path: release/github-upload
+          if-no-files-found: error
+      - name: Publish tagged GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" release/github-upload/*.zip release/github-upload/*.tar.gz release/github-upload/SHA256SUMS.txt --generate-notes --verify-tag

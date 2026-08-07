@@ -38,13 +38,9 @@ resource without moving between several separate tools.
 
 ## Download
 
-| Platform | Package | Size |
-| --- | --- | ---: |
-| Windows x86-64 | [EagleEditor-v0.1.0-windows-x86_64.zip](EagleEditor-v0.1.0-windows-x86_64.zip) | 19 MB |
-| Linux x86-64 | [EagleEditor-v0.1.0-linux-x86_64.tar.gz](EagleEditor-v0.1.0-linux-x86_64.tar.gz) | 8.2 MB |
-
-Release downloads are also available on the
+Prebuilt Windows and Linux packages are available on the
 [GitHub Releases page](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases).
+Each release includes a `SHA256SUMS.txt` file for archive verification.
 
 ## Getting started
 
@@ -76,6 +72,39 @@ directly from the command line on either platform:
 ```text
 EagleEditor "/path/to/resource"
 ```
+
+On first start, Eagle asks for the GTA: San Andreas installation folder and
+verifies it by checking for `models/gta3.img`. The selected path is stored in
+the user-local Eagle Editor preferences and can be changed later in the editor's
+Preferences dialog.
+
+## Build from source
+
+Eagle Editor requires Rust 1.85 or newer. Clone the repository, then build and
+test it from the repository root:
+
+```bash
+git clone https://github.com/BlueEagle12/MTA-Eagle-Editor.git
+cd MTA-Eagle-Editor
+cargo test --locked
+cargo build --release --locked
+```
+
+The executable is written to `target/release/eagle-editor` on Linux or
+`target/release/eagle-editor.exe` on Windows. To build and immediately open a
+resource:
+
+```bash
+./scripts/run.sh "/path/to/resource"
+```
+
+On Linux, install a native compiler toolchain, OpenGL development files, and
+X11 development files if they are not already present. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the project conventions and local checks.
+
+The LOD audit reads `eagleLoader/config.xml` relative to the working directory
+when it is available. Set `EAGLE_LOADER_CONFIG` to an explicit `config.xml`
+path when developing against a loader stored elsewhere.
 
 ## Project format
 
@@ -150,28 +179,6 @@ The complete documentation is maintained in the
 - [Custom Traffic Lights](https://github.com/BlueEagle12/MTA-Eagle-Editor/wiki/Custom-Traffic-Lights)
   — native GTA traffic-light setup
 
-## Verify a download
-
-Published hashes are in [`SHA256SUMS.txt`](SHA256SUMS.txt). From the repository
-or a folder containing the two archives:
-
-```bash
-sha256sum -c SHA256SUMS.txt
-```
-
-For a single file on Windows PowerShell:
-
-```powershell
-Get-FileHash .\EagleEditor-v0.1.0-windows-x86_64.zip -Algorithm SHA256
-```
-
-Expected SHA-256 values:
-
-```text
-edcb19579c4510771ae10fa438967fa6a83ec7d9ca4e3921c0fc3cc465a6f338  EagleEditor-v0.1.0-linux-x86_64.tar.gz
-1a381004e6d9d3848365c6245afe1d6a44f7ac56e9e66fef303b278d20b85775  EagleEditor-v0.1.0-windows-x86_64.zip
-```
-
 ## Troubleshooting and feedback
 
 - On Linux, make sure current OpenGL drivers and the system X11 libraries are
@@ -186,3 +193,5 @@ edcb19579c4510771ae10fa438967fa6a83ec7d9ca4e3921c0fc3cc465a6f338  EagleEditor-v0
 ## License
 
 Eagle Editor is distributed under the [GNU General Public License v3.0](LICENSE).
+Bundled third-party components and trademarks are described in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -1,4 +1,0 @@
-Eagle Editor
-
-Run EagleEditor.exe.
-Choose an Eagle resource in the Project Manager, or pass its folder on the command line.
