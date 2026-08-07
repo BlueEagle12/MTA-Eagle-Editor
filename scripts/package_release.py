@@ -65,6 +65,14 @@ def stage(platform: str, binary: Path, output: Path, version: str) -> Path:
     licenses = folder / "LICENSES"
     licenses.mkdir()
     shutil.copy2(ROOT / "LICENSES" / "OFL-1.1.txt", licenses / "OFL-1.1.txt")
+    shutil.copy2(
+        ROOT / "vendor" / "miniquad" / "LICENSE-MIT",
+        licenses / "MINIQUAD-LICENSE-MIT",
+    )
+    shutil.copy2(
+        ROOT / "vendor" / "miniquad" / "LICENSE-APACHE",
+        licenses / "MINIQUAD-LICENSE-APACHE",
+    )
     if platform.startswith("windows") and os.name != "nt":
         copy_mingw_runtime(folder)
     (folder / "RUNNING.txt").write_text(
@@ -94,11 +102,15 @@ def archive_folder(folder: Path) -> Path:
     return archive
 
 
-def bundle(output: Path) -> None:
+def bundle(output: Path, version: str) -> None:
     for pattern in ("EagleEditor-v*.zip", "EagleEditor-v*.tar.gz", "SHA256SUMS.txt"):
         for stale in output.glob(pattern):
             stale.unlink()
-    archives = [archive_folder(folder) for folder in sorted(output.glob("EagleEditor-v*-*")) if folder.is_dir()]
+    archives = [
+        archive_folder(folder)
+        for folder in sorted(output.glob(f"EagleEditor-v{version}-*"))
+        if folder.is_dir()
+    ]
     checksums = []
     for archive in archives:
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
@@ -122,7 +134,7 @@ def main() -> None:
             parser.error(f"binary does not exist: {args.binary}")
         stage(args.platform, args.binary.resolve(), args.output, args.version)
     else:
-        bundle(args.output)
+        bundle(args.output, args.version)
 
 
 if __name__ == "__main__":

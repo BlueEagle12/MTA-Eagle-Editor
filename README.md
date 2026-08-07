@@ -2,7 +2,7 @@
 
 **A native 3D world and asset editor for Multi Theft Auto: San Andreas.**
 
-[![Release](https://img.shields.io/badge/release-v0.1.0-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.1-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-4b5563)](#download)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green)](LICENSE)
 
@@ -12,7 +12,7 @@ asset problems, configure lighting and physics, and save the result back to the
 resource without moving between several separate tools.
 
 > [!IMPORTANT]
-> v0.1.0 is the first public release. Keep a backup or use version control for
+> Eagle Editor is an early public release. Keep a backup or use version control for
 > production resources, especially before running bulk repair or optimization.
 
 ## Highlights

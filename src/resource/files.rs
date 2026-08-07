@@ -3693,10 +3693,39 @@ mod tests {
 
     #[test]
     pub(crate) fn gta_sa_internal_col_names_are_indexed_from_archives() {
-        let gta_sa_dir = load_gta_sa_dir_preference();
-        if !gta_sa_dir.is_dir() {
-            return;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let gta_sa_dir = env::temp_dir().join(format!(
+            "eagle_gta_archive_index_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(gta_sa_dir.join("models")).unwrap();
+
+        let expected = [
+            "alpha_fence.col",
+            "bistro_blok.col",
+            "gen_roofbit1.col",
+            "kmb_deadarm.col",
+            "roofstuff13.col",
+        ];
+        let mut packed_col = Vec::new();
+        for name in expected {
+            let stem = name.trim_end_matches(".col").as_bytes();
+            let mut model = vec![0u8; 32];
+            model[0..4].copy_from_slice(b"COL2");
+            model[4..8].copy_from_slice(&24u32.to_le_bytes());
+            model[8..8 + stem.len()].copy_from_slice(stem);
+            packed_col.extend(model);
         }
+        write_img_archive(
+            &gta_sa_dir.join(GTA_SA_MARKER_FILE),
+            &[("generic.col".to_string(), packed_col)],
+        )
+        .unwrap();
+
         let mut dffs = BTreeSet::new();
         let mut cols = BTreeSet::new();
         let mut txds = BTreeSet::new();
@@ -3706,15 +3735,11 @@ mod tests {
             &mut cols,
             &mut txds,
         );
-        for name in [
-            "alpha_fence.col",
-            "bistro_blok.col",
-            "gen_roofbit1.col",
-            "kmb_deadarm.col",
-            "roofstuff13.col",
-        ] {
+        for name in expected {
             assert!(cols.contains(name), "missing internal COL model {name}");
         }
+
+        fs::remove_dir_all(gta_sa_dir).unwrap();
     }
 
     #[test]
