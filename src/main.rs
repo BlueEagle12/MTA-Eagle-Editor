@@ -64,6 +64,22 @@ const LIVE_RESOURCE_REFRESH_FRAME_BUDGET: Duration = Duration::from_millis(5);
 const DEFAULT_CAMERA_SPEED: f32 = 360.0;
 const MIN_CAMERA_SPEED: f32 = 20.0;
 const MAX_CAMERA_SPEED: f32 = 5000.0;
+/// Multiplier applied to every transform gimbal/gizmo's world-space size. The
+/// gimbals are sized from camera distance, which reads far too small on small
+/// or low-resolution displays, so this is user tunable.
+const DEFAULT_GIZMO_SCALE: f32 = 1.0;
+const MIN_GIZMO_SCALE: f32 = 0.25;
+const MAX_GIZMO_SCALE: f32 = 10.0;
+/// Multiplier on the base mouse-look sensitivity. Defaults tuned on one mouse
+/// feel wildly different on other hardware, so this is user tunable.
+const DEFAULT_CAMERA_ROTATION_SPEED: f32 = 1.0;
+const MIN_CAMERA_ROTATION_SPEED: f32 = 0.1;
+const MAX_CAMERA_ROTATION_SPEED: f32 = 4.0;
+/// Radians of camera rotation per pixel of mouse movement, before the user's
+/// rotation speed multiplier is applied.
+const CAMERA_LOOK_SENSITIVITY: f32 = 0.003;
+/// Factor used by the Preferences dialog's speed steppers.
+const CAMERA_SPEED_STEP_FACTOR: f32 = 1.25;
 const CAMERA_SPEED_WHEEL_FACTOR: f32 = 1.15;
 const DEFAULT_FOG_STRENGTH: f32 = 1.0;
 const MIN_FOG_STRENGTH: f32 = 0.0;
@@ -2369,7 +2385,6 @@ enum InspectorField {
     DefinitionLod,
     DefinitionTimeIn,
     DefinitionTimeOut,
-    CameraSpeed,
     CollisionFaceMaterial,
     CollisionFaceLight,
     CollisionVertexX,
@@ -2766,6 +2781,15 @@ struct LoadDialog {
 
 struct PreferencesDialog {
     gta_sa_dir: String,
+    /// Pending viewport values. They are staged here rather than applied live so
+    /// Cancel discards them along with the path edit.
+    gizmo_scale: f32,
+    camera_speed: f32,
+    camera_rotation_speed: f32,
+    msaa_samples: i32,
+    /// MSAA as it was when the dialog opened, so "needs a restart" can be
+    /// detected without re-reading preferences.txt every frame.
+    msaa_samples_saved: i32,
     cursor: usize,
     selection_anchor: Option<usize>,
 }
@@ -4099,6 +4123,8 @@ struct AppState {
     save_log_scroll: f32,
     save_log_follow_tail: bool,
     camera_speed: f32,
+    camera_rotation_speed: f32,
+    gizmo_scale: f32,
     gta_sa_dir: PathBuf,
     particle_effects: Vec<ParticleEffectDef>,
     bake_settings: BakeSettings,

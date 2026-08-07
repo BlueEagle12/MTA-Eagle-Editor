@@ -11293,6 +11293,13 @@ pub(crate) fn open_preferences_dialog(app: &mut AppState) {
         cursor: gta_sa_dir.len(),
         selection_anchor: None,
         gta_sa_dir,
+        gizmo_scale: clamp_gizmo_scale(app.gizmo_scale),
+        camera_speed: clamp_camera_speed(app.camera_speed),
+        camera_rotation_speed: clamp_camera_rotation_speed(app.camera_rotation_speed),
+        // MSAA only takes effect at window creation, so the live value is the
+        // saved preference rather than anything on AppState.
+        msaa_samples: load_msaa_samples_preference(),
+        msaa_samples_saved: load_msaa_samples_preference(),
     });
 }
 

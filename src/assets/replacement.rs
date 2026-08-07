@@ -3733,15 +3733,22 @@ pub(crate) fn dist_to_segment(point: Vec2, a: Vec2, b: Vec2) -> f32 {
     point.distance(a + ab * t)
 }
 
+/// User-tunable multiplier for gimbal/gizmo size. Callers that apply their own
+/// clamps must scale those bounds by this so the preference is not clamped away.
+pub(crate) fn gizmo_scale(app: &AppState) -> f32 {
+    clamp_gizmo_scale(app.gizmo_scale)
+}
+
 pub(crate) fn gizmo_visual_length(app: &AppState, origin: Vec3) -> f32 {
     let distance = (origin - app.camera.pos).length().max(80.0);
-    if app.active_tab == AppTab::Lights {
+    let length = if app.active_tab == AppTab::Lights {
         // Light handles are frequently manipulated against an empty sky or
         // at long range, so give them a substantially larger screen presence.
         (distance * 0.006).clamp(5.0, 14.0)
     } else {
         (distance * 0.003).clamp(2.0, 7.0)
-    }
+    };
+    length * gizmo_scale(app)
 }
 
 pub(crate) fn selected_origin(app: &AppState) -> Option<Vec3> {
@@ -5703,6 +5710,26 @@ pub(crate) fn set_camera_speed(app: &mut AppState, speed: f32) {
     app.camera_speed = speed;
     save_camera_speed_preference(speed);
     app.status_message = format!("Camera speed {:.0}", speed);
+}
+
+pub(crate) fn set_camera_rotation_speed(app: &mut AppState, speed: f32) {
+    let speed = clamp_camera_rotation_speed(speed);
+    if (app.camera_rotation_speed - speed).abs() < 0.001 {
+        return;
+    }
+    app.camera_rotation_speed = speed;
+    save_camera_rotation_speed_preference(speed);
+    app.status_message = format!("Camera rotation speed {speed:.2}x");
+}
+
+pub(crate) fn set_gizmo_scale(app: &mut AppState, scale: f32) {
+    let scale = clamp_gizmo_scale(scale);
+    if (app.gizmo_scale - scale).abs() < 0.001 {
+        return;
+    }
+    app.gizmo_scale = scale;
+    save_gizmo_scale_preference(scale);
+    app.status_message = format!("Gimbal size {scale:.2}x");
 }
 
 pub(crate) fn save_lights_for_app(app: &mut AppState) {

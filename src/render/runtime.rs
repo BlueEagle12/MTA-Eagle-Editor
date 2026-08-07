@@ -378,7 +378,8 @@ fn draw_center_of_mass_marker(app: &AppState) {
         return;
     };
     let center = placement_matrix(placement).transform_point3(local_center);
-    let radius = (gizmo_visual_length(app, center) * 0.62).clamp(2.0, 6.0);
+    let scale = gizmo_scale(app);
+    let radius = (gizmo_visual_length(app, center) * 0.62).clamp(2.0 * scale, 6.0 * scale);
 
     unsafe {
         gl::PushAttrib(
@@ -596,7 +597,7 @@ pub(crate) fn draw_rotation_ring(
     }
 }
 
-fn draw_gizmo_center_ring(origin: Vec3, camera_pos: Vec3, length: f32) {
+fn draw_gizmo_center_ring(origin: Vec3, camera_pos: Vec3, length: f32, scale: f32) {
     let view_dir = (camera_pos - origin).normalize_or_zero();
     let view_dir = if view_dir.length_squared() > 0.0001 {
         view_dir
@@ -609,7 +610,7 @@ fn draw_gizmo_center_ring(origin: Vec3, camera_pos: Vec3, length: f32) {
         view_dir.cross(Vec3::X).normalize_or_zero()
     };
     let bitangent = view_dir.cross(tangent).normalize_or_zero();
-    let radius = (length * 0.12).clamp(3.0, 13.0);
+    let radius = (length * 0.12).clamp(3.0 * scale, 13.0 * scale);
     unsafe {
         gl::LineWidth(1.5);
         gl::Color4f(0.88, 0.88, 0.88, 0.72);
@@ -641,7 +642,7 @@ pub(crate) fn draw_transform_gizmo(app: &AppState) {
         gl::Disable(gl::DEPTH_TEST);
         gl::Enable(gl::BLEND);
         gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
-        draw_gizmo_center_ring(origin, app.camera.pos, length);
+        draw_gizmo_center_ring(origin, app.camera.pos, length, gizmo_scale(app));
         match app.transform_mode {
             TransformMode::Select => {}
             TransformMode::Move => {

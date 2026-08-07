@@ -435,6 +435,7 @@ pub(crate) fn draw_preferences_dialog(app: &AppState) {
         rect.y + 188.0,
         ui_muted(),
     );
+    draw_preferences_viewport_section(app, dialog, rect);
     draw_dialog_button(
         &app.ui_font,
         preferences_cleanup_autosaves_rect(),
@@ -453,6 +454,101 @@ pub(crate) fn draw_preferences_dialog(app: &AppState) {
         "Cancel",
         false,
     );
+}
+
+/// Read-only value chip sitting between a stepper's - and + buttons.
+fn draw_preferences_value_chip(app: &AppState, rect: Rect, value: &str) {
+    draw_rrect_bordered(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        7.0,
+        1.0,
+        Color::new(0.055, 0.064, 0.078, 1.0),
+        ui_border(),
+    );
+    let width = ui_text_width(value, 16);
+    ui_text(
+        &app.ui_font,
+        value,
+        rect.x + (rect.w - width) * 0.5,
+        rect.y + 20.0,
+        WHITE,
+    );
+}
+
+fn draw_preferences_stepper(
+    app: &AppState,
+    row: usize,
+    label: &str,
+    value: &str,
+    can_decrease: bool,
+    can_increase: bool,
+) {
+    let (label_x, row_y) = preferences_row_origin(row);
+    ui_text(&app.ui_font, label, label_x, row_y + 20.0, ui_dim());
+    let (minus, chip, plus) = preferences_stepper_rects(row);
+    draw_dialog_button(&app.ui_font, minus, "-", can_decrease);
+    draw_preferences_value_chip(app, chip, value);
+    draw_dialog_button(&app.ui_font, plus, "+", can_increase);
+}
+
+fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog, rect: Rect) {
+    ui_text(
+        &app.ui_font,
+        "Viewport",
+        rect.x + 24.0,
+        rect.y + 224.0,
+        WHITE,
+    );
+    draw_preferences_stepper(
+        app,
+        0,
+        "Gimbal Size",
+        &format!("{:.2}x", dialog.gizmo_scale),
+        dialog.gizmo_scale > MIN_GIZMO_SCALE,
+        dialog.gizmo_scale < MAX_GIZMO_SCALE,
+    );
+    draw_preferences_stepper(
+        app,
+        1,
+        "Camera Speed",
+        &format!("{:.0}", dialog.camera_speed),
+        dialog.camera_speed > MIN_CAMERA_SPEED,
+        dialog.camera_speed < MAX_CAMERA_SPEED,
+    );
+    draw_preferences_stepper(
+        app,
+        2,
+        "Camera Rotation Speed",
+        &format!("{:.2}x", dialog.camera_rotation_speed),
+        dialog.camera_rotation_speed > MIN_CAMERA_ROTATION_SPEED,
+        dialog.camera_rotation_speed < MAX_CAMERA_ROTATION_SPEED,
+    );
+    let (label_x, msaa_y) = preferences_row_origin(PREFERENCES_MSAA_ROW);
+    ui_text(
+        &app.ui_font,
+        "Anti-aliasing",
+        label_x,
+        msaa_y + 20.0,
+        ui_dim(),
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        preferences_msaa_rect(),
+        msaa_samples_label(dialog.msaa_samples),
+        clamp_msaa_samples(dialog.msaa_samples) != 1,
+    );
+    if clamp_msaa_samples(dialog.msaa_samples) != clamp_msaa_samples(dialog.msaa_samples_saved) {
+        ui_text(
+            &app.ui_font,
+            "Takes effect after restarting the editor",
+            label_x,
+            msaa_y + 52.0,
+            ui_muted(),
+        );
+    }
 }
 
 pub(crate) fn draw_dff_replace_choice_dialog(app: &AppState) {

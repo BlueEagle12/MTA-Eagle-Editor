@@ -36,12 +36,48 @@ pub(crate) fn clamp_msaa_samples(value: i32) -> i32 {
     }
 }
 
+pub(crate) fn load_msaa_samples_preference() -> i32 {
+    load_preferences()
+        .get("msaa_samples")
+        .and_then(|value| value.parse::<i32>().ok())
+        .map(clamp_msaa_samples)
+        .unwrap_or(DEFAULT_MSAA_SAMPLES)
+}
+
+pub(crate) fn save_msaa_samples_preference(samples: i32) {
+    let mut values = load_preferences();
+    values.insert(
+        "msaa_samples".to_string(),
+        clamp_msaa_samples(samples).to_string(),
+    );
+    save_preferences(&values);
+}
+
+pub(crate) fn msaa_samples_label(samples: i32) -> &'static str {
+    match clamp_msaa_samples(samples) {
+        2 => "2x MSAA",
+        4 => "4x MSAA",
+        _ => "Off",
+    }
+}
+
+/// Cycles Off -> 2x -> 4x -> Off.
+pub(crate) fn next_msaa_samples(samples: i32) -> i32 {
+    match clamp_msaa_samples(samples) {
+        1 => 2,
+        2 => 4,
+        _ => 1,
+    }
+}
+
 pub(crate) fn requested_msaa_samples() -> i32 {
+    // The saved preference is the baseline; the env var and CLI flag still win
+    // so a bad setting can be overridden without editing preferences.txt.
     let mut samples = env::var("EAGLE_MSAA")
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
         .map(clamp_msaa_samples)
-        .unwrap_or(DEFAULT_MSAA_SAMPLES);
+        .unwrap_or_else(load_msaa_samples_preference);
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -62,6 +98,39 @@ pub(crate) fn clamp_camera_speed(value: f32) -> f32 {
         value.clamp(MIN_CAMERA_SPEED, MAX_CAMERA_SPEED)
     } else {
         DEFAULT_CAMERA_SPEED
+    }
+}
+
+pub(crate) fn clamp_gizmo_scale(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(MIN_GIZMO_SCALE, MAX_GIZMO_SCALE)
+    } else {
+        DEFAULT_GIZMO_SCALE
+    }
+}
+
+/// Step size for the gimbal stepper. Coarser at the top of the range so getting
+/// from 1x to 10x does not take three dozen clicks.
+pub(crate) fn gizmo_scale_step(value: f32, increasing: bool) -> f32 {
+    let band = if increasing {
+        value + 0.001
+    } else {
+        value - 0.001
+    };
+    if band < 2.0 {
+        0.25
+    } else if band < 5.0 {
+        0.5
+    } else {
+        1.0
+    }
+}
+
+pub(crate) fn clamp_camera_rotation_speed(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(MIN_CAMERA_ROTATION_SPEED, MAX_CAMERA_ROTATION_SPEED)
+    } else {
+        DEFAULT_CAMERA_ROTATION_SPEED
     }
 }
 
@@ -703,6 +772,40 @@ pub(crate) fn save_camera_speed_preference(speed: f32) {
     values.insert(
         "camera_speed".to_string(),
         format!("{:.3}", clamp_camera_speed(speed)),
+    );
+    save_preferences(&values);
+}
+
+pub(crate) fn load_camera_rotation_speed_preference() -> f32 {
+    load_preferences()
+        .get("camera_rotation_speed")
+        .and_then(|value| value.parse::<f32>().ok())
+        .map(clamp_camera_rotation_speed)
+        .unwrap_or(DEFAULT_CAMERA_ROTATION_SPEED)
+}
+
+pub(crate) fn save_camera_rotation_speed_preference(speed: f32) {
+    let mut values = load_preferences();
+    values.insert(
+        "camera_rotation_speed".to_string(),
+        format!("{:.3}", clamp_camera_rotation_speed(speed)),
+    );
+    save_preferences(&values);
+}
+
+pub(crate) fn load_gizmo_scale_preference() -> f32 {
+    load_preferences()
+        .get("gizmo_scale")
+        .and_then(|value| value.parse::<f32>().ok())
+        .map(clamp_gizmo_scale)
+        .unwrap_or(DEFAULT_GIZMO_SCALE)
+}
+
+pub(crate) fn save_gizmo_scale_preference(scale: f32) {
+    let mut values = load_preferences();
+    values.insert(
+        "gizmo_scale".to_string(),
+        format!("{:.2}", clamp_gizmo_scale(scale)),
     );
     save_preferences(&values);
 }

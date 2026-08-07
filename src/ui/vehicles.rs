@@ -2889,7 +2889,8 @@ fn vehicle_component_pivot(mesh: &RenderMesh, component: usize) -> Option<Vec3> 
 }
 
 fn vehicle_gizmo_visual_length(app: &AppState, origin: Vec3) -> f32 {
-    (gizmo_visual_length(app, origin) * 0.62).clamp(1.6, 4.6)
+    let scale = gizmo_scale(app);
+    (gizmo_visual_length(app, origin) * 0.62).clamp(1.6 * scale, 4.6 * scale)
 }
 
 fn vehicle_component_rotation_matrix(rotation: V3) -> Mat4 {
@@ -3084,7 +3085,7 @@ fn draw_vehicle_rotation_gimbal(app: &AppState) {
         gl::Disable(gl::DEPTH_TEST);
         gl::Enable(gl::BLEND);
         gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
-        draw_vehicle_gizmo_center_ring(center, app.camera.pos, length);
+        draw_vehicle_gizmo_center_ring(center, app.camera.pos, length, gizmo_scale(app));
         for axis in [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
             let (a, b) = vehicle_ring_basis(app, component, axis);
             draw_rotation_ring(
@@ -3104,7 +3105,7 @@ fn draw_vehicle_rotation_gimbal(app: &AppState) {
     }
 }
 
-fn draw_vehicle_gizmo_center_ring(origin: Vec3, camera_pos: Vec3, length: f32) {
+fn draw_vehicle_gizmo_center_ring(origin: Vec3, camera_pos: Vec3, length: f32, scale: f32) {
     let view_dir = (camera_pos - origin).normalize_or_zero();
     let view_dir = if view_dir.length_squared() > 0.0001 {
         view_dir
@@ -3117,7 +3118,7 @@ fn draw_vehicle_gizmo_center_ring(origin: Vec3, camera_pos: Vec3, length: f32) {
         view_dir.cross(Vec3::X).normalize_or_zero()
     };
     let bitangent = view_dir.cross(tangent).normalize_or_zero();
-    let radius = (length * 0.12).clamp(3.0, 13.0);
+    let radius = (length * 0.12).clamp(3.0 * scale, 13.0 * scale);
     unsafe {
         gl::LineWidth(1.5);
         gl::Color4f(0.88, 0.88, 0.88, 0.72);

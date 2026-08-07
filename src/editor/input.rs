@@ -739,15 +739,6 @@ pub(crate) fn inspector_field_rect(app: &AppState, field: InspectorField) -> Rec
         InspectorField::GlobalRotationZ => {
             settings_layout_field_rect(app, |l| l.global_rotation.map(|r| r[2]))
         }
-        InspectorField::CameraSpeed => {
-            if app.active_tab == AppTab::Preview && app.properties_tab == PropertiesTab::Settings {
-                settings_layout_field_rect(app, |layout| layout.camera_speed)
-            } else if app.active_tab == AppTab::Collisions {
-                Rect::new(x, TOP_H + 500.0 - app.properties_scroll, 150.0, 30.0)
-            } else {
-                Rect::new(x, TOP_H + 286.0, 150.0, 30.0)
-            }
-        }
         InspectorField::CollisionFaceMaterial => {
             if app.active_tab == AppTab::Editing {
                 col_layout_field_rect(app, |layout| layout.material)
@@ -1002,7 +993,6 @@ pub(crate) fn inspector_fields(app: &AppState) -> Vec<InspectorField> {
             InspectorField::CollisionVertexX,
             InspectorField::CollisionVertexY,
             InspectorField::CollisionVertexZ,
-            InspectorField::CameraSpeed,
         ];
     }
     if app.active_tab == AppTab::Editing
@@ -1131,7 +1121,6 @@ pub(crate) fn inspector_fields(app: &AppState) -> Vec<InspectorField> {
         return vec![
             InspectorField::SnapMove,
             InspectorField::SnapRotate,
-            InspectorField::CameraSpeed,
             InspectorField::GlobalOffsetX,
             InspectorField::GlobalOffsetY,
             InspectorField::GlobalOffsetZ,
@@ -1201,9 +1190,6 @@ pub(crate) fn clicked_inspector_field(app: &AppState, mouse: Vec2) -> Option<Ins
 }
 
 pub(crate) fn inspector_field_value(app: &AppState, field: InspectorField) -> String {
-    if field == InspectorField::CameraSpeed {
-        return format!("{:.0}", app.camera_speed);
-    }
     if field == InspectorField::SnapMove {
         return format!("{:.3}", app.snap_move);
     }
@@ -1576,7 +1562,6 @@ pub(crate) fn inspector_field_value(app: &AppState, field: InspectorField) -> St
             .and_then(|def| def.attrs.get("timeOut"))
             .cloned()
             .unwrap_or_default(),
-        InspectorField::CameraSpeed => unreachable!(),
         _ => String::new(),
     }
 }
@@ -2480,14 +2465,6 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
                 set_optional_attr(&mut def.attrs, "timeOut", time.clone());
                 mark_definition_override_attr(def, "timeOut");
             }
-        }
-        InspectorField::CameraSpeed => {
-            if let Some(speed) = parse_finite_f32(&value) {
-                set_camera_speed(app, speed);
-            } else {
-                app.status_message = "Camera speed must be a finite number".to_string();
-            }
-            return;
         }
         InspectorField::CollisionPrimitiveRotX
         | InspectorField::CollisionPrimitiveRotY
@@ -4211,19 +4188,77 @@ pub(crate) fn load_dialog_rect() -> Rect {
     save_as_dialog_rect()
 }
 
+pub(crate) const PREFERENCES_DIALOG_H: f32 = 514.0;
+/// First row of the Viewport section, relative to the dialog's top edge.
+const PREFERENCES_VIEWPORT_ROW_Y: f32 = 246.0;
+const PREFERENCES_VIEWPORT_ROW_GAP: f32 = 44.0;
+const PREFERENCES_STEP_W: f32 = 32.0;
+const PREFERENCES_VALUE_W: f32 = 104.0;
+
 pub(crate) fn preferences_dialog_rect() -> Rect {
     let w = 760.0_f32.min(screen_width() - 80.0);
+    let h = PREFERENCES_DIALOG_H.min(screen_height() - 40.0);
     Rect::new(
         (screen_width() - w) * 0.5,
-        screen_height() * 0.5 - 124.0,
+        ((screen_height() - h) * 0.5).max(20.0),
         w,
-        248.0,
+        h,
     )
 }
 
 pub(crate) fn preferences_input_rect() -> Rect {
     let rect = preferences_dialog_rect();
     Rect::new(rect.x + 24.0, rect.y + 98.0, rect.w - 48.0, 32.0)
+}
+
+/// Row `row` of the Viewport section: the label sits at the left, the control
+/// group is right-aligned. Returns (label_x, row_y).
+pub(crate) fn preferences_row_origin(row: usize) -> (f32, f32) {
+    let rect = preferences_dialog_rect();
+    (
+        rect.x + 24.0,
+        rect.y + PREFERENCES_VIEWPORT_ROW_Y + row as f32 * PREFERENCES_VIEWPORT_ROW_GAP,
+    )
+}
+
+/// Stepper for row `row`: (minus, value, plus).
+pub(crate) fn preferences_stepper_rects(row: usize) -> (Rect, Rect, Rect) {
+    let rect = preferences_dialog_rect();
+    let (_, y) = preferences_row_origin(row);
+    let right = rect.x + rect.w - 24.0;
+    let plus = Rect::new(right - PREFERENCES_STEP_W, y, PREFERENCES_STEP_W, 30.0);
+    let value = Rect::new(
+        plus.x - 6.0 - PREFERENCES_VALUE_W,
+        y,
+        PREFERENCES_VALUE_W,
+        30.0,
+    );
+    let minus = Rect::new(
+        value.x - 6.0 - PREFERENCES_STEP_W,
+        y,
+        PREFERENCES_STEP_W,
+        30.0,
+    );
+    (minus, value, plus)
+}
+
+pub(crate) fn preferences_gizmo_scale_rects() -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(0)
+}
+
+pub(crate) fn preferences_camera_speed_rects() -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(1)
+}
+
+pub(crate) fn preferences_camera_rotation_speed_rects() -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(2)
+}
+
+pub(crate) const PREFERENCES_MSAA_ROW: usize = 3;
+
+pub(crate) fn preferences_msaa_rect() -> Rect {
+    let (_, value, plus) = preferences_stepper_rects(PREFERENCES_MSAA_ROW);
+    Rect::new(value.x, value.y, value.w + 6.0 + plus.w, value.h)
 }
 
 pub(crate) fn preferences_cleanup_autosaves_rect() -> Rect {
@@ -4483,8 +4518,21 @@ pub(crate) fn save_preferences_dialog(app: &mut AppState, dialog: PreferencesDia
     app.physics_root_dropdown_open = false;
     save_gta_sa_dir_preference(&path);
     invalidate_validation_cache(app);
-    app.status_message =
-        "Preferences saved. Reload the resource to re-index GTA:SA assets.".to_string();
+
+    set_gizmo_scale(app, dialog.gizmo_scale);
+    set_camera_speed(app, dialog.camera_speed);
+    set_camera_rotation_speed(app, dialog.camera_rotation_speed);
+    let msaa_changed =
+        clamp_msaa_samples(dialog.msaa_samples) != clamp_msaa_samples(dialog.msaa_samples_saved);
+    if msaa_changed {
+        save_msaa_samples_preference(dialog.msaa_samples);
+    }
+
+    app.status_message = if msaa_changed {
+        "Preferences saved. Restart for the anti-aliasing change, and reload the resource to re-index GTA:SA assets.".to_string()
+    } else {
+        "Preferences saved. Reload the resource to re-index GTA:SA assets.".to_string()
+    };
 }
 
 pub(crate) fn update_load_dialog_input(app: &mut AppState, mouse: Vec2) -> bool {
@@ -4611,6 +4659,47 @@ pub(crate) fn update_preferences_dialog_input(app: &mut AppState, mouse: Vec2) -
                 set_preferences_cursor_from_mouse(dialog, mouse.x);
             }
             return true;
+        }
+        let (gizmo_minus, _, gizmo_plus) = preferences_gizmo_scale_rects();
+        let (speed_minus, _, speed_plus) = preferences_camera_speed_rects();
+        let (spin_minus, _, spin_plus) = preferences_camera_rotation_speed_rects();
+        if let Some(dialog) = app.preferences_dialog.as_mut() {
+            if gizmo_minus.contains(mouse) {
+                let step = gizmo_scale_step(dialog.gizmo_scale, false);
+                dialog.gizmo_scale = clamp_gizmo_scale(dialog.gizmo_scale - step);
+                return true;
+            }
+            if gizmo_plus.contains(mouse) {
+                let step = gizmo_scale_step(dialog.gizmo_scale, true);
+                dialog.gizmo_scale = clamp_gizmo_scale(dialog.gizmo_scale + step);
+                return true;
+            }
+            if speed_minus.contains(mouse) {
+                dialog.camera_speed =
+                    clamp_camera_speed(dialog.camera_speed / CAMERA_SPEED_STEP_FACTOR);
+                return true;
+            }
+            if speed_plus.contains(mouse) {
+                dialog.camera_speed =
+                    clamp_camera_speed(dialog.camera_speed * CAMERA_SPEED_STEP_FACTOR);
+                return true;
+            }
+            if spin_minus.contains(mouse) {
+                dialog.camera_rotation_speed = clamp_camera_rotation_speed(
+                    dialog.camera_rotation_speed / CAMERA_SPEED_STEP_FACTOR,
+                );
+                return true;
+            }
+            if spin_plus.contains(mouse) {
+                dialog.camera_rotation_speed = clamp_camera_rotation_speed(
+                    dialog.camera_rotation_speed * CAMERA_SPEED_STEP_FACTOR,
+                );
+                return true;
+            }
+            if preferences_msaa_rect().contains(mouse) {
+                dialog.msaa_samples = next_msaa_samples(dialog.msaa_samples);
+                return true;
+            }
         }
         if preferences_cleanup_autosaves_rect().contains(mouse) {
             app.confirm_dialog = Some(ConfirmDialog {
@@ -8049,8 +8138,9 @@ pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
             None
         };
         let orbit_radius = focus_target.map(|target| (app.camera.pos - target).length().max(1.0));
-        app.camera.yaw += delta.x * 0.003;
-        app.camera.pitch = (app.camera.pitch - delta.y * 0.003).clamp(-1.54, 1.54);
+        let look = CAMERA_LOOK_SENSITIVITY * clamp_camera_rotation_speed(app.camera_rotation_speed);
+        app.camera.yaw += delta.x * look;
+        app.camera.pitch = (app.camera.pitch - delta.y * look).clamp(-1.54, 1.54);
         if let (Some(target), Some(radius)) = (focus_target, orbit_radius) {
             let (forward, _) = camera_vectors(&app.camera);
             app.camera_focus = Some(target);

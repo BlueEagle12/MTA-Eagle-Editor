@@ -832,7 +832,6 @@ pub(crate) struct SettingsPanelLayout {
     pub(crate) local_lod: Option<Rect>,
     pub(crate) snap_move: Option<Rect>,
     pub(crate) snap_rotate: Option<Rect>,
-    pub(crate) camera_speed: Option<Rect>,
     pub(crate) pick_lods: Option<Rect>,
     pub(crate) camera_mode: Option<Rect>,
     pub(crate) box_mode: Option<Rect>,
@@ -861,7 +860,6 @@ pub(crate) fn settings_panel_layout(app: &AppState) -> SettingsPanelLayout {
         local_lod: None,
         snap_move: None,
         snap_rotate: None,
-        camera_speed: None,
         pick_lods: None,
         camera_mode: None,
         box_mode: None,
@@ -919,8 +917,7 @@ pub(crate) fn settings_panel_layout(app: &AppState) -> SettingsPanelLayout {
     layout.headers[1] = elem_full(x0, y, DFF_SEC_HEADER_H);
     y += DFF_SEC_HEADER_H + 6.0;
     if !collapsed[1] {
-        layout.camera_speed = Some(elem_half(x0, y + ELEM_LABEL_GAP, 0, ELEM_FIELD_H));
-        layout.pick_lods = Some(elem_half(x0, y + ELEM_LABEL_GAP, 1, ELEM_FIELD_H));
+        layout.pick_lods = Some(elem_half(x0, y + ELEM_LABEL_GAP, 0, ELEM_FIELD_H));
         y += ELEM_LABEL_GAP + ELEM_FIELD_H + ELEM_ROW_GAP;
         layout.camera_mode = Some(elem_full(x0, y, DFF_BTN_H));
         y += DFF_BTN_H + ELEM_ROW_GAP;
@@ -3214,7 +3211,6 @@ pub(crate) fn draw_properties_settings(app: &AppState, _x: f32, _y: f32) {
         draw_input_box(app, InspectorField::SnapRotate, "Rotate Snap");
     }
     if !app.settings_panel_collapsed[1] {
-        draw_input_box(app, InspectorField::CameraSpeed, "Camera Speed");
         text_button(
             &app.ui_font,
             properties_lod_selectable_toggle_rect(app),
@@ -3495,7 +3491,6 @@ pub(crate) fn draw_collision_panel(app: &AppState) {
             ui_dim(),
         );
     }
-    draw_input_box(app, InspectorField::CameraSpeed, "Camera Speed");
     ui_text(
         &app.ui_font,
         "Moving/rotating the element moves its base model and COL together.",
