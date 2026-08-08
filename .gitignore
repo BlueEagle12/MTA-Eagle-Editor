@@ -9,3 +9,4 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+build-linux-dev.sh
