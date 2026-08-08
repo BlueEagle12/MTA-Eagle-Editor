@@ -1481,6 +1481,294 @@ pub(crate) fn draw_dff_merge_choice_dialog(app: &AppState) {
     draw_dialog_button(&app.ui_font, layout.cancel, "Cancel", false);
 }
 
+// ---------------------------------------------------------------------------
+// Optimize / Repair DFF
+// ---------------------------------------------------------------------------
+
+/// One toggle row in the optimize sheet: label, help text, and accessors for
+/// the flag it drives.
+pub(crate) struct DffOptimizeToggle {
+    pub(crate) label: &'static str,
+    pub(crate) detail: &'static str,
+    pub(crate) get: fn(&DffOptimizeOptions) -> bool,
+    pub(crate) set: fn(&mut DffOptimizeOptions, bool),
+    /// Indented sub-option, only interactive while its parent is enabled.
+    pub(crate) nested: bool,
+}
+
+/// The toggle list, in the order it is drawn. Ordering here is presentational;
+/// the passes always execute in the fixed order `run_dff_optimize` documents.
+pub(crate) fn dff_optimize_toggles() -> Vec<DffOptimizeToggle> {
+    vec![
+        DffOptimizeToggle {
+            label: "Reorder transparent faces",
+            detail: "Draw alpha faces after opaque ones so glass stops culling what is behind it",
+            get: |options| options.reorder_transparent_faces,
+            set: |options, value| options.reorder_transparent_faces = value,
+            nested: false,
+        },
+        DffOptimizeToggle {
+            label: "Sort alpha faces back-to-front",
+            detail: "Order those alpha faces outward from the model centre",
+            get: |options| options.depth_sort_transparent_faces,
+            set: |options, value| options.depth_sort_transparent_faces = value,
+            nested: true,
+        },
+        DffOptimizeToggle {
+            label: "Remove degenerate faces",
+            detail: "Triangles with a repeated corner or zero area",
+            get: |options| options.remove_degenerate_faces,
+            set: |options, value| options.remove_degenerate_faces = value,
+            nested: false,
+        },
+        DffOptimizeToggle {
+            label: "Remove duplicate faces",
+            detail: "Triangles repeating an earlier one in the same material",
+            get: |options| options.remove_duplicate_faces,
+            set: |options, value| options.remove_duplicate_faces = value,
+            nested: false,
+        },
+        DffOptimizeToggle {
+            label: "Weld duplicate vertices",
+            detail: "Merge vertices identical across every stream (splits UV seams stay separate)",
+            get: |options| options.weld_vertices,
+            set: |options, value| options.weld_vertices = value,
+            nested: false,
+        },
+        DffOptimizeToggle {
+            label: "Remove unused vertices",
+            detail: "Drop vertices no triangle references",
+            get: |options| options.remove_unused_vertices,
+            set: |options, value| options.remove_unused_vertices = value,
+            nested: false,
+        },
+        DffOptimizeToggle {
+            label: "Merge duplicate materials",
+            detail: "Fold material slots sharing a texture, colour, and surface values",
+            get: |options| options.merge_duplicate_materials,
+            set: |options, value| options.merge_duplicate_materials = value,
+            nested: false,
+        },
+        DffOptimizeToggle {
+            label: "Remove unused materials",
+            detail: "Drop material slots no triangle uses",
+            get: |options| options.remove_unused_materials,
+            set: |options, value| options.remove_unused_materials = value,
+            nested: false,
+        },
+        DffOptimizeToggle {
+            label: "Optimize vertex cache order",
+            detail: "Reorder indices per material for GPU cache locality",
+            get: |options| options.optimize_vertex_cache,
+            set: |options, value| options.optimize_vertex_cache = value,
+            nested: false,
+        },
+        DffOptimizeToggle {
+            label: "Fix missing prelighting",
+            detail: "Fill an absent day or night vertex colour stream so the model is not black",
+            get: |options| options.fix_prelighting,
+            set: |options, value| options.fix_prelighting = value,
+            nested: false,
+        },
+    ]
+}
+
+pub(crate) const DFF_OPTIMIZE_ROW_H: f32 = 42.0;
+
+pub(crate) struct DffOptimizeDialogLayout {
+    pub(crate) rect: Rect,
+    pub(crate) rows: Vec<Rect>,
+    pub(crate) select_all: Rect,
+    pub(crate) select_none: Rect,
+    pub(crate) run: Rect,
+    pub(crate) cancel: Rect,
+}
+
+pub(crate) fn dff_optimize_dialog_layout() -> DffOptimizeDialogLayout {
+    let toggles = dff_optimize_toggles().len();
+    let w = 640.0_f32.min(screen_width() - 80.0);
+    let list_h = toggles as f32 * DFF_OPTIMIZE_ROW_H;
+    let h = (list_h + 190.0).min(screen_height() - 60.0);
+    let rect = Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - h) * 0.5,
+        w,
+        h,
+    );
+    let list_y = rect.y + 74.0;
+    let rows = (0..toggles)
+        .map(|index| {
+            Rect::new(
+                rect.x + 24.0,
+                list_y + index as f32 * DFF_OPTIMIZE_ROW_H,
+                rect.w - 48.0,
+                DFF_OPTIMIZE_ROW_H - 6.0,
+            )
+        })
+        .collect::<Vec<_>>();
+    let btn_h = 34.0;
+    let btn_y = rect.y + rect.h - btn_h - 20.0;
+    DffOptimizeDialogLayout {
+        select_all: Rect::new(rect.x + 24.0, btn_y, 96.0, btn_h),
+        select_none: Rect::new(rect.x + 128.0, btn_y, 96.0, btn_h),
+        run: Rect::new(rect.x + rect.w - 24.0 - 210.0, btn_y, 120.0, btn_h),
+        cancel: Rect::new(rect.x + rect.w - 24.0 - 84.0, btn_y, 84.0, btn_h),
+        rows,
+        rect,
+    }
+}
+
+pub(crate) fn draw_dff_optimize_dialog(app: &AppState) {
+    let Some(dialog) = app.dff_optimize_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let layout = dff_optimize_dialog_layout();
+    draw_panel_rect(&app.ui_font, layout.rect, Some("Optimize / Repair DFF"));
+    ui_text(
+        &app.ui_font,
+        &format!(
+            "Choose what to apply to {}:",
+            ellipsize(&dialog.dff_name, 44)
+        ),
+        layout.rect.x + 24.0,
+        layout.rect.y + 62.0,
+        LIGHTGRAY,
+    );
+    let toggles = dff_optimize_toggles();
+    for (index, toggle) in toggles.iter().enumerate() {
+        let Some(rect) = layout.rows.get(index) else {
+            break;
+        };
+        let indent = if toggle.nested { 22.0 } else { 0.0 };
+        // A sub-option is meaningless with its parent off, so grey it out.
+        let parent_on = !toggle.nested || dialog.options.reorder_transparent_faces;
+        let checked = (toggle.get)(&dialog.options) && parent_on;
+        draw_checkbox(
+            &app.ui_font,
+            Rect::new(rect.x + indent, rect.y, rect.w - indent, 22.0),
+            toggle.label,
+            checked,
+        );
+        ui_text_size(
+            &app.ui_font,
+            toggle.detail,
+            rect.x + indent + 28.0,
+            rect.y + 34.0,
+            13,
+            if parent_on { ui_dim() } else { ui_muted() },
+        );
+    }
+    draw_dialog_button(&app.ui_font, layout.select_all, "All", false);
+    draw_dialog_button(&app.ui_font, layout.select_none, "None", false);
+    draw_dialog_button(&app.ui_font, layout.run, "Run", true);
+    draw_dialog_button(&app.ui_font, layout.cancel, "Cancel", false);
+}
+
+// ---------------------------------------------------------------------------
+// Pair an external TXD with an opened DFF
+// ---------------------------------------------------------------------------
+
+pub(crate) struct DffTxdPairDialogLayout {
+    pub(crate) rect: Rect,
+    pub(crate) list: Rect,
+    pub(crate) browse: Rect,
+    pub(crate) skip: Rect,
+}
+
+pub(crate) fn dff_txd_pair_dialog_layout() -> DffTxdPairDialogLayout {
+    let w = 560.0_f32.min(screen_width() - 80.0);
+    let h = 320.0_f32.min(screen_height() - 60.0);
+    let rect = Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - h) * 0.5,
+        w,
+        h,
+    );
+    let btn_h = 36.0;
+    let btn_y = rect.y + rect.h - btn_h - 20.0;
+    DffTxdPairDialogLayout {
+        list: Rect::new(rect.x + 24.0, rect.y + 118.0, rect.w - 48.0, rect.h - 190.0),
+        browse: Rect::new(rect.x + rect.w - 24.0 - 268.0, btn_y, 180.0, btn_h),
+        skip: Rect::new(rect.x + rect.w - 24.0 - 80.0, btn_y, 80.0, btn_h),
+        rect,
+    }
+}
+
+pub(crate) fn draw_dff_txd_pair_dialog(app: &AppState) {
+    let Some(dialog) = app.dff_txd_pair_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let layout = dff_txd_pair_dialog_layout();
+    draw_panel_rect(&app.ui_font, layout.rect, Some("Textures Not Found"));
+    ui_text(
+        &app.ui_font,
+        &format!(
+            "{} has {} of {} material texture(s) the editor cannot resolve.",
+            ellipsize(&dialog.dff_name, 30),
+            dialog.missing_textures.len(),
+            dialog.material_count
+        ),
+        layout.rect.x + 24.0,
+        layout.rect.y + 66.0,
+        WHITE,
+    );
+    ui_text_size(
+        &app.ui_font,
+        "Pair a TXD to texture this model, or skip and edit it untextured.",
+        layout.rect.x + 24.0,
+        layout.rect.y + 92.0,
+        14,
+        LIGHTGRAY,
+    );
+    draw_rrect_bordered(
+        layout.list.x,
+        layout.list.y,
+        layout.list.w,
+        layout.list.h,
+        8.0,
+        1.0,
+        ui_input_bg(),
+        ui_border(),
+    );
+    let row_h = 22.0;
+    let visible = (layout.list.h / row_h).floor().max(1.0) as usize;
+    let max_start = dialog.missing_textures.len().saturating_sub(visible);
+    let start = (dialog.scroll.floor().max(0.0) as usize).min(max_start);
+    for (row, texture) in dialog
+        .missing_textures
+        .iter()
+        .skip(start)
+        .take(visible)
+        .enumerate()
+    {
+        ui_text_size(
+            &app.ui_font,
+            texture,
+            layout.list.x + 12.0,
+            layout.list.y + 18.0 + row as f32 * row_h,
+            14,
+            ui_muted(),
+        );
+    }
+    if dialog.missing_textures.len() > visible {
+        ui_text_size(
+            &app.ui_font,
+            &format!(
+                "{} more...",
+                dialog.missing_textures.len() - (start + visible)
+            ),
+            layout.list.x + layout.list.w - 96.0,
+            layout.list.y + layout.list.h - 8.0,
+            13,
+            ui_dim(),
+        );
+    }
+    draw_dialog_button(&app.ui_font, layout.browse, "Choose TXD...", true);
+    draw_dialog_button(&app.ui_font, layout.skip, "Skip", false);
+}
+
 pub(crate) struct DffTextureDuplicateDialogLayout {
     pub(crate) rect: Rect,
     pub(crate) input: Rect,

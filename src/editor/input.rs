@@ -998,11 +998,10 @@ pub(crate) fn inspector_fields(app: &AppState) -> Vec<InspectorField> {
     if app.active_tab == AppTab::Editing
         && matches!(app.editing.asset.as_ref(), Some(EditingAsset::Dff(_)))
     {
+        // Material RGBA is edited with drag bars rather than text boxes, so the
+        // four colour fields are deliberately absent here: listing them would
+        // let a click on a bar open a text editor on top of it.
         let mut fields = vec![
-            InspectorField::DffMaterialRed,
-            InspectorField::DffMaterialGreen,
-            InspectorField::DffMaterialBlue,
-            InspectorField::DffMaterialAlpha,
             InspectorField::DffMaterialAmbient,
             InspectorField::DffMaterialDiffuse,
             InspectorField::DffMaterialSpecular,
@@ -5608,6 +5607,111 @@ pub(crate) fn update_dff_merge_choice_dialog_input(app: &mut AppState, mouse: Ve
     true
 }
 
+pub(crate) fn update_dff_optimize_dialog_input(app: &mut AppState, mouse: Vec2) -> bool {
+    if app.dff_optimize_dialog.is_none() {
+        return false;
+    }
+    let layout = dff_optimize_dialog_layout();
+    if is_key_pressed(KeyCode::Escape) {
+        app.dff_optimize_dialog = None;
+        app.status_message = "Cancelled".to_string();
+        return true;
+    }
+    let run = is_key_pressed(KeyCode::Enter);
+    if !is_mouse_button_pressed(MouseButton::Left) && !run {
+        // Still swallow input so clicks do not fall through to the viewport.
+        return true;
+    }
+    if !run {
+        if layout.cancel.contains(mouse) || !layout.rect.contains(mouse) {
+            app.dff_optimize_dialog = None;
+            app.status_message = "Cancelled".to_string();
+            return true;
+        }
+        let toggles = dff_optimize_toggles();
+        if let Some(dialog) = app.dff_optimize_dialog.as_mut() {
+            if layout.select_all.contains(mouse) {
+                for toggle in &toggles {
+                    (toggle.set)(&mut dialog.options, true);
+                }
+                return true;
+            }
+            if layout.select_none.contains(mouse) {
+                for toggle in &toggles {
+                    (toggle.set)(&mut dialog.options, false);
+                }
+                return true;
+            }
+            for (index, toggle) in toggles.iter().enumerate() {
+                let Some(rect) = layout.rows.get(index) else {
+                    break;
+                };
+                if !rect.contains(mouse) {
+                    continue;
+                }
+                // The nested depth-sort row does nothing while its parent is off.
+                if toggle.nested && !dialog.options.reorder_transparent_faces {
+                    return true;
+                }
+                let value = !(toggle.get)(&dialog.options);
+                (toggle.set)(&mut dialog.options, value);
+                return true;
+            }
+        }
+        if !layout.run.contains(mouse) {
+            return true;
+        }
+    }
+    let Some(dialog) = app.dff_optimize_dialog.take() else {
+        return true;
+    };
+    app.dff_optimize_options = dialog.options;
+    let still_open = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.name.eq_ignore_ascii_case(&dialog.dff_name)
+    );
+    if !still_open {
+        app.status_message =
+            "The DFF changed while the optimize dialog was open; nothing was applied".to_string();
+        return true;
+    }
+    apply_dff_optimize(app, dialog.options);
+    true
+}
+
+pub(crate) fn update_dff_txd_pair_dialog_input(app: &mut AppState, mouse: Vec2) -> bool {
+    if app.dff_txd_pair_dialog.is_none() {
+        return false;
+    }
+    let layout = dff_txd_pair_dialog_layout();
+    let wheel = mouse_wheel().1;
+    if wheel != 0.0
+        && layout.list.contains(mouse)
+        && let Some(dialog) = app.dff_txd_pair_dialog.as_mut()
+    {
+        let max_start = dialog.missing_textures.len().saturating_sub(1) as f32;
+        dialog.scroll = (dialog.scroll - wheel.signum() * 3.0).clamp(0.0, max_start);
+        return true;
+    }
+    if is_key_pressed(KeyCode::Escape) {
+        app.dff_txd_pair_dialog = None;
+        app.status_message = "Continuing without a paired TXD".to_string();
+        return true;
+    }
+    if !is_mouse_button_pressed(MouseButton::Left) {
+        return true;
+    }
+    if layout.browse.contains(mouse) {
+        start_editing_dff_txd_pair_browse(app);
+        return true;
+    }
+    if layout.skip.contains(mouse) || !layout.rect.contains(mouse) {
+        app.dff_txd_pair_dialog = None;
+        app.status_message = "Continuing without a paired TXD".to_string();
+    }
+    true
+}
+
 fn set_dff_texture_duplicate_cursor_from_mouse(
     dialog: &mut DffTextureDuplicateDialog,
     mouse_x: f32,
@@ -6734,6 +6838,12 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         return;
     }
     if update_dff_merge_choice_dialog_input(app, mouse) {
+        return;
+    }
+    if update_dff_optimize_dialog_input(app, mouse) {
+        return;
+    }
+    if update_dff_txd_pair_dialog_input(app, mouse) {
         return;
     }
     if update_dff_texture_view_dialog_input(app, mouse) {

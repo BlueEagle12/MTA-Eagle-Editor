@@ -4206,6 +4206,23 @@ fn draw_editing_material_specular_preview(mesh: &RenderMesh, raw: &RawMesh, came
     }
 }
 
+/// Draw order for the editing preview.
+///
+/// `Sorted` is the forgiving editor view: every opaque batch first, alpha last
+/// with depth writes off, so the model always looks right regardless of how the
+/// faces are stored.
+///
+/// `StoredFaceOrder` reproduces what San Andreas actually does — batches are
+/// drawn in the order the DFF stores them and alpha faces write depth. A model
+/// whose transparent faces come before the geometry behind them will visibly
+/// cull that geometry, which is the whole point: it makes a broken face order
+/// obvious in the viewport instead of invisible until the model is in game.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditingPreviewFaceOrder {
+    Sorted,
+    StoredFaceOrder,
+}
+
 fn draw_editing_render_mesh_preview(
     mesh: &RenderMesh,
     raw: &RawMesh,
@@ -4215,30 +4232,75 @@ fn draw_editing_render_mesh_preview(
     classes: &TextureMaterialClasses,
     txd_name: Option<&str>,
     fallback_material: u8,
+    face_order: EditingPreviewFaceOrder,
 ) {
     unsafe {
         gl::Enable(gl::CULL_FACE);
         gl::LightModeli(gl::LIGHT_MODEL_TWO_SIDE, gl::FALSE as i32);
-        for pass in [
-            TransparencyMode::Opaque,
-            TransparencyMode::Cutout,
-            TransparencyMode::Blend,
-        ] {
-            match pass {
-                TransparencyMode::Blend => {
-                    gl::Enable(gl::BLEND);
-                    gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
-                    gl::Disable(gl::ALPHA_TEST);
-                    gl::DepthMask(gl::FALSE);
-                }
-                TransparencyMode::Opaque | TransparencyMode::Cutout => {
-                    gl::Disable(gl::BLEND);
-                    gl::Enable(gl::ALPHA_TEST);
-                    gl::AlphaFunc(gl::GREATER, 0.08);
-                    gl::DepthMask(gl::TRUE);
+        // In stored-face-order mode there is a single pass over every batch,
+        // sequenced by the first DFF triangle each batch owns.
+        let stored_order = face_order == EditingPreviewFaceOrder::StoredFaceOrder;
+        let mut sequence: Vec<usize> = (0..mesh.parts.len()).collect();
+        if stored_order {
+            sequence.sort_by_key(|index| {
+                mesh.parts[*index]
+                    .face_indices
+                    .iter()
+                    .copied()
+                    .min()
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let passes: Vec<TransparencyMode> = if stored_order {
+            vec![TransparencyMode::Opaque]
+        } else {
+            vec![
+                TransparencyMode::Opaque,
+                TransparencyMode::Cutout,
+                TransparencyMode::Blend,
+            ]
+        };
+        for pass in passes.iter().copied() {
+            if !stored_order {
+                match pass {
+                    TransparencyMode::Blend => {
+                        gl::Enable(gl::BLEND);
+                        gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+                        gl::Disable(gl::ALPHA_TEST);
+                        gl::DepthMask(gl::FALSE);
+                    }
+                    TransparencyMode::Opaque | TransparencyMode::Cutout => {
+                        gl::Disable(gl::BLEND);
+                        gl::Enable(gl::ALPHA_TEST);
+                        gl::AlphaFunc(gl::GREATER, 0.08);
+                        gl::DepthMask(gl::TRUE);
+                    }
                 }
             }
-            for part in mesh.parts.iter().filter(|part| part.transparency == pass) {
+            for index in sequence.iter().copied() {
+                let part = &mesh.parts[index];
+                if !stored_order && part.transparency != pass {
+                    continue;
+                }
+                if stored_order {
+                    // Depth writes stay on for alpha too. That is precisely the
+                    // behaviour that makes a badly ordered DFF cull whatever is
+                    // behind its transparent faces.
+                    match part.transparency {
+                        TransparencyMode::Blend => {
+                            gl::Enable(gl::BLEND);
+                            gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+                            gl::Enable(gl::ALPHA_TEST);
+                            gl::AlphaFunc(gl::GREATER, 0.0);
+                        }
+                        TransparencyMode::Opaque | TransparencyMode::Cutout => {
+                            gl::Disable(gl::BLEND);
+                            gl::Enable(gl::ALPHA_TEST);
+                            gl::AlphaFunc(gl::GREATER, 0.08);
+                        }
+                    }
+                    gl::DepthMask(gl::TRUE);
+                }
                 if mode != ViewportRenderMode::ShadedTextured {
                     gl::Disable(gl::FOG);
                     let classification = collision_classification_color(
@@ -4534,6 +4596,11 @@ pub(crate) fn draw_editing_preview(app: &mut AppState, _viewport: Rect) -> bool 
                     &app.material_classes,
                     dff.txd_context.as_deref(),
                     app.collision_generation_fallback_material,
+                    if app.dff_face_order_preview {
+                        EditingPreviewFaceOrder::StoredFaceOrder
+                    } else {
+                        EditingPreviewFaceOrder::Sorted
+                    },
                 );
                 draw_render_mesh_edges(mesh);
             } else {

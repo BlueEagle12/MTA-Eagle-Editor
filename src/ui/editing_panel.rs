@@ -336,7 +336,7 @@ fn dff_ctl_x2(right: Rect) -> f32 {
 // testing always matches what is on screen.
 // ---------------------------------------------------------------------------
 
-pub(crate) const DFF_SECTION_COUNT: usize = 10;
+pub(crate) const DFF_SECTION_COUNT: usize = 11;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DffSection {
@@ -350,6 +350,7 @@ pub(crate) enum DffSection {
     Mesh = 7,
     Cutter = 8,
     Lod = 9,
+    Optimize = 10,
 }
 
 pub(crate) const DFF_SECTIONS: [DffSection; DFF_SECTION_COUNT] = [
@@ -363,6 +364,7 @@ pub(crate) const DFF_SECTIONS: [DffSection; DFF_SECTION_COUNT] = [
     DffSection::Mesh,
     DffSection::Cutter,
     DffSection::Lod,
+    DffSection::Optimize,
 ];
 
 impl DffSection {
@@ -378,6 +380,7 @@ impl DffSection {
             DffSection::Mesh => "Mesh Tools",
             DffSection::Cutter => "Boolean Cutter",
             DffSection::Lod => "LOD Generator",
+            DffSection::Optimize => "Optimize & Repair",
         }
     }
 }
@@ -393,6 +396,19 @@ pub(crate) fn dff_default_collapsed() -> [bool; DFF_SECTION_COUNT] {
 pub(crate) const DFF_BTN_H: f32 = 34.0;
 pub(crate) const DFF_SMALL_BTN_H: f32 = 30.0;
 pub(crate) const DFF_SEC_HEADER_H: f32 = 32.0;
+/// Vertical breathing room between stacked buttons inside a section.
+pub(crate) const DFF_ROW_GAP: f32 = 9.0;
+/// `draw_input_box` paints its caption *above* the box, so every numeric row
+/// needs this much clear space reserved before the box itself or the caption
+/// lands on top of whatever control precedes it.
+pub(crate) const DFF_FIELD_LABEL_H: f32 = 19.0;
+pub(crate) const DFF_FIELD_H: f32 = 30.0;
+/// Height of one R/G/B/A drag bar in the material colour editor.
+pub(crate) const DFF_COLOR_BAR_H: f32 = 24.0;
+/// Width reserved to the right of a colour bar for its numeric readout.
+pub(crate) const DFF_COLOR_VALUE_W: f32 = 44.0;
+/// Width reserved to the left of a colour bar for its channel letter.
+pub(crate) const DFF_COLOR_LABEL_W: f32 = 22.0;
 pub(crate) const DFF_MAT_ROW_H: f32 = 40.0;
 pub(crate) const DFF_2DFX_ROW_H: f32 = 28.0;
 pub(crate) const DFF_LIGHT_ROW_H: f32 = 32.0;
@@ -477,6 +493,9 @@ pub(crate) struct DffPanelLayout {
     pub(crate) cutter_clear: Option<Rect>,
     pub(crate) cutter_resize: Option<[Rect; 6]>,
     pub(crate) generate_lod: Option<Rect>,
+    pub(crate) optimize_dff: Option<Rect>,
+    pub(crate) face_order_preview: Option<Rect>,
+    pub(crate) pair_txd: Option<Rect>,
     pub(crate) generate_collision: Rect,
     pub(crate) flip_normals: Rect,
     pub(crate) stage: Rect,
@@ -585,6 +604,9 @@ pub(crate) fn dff_panel_layout(
         cutter_clear: None,
         cutter_resize: None,
         generate_lod: None,
+        optimize_dff: None,
+        face_order_preview: None,
+        pair_txd: None,
         generate_collision: Rect::new(x0, panel.y + panel.h - DFF_BTN_H - 12.0, thirdw, DFF_BTN_H),
         flip_normals: Rect::new(
             x0 + thirdw + 10.0,
@@ -682,23 +704,28 @@ pub(crate) fn dff_panel_layout(
                 y += visible as f32 * DFF_MAT_ROW_H + 6.0;
                 layout.view_texture = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                 layout.rename_texture = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
-                y += DFF_BTN_H + 6.0;
+                y += DFF_BTN_H + DFF_ROW_GAP;
                 layout.duplicate_texture = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                y += DFF_BTN_H + 6.0;
+                y += DFF_BTN_H + DFF_ROW_GAP;
                 layout.set_material_texture_from_txd = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                 layout.set_material_texture_browse = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
-                y += DFF_BTN_H + 6.0;
+                y += DFF_BTN_H + DFF_ROW_GAP;
                 layout.new_material_for_faces = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                 layout.assign_material_to_faces = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
-                y += DFF_BTN_H + 6.0;
+                y += DFF_BTN_H + DFF_ROW_GAP;
                 layout.delete_unused_material = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                y += DFF_BTN_H + 12.0;
+                // "Material Colour" caption, then the four RGBA drag bars.
+                y += DFF_BTN_H + 20.0 + DFF_FIELD_LABEL_H;
+                let bar_x = x0 + DFF_COLOR_LABEL_W;
+                let bar_w =
+                    (fullw - DFF_COLOR_LABEL_W - DFF_COLOR_VALUE_W).max(80.0);
                 let mut color = [zero; 4];
                 for rect in &mut color {
-                    *rect = Rect::new(x0, y, fullw, 30.0);
-                    y += 42.0;
+                    *rect = Rect::new(bar_x, y, bar_w, DFF_COLOR_BAR_H);
+                    y += DFF_COLOR_BAR_H + 10.0;
                 }
                 layout.material_color = Some(color);
+                y += 6.0;
                 layout.material_color_swatch = Some(Rect::new(x0, y, 44.0, 58.0));
                 let preset_x = x0 + 54.0;
                 let preset_w = (fullw - 54.0 - 8.0 * 4.0) / 9.0;
@@ -718,59 +745,65 @@ pub(crate) fn dff_panel_layout(
                     );
                 }
                 layout.material_alpha_presets = Some(alpha_presets);
-                y += 70.0;
+                y += 58.0 + gap;
                 let mut surface = [zero; 3];
                 for rect in &mut surface {
-                    *rect = Rect::new(x0, y, fullw, 30.0);
-                    y += 42.0;
+                    y += DFF_FIELD_LABEL_H;
+                    *rect = Rect::new(x0, y, fullw, DFF_FIELD_H);
+                    y += DFF_FIELD_H + DFF_ROW_GAP;
                 }
                 layout.material_surface = Some(surface);
+                y += 4.0;
                 layout.collision_material = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                y += DFF_BTN_H + 6.0;
+                y += DFF_BTN_H + DFF_ROW_GAP;
                 layout.shadow_casting_toggle = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                y += DFF_BTN_H + 6.0;
+                y += DFF_BTN_H + DFF_ROW_GAP;
                 if !selected_dff_faces_are_emitter_target(dff) {
                     layout.shadow_casting_scope = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                    y += DFF_BTN_H + 6.0;
+                    y += DFF_BTN_H + DFF_ROW_GAP;
                 }
                 layout.emitter_toggle = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
                 y += DFF_BTN_H + gap;
                 if emitter.enabled {
                     layout.emitter_source = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                    y += DFF_BTN_H + 6.0;
+                    y += DFF_BTN_H + DFF_ROW_GAP;
                     if !selected_dff_faces_are_emitter_target(dff) {
                         layout.emitter_scope = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                        y += DFF_BTN_H + 6.0;
+                        y += DFF_BTN_H + DFF_ROW_GAP;
                     }
                     layout.emitter_cast_mode = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                    y += DFF_BTN_H + 6.0;
+                    y += DFF_BTN_H + DFF_ROW_GAP;
                     if emitter.cast_mode == MaterialEmitterCastMode::Point {
-                        layout.emitter_max_grouping_size = Some(Rect::new(x0, y, fullw, 30.0));
-                        y += 30.0 + 12.0;
-                        layout.emitter_point_up_strength = Some(Rect::new(x0, y, fullw, 30.0));
-                        y += 30.0 + 12.0;
-                        layout.emitter_point_down_strength = Some(Rect::new(x0, y, fullw, 30.0));
-                        y += 30.0 + 12.0;
-                        layout.emitter_point_sides_strength = Some(Rect::new(x0, y, fullw, 30.0));
-                        y += 30.0 + 12.0;
+                        for slot in [
+                            &mut layout.emitter_max_grouping_size,
+                            &mut layout.emitter_point_up_strength,
+                            &mut layout.emitter_point_down_strength,
+                            &mut layout.emitter_point_sides_strength,
+                        ] {
+                            y += DFF_FIELD_LABEL_H;
+                            *slot = Some(Rect::new(x0, y, fullw, DFF_FIELD_H));
+                            y += DFF_FIELD_H + DFF_ROW_GAP;
+                        }
                     }
                     layout.emitter_day = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                     layout.emitter_night = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
-                    y += DFF_BTN_H + 6.0;
+                    y += DFF_BTN_H + DFF_ROW_GAP;
                     layout.emitter_inversed = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                    y += DFF_BTN_H + 18.0;
-                    layout.emitter_strength = Some(Rect::new(x0, y, fullw, 30.0));
-                    y += 30.0 + 12.0;
-                    layout.emitter_falloff = Some(Rect::new(x0, y, fullw, 30.0));
-                    y += 30.0 + 12.0;
+                    y += DFF_BTN_H + DFF_ROW_GAP;
+                    for slot in [&mut layout.emitter_strength, &mut layout.emitter_falloff] {
+                        y += DFF_FIELD_LABEL_H;
+                        *slot = Some(Rect::new(x0, y, fullw, DFF_FIELD_H));
+                        y += DFF_FIELD_H + DFF_ROW_GAP;
+                    }
                     if emitter.use_temperature {
-                        layout.emitter_temperature = Some(Rect::new(x0, y, fullw, 30.0));
-                        y += 30.0 + 12.0;
+                        y += DFF_FIELD_LABEL_H;
+                        layout.emitter_temperature = Some(Rect::new(x0, y, fullw, DFF_FIELD_H));
+                        y += DFF_FIELD_H + DFF_ROW_GAP;
                     } else if !emitter.use_material_color {
                         let mut color = [zero; 3];
                         for rect in &mut color {
                             *rect = Rect::new(x0 + 28.0, y, fullw - 28.0, 24.0);
-                            y += 31.0;
+                            y += 24.0 + 9.0;
                         }
                         layout.emitter_color = Some(color);
                         y += 2.0;
@@ -853,6 +886,14 @@ pub(crate) fn dff_panel_layout(
             }
             DffSection::Lod => {
                 layout.generate_lod = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + gap;
+            }
+            DffSection::Optimize => {
+                layout.optimize_dff = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + DFF_ROW_GAP;
+                layout.face_order_preview = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + DFF_ROW_GAP;
+                layout.pair_txd = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
                 y += DFF_BTN_H + gap;
             }
         }
@@ -2236,6 +2277,10 @@ pub(crate) fn editing_open_asset_row(app: &mut AppState, row: EditingImgRow) {
             panel_collapsed: dff_default_collapsed(),
         }));
         frame_editing_camera(app, bounds);
+        // A DFF whose textures cannot be resolved renders untextured and its
+        // material list is useless, so offer to pair a TXD straight away rather
+        // than letting the user discover the problem in the viewport.
+        maybe_prompt_dff_txd_pairing(app);
     } else if key.ends_with(".col") {
         let mut local = row.entry.clone();
         local.offset = 0;
@@ -4126,6 +4171,223 @@ fn editing_apply_dff_material_preset(
     refresh_editing_dff_preview(app);
     app.status_message = format!("Updated DFF material #{material:02} color");
     true
+}
+
+// ---------------------------------------------------------------------------
+// Optimize / repair, transparent face ordering, and external TXD pairing
+// ---------------------------------------------------------------------------
+
+/// Material slots the renderer will blend rather than draw opaque.
+///
+/// Both sources matter: the material's own RGBA alpha, and the alpha flag on
+/// whichever texture native the material resolves to. A fully opaque material
+/// pointing at a cut-out foliage texture still has to render last.
+pub(crate) fn editing_dff_transparent_materials(
+    app: &AppState,
+    raw: &RawMesh,
+    txd_context: Option<&str>,
+) -> BTreeSet<usize> {
+    let txd_key = txd_context.map(|txd| asset_key(txd, ".txd"));
+    dff_transparent_material_set(raw, |texture| {
+        let Some(entries) = app.txd_textures.get(&lower(texture)) else {
+            return false;
+        };
+        let chosen = txd_key
+            .as_ref()
+            .and_then(|txd| {
+                entries
+                    .iter()
+                    .find(|entry| entry.txd_name.eq_ignore_ascii_case(txd))
+            })
+            .or_else(|| entries.first());
+        chosen.is_some_and(|entry| entry.has_alpha)
+    })
+}
+
+/// Distinct texture names the DFF references that no indexed TXD provides.
+///
+/// Empty texture names are skipped: an untextured material is a legitimate
+/// (if unusual) authoring choice and is not evidence of a missing dictionary.
+pub(crate) fn editing_dff_unresolved_textures(
+    app: &AppState,
+    raw: &RawMesh,
+    txd_context: Option<&str>,
+) -> Vec<String> {
+    let txd_key = txd_context.map(|txd| asset_key(txd, ".txd"));
+    let mut seen = BTreeSet::new();
+    let mut missing = Vec::new();
+    for texture in &raw.material_textures {
+        let trimmed = texture.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = lower(trimmed);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let resolved = app.txd_textures.get(&key).is_some_and(|entries| {
+            match txd_key.as_ref() {
+                // With an explicit pairing, only that dictionary counts —
+                // otherwise a same-named texture in an unrelated TXD would mask
+                // the fact that the paired one is wrong.
+                Some(txd) => entries
+                    .iter()
+                    .any(|entry| entry.txd_name.eq_ignore_ascii_case(txd)),
+                None => !entries.is_empty(),
+            }
+        });
+        if !resolved {
+            missing.push(trimmed.to_string());
+        }
+    }
+    missing
+}
+
+/// Open the TXD pairing prompt if the freshly opened DFF has textures the
+/// editor cannot resolve. Called right after a DFF is loaded.
+pub(crate) fn maybe_prompt_dff_txd_pairing(app: &mut AppState) {
+    if app.dff_txd_pair_dialog.is_some() {
+        return;
+    }
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        return;
+    };
+    let name = dff.name.clone();
+    let raw = dff.raw.clone();
+    let txd_context = dff.txd_context.clone();
+    let missing = editing_dff_unresolved_textures(app, &raw, txd_context.as_deref());
+    if missing.is_empty() {
+        return;
+    }
+    let material_count = dff_material_slot_count(&raw);
+    app.dff_txd_pair_dialog = Some(DffTxdPairDialog {
+        dff_name: name,
+        missing_textures: missing,
+        material_count,
+        scroll: 0.0,
+    });
+}
+
+/// Ask the OS for a `.txd` to pair with the open DFF.
+pub(crate) fn start_editing_dff_txd_pair_browse(app: &mut AppState) {
+    if !matches!(app.editing.asset.as_ref(), Some(EditingAsset::Dff(_))) {
+        app.status_message = "Open a DFF in Editing first".to_string();
+        return;
+    }
+    drain_text_input();
+    if app.dff_picker_rx.is_some() {
+        app.status_message = "A file browser is already open".to_string();
+        return;
+    }
+    let start_dir = app.root.clone();
+    let (tx, rx) = mpsc::channel();
+    app.dff_picker_rx = Some(rx);
+    app.status_message = "Choose a TXD to pair with this DFF...".to_string();
+    thread::spawn(move || {
+        let _ = tx.send((
+            DffPickerKind::EditingPairTxd,
+            choose_editing_open_path(start_dir),
+        ));
+    });
+}
+
+/// Index a loose `.txd` and point the open DFF at it.
+pub(crate) fn editing_pair_dff_txd(app: &mut AppState, path: PathBuf) {
+    let is_txd = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("txd"));
+    if !is_txd {
+        app.status_message = format!("{} is not a .txd file", path.display());
+        return;
+    }
+    let Some(txd_name) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| asset_key(name, ".txd"))
+    else {
+        app.status_message = "Selected TXD has no usable name".to_string();
+        return;
+    };
+    let before = app.txd_textures.len();
+    index_standalone_txd_file(&path, &mut app.txd_textures);
+    if app.txd_textures.len() == before
+        && !app
+            .txd_textures
+            .values()
+            .any(|entries| entries.iter().any(|e| e.txd_name.eq_ignore_ascii_case(&txd_name)))
+    {
+        app.status_message = format!("No textures could be read from {}", path.display());
+        return;
+    }
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        dff.txd_context = Some(txd_name.clone());
+        dff.txd_source_label = format!("Paired TXD: {txd_name}");
+        dff.collision_material_picker_scope = CollisionMaterialAssignmentScope::ExactTxd;
+    }
+    refresh_editing_dff_preview(app);
+    app.dff_txd_pair_dialog = None;
+    let still_missing = match app.editing.asset.as_ref() {
+        Some(EditingAsset::Dff(dff)) => {
+            editing_dff_unresolved_textures(app, &dff.raw, dff.txd_context.as_deref()).len()
+        }
+        _ => 0,
+    };
+    app.status_message = if still_missing > 0 {
+        format!("Paired {txd_name}; {still_missing} texture(s) still unresolved")
+    } else {
+        format!("Paired {txd_name}; all textures resolved")
+    };
+}
+
+/// Open the optimize toggle sheet for the DFF currently in the editor.
+pub(crate) fn open_dff_optimize_dialog(app: &mut AppState) {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        app.status_message = "Open a DFF in Editing first".to_string();
+        return;
+    };
+    drain_text_input();
+    app.dff_optimize_dialog = Some(DffOptimizeDialog {
+        dff_name: dff.name.clone(),
+        options: app.dff_optimize_options,
+    });
+}
+
+/// Run the enabled passes against the open DFF as one undoable edit.
+pub(crate) fn apply_dff_optimize(app: &mut AppState, options: DffOptimizeOptions) {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        app.status_message = "Open a DFF in Editing first".to_string();
+        return;
+    };
+    if !options.any() {
+        app.status_message = "Enable at least one optimization first".to_string();
+        return;
+    }
+    let mut raw = dff.raw.clone();
+    let transparent = editing_dff_transparent_materials(app, &raw, dff.txd_context.as_deref());
+    let report = run_dff_optimize(&mut raw, options, &transparent);
+    if !report.changed() {
+        app.status_message = report.summary();
+        return;
+    }
+    let before = editing_history_snapshot_with_material_sidecars(app);
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        dff.raw = raw;
+        dff.dirty = true;
+        // Face and vertex indices just moved, so any live selection is stale.
+        dff.selected_face = None;
+        dff.selected_faces.clear();
+        dff.selected_edges.clear();
+        dff.selected_vertex = None;
+        dff.selected_vertices.clear();
+        dff.hovered_face = None;
+        dff.hovered_vertex = None;
+        let slots = dff_material_slot_count(&dff.raw);
+        dff.selected_material = dff.selected_material.min(slots.saturating_sub(1));
+    }
+    commit_editing_history(app, "Optimize DFF", before);
+    refresh_editing_dff_preview(app);
+    app.status_message = report.summary();
 }
 
 fn set_dff_material_texture(
@@ -18258,6 +18520,59 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
     {
         let emitter = selected_material_emitter(app);
         let layout = dff_panel_layout(dff, emitter, dff_face_emitter_entries(app, &dff.name).len());
+        // Resolve the drag against the material colour bars while `dff` is still
+        // borrowed, then release it before touching `app` mutably below.
+        let material_color_drag = layout.material_color.and_then(|bars| {
+            bars.iter().enumerate().find_map(|(channel, rect)| {
+                if !rect.contains(mouse) {
+                    return None;
+                }
+                let value = ((mouse.x - rect.x) / rect.w).clamp(0.0, 1.0);
+                let mut color = dff
+                    .raw
+                    .materials
+                    .get(dff.selected_material)
+                    .map(|material| material.color)
+                    .unwrap_or_else(neutral_vertex_color);
+                Some(match channel {
+                    0 => {
+                        color.x = value;
+                        (0usize, Some(color), None)
+                    }
+                    1 => {
+                        color.y = value;
+                        (1usize, Some(color), None)
+                    }
+                    2 => {
+                        color.z = value;
+                        (2usize, Some(color), None)
+                    }
+                    _ => (3usize, None, Some(value)),
+                })
+            })
+        });
+        if let Some((channel, color, alpha)) = material_color_drag {
+            // Snapshot only on the frame the drag starts, so a whole drag
+            // collapses into a single undo step.
+            let before = is_mouse_button_pressed(MouseButton::Left)
+                .then(|| editing_history_snapshot(app));
+            if editing_apply_dff_material_preset(app, color, alpha) {
+                if let Some(before) = before {
+                    commit_editing_history(app, "Set DFF Material Color", before);
+                }
+                let value = alpha.unwrap_or_else(|| match channel {
+                    0 => color.map(|c| c.x).unwrap_or_default(),
+                    1 => color.map(|c| c.y).unwrap_or_default(),
+                    _ => color.map(|c| c.z).unwrap_or_default(),
+                });
+                app.status_message = format!(
+                    "Material {} {:.0}",
+                    ["red", "green", "blue", "alpha"][channel],
+                    (value * 255.0).round()
+                );
+            }
+            return true;
+        }
         if let Some(bars) = layout.emitter_color {
             for (channel, rect) in bars.iter().enumerate() {
                 if rect.contains(mouse) {
@@ -19193,6 +19508,30 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             }
             if layout.generate_lod.is_some_and(|rect| rect.contains(mouse)) {
                 request_editing_dff_lod(app);
+                return true;
+            }
+            if layout.optimize_dff.is_some_and(|rect| rect.contains(mouse)) {
+                open_dff_optimize_dialog(app);
+                return true;
+            }
+            if layout
+                .face_order_preview
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                app.dff_face_order_preview = !app.dff_face_order_preview;
+                app.status_message = if app.dff_face_order_preview {
+                    "Face order preview on: alpha faces draw in stored order and write depth, \
+                     exactly as San Andreas renders them"
+                        .to_string()
+                } else {
+                    "Face order preview off: the editor sorts transparent faces for you"
+                        .to_string()
+                };
+                // Draw-order only; the compiled preview mesh is unaffected.
+                return true;
+            }
+            if layout.pair_txd.is_some_and(|rect| rect.contains(mouse)) {
+                start_editing_dff_txd_pair_browse(app);
                 return true;
             }
             // Face-lighting rows select the complete linked face set.
@@ -21994,6 +22333,41 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
         );
     }
+    if let Some(rect) = layout.optimize_dff {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.cube,
+            "Optimize / Repair DFF...",
+            app.dff_optimize_dialog.is_some(),
+            false,
+        );
+    }
+    if let Some(rect) = layout.face_order_preview {
+        text_button(
+            &app.ui_font,
+            rect,
+            if app.dff_face_order_preview {
+                "Face Order Preview: SA-Accurate"
+            } else {
+                "Face Order Preview: Editor Sorted"
+            },
+            app.dff_face_order_preview,
+        );
+    }
+    if let Some(rect) = layout.pair_txd {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.select,
+            &match dff.txd_context.as_deref() {
+                Some(txd) => format!("Paired TXD: {} (change...)", ellipsize(txd, 24)),
+                None => "Pair External TXD...".to_string(),
+            },
+            false,
+            false,
+        );
+    }
 
     // Breakable PLG fracture zones. Selecting a row maps the native debris
     // group back onto intact faces, giving an immediate colored/highlighted
@@ -22431,18 +22805,68 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             true,
         );
     }
-    if layout.material_color.is_some() {
-        draw_input_box(app, InspectorField::DffMaterialRed, "Color R (0-255)");
-        draw_input_box(app, InspectorField::DffMaterialGreen, "Color G (0-255)");
-        draw_input_box(app, InspectorField::DffMaterialBlue, "Color B (0-255)");
-        draw_input_box(app, InspectorField::DffMaterialAlpha, "Alpha (0-255)");
-    }
     let material_properties = dff
         .raw
         .materials
         .get(dff.selected_material)
         .copied()
         .unwrap_or_else(default_dff_material);
+    if let Some(bars) = layout.material_color {
+        // Same drag-bar treatment as the vertex lighting editor's RGB picker so
+        // the two colour controls behave identically.
+        ui_text_size(
+            &app.ui_font,
+            "Material Colour (drag to adjust)",
+            bars[0].x - DFF_COLOR_LABEL_W,
+            bars[0].y - 10.0,
+            14,
+            ui_dim(),
+        );
+        let channels = [
+            ("R", RED, material_properties.color.x),
+            ("G", GREEN, material_properties.color.y),
+            ("B", BLUE, material_properties.color.z),
+            ("A", LIGHTGRAY, material_properties.alpha),
+        ];
+        for (idx, (label, color, value)) in channels.into_iter().enumerate() {
+            let rect = bars[idx];
+            let value = value.clamp(0.0, 1.0);
+            ui_text(
+                &app.ui_font,
+                label,
+                rect.x - DFF_COLOR_LABEL_W + 4.0,
+                rect.y + rect.h - 7.0,
+                LIGHTGRAY,
+            );
+            draw_rrect_bordered(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                6.0,
+                1.0,
+                Color::new(0.050, 0.058, 0.070, 1.0),
+                ui_border(),
+            );
+            draw_rrect(rect.x, rect.y, rect.w * value, rect.h, 6.0, color);
+            draw_line(
+                rect.x + rect.w * value,
+                rect.y - 2.0,
+                rect.x + rect.w * value,
+                rect.y + rect.h + 2.0,
+                2.0,
+                WHITE,
+            );
+            ui_text_size(
+                &app.ui_font,
+                &format!("{:.0}", (value * 255.0).round()),
+                rect.x + rect.w + 8.0,
+                rect.y + rect.h - 7.0,
+                14,
+                ui_muted(),
+            );
+        }
+    }
     if let Some(swatch) = layout.material_color_swatch {
         let cell = swatch.w / 4.0;
         for y in 0..6 {

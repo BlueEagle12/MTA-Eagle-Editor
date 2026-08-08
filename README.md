@@ -2,7 +2,7 @@
 
 **A native 3D world and asset editor for Multi Theft Auto: San Andreas.**
 
-[![Release](https://img.shields.io/badge/release-v0.1.2-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.3-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-4b5563)](#download)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green)](LICENSE)
 
@@ -10,6 +10,17 @@ Eagle Editor opens an Eagle/MTA resource as an interactive 3D project. Preview
 the complete map, inspect and edit RenderWare assets, build LODs, repair common
 asset problems, configure lighting and physics, and save the result back to the
 resource without moving between several separate tools.
+
+## What’s new in 0.1.3
+
+- **Per-DFF optimization and repair:** inspect an individual model in the DFF
+  editor, choose the cleanup passes to run, preview the result, and stage it
+  directly into the resource archive.
+- **RenderWare alpha-face ordering:** optimize transparent faces to render
+  after opaque geometry and preserve that draw order in the exported BinMesh,
+  fixing common in-game glass, fence, and foliage depth artifacts.
+- **DFF editor polish:** improved optimization controls, texture-pairing flow,
+  material editing, and related editor interaction fixes.
 
 > [!IMPORTANT]
 > Eagle Editor is an early public release. Keep a backup or use version control for
@@ -60,8 +71,8 @@ code-signed. Verify the archive checksum below before choosing **Run anyway**.
 The Linux build requires an x86-64 desktop with X11 and OpenGL drivers.
 
 ```bash
-tar -xzf EagleEditor-v0.1.2-linux-x86_64.tar.gz
-cd EagleEditor-v0.1.2-linux-x86_64
+tar -xzf EagleEditor-v0.1.3-linux-x86_64.tar.gz
+cd EagleEditor-v0.1.3-linux-x86_64
 chmod +x EagleEditor
 ./EagleEditor
 ```

@@ -683,6 +683,7 @@ mod tests {
             definitions,
             building_dffs: HashSet::new(),
             opaque_materials_by_dff: BTreeMap::new(),
+            transparent_materials_by_dff: BTreeMap::new(),
         }
     }
 
@@ -2446,6 +2447,7 @@ mod tests {
             loaded_definition_ids: HashSet::new(),
             building_dffs: HashSet::new(),
             opaque_materials_by_dff: BTreeMap::new(),
+            transparent_materials_by_dff: BTreeMap::new(),
         };
         let plan = TxdCleanupPlan {
             targets: Vec::new(),
@@ -2510,6 +2512,7 @@ mod tests {
             loaded_definition_ids: HashSet::new(),
             building_dffs: HashSet::new(),
             opaque_materials_by_dff: BTreeMap::new(),
+            transparent_materials_by_dff: BTreeMap::new(),
         };
         let plan = TxdCleanupPlan {
             targets: Vec::new(),
@@ -2988,14 +2991,101 @@ mod tests {
     fn valid_dff_optimization_is_idempotent() {
         let bytes = write_normalized_dff(&test_raw_dff_mesh(), "valid").unwrap();
 
-        let first = optimize_dff_bytes("valid.dff", &bytes, false, &BTreeSet::new()).unwrap();
-        let second =
-            optimize_dff_bytes("valid.dff", &first.bytes, false, &BTreeSet::new()).unwrap();
+        let first = optimize_dff_bytes(
+            "valid.dff",
+            &bytes,
+            false,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let second = optimize_dff_bytes(
+            "valid.dff",
+            &first.bytes,
+            false,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(first.bytes, bytes);
         assert_eq!(second.bytes, first.bytes);
         assert!(first.reasons.is_empty());
         assert!(second.reasons.is_empty());
+    }
+
+    #[test]
+    fn dff_optimization_stages_transparent_faces_after_opaque_faces() {
+        let mut raw = test_raw_dff_mesh();
+        raw.vertices.extend([
+            V3 {
+                x: 2.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            V3 {
+                x: 3.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            V3 {
+                x: 2.0,
+                y: 1.0,
+                z: 0.0,
+            },
+        ]);
+        raw.normals.extend([V3 {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        }; 3]);
+        raw.uvs.extend([V2 { u: 0.0, v: 0.0 }; 3]);
+        raw.materials = vec![
+            RawMaterial {
+                alpha: 0.5,
+                ..RawMaterial::default()
+            },
+            RawMaterial {
+                alpha: 1.0,
+                ..RawMaterial::default()
+            },
+        ];
+        raw.material_textures = vec!["glass".to_string(), "wall".to_string()];
+        raw.triangles = vec![
+            Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 0,
+            },
+            Tri {
+                a: 3,
+                b: 4,
+                c: 5,
+                material: 1,
+            },
+        ];
+        let source = write_normalized_dff(&raw, "glass_wall").unwrap();
+
+        let output = optimize_dff_bytes(
+            "glass_wall.dff",
+            &source,
+            false,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let reparsed = parse_dff_mesh_preserving_topology(&output.bytes);
+
+        assert_eq!(output.transparent_faces_reordered, 2);
+        assert_eq!(
+            reparsed
+                .triangles
+                .iter()
+                .map(|triangle| triangle.material)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
     }
 
     #[test]
@@ -3942,6 +4032,7 @@ struct DffOptimizeOutput {
     reasons: Vec<String>,
     warnings: Vec<String>,
     compaction: DffLosslessCompactionStats,
+    transparent_faces_reordered: usize,
 }
 
 fn optimize_dff_bytes(
@@ -3949,6 +4040,7 @@ fn optimize_dff_bytes(
     source: &[u8],
     _is_building: bool,
     opaque_materials: &BTreeSet<u16>,
+    transparent_materials: &BTreeSet<u16>,
 ) -> Result<DffOptimizeOutput, String> {
     let mut bytes = source[..dff_chunk_len(source).min(source.len())].to_vec();
     let original = bytes.clone();
@@ -3965,6 +4057,7 @@ fn optimize_dff_bytes(
     // Triangle/vertex remapping would invalidate the separate debris mesh and
     // its editor face mapping. Preserve authored fracture geometry exactly;
     // users can regenerate zones explicitly after topology edits.
+    let mut transparent_faces_reordered = 0usize;
     let compaction = if raw
         .components
         .iter()
@@ -3974,12 +4067,22 @@ fn optimize_dff_bytes(
     } else {
         compact_raw_mesh_lossless(&mut compacted, opaque_materials)
     };
+    if !raw
+        .components
+        .iter()
+        .any(|component| component.breakable.is_some())
+    {
+        let mut transparent = dff_transparent_material_set(&compacted, |_| false);
+        transparent.extend(transparent_materials.iter().map(|material| *material as usize));
+        transparent_faces_reordered = dff_reorder_transparent_faces(&mut compacted, &transparent, false);
+    }
     let compaction_changed = compaction.vertices_removed != 0
         || compaction.invalid_triangles_removed != 0
         || compaction.degenerate_triangles_removed != 0
         || compaction.duplicate_triangles_removed != 0
         || compaction.materials_removed != 0
-        || compaction.triangles_reordered != 0;
+        || compaction.triangles_reordered != 0
+        || transparent_faces_reordered != 0;
     let mut warnings = Vec::new();
     let mut reasons = Vec::new();
     let mut applied_compaction = DffLosslessCompactionStats::default();
@@ -4012,13 +4115,14 @@ fn optimize_dff_bytes(
             bytes = candidate;
             applied_compaction = compaction;
             reasons.push(format!(
-                "lossless compaction removed {} vertex/vertices, {} triangle(s), and {} material slot(s); reordered {} opaque triangle position(s)",
+                "lossless compaction removed {} vertex/vertices, {} triangle(s), and {} material slot(s); reordered {} opaque triangle position(s) and {} transparent face(s)",
                 compaction.vertices_removed,
                 compaction.invalid_triangles_removed
                     + compaction.degenerate_triangles_removed
                     + compaction.duplicate_triangles_removed,
                 compaction.materials_removed,
-                compaction.triangles_reordered
+                compaction.triangles_reordered,
+                transparent_faces_reordered,
             ));
         } else {
             warnings.push(
@@ -4107,6 +4211,7 @@ fn optimize_dff_bytes(
         reasons,
         warnings,
         compaction: applied_compaction,
+        transparent_faces_reordered,
     })
 }
 
@@ -7954,6 +8059,7 @@ struct GeometryCleanupResult {
     dff_triangles_removed: usize,
     dff_materials_removed: usize,
     dff_triangles_reordered: usize,
+    dff_transparent_faces_reordered: usize,
     cols_scanned: usize,
     cols_repaired: usize,
     col_faces_removed: usize,
@@ -7981,6 +8087,7 @@ struct GeometryOptimizationContext {
     loaded_definition_ids: HashSet<String>,
     building_dffs: HashSet<String>,
     opaque_materials_by_dff: BTreeMap<String, BTreeSet<u16>>,
+    transparent_materials_by_dff: BTreeMap<String, BTreeSet<u16>>,
 }
 
 impl GeometryOptimizationContext {
@@ -7991,6 +8098,7 @@ impl GeometryOptimizationContext {
             .map(|placement| placement.id.clone())
             .collect::<HashSet<_>>();
         let mut opaque_materials_by_dff = BTreeMap::<String, BTreeSet<u16>>::new();
+        let mut transparent_materials_by_dff = BTreeMap::<String, BTreeSet<u16>>::new();
         let mut seen_mesh_scopes = HashSet::<String>::new();
         for placement in &app.placements {
             if !loaded_definition_ids.contains(&placement.id) {
@@ -8021,9 +8129,19 @@ impl GeometryOptimizationContext {
                 .map(|part| part.material_index as u16)
                 .collect::<BTreeSet<_>>();
             opaque_materials_by_dff
-                .entry(dff_name)
+                .entry(dff_name.clone())
                 .and_modify(|known| known.retain(|material| opaque.contains(material)))
                 .or_insert(opaque);
+            let transparent = mesh
+                .parts
+                .iter()
+                .filter(|part| part.transparency == TransparencyMode::Blend)
+                .map(|part| part.material_index as u16)
+                .collect::<BTreeSet<_>>();
+            transparent_materials_by_dff
+                .entry(dff_name)
+                .and_modify(|known| known.retain(|material| transparent.contains(material)))
+                .or_insert(transparent);
         }
         Self {
             root: app.root.clone(),
@@ -8032,6 +8150,7 @@ impl GeometryOptimizationContext {
             loaded_definition_ids,
             building_dffs: building_dff_set(app),
             opaque_materials_by_dff,
+            transparent_materials_by_dff,
         }
     }
 
@@ -8823,7 +8942,7 @@ impl AssetOptimizationJob {
             )
         } else if result.geometry.errors.is_empty() && result.txd.errors.is_empty() {
             format!(
-                "Asset optimization ({}) finished in {elapsed:.1}s: TXD policy {}, staged {} TXD(s), removed {} unused texture(s) ({}), consolidated {} group(s) and {} donor TXD(s), repaired {} texture payload(s), renamed {} texture(s), and updated {} texture-reference DFF(s); repaired {}/{} DFF(s), removing {} vertex/vertices, {} triangle(s), and {} material slot(s) and reordering {} opaque triangle position(s); repaired {}/{} COL(s), removed {} collision face(s) ({} by coplanar reduction) and {} redundant collision vertex/vertices, reoriented {} face(s) across {} inverted ground mesh(es), generated {} spatial face group(s) with {} face reorder(s), and corrected {} COL alignment(s). Save promotes staged changes.",
+                "Asset optimization ({}) finished in {elapsed:.1}s: TXD policy {}, staged {} TXD(s), removed {} unused texture(s) ({}), consolidated {} group(s) and {} donor TXD(s), repaired {} texture payload(s), renamed {} texture(s), and updated {} texture-reference DFF(s); repaired {}/{} DFF(s), removing {} vertex/vertices, {} triangle(s), and {} material slot(s), reordering {} opaque triangle position(s), and moving {} transparent face(s) after opaque geometry; repaired {}/{} COL(s), removed {} collision face(s) ({} by coplanar reduction) and {} redundant collision vertex/vertices, reoriented {} face(s) across {} inverted ground mesh(es), generated {} spatial face group(s) with {} face reorder(s), and corrected {} COL alignment(s). Save promotes staged changes.",
                 txd_profile_label(self.txd_profile),
                 signed_texture_savings(self.txd_bytes_saved),
                 result.txd.cleaned_txds,
@@ -8840,6 +8959,7 @@ impl AssetOptimizationJob {
                 result.geometry.dff_triangles_removed,
                 result.geometry.dff_materials_removed,
                 result.geometry.dff_triangles_reordered,
+                result.geometry.dff_transparent_faces_reordered,
                 result.geometry.cols_repaired,
                 result.geometry.cols_scanned,
                 result.geometry.col_faces_removed,
@@ -9876,11 +9996,17 @@ fn apply_geometry_cleanup_filtered(
             .get(dff_name)
             .cloned()
             .unwrap_or_default();
+        let transparent_materials = context
+            .transparent_materials_by_dff
+            .get(dff_name)
+            .cloned()
+            .unwrap_or_default();
         match optimize_dff_bytes(
             dff_name,
             &source,
             context.building_dffs.contains(dff_name),
             &opaque_materials,
+            &transparent_materials,
         ) {
             Ok(output) => {
                 result.dff_vertices_removed += output.compaction.vertices_removed;
@@ -9889,6 +10015,7 @@ fn apply_geometry_cleanup_filtered(
                     + output.compaction.duplicate_triangles_removed;
                 result.dff_materials_removed += output.compaction.materials_removed;
                 result.dff_triangles_reordered += output.compaction.triangles_reordered;
+                result.dff_transparent_faces_reordered += output.transparent_faces_reordered;
                 let raw = parse_dff_mesh(&output.bytes);
                 if output.bytes != source {
                     staged_assets.push((dff_name.clone(), output.bytes.clone()));
@@ -12650,6 +12777,10 @@ pub(crate) fn poll_dff_picker(app: &mut AppState) {
             Ok(Some(path)),
         ) => replace_texture_in_archive(app, definition_id, txd_name, texture_name, path),
         (DffPickerKind::EditingOpenFile, Ok(Some(path))) => open_editing_file(app, path),
+        (DffPickerKind::EditingPairTxd, Ok(Some(path))) => editing_pair_dff_txd(app, path),
+        (DffPickerKind::EditingPairTxd, Ok(None)) => {
+            app.status_message = "TXD pairing cancelled".to_string();
+        }
         (DffPickerKind::EditingMergeImg, Ok(Some(path))) => start_editing_img_merge_scan(app, path),
         (DffPickerKind::EditingAddEntry, Ok(Some(path))) => editing_add_entry_from_path(app, path),
         (DffPickerKind::EditingReplaceEntry { entry_name }, Ok(Some(path))) => {

@@ -2125,14 +2125,25 @@ fn write_geometry(
 
     let mut bin_mesh = Vec::new();
     bin_mesh.extend_from_slice(&0u32.to_le_bytes());
-    let mut groups = BTreeMap::<u16, Vec<u32>>::new();
+    // A BinMesh may contain several batches with the same material. Keep
+    // consecutive material runs instead of collecting every material into one
+    // sorted map: the runtime consumes BinMesh order, so merging runs would
+    // undo editor face-order optimizations (notably opaque-before-alpha).
+    let mut groups = Vec::<(u16, Vec<u32>)>::new();
     for tri in &export.triangles {
+        if groups
+            .last()
+            .is_none_or(|(material, _)| *material != tri.material)
+        {
+            groups.push((tri.material, Vec::new()));
+        }
         groups
-            .entry(tri.material)
-            .or_default()
+            .last_mut()
+            .expect("a BinMesh group was just created")
+            .1
             .extend([tri.b, tri.a, tri.c]);
     }
-    let total_indices: usize = groups.values().map(Vec::len).sum();
+    let total_indices: usize = groups.iter().map(|(_, indices)| indices.len()).sum();
     bin_mesh.extend_from_slice(&(groups.len() as u32).to_le_bytes());
     bin_mesh.extend_from_slice(&(total_indices as u32).to_le_bytes());
     for (material, indices) in groups {
@@ -2597,6 +2608,71 @@ mod tests {
         assert_ne!(flags & 0x10, 0);
         assert_eq!(has_normals, 1);
         assert!(contains_chunk(&bytes, 0x050e));
+    }
+
+    #[test]
+    fn bin_mesh_round_trip_preserves_cross_material_triangle_order() {
+        let mut raw = test_raw_mesh();
+        raw.vertices.extend([
+            V3 {
+                x: 2.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            V3 {
+                x: 3.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            V3 {
+                x: 2.0,
+                y: 1.0,
+                z: 0.0,
+            },
+        ]);
+        raw.normals.extend(
+            [V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            }; 3],
+        );
+        raw.uvs.extend([V2 { u: 0.0, v: 0.0 }; 3]);
+        raw.materials.push(RawMaterial::default());
+        raw.material_textures.push("alpha".to_string());
+        raw.triangles = vec![
+            Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 0,
+            },
+            Tri {
+                a: 3,
+                b: 4,
+                c: 5,
+                material: 1,
+            },
+            Tri {
+                a: 2,
+                b: 1,
+                c: 0,
+                material: 0,
+            },
+        ];
+
+        let bytes = write_normalized_dff(&raw, "ordered").unwrap();
+        let reparsed = parse_dff_mesh_preserving_topology(&bytes);
+
+        assert_eq!(
+            reparsed
+                .triangles
+                .iter()
+                .map(|triangle| triangle.material)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 0],
+            "the runtime BinMesh must retain the staged face ordering"
+        );
     }
 
     #[test]

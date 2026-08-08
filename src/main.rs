@@ -351,7 +351,7 @@ mod resource;
 mod ui;
 
 use col::{editing::*, export::*, generation::*, import::*, optimizer::*, validation::*};
-use dff::{breakable::*, export::*, import::*, lod::*};
+use dff::{breakable::*, export::*, import::*, lod::*, optimize::*};
 
 use app::preferences::*;
 use assets::{join::*, replacement::*, textures::*, txd::*};
@@ -2833,6 +2833,8 @@ enum DffPickerKind {
         texture_name: String,
     },
     EditingOpenFile,
+    /// Pick a loose `.txd` to pair with the DFF open in the editor.
+    EditingPairTxd,
     EditingMergeImg,
     EditingAddEntry,
     EditingReplaceEntry {
@@ -2891,6 +2893,28 @@ struct DffPrelightImportDialog {
 
 struct DffMergeChoiceDialog {
     selected_count: usize,
+}
+
+/// Toggle sheet shown by the DFF editor's "Optimize / Repair DFF" button.
+///
+/// The dialog only edits `options`; nothing is applied until the user presses
+/// Run, so the toggles can be reviewed first.
+struct DffOptimizeDialog {
+    /// Name of the DFF the dialog was opened for, so a run is rejected if the
+    /// editor moved on to a different asset while the sheet was open.
+    dff_name: String,
+    options: DffOptimizeOptions,
+}
+
+/// Prompt shown when an opened DFF references textures that no loaded TXD
+/// provides, offering to pair an external `.txd` with it.
+struct DffTxdPairDialog {
+    dff_name: String,
+    /// Distinct texture names the DFF asks for and the editor cannot resolve.
+    missing_textures: Vec<String>,
+    /// Total material slots, for the "n of m" line.
+    material_count: usize,
+    scroll: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4070,6 +4094,14 @@ struct AppState {
     dff_replace_choice_dialog: Option<DffReplaceChoiceDialog>,
     dff_prelight_import_dialog: Option<DffPrelightImportDialog>,
     dff_merge_choice_dialog: Option<DffMergeChoiceDialog>,
+    dff_optimize_dialog: Option<DffOptimizeDialog>,
+    dff_txd_pair_dialog: Option<DffTxdPairDialog>,
+    /// Draw the open DFF in its stored face order with depth writes on, so
+    /// mis-ordered alpha faces visibly punch holes exactly as they do in San
+    /// Andreas instead of being silently fixed up by the editor's sorted pass.
+    dff_face_order_preview: bool,
+    /// Options carried between openings of the optimize dialog.
+    dff_optimize_options: DffOptimizeOptions,
     dff_texture_duplicate_dialog: Option<DffTextureDuplicateDialog>,
     dff_texture_view_dialog: Option<DffTextureViewDialog>,
     element_id_rename_dialog: Option<ElementIdRenameDialog>,
@@ -4821,6 +4853,8 @@ async fn main() {
                     && app.blender_import_rx.is_none()
                     && app.dff_replace_choice_dialog.is_none()
                     && app.dff_merge_choice_dialog.is_none()
+                    && app.dff_optimize_dialog.is_none()
+                    && app.dff_txd_pair_dialog.is_none()
                     && app.dff_texture_duplicate_dialog.is_none()
                     && app.dff_texture_view_dialog.is_none()
                     && app.element_id_rename_dialog.is_none()
@@ -4860,6 +4894,8 @@ async fn main() {
                     draw_save_as_dialog(app);
                     draw_dff_replace_choice_dialog(app);
                     draw_dff_merge_choice_dialog(app);
+                    draw_dff_optimize_dialog(app);
+                    draw_dff_txd_pair_dialog(app);
                     draw_dff_texture_duplicate_dialog(app);
                     draw_dff_texture_view_dialog(app);
                     draw_element_id_rename_dialog(app);
