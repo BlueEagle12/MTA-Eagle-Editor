@@ -52,6 +52,8 @@ resource without moving between several separate tools.
 Prebuilt Windows and Linux packages are available on the
 [GitHub Releases page](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases).
 Each release includes a `SHA256SUMS.txt` file for archive verification.
+Maintainers should follow [RELEASING.md](RELEASING.md) when preparing a new
+version.
 
 ## Getting started
 
