@@ -381,6 +381,7 @@ struct Options {
     vbo_immediate: bool,
     monitor: Option<u32>,
     msaa_samples: i32,
+    draw_distance_percent: u16,
     draw_radius: f32,
     part_budget: usize,
     vertex_budget: usize,
@@ -599,6 +600,10 @@ const FRACTURE_PREVIEW_DURATION_SECONDS: f64 = 2.8;
 #[derive(Clone, Default, PartialEq)]
 struct RawMeshComponent {
     name: String,
+    /// The RenderWare frame this geometry's atomic is attached to.  The
+    /// imported mesh stores vertices in world space, so retaining this index
+    /// lets the writer restore them to the matching frame-local space.
+    frame_index: Option<usize>,
     vertex_start: usize,
     vertex_end: usize,
     tri_start: usize,
@@ -2787,6 +2792,7 @@ struct PreferencesDialog {
     camera_speed: f32,
     camera_rotation_speed: f32,
     msaa_samples: i32,
+    draw_distance_percent: u16,
     /// MSAA as it was when the dialog opened, so "needs a restart" can be
     /// detected without re-reading preferences.txt every frame.
     msaa_samples_saved: i32,
@@ -4096,10 +4102,6 @@ struct AppState {
     dff_merge_choice_dialog: Option<DffMergeChoiceDialog>,
     dff_optimize_dialog: Option<DffOptimizeDialog>,
     dff_txd_pair_dialog: Option<DffTxdPairDialog>,
-    /// Draw the open DFF in its stored face order with depth writes on, so
-    /// mis-ordered alpha faces visibly punch holes exactly as they do in San
-    /// Andreas instead of being silently fixed up by the editor's sorted pass.
-    dff_face_order_preview: bool,
     /// Options carried between openings of the optimize dialog.
     dff_optimize_options: DffOptimizeOptions,
     dff_texture_duplicate_dialog: Option<DffTextureDuplicateDialog>,
@@ -4480,7 +4482,8 @@ fn parse_options() -> Options {
         vbo_immediate: false,
         monitor: None,
         msaa_samples: requested_msaa_samples(),
-        draw_radius: DEFAULT_DRAW,
+        draw_distance_percent: load_draw_distance_percent_preference(),
+        draw_radius: DEFAULT_DRAW * load_draw_distance_percent_preference() as f32 / 100.0,
         part_budget: usize::MAX,
         vertex_budget: DEFAULT_VERTEX_BUDGET,
         lod_mode: LodMode::Swap,

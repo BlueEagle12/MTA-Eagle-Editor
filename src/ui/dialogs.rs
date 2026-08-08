@@ -549,6 +549,14 @@ fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog,
             ui_muted(),
         );
     }
+    draw_preferences_stepper(
+        app,
+        PREFERENCES_DRAW_DISTANCE_ROW,
+        "Draw Distance",
+        &format!("{}%", dialog.draw_distance_percent),
+        dialog.draw_distance_percent > 25,
+        dialog.draw_distance_percent < 200,
+    );
 }
 
 pub(crate) fn draw_dff_replace_choice_dialog(app: &AppState) {

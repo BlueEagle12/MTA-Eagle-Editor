@@ -494,7 +494,6 @@ pub(crate) struct DffPanelLayout {
     pub(crate) cutter_resize: Option<[Rect; 6]>,
     pub(crate) generate_lod: Option<Rect>,
     pub(crate) optimize_dff: Option<Rect>,
-    pub(crate) face_order_preview: Option<Rect>,
     pub(crate) pair_txd: Option<Rect>,
     pub(crate) generate_collision: Rect,
     pub(crate) flip_normals: Rect,
@@ -605,7 +604,6 @@ pub(crate) fn dff_panel_layout(
         cutter_resize: None,
         generate_lod: None,
         optimize_dff: None,
-        face_order_preview: None,
         pair_txd: None,
         generate_collision: Rect::new(x0, panel.y + panel.h - DFF_BTN_H - 12.0, thirdw, DFF_BTN_H),
         flip_normals: Rect::new(
@@ -890,8 +888,6 @@ pub(crate) fn dff_panel_layout(
             }
             DffSection::Optimize => {
                 layout.optimize_dff = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                y += DFF_BTN_H + DFF_ROW_GAP;
-                layout.face_order_preview = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
                 y += DFF_BTN_H + DFF_ROW_GAP;
                 layout.pair_txd = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
                 y += DFF_BTN_H + gap;
@@ -2135,6 +2131,28 @@ pub(crate) fn open_editing_file_unchecked(app: &mut AppState, path: PathBuf) {
     app.editing.message = format!("Opened loose asset {}", path.display());
     app.status_message = app.editing.message.clone();
     editing_open_selected_asset(app);
+    // A loose DFF commonly ships beside a same-stem TXD. Index and select it
+    // automatically so alpha-aware preview and face ordering work without a
+    // manual pairing step.
+    if ext == "dff" {
+        let paired_txd = path.with_extension("txd");
+        if paired_txd.is_file() {
+            let txd_name = asset_key(
+                paired_txd
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default(),
+                ".txd",
+            );
+            index_standalone_txd_file(&paired_txd, &mut app.txd_textures);
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.txd_context = Some(txd_name.clone());
+                dff.txd_source_label = format!("Paired TXD: {txd_name}");
+                dff.collision_material_picker_scope = CollisionMaterialAssignmentScope::ExactTxd;
+            }
+            refresh_editing_dff_preview(app);
+        }
+    }
 }
 
 pub(crate) fn open_selected_editing_img(app: &mut AppState) {
@@ -4189,18 +4207,13 @@ pub(crate) fn editing_dff_transparent_materials(
 ) -> BTreeSet<usize> {
     let txd_key = txd_context.map(|txd| asset_key(txd, ".txd"));
     dff_transparent_material_set(raw, |texture| {
-        let Some(entries) = app.txd_textures.get(&lower(texture)) else {
-            return false;
-        };
-        let chosen = txd_key
-            .as_ref()
-            .and_then(|txd| {
-                entries
-                    .iter()
-                    .find(|entry| entry.txd_name.eq_ignore_ascii_case(txd))
-            })
-            .or_else(|| entries.first());
-        chosen.is_some_and(|entry| entry.has_alpha)
+        texture_transparency_mode(
+            texture,
+            txd_key.as_deref(),
+            &app.texture_files,
+            &app.txd_textures,
+            app.options.textures,
+        ) == TransparencyMode::Blend
     })
 }
 
@@ -11959,11 +11972,11 @@ pub(crate) fn editing_flip_dff_normals(app: &mut AppState) {
 }
 
 fn validate_normalized_dff_stage(raw: &RawMesh, frame: &str) -> Result<(), String> {
-    if raw_mesh_is_safe_for_normalized_rewrite(raw, frame) {
+    if raw_mesh_is_safe_for_hierarchy_rewrite(raw, frame) {
         Ok(())
     } else {
         Err(
-            "the model has a multi-frame/component hierarchy that the normalized writer would flatten"
+            "the model has an invalid or unsupported frame/component hierarchy"
                 .to_string(),
         )
     }
@@ -12000,6 +12013,19 @@ pub(crate) fn editing_stage_dff_asset(app: &mut AppState) -> bool {
         }
         _ => None,
     });
+    let source_bytes = app.editing.asset.as_ref().and_then(|asset| {
+        let EditingAsset::Dff(dff) = asset else {
+            return None;
+        };
+        let key = editing_key(&dff.name);
+        app.editing.modified_entries.get(&key).cloned().or_else(|| {
+            app.editing
+                .rows
+                .iter()
+                .find(|row| editing_key(&row.entry.name) == key)
+                .map(|row| read_img_entry(&row.entry)[..row.logical_size.min(row.entry.size as usize)].to_vec())
+        })
+    });
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return false;
     };
@@ -12008,6 +12034,34 @@ pub(crate) fn editing_stage_dff_asset(app: &mut AppState) -> bool {
         .and_then(|stem| stem.to_str())
         .unwrap_or("model");
     if let Err(error) = validate_normalized_dff_stage(&dff.raw, frame) {
+        if let Some(source_bytes) = source_bytes.as_deref() {
+            let source_raw = parse_dff_mesh(source_bytes);
+            match rewrite_dff_bin_mesh_face_order(source_bytes, &source_raw, &dff.raw) {
+                Ok(Some(bytes)) => {
+                    let refresh_name = dff.name.clone();
+                    app.editing
+                        .modified_entries
+                        .insert(editing_key(&refresh_name), bytes.clone());
+                    dff.dirty = false;
+                    dff.normalized_warning = false;
+                    dff.normalized_rewrite_confirmed = true;
+                    app.status_message = format!(
+                        "Staged hierarchy-preserving DFF face order for {}",
+                        dff.name
+                    );
+                    refresh_live_asset_from_editing_entry(app, &refresh_name, &bytes);
+                    return true;
+                }
+                Ok(None) => {}
+                Err(rewrite_error) => {
+                    app.status_message = format!(
+                        "Could not preserve the DFF hierarchy while writing {}: {rewrite_error}",
+                        dff.name
+                    );
+                    return false;
+                }
+            }
+        }
         app.status_message = format!("Could not write DFF {}: {error}", dff.name);
         return false;
     }
@@ -19514,22 +19568,6 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 open_dff_optimize_dialog(app);
                 return true;
             }
-            if layout
-                .face_order_preview
-                .is_some_and(|rect| rect.contains(mouse))
-            {
-                app.dff_face_order_preview = !app.dff_face_order_preview;
-                app.status_message = if app.dff_face_order_preview {
-                    "Face order preview on: alpha faces draw in stored order and write depth, \
-                     exactly as San Andreas renders them"
-                        .to_string()
-                } else {
-                    "Face order preview off: the editor sorts transparent faces for you"
-                        .to_string()
-                };
-                // Draw-order only; the compiled preview mesh is unaffected.
-                return true;
-            }
             if layout.pair_txd.is_some_and(|rect| rect.contains(mouse)) {
                 start_editing_dff_txd_pair_browse(app);
                 return true;
@@ -22343,18 +22381,6 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
         );
     }
-    if let Some(rect) = layout.face_order_preview {
-        text_button(
-            &app.ui_font,
-            rect,
-            if app.dff_face_order_preview {
-                "Face Order Preview: SA-Accurate"
-            } else {
-                "Face Order Preview: Editor Sorted"
-            },
-            app.dff_face_order_preview,
-        );
-    }
     if let Some(rect) = layout.pair_txd {
         editing_action_button(
             &app.ui_font,
@@ -25095,6 +25121,7 @@ mod tests {
         let mut raw = test_clockwise_triangle_raw();
         raw.components.push(RawMeshComponent {
             name: "model".to_string(),
+            frame_index: None,
             vertex_start: 0,
             vertex_end: raw.vertices.len(),
             tri_start: 0,
@@ -25118,6 +25145,7 @@ mod tests {
         raw.components = vec![
             RawMeshComponent {
                 name: "body".to_string(),
+                frame_index: None,
                 vertex_start: 0,
                 vertex_end: raw.vertices.len(),
                 tri_start: 0,
@@ -25132,7 +25160,7 @@ mod tests {
 
         let error = validate_normalized_dff_stage(&raw, "model").unwrap_err();
 
-        assert!(error.contains("multi-frame/component hierarchy"));
+        assert!(error.contains("frame/component hierarchy"));
     }
 
     #[test]

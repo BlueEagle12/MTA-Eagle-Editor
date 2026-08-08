@@ -2268,6 +2268,7 @@ mod tests {
         ];
         let component = RawMeshComponent {
             name: "door".to_string(),
+            frame_index: None,
             vertex_start: 0,
             vertex_end: 3,
             tri_start: 0,
@@ -2392,6 +2393,7 @@ mod tests {
             material_textures: vec![String::new()],
             components: vec![RawMeshComponent {
                 name: "shared".to_string(),
+                frame_index: None,
                 vertex_start: 0,
                 vertex_end: 3,
                 tri_start: 0,
@@ -2474,6 +2476,7 @@ mod tests {
             material_textures: vec![String::new()],
             components: vec![RawMeshComponent {
                 name: "shared".to_string(),
+                frame_index: None,
                 vertex_start: 0,
                 vertex_end: 4,
                 tri_start: 0,
@@ -2601,6 +2604,7 @@ mod tests {
             material_textures: vec![String::new()],
             components: vec![RawMeshComponent {
                 name: "shared".to_string(),
+                frame_index: None,
                 vertex_start: 0,
                 vertex_end: 3,
                 tri_start: 0,

@@ -341,6 +341,7 @@ fn combine_dffs(sources: &[JoinSource], anchor: &Placement) -> Result<RawMesh, S
         }
         out.components.push(RawMeshComponent {
             name: source.placement.id.clone(),
+            frame_index: None,
             vertex_start,
             vertex_end: out.vertices.len(),
             tri_start,

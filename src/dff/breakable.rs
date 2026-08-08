@@ -674,6 +674,7 @@ mod tests {
             material_textures: vec!["wood".to_string()],
             components: vec![RawMeshComponent {
                 name: "object".to_string(),
+                frame_index: None,
                 vertex_start: 0,
                 vertex_end: 3,
                 tri_start: 0,

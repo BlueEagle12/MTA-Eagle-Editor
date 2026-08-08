@@ -1141,6 +1141,7 @@ fn duplicate_vehicle_wheel_components(raw: &mut RawMesh) {
         }
         raw.components.push(RawMeshComponent {
             name: target.name.clone(),
+            frame_index: None,
             vertex_start,
             vertex_end,
             tri_start,
@@ -7435,6 +7436,7 @@ mod tests {
             }],
             components: vec![RawMeshComponent {
                 name: "custom_rim_mesh".to_string(),
+                frame_index: None,
                 vertex_start: 0,
                 vertex_end: 3,
                 tri_start: 0,
@@ -7534,6 +7536,7 @@ mod tests {
             }],
             components: vec![RawMeshComponent {
                 name: "steering_wheel".to_string(),
+                frame_index: None,
                 vertex_start: 0,
                 vertex_end: 3,
                 tri_start: 0,

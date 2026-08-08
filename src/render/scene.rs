@@ -496,7 +496,17 @@ pub(crate) fn draw_placement_render_mesh(
         }
         gl::PushMatrix();
         gl::MultMatrixf(model_cols.as_ptr());
-        for part in &mesh.parts {
+        let mut order: Vec<usize> = (0..mesh.parts.len()).collect();
+        order.sort_by_key(|index| {
+            mesh.parts[*index]
+                .face_indices
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+        for index in order {
+            let part = &mesh.parts[index];
             let transparency = if alpha < 0.999 {
                 TransparencyMode::Blend
             } else {
@@ -683,7 +693,17 @@ fn draw_placement_render_mesh_view_mode(
         }
         gl::PushMatrix();
         gl::MultMatrixf(model_cols.as_ptr());
-        for part in &mesh.parts {
+        let mut order: Vec<usize> = (0..mesh.parts.len()).collect();
+        order.sort_by_key(|index| {
+            mesh.parts[*index]
+                .face_indices
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+        for index in order {
+            let part = &mesh.parts[index];
             let classification = collision_classification_color(
                 classes,
                 txd_name,
@@ -762,16 +782,27 @@ fn draw_preview_view_mode_scene(
             continue;
         }
         let double_sided = placement_disable_backface_culling(placement, &app.definitions);
-        let txd_name = definition_txd_name(&app.definitions, &placement.id);
-        let (drawn_parts, drawn_vertices) = draw_placement_render_mesh_view_mode(
-            placement,
-            mesh,
-            double_sided,
-            app.viewport_render_mode,
-            &app.material_classes,
-            txd_name,
-            app.collision_generation_fallback_material,
-        );
+        let (drawn_parts, drawn_vertices) = if app.viewport_render_mode
+            == ViewportRenderMode::ShadedTextured
+        {
+            draw_placement_render_mesh(
+                placement,
+                mesh,
+                double_sided,
+                scene_ambient_lift_from_timecyc(&app.timecyc),
+            )
+        } else {
+            let txd_name = definition_txd_name(&app.definitions, &placement.id);
+            draw_placement_render_mesh_view_mode(
+                placement,
+                mesh,
+                double_sided,
+                app.viewport_render_mode,
+                &app.material_classes,
+                txd_name,
+                app.collision_generation_fallback_material,
+            )
+        };
         placements += 1;
         parts += drawn_parts;
         vertices += drawn_vertices;
@@ -1262,9 +1293,11 @@ pub(crate) fn build_world_cells(
     want_lod: bool,
     ambient_lift: V3,
 ) -> Vec<WorldCell> {
-    // Keep neighboring placements with the same render state in fewer VBOs
-    // without making frustum culling as coarse as the larger map chunks.
-    const CELL_SIZE: f32 = 512.0;
+    // This is the culling granularity for the fast VBO renderer.  At 512 m a
+    // single visible edge of a dense city block could submit an entire
+    // neighborhood; 256 m keeps batching efficient while letting the frustum
+    // reject substantially more off-screen geometry on lower-end GPUs.
+    const CELL_SIZE: f32 = 256.0;
     let mut cells = HashMap::<(i32, i32), WorldCellBuild>::new();
     for p in placements {
         if placement_is_lod(p, lod_ids) != want_lod {
@@ -4206,23 +4239,6 @@ fn draw_editing_material_specular_preview(mesh: &RenderMesh, raw: &RawMesh, came
     }
 }
 
-/// Draw order for the editing preview.
-///
-/// `Sorted` is the forgiving editor view: every opaque batch first, alpha last
-/// with depth writes off, so the model always looks right regardless of how the
-/// faces are stored.
-///
-/// `StoredFaceOrder` reproduces what San Andreas actually does — batches are
-/// drawn in the order the DFF stores them and alpha faces write depth. A model
-/// whose transparent faces come before the geometry behind them will visibly
-/// cull that geometry, which is the whole point: it makes a broken face order
-/// obvious in the viewport instead of invisible until the model is in game.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EditingPreviewFaceOrder {
-    Sorted,
-    StoredFaceOrder,
-}
-
 fn draw_editing_render_mesh_preview(
     mesh: &RenderMesh,
     raw: &RawMesh,
@@ -4232,75 +4248,40 @@ fn draw_editing_render_mesh_preview(
     classes: &TextureMaterialClasses,
     txd_name: Option<&str>,
     fallback_material: u8,
-    face_order: EditingPreviewFaceOrder,
 ) {
     unsafe {
         gl::Enable(gl::CULL_FACE);
         gl::LightModeli(gl::LIGHT_MODEL_TWO_SIDE, gl::FALSE as i32);
-        // In stored-face-order mode there is a single pass over every batch,
-        // sequenced by the first DFF triangle each batch owns.
-        let stored_order = face_order == EditingPreviewFaceOrder::StoredFaceOrder;
+        // Render DFF batches exactly in their stored order. This matches San
+        // Andreas: alpha faces write depth, so bad ordering remains visible.
         let mut sequence: Vec<usize> = (0..mesh.parts.len()).collect();
-        if stored_order {
-            sequence.sort_by_key(|index| {
-                mesh.parts[*index]
-                    .face_indices
-                    .iter()
-                    .copied()
-                    .min()
-                    .unwrap_or(usize::MAX)
-            });
-        }
-        let passes: Vec<TransparencyMode> = if stored_order {
-            vec![TransparencyMode::Opaque]
-        } else {
-            vec![
-                TransparencyMode::Opaque,
-                TransparencyMode::Cutout,
-                TransparencyMode::Blend,
-            ]
-        };
-        for pass in passes.iter().copied() {
-            if !stored_order {
-                match pass {
-                    TransparencyMode::Blend => {
-                        gl::Enable(gl::BLEND);
-                        gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
-                        gl::Disable(gl::ALPHA_TEST);
-                        gl::DepthMask(gl::FALSE);
-                    }
-                    TransparencyMode::Opaque | TransparencyMode::Cutout => {
-                        gl::Disable(gl::BLEND);
-                        gl::Enable(gl::ALPHA_TEST);
-                        gl::AlphaFunc(gl::GREATER, 0.08);
-                        gl::DepthMask(gl::TRUE);
-                    }
+        sequence.sort_by_key(|index| {
+            mesh.parts[*index]
+                .face_indices
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+        for index in sequence {
+            let part = &mesh.parts[index];
+            // Depth writes stay on for alpha too. That is precisely the
+            // behaviour that makes a badly ordered DFF cull whatever is
+            // behind its transparent faces.
+            match part.transparency {
+                TransparencyMode::Blend => {
+                    gl::Enable(gl::BLEND);
+                    gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+                    gl::Enable(gl::ALPHA_TEST);
+                    gl::AlphaFunc(gl::GREATER, 0.0);
+                }
+                TransparencyMode::Opaque | TransparencyMode::Cutout => {
+                    gl::Disable(gl::BLEND);
+                    gl::Enable(gl::ALPHA_TEST);
+                    gl::AlphaFunc(gl::GREATER, 0.08);
                 }
             }
-            for index in sequence.iter().copied() {
-                let part = &mesh.parts[index];
-                if !stored_order && part.transparency != pass {
-                    continue;
-                }
-                if stored_order {
-                    // Depth writes stay on for alpha too. That is precisely the
-                    // behaviour that makes a badly ordered DFF cull whatever is
-                    // behind its transparent faces.
-                    match part.transparency {
-                        TransparencyMode::Blend => {
-                            gl::Enable(gl::BLEND);
-                            gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
-                            gl::Enable(gl::ALPHA_TEST);
-                            gl::AlphaFunc(gl::GREATER, 0.0);
-                        }
-                        TransparencyMode::Opaque | TransparencyMode::Cutout => {
-                            gl::Disable(gl::BLEND);
-                            gl::Enable(gl::ALPHA_TEST);
-                            gl::AlphaFunc(gl::GREATER, 0.08);
-                        }
-                    }
-                    gl::DepthMask(gl::TRUE);
-                }
+            gl::DepthMask(gl::TRUE);
                 if mode != ViewportRenderMode::ShadedTextured {
                     gl::Disable(gl::FOG);
                     let classification = collision_classification_color(
@@ -4333,7 +4314,6 @@ fn draw_editing_render_mesh_preview(
                 } else {
                     draw_render_part_buffer(part);
                 }
-            }
         }
         if mode == ViewportRenderMode::ShadedTextured {
             draw_editing_material_specular_preview(mesh, raw, camera_pos);
@@ -4596,11 +4576,6 @@ pub(crate) fn draw_editing_preview(app: &mut AppState, _viewport: Rect) -> bool 
                     &app.material_classes,
                     dff.txd_context.as_deref(),
                     app.collision_generation_fallback_material,
-                    if app.dff_face_order_preview {
-                        EditingPreviewFaceOrder::StoredFaceOrder
-                    } else {
-                        EditingPreviewFaceOrder::Sorted
-                    },
                 );
                 draw_render_mesh_edges(mesh);
             } else {

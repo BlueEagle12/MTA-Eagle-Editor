@@ -644,6 +644,7 @@ fn parse_geometry_chunk(b: &[u8], start: usize, end: usize, mesh: &mut RawMesh) 
         // Vertex block validated: commit everything together.
         mesh.components.push(RawMeshComponent {
             name: String::new(),
+            frame_index: None,
             vertex_start: vertex_base as usize,
             vertex_end: vertex_base as usize + _vert_count,
             tri_start,
@@ -959,6 +960,7 @@ fn assign_component_names_and_transforms(bytes: &[u8], mesh: &mut RawMesh) {
             let frame_idx = frame_idx as usize;
             if let Some(frame) = frames.get(frame_idx) {
                 component.name = frame.name.clone();
+                component.frame_index = Some(frame_idx);
             }
             if let Some(transform) =
                 world_frame_transform(&frames, frame_idx, &mut visiting, &mut cached)

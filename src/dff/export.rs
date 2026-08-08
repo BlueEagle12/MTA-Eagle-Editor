@@ -660,6 +660,189 @@ pub(crate) fn repair_dff_bounds_spheres(bytes: &mut [u8]) -> usize {
     scan(bytes, 0, len)
 }
 
+/// Rewrites only BinMesh draw batches to match a reordered `RawMesh` while
+/// retaining the original DFF's frames, atomics, plugins, and hierarchy.
+///
+/// This is intentionally limited to a pure triangle permutation. It lets the
+/// DFF editor save alpha-face ordering for multi-frame models that cannot be
+/// safely passed through the normalized writer.
+pub(crate) fn rewrite_dff_bin_mesh_face_order(
+    bytes: &[u8],
+    source: &RawMesh,
+    reordered: &RawMesh,
+) -> Result<Option<Vec<u8>>, String> {
+    fn chunk_end(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+        (start + 12 <= end).then_some(())?;
+        start
+            .checked_add(12)?
+            .checked_add(rd32(bytes, start + 4) as usize)
+            .filter(|chunk_end| *chunk_end <= end && *chunk_end <= bytes.len())
+    }
+
+    fn bin_materials(payload: &[u8]) -> Result<Vec<u16>, String> {
+        if payload.len() < 12 {
+            return Err("DFF BinMesh is truncated".to_string());
+        }
+        let triangle_strip = rd32(payload, 0) & 1 != 0;
+        let mesh_count = rd32(payload, 4) as usize;
+        let mut out = Vec::new();
+        let mut offset = 12usize;
+        for _ in 0..mesh_count {
+            if offset + 8 > payload.len() {
+                return Err("DFF BinMesh group is truncated".to_string());
+            }
+            let index_count = rd32(payload, offset) as usize;
+            let material = rd32(payload, offset + 4).min(u16::MAX as u32) as u16;
+            offset += 8;
+            if (!triangle_strip && index_count % 3 != 0)
+                || (triangle_strip && index_count < 3)
+                || offset + index_count * 4 > payload.len()
+            {
+                return Err("DFF BinMesh indices are invalid".to_string());
+            }
+            let triangle_count = if triangle_strip { index_count - 2 } else { index_count / 3 };
+            out.extend(std::iter::repeat_n(material, triangle_count));
+            offset += index_count * 4;
+        }
+        Ok(out)
+    }
+
+    fn collect_bin_mesh_payloads(
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+        payloads: &mut Vec<Vec<u8>>,
+    ) -> Result<(), String> {
+        let mut chunk = start;
+        while chunk < end {
+            let Some(current_end) = chunk_end(bytes, chunk, end) else {
+                return Err("DFF has invalid RenderWare chunk boundaries".to_string());
+            };
+            let id = rd32(bytes, chunk);
+            let data = chunk + 12;
+            if id == 0x050e {
+                payloads.push(bytes[data..current_end].to_vec());
+            } else if matches!(id, 0x10 | 0x0e | 0x1a | 0x0f | 0x03) {
+                collect_bin_mesh_payloads(bytes, data, current_end, payloads)?;
+            }
+            chunk = current_end;
+        }
+        Ok(())
+    }
+
+    fn rebuild(
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+        replacements: &[Vec<u8>],
+        replacement_index: &mut usize,
+    ) -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        let mut chunk = start;
+        while chunk < end {
+            let Some(current_end) = chunk_end(bytes, chunk, end) else {
+                return Err("DFF has invalid RenderWare chunk boundaries".to_string());
+            };
+            let id = rd32(bytes, chunk);
+            let data = chunk + 12;
+            let payload = if id == 0x050e {
+                let replacement = replacements
+                    .get(*replacement_index)
+                    .ok_or_else(|| "DFF BinMesh count changed while rewriting".to_string())?;
+                *replacement_index += 1;
+                replacement.clone()
+            } else if matches!(id, 0x10 | 0x0e | 0x1a | 0x0f | 0x03) {
+                rebuild(bytes, data, current_end, replacements, replacement_index)?
+            } else {
+                out.extend_from_slice(&bytes[chunk..current_end]);
+                chunk = current_end;
+                continue;
+            };
+            out.extend_from_slice(&rw_chunk_with_version(id, rd32(bytes, chunk + 8), payload));
+            chunk = current_end;
+        }
+        Ok(out)
+    }
+
+    if source.vertices != reordered.vertices
+        || source.materials != reordered.materials
+        || source.material_textures != reordered.material_textures
+        || source.components.len() != reordered.components.len()
+    {
+        return Ok(None);
+    }
+    let len = dff_chunk_len(bytes);
+    let mut payloads = Vec::new();
+    collect_bin_mesh_payloads(bytes, 0, len, &mut payloads)?;
+    if payloads.len() != source.components.len() {
+        return Ok(None);
+    }
+    let mut replacements = Vec::with_capacity(payloads.len());
+    for ((component, updated_component), payload) in source
+        .components
+        .iter()
+        .zip(&reordered.components)
+        .zip(payloads)
+    {
+        let original = &source.triangles[component.tri_start..component.tri_end];
+        let updated = &reordered.triangles[updated_component.tri_start..updated_component.tri_end];
+        let local_materials = bin_materials(&payload)?;
+        if original.len() != updated.len() || original.len() != local_materials.len() {
+            return Ok(None);
+        }
+        let mut material_map = HashMap::<u16, u16>::new();
+        for (triangle, local_material) in original.iter().zip(local_materials) {
+            if material_map
+                .insert(triangle.material, local_material)
+                .is_some_and(|known| known != local_material)
+            {
+                return Ok(None);
+            }
+        }
+        let mut groups = Vec::<(u16, Vec<u32>)>::new();
+        for triangle in updated {
+            let material = *material_map.get(&triangle.material).ok_or_else(|| {
+                "DFF face reorder introduced a material not present in the source BinMesh".to_string()
+            })?;
+            let indices = [triangle.b, triangle.a, triangle.c];
+            if indices.iter().any(|index| {
+                let index = *index as usize;
+                index < updated_component.vertex_start || index >= updated_component.vertex_end
+            }) {
+                return Ok(None);
+            }
+            if groups.last().is_none_or(|(known, _)| *known != material) {
+                groups.push((material, Vec::new()));
+            }
+            groups.last_mut().expect("BinMesh group exists").1.extend(
+                indices
+                    .into_iter()
+                    .map(|index| index - updated_component.vertex_start as u32),
+            );
+        }
+        let total_indices = groups.iter().map(|(_, indices)| indices.len()).sum::<usize>();
+        let mut replacement = Vec::with_capacity(12 + total_indices * 4 + groups.len() * 8);
+        replacement.extend_from_slice(&0u32.to_le_bytes());
+        replacement.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+        replacement.extend_from_slice(&(total_indices as u32).to_le_bytes());
+        for (material, indices) in groups {
+            replacement.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+            replacement.extend_from_slice(&(material as u32).to_le_bytes());
+            for index in indices {
+                replacement.extend_from_slice(&index.to_le_bytes());
+            }
+        }
+        replacements.push(replacement);
+    }
+    let mut replacement_index = 0usize;
+    let mut output = rebuild(bytes, 0, len, &replacements, &mut replacement_index)?;
+    if replacement_index != replacements.len() {
+        return Err("DFF BinMesh rewrite did not consume every geometry".to_string());
+    }
+    output.extend_from_slice(&bytes[len..]);
+    Ok((output != bytes).then_some(output))
+}
+
 /// Detects a top-level UV Animation Dictionary (chunk 0x2b) positioned after the
 /// Clump (chunk 0x10) and reorders it to appear before the clump.
 ///
@@ -1422,6 +1605,47 @@ pub(crate) fn raw_mesh_is_safe_for_normalized_rewrite(raw: &RawMesh, frame_name:
     component_safe && frame_safe
 }
 
+/// Returns true when the normalized writer can retain a DFF's frame list and
+/// atomic-to-frame bindings.  Unlike `raw_mesh_is_safe_for_normalized_rewrite`,
+/// this deliberately accepts real multi-frame models.
+pub(crate) fn raw_mesh_is_safe_for_hierarchy_rewrite(raw: &RawMesh, frame_name: &str) -> bool {
+    if raw.components.is_empty() {
+        return raw.frames.is_empty()
+            || (raw.frames.len() == 1
+                && (raw.frames[0].name.trim().is_empty()
+                    || raw.frames[0].name.eq_ignore_ascii_case(frame_name)));
+    }
+    if raw.components.iter().any(|component| {
+        component.vertex_start > component.vertex_end
+            || component.vertex_end > raw.vertices.len()
+            || component.tri_start > component.tri_end
+            || component.tri_end > raw.triangles.len()
+            || component.tri_start == component.tri_end
+            || component
+                .frame_index
+                .is_some_and(|frame| frame >= raw.frames.len())
+    }) {
+        return false;
+    }
+    raw.frames.iter().enumerate().all(|(index, frame)| {
+        if frame.parent >= 0
+            && ((frame.parent as usize) >= raw.frames.len() || frame.parent as usize == index)
+        {
+            return false;
+        }
+        let mut parent = frame.parent;
+        let mut traversed = 0usize;
+        while parent >= 0 {
+            if traversed == raw.frames.len() {
+                return false;
+            }
+            parent = raw.frames[parent as usize].parent;
+            traversed += 1;
+        }
+        true
+    })
+}
+
 fn raw_mesh_bounds_sphere(raw: &RawMesh) -> (V3, f32) {
     if raw.vertices.is_empty() {
         return (V3::default(), 0.0);
@@ -1496,6 +1720,125 @@ struct ExportMesh {
     has_prelit: bool,
     has_night_prelit: bool,
     include_normals: bool,
+}
+
+struct HierarchyExportMesh {
+    mesh: ExportMesh,
+    frame_index: usize,
+    component_index: Option<usize>,
+}
+
+fn dot(a: V3, b: V3) -> f32 {
+    a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+fn normalized_frame_vector(value: V3) -> V3 {
+    let length = (value.x * value.x + value.y * value.y + value.z * value.z).sqrt();
+    if length > 0.0001 {
+        V3 {
+            x: value.x / length,
+            y: value.y / length,
+            z: value.z / length,
+        }
+    } else {
+        value
+    }
+}
+
+fn inverse_frame_point(frame: &RawMeshFrame, point: V3) -> V3 {
+    let offset = V3 {
+        x: point.x - frame.pos.x,
+        y: point.y - frame.pos.y,
+        z: point.z - frame.pos.z,
+    };
+    V3 {
+        x: dot(offset, frame.right),
+        y: dot(offset, frame.up),
+        z: dot(offset, frame.at),
+    }
+}
+
+fn inverse_frame_vector(frame: &RawMeshFrame, vector: V3) -> V3 {
+    V3 {
+        x: dot(vector, frame.right),
+        y: dot(vector, frame.up),
+        z: dot(vector, frame.at),
+    }
+}
+
+fn component_frame_index(raw: &RawMesh, component: &RawMeshComponent) -> usize {
+    component
+        .frame_index
+        .filter(|index| *index < raw.frames.len())
+        .or_else(|| {
+            (!component.name.trim().is_empty()).then(|| {
+                raw.frames
+                    .iter()
+                    .position(|frame| frame.name.eq_ignore_ascii_case(&component.name))
+            })
+            .flatten()
+        })
+        .unwrap_or(0)
+}
+
+fn build_hierarchy_export_meshes(raw: &RawMesh, include_normals: bool) -> Vec<HierarchyExportMesh> {
+    if raw.components.is_empty() {
+        return build_export_meshes(raw, include_normals)
+            .into_iter()
+            .map(|mesh| HierarchyExportMesh {
+                mesh,
+                frame_index: 0,
+                component_index: None,
+            })
+            .collect();
+    }
+
+    let mut exports = Vec::new();
+    for (component_index, component) in raw.components.iter().enumerate() {
+        if component.tri_start >= component.tri_end {
+            continue;
+        }
+        let frame_index = component_frame_index(raw, component);
+        let mut component_raw = raw.clone();
+        component_raw.triangles = raw.triangles[component.tri_start..component.tri_end].to_vec();
+        if let Some(frame) = raw.frames.get(frame_index) {
+            for vertex in &mut component_raw.vertices {
+                *vertex = inverse_frame_point(frame, *vertex);
+            }
+            for normal in &mut component_raw.normals {
+                *normal = normalized_frame_vector(inverse_frame_vector(frame, *normal));
+            }
+        }
+        exports.extend(
+            build_export_meshes(&component_raw, include_normals)
+                .into_iter()
+                .map(|mesh| HierarchyExportMesh {
+                    mesh,
+                    frame_index,
+                    component_index: Some(component_index),
+                }),
+        );
+    }
+    exports
+}
+
+fn local_frame_transform(frames: &[RawMeshFrame], index: usize) -> RawMeshFrame {
+    let frame = &frames[index];
+    let Some(parent) = (frame.parent >= 0)
+        .then_some(frame.parent as usize)
+        .filter(|parent| *parent < frames.len())
+        .and_then(|parent| frames.get(parent))
+    else {
+        return frame.clone();
+    };
+    RawMeshFrame {
+        name: frame.name.clone(),
+        parent: frame.parent,
+        right: inverse_frame_vector(parent, frame.right),
+        up: inverse_frame_vector(parent, frame.up),
+        at: inverse_frame_vector(parent, frame.at),
+        pos: inverse_frame_point(parent, frame.pos),
+    }
 }
 
 fn build_export_meshes(raw: &RawMesh, include_normals: bool) -> Vec<ExportMesh> {
@@ -1912,7 +2255,7 @@ pub(crate) fn write_normalized_dff_with_options(
         ));
     }
     let raw = normalize_export_prelight_streams(raw);
-    let exports = build_export_meshes(&raw, options.include_normals);
+    let exports = build_hierarchy_export_meshes(&raw, options.include_normals);
     if exports.is_empty() {
         return Err("DFF normalization produced no geometry".to_string());
     }
@@ -1920,39 +2263,58 @@ pub(crate) fn write_normalized_dff_with_options(
     let material_animations = material_animation_infos(&raw, materials.len());
     let has_material_animations = raw_has_material_animations(&raw);
 
+    let output_frames = if raw.frames.is_empty() {
+        vec![RawMeshFrame {
+            name: frame_name.to_string(),
+            parent: -1,
+            right: V3 { x: 1.0, y: 0.0, z: 0.0 },
+            up: V3 { x: 0.0, y: 1.0, z: 0.0 },
+            at: V3 { x: 0.0, y: 0.0, z: 1.0 },
+            pos: V3::default(),
+        }]
+    } else {
+        (0..raw.frames.len())
+            .map(|index| local_frame_transform(&raw.frames, index))
+            .collect::<Vec<_>>()
+    };
     let mut frame_struct = Vec::new();
-    for value in [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] {
-        frame_struct.extend_from_slice(&value.to_le_bytes());
+    for frame in &output_frames {
+        for value in [
+            frame.right.x, frame.right.y, frame.right.z, frame.up.x, frame.up.y, frame.up.z,
+            frame.at.x, frame.at.y, frame.at.z, frame.pos.x, frame.pos.y, frame.pos.z,
+        ] {
+            frame_struct.extend_from_slice(&value.to_le_bytes());
+        }
+        let parent = (frame.parent >= 0 && (frame.parent as usize) < output_frames.len())
+            .then_some(frame.parent)
+            .unwrap_or(-1);
+        frame_struct.extend_from_slice(&parent.to_le_bytes());
+        frame_struct.extend_from_slice(&0u32.to_le_bytes());
     }
-    for value in [0.0f32, 0.0, 0.0] {
-        frame_struct.extend_from_slice(&value.to_le_bytes());
-    }
-    frame_struct.extend_from_slice(&(-1i32).to_le_bytes());
-    frame_struct.extend_from_slice(&0u32.to_le_bytes());
     let mut frame_list = rw_chunk(0x01, {
         let mut data = Vec::new();
-        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&(output_frames.len() as u32).to_le_bytes());
         data.extend_from_slice(&frame_struct);
         data
     });
-    frame_list.extend_from_slice(&rw_chunk(0x03, rw_chunk(0x0253f2fe, rw_string(frame_name))));
+    for frame in &output_frames {
+        let name = if frame.name.trim().is_empty() {
+            frame_name
+        } else {
+            &frame.name
+        };
+        frame_list.extend_from_slice(&rw_chunk(0x03, rw_chunk(0x0253f2fe, rw_string(name))));
+    }
 
     let mut geometry_list = rw_chunk(0x01, (exports.len() as u32).to_le_bytes().to_vec());
     for (export_idx, export) in exports.iter().enumerate() {
         let effects_2dfx = (export_idx + 1 == exports.len()).then_some(raw.effects_2dfx.as_slice());
-        let breakable = if exports.len() == raw.components.len() {
-            raw.components
-                .get(export_idx)
-                .and_then(|component| component.breakable.as_ref())
-        } else if exports.len() == 1 {
-            raw.components
-                .iter()
-                .find_map(|component| component.breakable.as_ref())
-        } else {
-            None
-        };
+        let breakable = export
+            .component_index
+            .and_then(|component| raw.components.get(component))
+            .and_then(|component| component.breakable.as_ref());
         geometry_list.extend_from_slice(&write_geometry(
-            export,
+            &export.mesh,
             &materials,
             &raw.materials,
             &material_animations,
@@ -1971,8 +2333,12 @@ pub(crate) fn write_normalized_dff_with_options(
     });
     clump.extend_from_slice(&rw_chunk(0x0e, frame_list));
     clump.extend_from_slice(&rw_chunk(0x1a, geometry_list));
-    for geometry_idx in 0..exports.len() {
-        clump.extend_from_slice(&write_atomic(geometry_idx as u32, has_material_animations));
+    for (geometry_idx, export) in exports.iter().enumerate() {
+        clump.extend_from_slice(&write_atomic(
+            export.frame_index.min(output_frames.len().saturating_sub(1)) as u32,
+            geometry_idx as u32,
+            has_material_animations,
+        ));
     }
     clump.extend_from_slice(&rw_chunk(0x03, Vec::new()));
     // The UV Animation Dictionary MUST be streamed before the Clump: GTA:SA's
@@ -2306,11 +2672,11 @@ fn write_uv_animation_anim(animation: &DffUvAnimation) -> Vec<u8> {
     rw_chunk(0x1b, data)
 }
 
-fn write_atomic(geometry_idx: u32, has_material_animations: bool) -> Vec<u8> {
+fn write_atomic(frame_idx: u32, geometry_idx: u32, has_material_animations: bool) -> Vec<u8> {
     rw_chunk(0x14, {
         let mut atomic = rw_chunk(0x01, {
             let mut data = Vec::new();
-            for value in [0u32, geometry_idx, 5, 0] {
+            for value in [frame_idx, geometry_idx, 5, 0] {
                 data.extend_from_slice(&value.to_le_bytes());
             }
             data
@@ -3271,6 +3637,7 @@ mod tests {
             components: vec![
                 RawMeshComponent {
                     name: "chassis".into(),
+                    frame_index: Some(0),
                     vertex_start: 0,
                     vertex_end: 3,
                     tri_start: 0,
@@ -3279,6 +3646,7 @@ mod tests {
                 },
                 RawMeshComponent {
                     name: "door_lf_dummy".into(),
+                    frame_index: Some(1),
                     vertex_start: 3,
                     vertex_end: 6,
                     tri_start: 1,
@@ -3299,4 +3667,68 @@ mod tests {
         assert_eq!(raw.vertices.len(), 6);
         assert!(!raw_mesh_is_safe_for_normalized_rewrite(&raw, "chassis"));
     }
+
+    #[test]
+    fn normalized_writer_round_trips_multi_frame_component_hierarchy() {
+        let identity = |name: &str, parent| RawMeshFrame {
+            name: name.to_string(),
+            parent,
+            right: V3 { x: 1.0, y: 0.0, z: 0.0 },
+            up: V3 { x: 0.0, y: 1.0, z: 0.0 },
+            at: V3 { x: 0.0, y: 0.0, z: 1.0 },
+            pos: V3::default(),
+        };
+        let mut child = identity("door_lf_dummy", 0);
+        child.pos.x = 10.0;
+        let raw = RawMesh {
+            vertices: vec![
+                V3 { x: 0.0, y: 0.0, z: 0.0 },
+                V3 { x: 1.0, y: 0.0, z: 0.0 },
+                V3 { x: 0.0, y: 1.0, z: 0.0 },
+                V3 { x: 10.0, y: 0.0, z: 0.0 },
+                V3 { x: 11.0, y: 0.0, z: 0.0 },
+                V3 { x: 10.0, y: 1.0, z: 0.0 },
+            ],
+            normals: vec![V3 { x: 0.0, y: 0.0, z: 1.0 }; 6],
+            triangles: vec![
+                Tri { a: 0, b: 1, c: 2, material: 0 },
+                Tri { a: 3, b: 4, c: 5, material: 0 },
+            ],
+            material_textures: vec!["shared".into()],
+            components: vec![
+                RawMeshComponent {
+                    name: "chassis".into(),
+                    frame_index: Some(0),
+                    vertex_start: 0,
+                    vertex_end: 3,
+                    tri_start: 0,
+                    tri_end: 1,
+                    breakable: None,
+                },
+                RawMeshComponent {
+                    name: "door_lf_dummy".into(),
+                    frame_index: Some(1),
+                    vertex_start: 3,
+                    vertex_end: 6,
+                    tri_start: 1,
+                    tri_end: 2,
+                    breakable: None,
+                },
+            ],
+            frames: vec![identity("chassis", -1), child],
+            ..RawMesh::default()
+        };
+
+        assert!(raw_mesh_is_safe_for_hierarchy_rewrite(&raw, "chassis"));
+        let bytes = write_normalized_dff(&raw, "model").unwrap();
+        let parsed = crate::dff::import::parse_dff_mesh(&bytes);
+
+        assert_eq!(parsed.frames.len(), 2);
+        assert_eq!(parsed.frames[1].parent, 0);
+        assert_eq!(parsed.components.len(), 2);
+        assert_eq!(parsed.components[0].frame_index, Some(0));
+        assert_eq!(parsed.components[1].frame_index, Some(1));
+        assert!(parsed.vertices.iter().any(|vertex| (vertex.x - 10.0).abs() < 0.001));
+    }
+
 }

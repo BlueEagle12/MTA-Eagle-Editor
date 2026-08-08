@@ -3880,9 +3880,9 @@ fn normalize_dff_entry(name: &str, bytes: &[u8], include_normals: bool) -> Resul
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("dff_repair");
-    if !raw_mesh_is_safe_for_normalized_rewrite(&raw, frame_name) {
+    if !raw_mesh_is_safe_for_hierarchy_rewrite(&raw, frame_name) {
         return Err(
-            "normalized rewrite would flatten a meaningful frame/component hierarchy".to_string(),
+            "normalized rewrite cannot preserve this frame/component hierarchy".to_string(),
         );
     }
     let blockers = dff_normalized_rewrite_blockers(bytes);
@@ -4090,7 +4090,7 @@ fn optimize_dff_bytes(
         if compacted.vertices.is_empty() || compacted.triangles.is_empty() {
             return Err("DFF compaction removed all usable geometry".to_string());
         }
-        if raw_mesh_is_safe_for_normalized_rewrite(&raw, frame_name) {
+        if raw_mesh_is_safe_for_hierarchy_rewrite(&compacted, frame_name) {
             let candidate = write_normalized_dff_with_options(
                 &compacted,
                 frame_name,
@@ -4107,6 +4107,8 @@ fn optimize_dff_bytes(
                 || reparsed.material_animations != compacted.material_animations
                 || reparsed.uv_animations != compacted.uv_animations
                 || reparsed.effects_2dfx != compacted.effects_2dfx
+                || reparsed.components != compacted.components
+                || reparsed.frames != compacted.frames
             {
                 return Err(
                     "DFF compaction candidate failed semantic round-trip validation".to_string(),
@@ -4126,7 +4128,7 @@ fn optimize_dff_bytes(
             ));
         } else {
             warnings.push(
-                "lossless topology compaction skipped because the DFF has a meaningful multi-component/frame hierarchy"
+                "lossless topology compaction skipped because the DFF has an invalid or unsupported frame/component hierarchy"
                     .to_string(),
             );
         }
@@ -11427,6 +11429,7 @@ pub(crate) fn open_preferences_dialog(app: &mut AppState) {
         // saved preference rather than anything on AppState.
         msaa_samples: load_msaa_samples_preference(),
         msaa_samples_saved: load_msaa_samples_preference(),
+        draw_distance_percent: app.options.draw_distance_percent,
     });
 }
 

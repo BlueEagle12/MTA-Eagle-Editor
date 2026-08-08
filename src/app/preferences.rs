@@ -53,6 +53,27 @@ pub(crate) fn save_msaa_samples_preference(samples: i32) {
     save_preferences(&values);
 }
 
+pub(crate) fn clamp_draw_distance_percent(value: u16) -> u16 {
+    value.clamp(25, 200)
+}
+
+pub(crate) fn load_draw_distance_percent_preference() -> u16 {
+    load_preferences()
+        .get("draw_distance_percent")
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(clamp_draw_distance_percent)
+        .unwrap_or(100)
+}
+
+pub(crate) fn save_draw_distance_percent_preference(value: u16) {
+    let mut values = load_preferences();
+    values.insert(
+        "draw_distance_percent".to_string(),
+        clamp_draw_distance_percent(value).to_string(),
+    );
+    save_preferences(&values);
+}
+
 pub(crate) fn msaa_samples_label(samples: i32) -> &'static str {
     match clamp_msaa_samples(samples) {
         2 => "2x MSAA",

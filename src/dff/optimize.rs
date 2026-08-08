@@ -1032,6 +1032,7 @@ mod tests {
         raw.components = vec![
             RawMeshComponent {
                 name: "a".to_string(),
+                frame_index: None,
                 vertex_start: 0,
                 vertex_end: 3,
                 tri_start: 0,
@@ -1040,6 +1041,7 @@ mod tests {
             },
             RawMeshComponent {
                 name: "b".to_string(),
+                frame_index: None,
                 vertex_start: 3,
                 vertex_end: 6,
                 tri_start: 1,
@@ -1072,6 +1074,7 @@ mod tests {
         raw.triangles.insert(0, Tri { a: 0, b: 0, c: 0, material: 0 });
         raw.components = vec![RawMeshComponent {
             name: "a".to_string(),
+            frame_index: None,
             vertex_start: 0,
             vertex_end: 6,
             tri_start: 0,

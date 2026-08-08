@@ -4187,7 +4187,7 @@ pub(crate) fn load_dialog_rect() -> Rect {
     save_as_dialog_rect()
 }
 
-pub(crate) const PREFERENCES_DIALOG_H: f32 = 514.0;
+pub(crate) const PREFERENCES_DIALOG_H: f32 = 558.0;
 /// First row of the Viewport section, relative to the dialog's top edge.
 const PREFERENCES_VIEWPORT_ROW_Y: f32 = 246.0;
 const PREFERENCES_VIEWPORT_ROW_GAP: f32 = 44.0;
@@ -4254,6 +4254,11 @@ pub(crate) fn preferences_camera_rotation_speed_rects() -> (Rect, Rect, Rect) {
 }
 
 pub(crate) const PREFERENCES_MSAA_ROW: usize = 3;
+pub(crate) const PREFERENCES_DRAW_DISTANCE_ROW: usize = 4;
+
+pub(crate) fn preferences_draw_distance_rects() -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(PREFERENCES_DRAW_DISTANCE_ROW)
+}
 
 pub(crate) fn preferences_msaa_rect() -> Rect {
     let (_, value, plus) = preferences_stepper_rects(PREFERENCES_MSAA_ROW);
@@ -4526,6 +4531,10 @@ pub(crate) fn save_preferences_dialog(app: &mut AppState, dialog: PreferencesDia
     if msaa_changed {
         save_msaa_samples_preference(dialog.msaa_samples);
     }
+    let draw_distance_percent = clamp_draw_distance_percent(dialog.draw_distance_percent);
+    app.options.draw_distance_percent = draw_distance_percent;
+    app.options.draw_radius = DEFAULT_DRAW * draw_distance_percent as f32 / 100.0;
+    save_draw_distance_percent_preference(draw_distance_percent);
 
     app.status_message = if msaa_changed {
         "Preferences saved. Restart for the anti-aliasing change, and reload the resource to re-index GTA:SA assets.".to_string()
@@ -4662,6 +4671,7 @@ pub(crate) fn update_preferences_dialog_input(app: &mut AppState, mouse: Vec2) -
         let (gizmo_minus, _, gizmo_plus) = preferences_gizmo_scale_rects();
         let (speed_minus, _, speed_plus) = preferences_camera_speed_rects();
         let (spin_minus, _, spin_plus) = preferences_camera_rotation_speed_rects();
+        let (draw_minus, _, draw_plus) = preferences_draw_distance_rects();
         if let Some(dialog) = app.preferences_dialog.as_mut() {
             if gizmo_minus.contains(mouse) {
                 let step = gizmo_scale_step(dialog.gizmo_scale, false);
@@ -4697,6 +4707,18 @@ pub(crate) fn update_preferences_dialog_input(app: &mut AppState, mouse: Vec2) -
             }
             if preferences_msaa_rect().contains(mouse) {
                 dialog.msaa_samples = next_msaa_samples(dialog.msaa_samples);
+                return true;
+            }
+            if draw_minus.contains(mouse) {
+                dialog.draw_distance_percent = clamp_draw_distance_percent(
+                    dialog.draw_distance_percent.saturating_sub(25),
+                );
+                return true;
+            }
+            if draw_plus.contains(mouse) {
+                dialog.draw_distance_percent = clamp_draw_distance_percent(
+                    dialog.draw_distance_percent.saturating_add(25),
+                );
                 return true;
             }
         }
