@@ -987,13 +987,7 @@ pub(crate) fn clicked_inspector_copy_action(
 
 pub(crate) fn inspector_fields(app: &AppState) -> Vec<InspectorField> {
     if app.active_tab == AppTab::Collisions {
-        return vec![
-            InspectorField::CollisionFaceMaterial,
-            InspectorField::CollisionFaceLight,
-            InspectorField::CollisionVertexX,
-            InspectorField::CollisionVertexY,
-            InspectorField::CollisionVertexZ,
-        ];
+        return Vec::new();
     }
     if app.active_tab == AppTab::Editing
         && matches!(app.editing.asset.as_ref(), Some(EditingAsset::Dff(_)))
@@ -1016,9 +1010,6 @@ pub(crate) fn inspector_fields(app: &AppState) -> Vec<InspectorField> {
                 fields.push(InspectorField::DffEmitterPointUpStrength);
                 fields.push(InspectorField::DffEmitterPointDownStrength);
                 fields.push(InspectorField::DffEmitterPointSidesStrength);
-            }
-            if selected_material_emitter(app).use_temperature {
-                fields.push(InspectorField::DffEmitterTemperature);
             }
         }
         return fields;
@@ -1079,11 +1070,9 @@ pub(crate) fn inspector_fields(app: &AppState) -> Vec<InspectorField> {
     if app.active_tab == AppTab::Lights {
         return vec![
             InspectorField::LightName,
-            InspectorField::LightProfile,
             InspectorField::LightIntensity,
             InspectorField::LightPosition,
             InspectorField::LightDirection,
-            InspectorField::LightTemperature,
             InspectorField::LightRadius,
         ];
     }
@@ -1671,12 +1660,25 @@ fn set_current_col_material(app: &mut AppState, material: u8) -> bool {
 
 fn handle_col_material_dropdown_click(app: &mut AppState, mouse: Vec2) -> bool {
     let rect = inspector_field_rect(app, InspectorField::CollisionFaceMaterial);
-    let active_context = (app.active_tab == AppTab::Editing
-        && matches!(app.editing.asset, Some(EditingAsset::Col(_))))
-        || (app.active_tab == AppTab::Collisions && app.selected_col_face.is_some());
+    let active_context = app.active_tab == AppTab::Editing
+        && matches!(app.editing.asset, Some(EditingAsset::Col(_)));
     if !active_context {
         app.col_material_dropdown_open = false;
         return false;
+    }
+    if app.col_material_dropdown_open && is_mouse_button_down(MouseButton::Left) {
+        let visible = COL_MATERIAL_DROPDOWN_VISIBLE.min(GTA_SA_COL_MATERIALS.len());
+        let total = GTA_SA_COL_MATERIALS.len();
+        let max_scroll = total.saturating_sub(visible) as f32;
+        let track = col_material_dropdown_scrollbar_rect(app);
+        let hit_area = Rect::new(track.x - 6.0, track.y, track.w + 12.0, track.h);
+        if max_scroll > 0.0 && hit_area.contains(mouse) {
+            let thumb_h = (track.h * visible as f32 / total as f32).max(14.0);
+            let travel = (track.h - thumb_h).max(1.0);
+            let position = (mouse.y - track.y - thumb_h * 0.5).clamp(0.0, travel);
+            app.col_material_dropdown_scroll = position / travel * max_scroll;
+            return true;
+        }
     }
     if !is_mouse_button_pressed(MouseButton::Left) {
         return false;
@@ -4187,7 +4189,7 @@ pub(crate) fn load_dialog_rect() -> Rect {
     save_as_dialog_rect()
 }
 
-pub(crate) const PREFERENCES_DIALOG_H: f32 = 558.0;
+pub(crate) const PREFERENCES_DIALOG_H: f32 = 646.0;
 /// First row of the Viewport section, relative to the dialog's top edge.
 const PREFERENCES_VIEWPORT_ROW_Y: f32 = 246.0;
 const PREFERENCES_VIEWPORT_ROW_GAP: f32 = 44.0;
@@ -4249,12 +4251,20 @@ pub(crate) fn preferences_camera_speed_rects() -> (Rect, Rect, Rect) {
     preferences_stepper_rects(1)
 }
 
-pub(crate) fn preferences_camera_rotation_speed_rects() -> (Rect, Rect, Rect) {
+pub(crate) fn preferences_vehicle_camera_speed_rects() -> (Rect, Rect, Rect) {
     preferences_stepper_rects(2)
 }
 
-pub(crate) const PREFERENCES_MSAA_ROW: usize = 3;
-pub(crate) const PREFERENCES_DRAW_DISTANCE_ROW: usize = 4;
+pub(crate) fn preferences_editing_camera_speed_rects() -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(3)
+}
+
+pub(crate) fn preferences_camera_rotation_speed_rects() -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(4)
+}
+
+pub(crate) const PREFERENCES_MSAA_ROW: usize = 5;
+pub(crate) const PREFERENCES_DRAW_DISTANCE_ROW: usize = 6;
 
 pub(crate) fn preferences_draw_distance_rects() -> (Rect, Rect, Rect) {
     preferences_stepper_rects(PREFERENCES_DRAW_DISTANCE_ROW)
@@ -4524,7 +4534,9 @@ pub(crate) fn save_preferences_dialog(app: &mut AppState, dialog: PreferencesDia
     invalidate_validation_cache(app);
 
     set_gizmo_scale(app, dialog.gizmo_scale);
-    set_camera_speed(app, dialog.camera_speed);
+    set_camera_speed_for_tab(app, AppTab::Preview, dialog.camera_speed);
+    set_camera_speed_for_tab(app, AppTab::Vehicles, dialog.vehicle_camera_speed);
+    set_camera_speed_for_tab(app, AppTab::Editing, dialog.editing_camera_speed);
     set_camera_rotation_speed(app, dialog.camera_rotation_speed);
     let msaa_changed =
         clamp_msaa_samples(dialog.msaa_samples) != clamp_msaa_samples(dialog.msaa_samples_saved);
@@ -4670,6 +4682,8 @@ pub(crate) fn update_preferences_dialog_input(app: &mut AppState, mouse: Vec2) -
         }
         let (gizmo_minus, _, gizmo_plus) = preferences_gizmo_scale_rects();
         let (speed_minus, _, speed_plus) = preferences_camera_speed_rects();
+        let (vehicle_speed_minus, _, vehicle_speed_plus) = preferences_vehicle_camera_speed_rects();
+        let (editing_speed_minus, _, editing_speed_plus) = preferences_editing_camera_speed_rects();
         let (spin_minus, _, spin_plus) = preferences_camera_rotation_speed_rects();
         let (draw_minus, _, draw_plus) = preferences_draw_distance_rects();
         if let Some(dialog) = app.preferences_dialog.as_mut() {
@@ -4693,6 +4707,30 @@ pub(crate) fn update_preferences_dialog_input(app: &mut AppState, mouse: Vec2) -
                     clamp_camera_speed(dialog.camera_speed * CAMERA_SPEED_STEP_FACTOR);
                 return true;
             }
+            if vehicle_speed_minus.contains(mouse) {
+                dialog.vehicle_camera_speed = clamp_detail_camera_speed(
+                    dialog.vehicle_camera_speed / CAMERA_SPEED_STEP_FACTOR,
+                );
+                return true;
+            }
+            if vehicle_speed_plus.contains(mouse) {
+                dialog.vehicle_camera_speed = clamp_detail_camera_speed(
+                    dialog.vehicle_camera_speed * CAMERA_SPEED_STEP_FACTOR,
+                );
+                return true;
+            }
+            if editing_speed_minus.contains(mouse) {
+                dialog.editing_camera_speed = clamp_editing_camera_speed(
+                    dialog.editing_camera_speed / CAMERA_SPEED_STEP_FACTOR,
+                );
+                return true;
+            }
+            if editing_speed_plus.contains(mouse) {
+                dialog.editing_camera_speed = clamp_editing_camera_speed(
+                    dialog.editing_camera_speed * CAMERA_SPEED_STEP_FACTOR,
+                );
+                return true;
+            }
             if spin_minus.contains(mouse) {
                 dialog.camera_rotation_speed = clamp_camera_rotation_speed(
                     dialog.camera_rotation_speed / CAMERA_SPEED_STEP_FACTOR,
@@ -4710,24 +4748,22 @@ pub(crate) fn update_preferences_dialog_input(app: &mut AppState, mouse: Vec2) -
                 return true;
             }
             if draw_minus.contains(mouse) {
-                dialog.draw_distance_percent = clamp_draw_distance_percent(
-                    dialog.draw_distance_percent.saturating_sub(25),
-                );
+                dialog.draw_distance_percent =
+                    clamp_draw_distance_percent(dialog.draw_distance_percent.saturating_sub(25));
                 return true;
             }
             if draw_plus.contains(mouse) {
-                dialog.draw_distance_percent = clamp_draw_distance_percent(
-                    dialog.draw_distance_percent.saturating_add(25),
-                );
+                dialog.draw_distance_percent =
+                    clamp_draw_distance_percent(dialog.draw_distance_percent.saturating_add(25));
                 return true;
             }
         }
         if preferences_cleanup_autosaves_rect().contains(mouse) {
             app.confirm_dialog = Some(ConfirmDialog {
                 action: ConfirmAction::CleanupAutosaves,
-                title: "Clean Up Autosaves?".to_string(),
-                body: "Delete autosave snapshots for this project?".to_string(),
-                detail: "Unsaved work in the editor is not changed. If it remains dirty, a new autosave can be created at a later interval.".to_string(),
+                title: "Delete Recovery Copies?".to_string(),
+                body: "Delete all recovery copies for this project?".to_string(),
+                detail: "This does not change the resource currently open in the editor. New unsaved changes can create another recovery copy later.".to_string(),
                 primary_label: "Clean Up".to_string(),
                 secondary_label: None,
                 secondary_action: None,
@@ -4950,7 +4986,18 @@ pub(crate) fn update_save_log_input(app: &mut AppState, mouse: Vec2) -> bool {
         let visible_rows = ((rect.h - 142.0) / 22.0).max(1.0) as usize;
         let max_scroll = rows.saturating_sub(visible_rows) as f32;
         app.save_log_scroll = app.save_log_scroll.clamp(0.0, max_scroll);
-        let (_, wheel_y) = mouse_wheel();
+        let list = Rect::new(rect.x + 24.0, rect.y + 78.0, rect.w - 48.0, rect.h - 142.0);
+        let track = Rect::new(list.x + list.w - 10.0, list.y + 8.0, 4.0, list.h - 16.0);
+        let hit_area = Rect::new(track.x - 6.0, track.y, track.w + 12.0, track.h);
+        if is_mouse_button_down(MouseButton::Left) && max_scroll > 0.0 && hit_area.contains(mouse) {
+            let thumb_h = (track.h * visible_rows as f32 / rows as f32).clamp(24.0, track.h);
+            let travel = (track.h - thumb_h).max(1.0);
+            app.save_log_scroll =
+                ((mouse.y - track.y - thumb_h * 0.5).clamp(0.0, travel) / travel) * max_scroll;
+            app.save_log_follow_tail = app.save_log_scroll >= max_scroll - 0.5;
+            return true;
+        }
+        let (_, wheel_y) = safe_mouse_wheel();
         if rect.contains(mouse) && wheel_y.abs() > 0.01 {
             app.save_log_scroll = (app.save_log_scroll - wheel_y * 3.0).clamp(0.0, max_scroll);
             app.save_log_follow_tail = app.save_log_scroll >= max_scroll - 0.5;
@@ -5119,7 +5166,7 @@ pub(crate) fn update_texture_archive_dialog_input(app: &mut AppState, mouse: Vec
     let visible_rows = ((rect.h - 180.0) / 38.0).floor().max(1.0) as usize;
     let max_scroll = dialog.textures.len().saturating_sub(visible_rows) as f32;
     if rect.contains(mouse) {
-        let (_x, wheel_y) = mouse_wheel();
+        let (_x, wheel_y) = safe_mouse_wheel();
         if wheel_y.abs() > 0.0 {
             if let Some(dialog) = app.texture_archive_dialog.as_mut() {
                 dialog.scroll = (dialog.scroll - wheel_y * 3.0).clamp(0.0, max_scroll);
@@ -5202,7 +5249,7 @@ pub(crate) fn update_dff_prelight_import_dialog_input(app: &mut AppState, mouse:
     let list_rect = Rect::new(rect.x + 24.0, rect.y + 108.0, rect.w - 48.0, rect.h - 176.0);
     let visible_rows = ((list_rect.h - 8.0) / 34.0).max(1.0) as usize;
     let max_scroll = dialog.entries.len().saturating_sub(visible_rows) as f32;
-    let (_, wheel_y) = mouse_wheel();
+    let (_, wheel_y) = safe_mouse_wheel();
     if rect.contains(mouse) && wheel_y.abs() > 0.01 {
         if let Some(dialog) = app.dff_prelight_import_dialog.as_mut() {
             dialog.scroll = (dialog.scroll - wheel_y * 3.0).clamp(0.0, max_scroll);
@@ -5313,7 +5360,7 @@ pub(crate) fn update_lod_batch_dialog_input(app: &mut AppState, mouse: Vec2) -> 
     let rect = lod_batch_dialog_rect();
     let list = lod_batch_list_rect();
     let visible_rows = (list.h / 30.0).max(1.0) as usize;
-    let (_, wheel_y) = mouse_wheel();
+    let (_, wheel_y) = safe_mouse_wheel();
     if wheel_y.abs() > f32::EPSILON && list.contains(mouse) {
         if let Some(dialog) = app.lod_batch_dialog.as_mut() {
             let max_scroll = dialog.candidates.len().saturating_sub(visible_rows) as f32;
@@ -5442,7 +5489,9 @@ pub(crate) fn run_confirm_action(app: &mut AppState, action: ConfirmAction) {
             start_load_resource_from_source(app, path, LoadSceneSource::Autosave, false)
         }
         ConfirmAction::DismissAutosave => {
-            app.status_message = "Autosave restore ignored".to_string();
+            app.status_message =
+                "Kept the saved resource. The recovery copy remains on disk and can be deleted in Preferences."
+                    .to_string();
         }
         ConfirmAction::CleanupAutosaves => request_autosave_cleanup(app),
         ConfirmAction::DismissWarning => {}
@@ -5706,7 +5755,7 @@ pub(crate) fn update_dff_txd_pair_dialog_input(app: &mut AppState, mouse: Vec2) 
         return false;
     }
     let layout = dff_txd_pair_dialog_layout();
-    let wheel = mouse_wheel().1;
+    let wheel = safe_mouse_wheel().1;
     if wheel != 0.0
         && layout.list.contains(mouse)
         && let Some(dialog) = app.dff_txd_pair_dialog.as_mut()
@@ -6115,15 +6164,6 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
     if app.active_tab == AppTab::Collisions {
         if !inspector_panel_content_rect().contains(mouse) {
             return false;
-        }
-        if collision_edit_button_rect(app).contains(mouse) {
-            if is_mouse_button_pressed(MouseButton::Left) {
-                app.collision_edit_mode = !app.collision_edit_mode;
-                if !app.collision_edit_mode {
-                    app.selected_col_face = None;
-                }
-            }
-            return true;
         }
         if collision_open_col_editor_rect(app).contains(mouse) {
             if is_mouse_button_pressed(MouseButton::Left) {
@@ -6651,8 +6691,16 @@ pub(crate) fn move_selected_light(app: &mut AppState, delta: Vec3) {
         return;
     }
     let before = light_history_snapshot(app);
+    let reference = app
+        .lights
+        .get(app.selected_light)
+        .and_then(|light| light_reference_placement(app, light))
+        .map(|(_, placement)| placement_matrix(placement).inverse());
     if let Some(light) = app.lights.get_mut(app.selected_light) {
-        light.position = from_mq(to_mq(light.position) + delta);
+        let local_delta = reference
+            .map(|inverse| inverse.transform_vector3(delta))
+            .unwrap_or(delta);
+        light.position = from_mq(to_mq(light.position) + local_delta);
     }
     mark_lights_changed(app);
     commit_light_history(app, "Nudge Light", before);
@@ -6703,8 +6751,18 @@ pub(crate) fn apply_gizmo_drag(app: &mut AppState, viewport: Rect, mouse: Vec2) 
                     }
                 }
                 GizmoTarget::Light => {
+                    let inverse = app
+                        .lights
+                        .get(app.selected_light)
+                        .and_then(|light| light_reference_placement(app, light))
+                        .map(|(_, placement)| placement_matrix(placement).inverse());
                     if let Some(light) = app.lights.get_mut(app.selected_light) {
-                        light.position = from_mq(to_mq(drag.start_pos) + delta);
+                        let world = to_mq(drag.start_pos) + delta;
+                        light.position = from_mq(
+                            inverse
+                                .map(|matrix| matrix.transform_point3(world))
+                                .unwrap_or(world),
+                        );
                     }
                 }
                 GizmoTarget::CollisionVertex => {
@@ -6784,6 +6842,11 @@ pub(crate) fn apply_gizmo_drag(app: &mut AppState, viewport: Rect, mouse: Vec2) 
                     }
                 }
                 GizmoTarget::Light => {
+                    let inverse_rotation = app
+                        .lights
+                        .get(app.selected_light)
+                        .and_then(|light| light_reference_placement(app, light))
+                        .map(|(_, placement)| placement_rotation_matrix(placement).inverse());
                     if let Some(light) = app.lights.get_mut(app.selected_light) {
                         let mut direction =
                             vec3(drag.start_rot.x, drag.start_rot.y, drag.start_rot.z);
@@ -6797,7 +6860,12 @@ pub(crate) fn apply_gizmo_drag(app: &mut AppState, viewport: Rect, mouse: Vec2) 
                         };
                         let rot = Mat4::from_axis_angle(rotation_axis, degrees.to_radians());
                         let direction = rot.transform_vector3(direction).normalize_or_zero();
-                        light.direction = from_mq(direction);
+                        light.direction = from_mq(
+                            inverse_rotation
+                                .map(|rotation| rotation.transform_vector3(direction))
+                                .unwrap_or(direction)
+                                .normalize_or_zero(),
+                        );
                     }
                 }
                 GizmoTarget::CollisionPrimitive => {
@@ -6853,6 +6921,52 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     poll_dff_picker(app);
     update_race_minimap(app);
     let mouse: Vec2 = mouse_position().into();
+    if app.camera.looking {
+        // Freecam owns pointer input until the right button is released. Do
+        // not let the cursor's virtual position hover or activate editor UI.
+        // The wheel still belongs to the active viewport so speed can be
+        // tuned without interrupting camera movement.
+        let wheel = safe_mouse_wheel().1;
+        if wheel.abs() > f32::EPSILON {
+            let active_tab = app.active_tab;
+            let speed =
+                camera_speed_after_wheel(camera_speed_for_tab(app, active_tab), wheel, active_tab);
+            set_camera_speed(app, speed);
+        }
+        app.hovered = None;
+        app.hovered_gizmo = None;
+        app.hovered_col_face = None;
+        app.hovered_col_vertex = None;
+        app.col_box_hovered_face = None;
+        app.hovered_water = None;
+        app.hovered_water_edge = None;
+        set_ui_interaction_suppressed(true);
+        return;
+    }
+    set_ui_interaction_suppressed(false);
+    if app.scrollbar_pointer_captured {
+        if !is_mouse_button_down(MouseButton::Left) {
+            app.scrollbar_pointer_captured = false;
+            app.editing.scrollbar_drag = None;
+            app.vehicle_browser.list_scroll_drag = false;
+            app.validation_list_scroll_drag = None;
+            set_scrollbar_hover_suppressed(false);
+            return;
+        }
+        match app.active_tab {
+            AppTab::Editing => {
+                let _ = handle_editing_click(app, mouse);
+            }
+            AppTab::Vehicles => {
+                let _ = update_vehicle_browser(app, mouse);
+            }
+            AppTab::Validation => {
+                let _ = handle_validation_scrollbar_drag(app, mouse);
+            }
+            _ => {}
+        }
+        return;
+    }
     if update_save_log_input(app, mouse) {
         return;
     }
@@ -6917,6 +7031,12 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     if handle_race_2d(app, mouse) {
         return;
     }
+    if update_light_temperature_slider(app, mouse) {
+        return;
+    }
+    if handle_open_light_dropdown_click(app, mouse) {
+        return;
+    }
     if is_mouse_button_pressed(MouseButton::Left) {
         if let Some(action) = clicked_inspector_copy_action(app, mouse) {
             if app.inspector_edit.is_some() {
@@ -6943,12 +7063,14 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     }
     if app.active_tab != AppTab::Editing
         && app.active_tab != AppTab::Race
+        && left_sidebar_visible()
         && update_outliner_type_filter_input(app, mouse)
     {
         return;
     }
     if app.active_tab != AppTab::Editing
         && app.active_tab != AppTab::Race
+        && left_sidebar_visible()
         && update_outliner_search_input(app, mouse)
     {
         return;
@@ -6956,10 +7078,13 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     if app.active_tab == AppTab::Lights
         && app.inspector_edit.is_some()
         && is_mouse_button_pressed(MouseButton::Left)
-        && inspector_field_rect(app, InspectorField::LightKind).contains(mouse)
+        && (inspector_field_rect(app, InspectorField::LightKind).contains(mouse)
+            || inspector_field_rect(app, InspectorField::LightProfile).contains(mouse))
     {
         apply_inspector_edit(app);
-        app.light_kind_dropdown_open = true;
+        let kind = inspector_field_rect(app, InspectorField::LightKind).contains(mouse);
+        app.light_kind_dropdown_open = kind;
+        app.light_profile_dropdown_open = !kind;
         return;
     }
     if handle_col_material_dropdown_click(app, mouse) {
@@ -7050,13 +7175,76 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         }
         return;
     }
-    let (_, wheel) = mouse_wheel();
+    let (_, wheel) = safe_mouse_wheel();
+    if handle_validation_scroll(app, mouse, wheel) {
+        return;
+    }
+    if app.inspector_scroll_drag {
+        if is_mouse_button_down(MouseButton::Left) {
+            app.properties_scroll = inspector_scroll_from_pointer(app, mouse);
+            return;
+        }
+        app.inspector_scroll_drag = false;
+    }
+    if is_mouse_button_down(MouseButton::Left)
+        && let Some(scroll) = inspector_scroll_from_mouse(app, mouse)
+    {
+        app.properties_scroll = scroll;
+        app.inspector_scroll_drag = true;
+        return;
+    }
+    if is_mouse_button_down(MouseButton::Left) && app.active_tab == AppTab::Water {
+        let list = water_list_rect(app);
+        let visible = water_visible_rows();
+        let max_scroll = app.water_planes.len().saturating_sub(visible) as f32;
+        let track = Rect::new(list.x + list.w - 10.0, list.y, 10.0, list.h);
+        if app.water_list_scroll_drag || (max_scroll > 0.0 && track.contains(mouse)) {
+            let thumb_h =
+                (list.h * visible as f32 / app.water_planes.len() as f32).clamp(28.0, list.h);
+            let travel = (list.h - thumb_h).max(1.0);
+            app.water_scroll =
+                ((mouse.y - list.y - thumb_h * 0.5).clamp(0.0, travel) / travel) * max_scroll;
+            app.water_list_scroll_drag = true;
+            update_water_hover(app, mouse);
+            return;
+        }
+    }
+    if !is_mouse_button_down(MouseButton::Left) {
+        app.water_list_scroll_drag = false;
+    }
+    if is_mouse_button_down(MouseButton::Left) && app.active_tab == AppTab::Lights {
+        let list = light_list_rect(app);
+        let max_scroll = app.lights.len().saturating_sub(LIGHT_LIST_VISIBLE_ROWS) as f32;
+        let track = Rect::new(list.x + list.w - 10.0, list.y, 10.0, list.h);
+        if app.light_list_scroll_drag || (max_scroll > 0.0 && track.contains(mouse)) {
+            let thumb_h = (list.h * LIGHT_LIST_VISIBLE_ROWS as f32 / app.lights.len() as f32)
+                .clamp(24.0, list.h);
+            let travel = (list.h - thumb_h).max(1.0);
+            app.light_list_scroll =
+                ((mouse.y - list.y - thumb_h * 0.5).clamp(0.0, travel) / travel) * max_scroll;
+            app.light_list_scroll_drag = true;
+            return;
+        }
+    }
+    if !is_mouse_button_down(MouseButton::Left) {
+        app.light_list_scroll_drag = false;
+    }
     if wheel.abs() > 0.0 && app.col_material_dropdown_open {
         let visible = COL_MATERIAL_DROPDOWN_VISIBLE.min(GTA_SA_COL_MATERIALS.len());
-        let max_scroll = GTA_SA_COL_MATERIALS.len().saturating_sub(visible) as f32;
-        app.col_material_dropdown_scroll =
-            (app.col_material_dropdown_scroll - wheel * 3.0).clamp(0.0, max_scroll);
-        return;
+        let first = col_material_option_rect(app, 0);
+        let last = col_material_option_rect(app, visible.saturating_sub(1));
+        let popup = Rect::new(
+            first.x - 4.0,
+            first.y - 4.0,
+            first.w + 8.0,
+            last.y + last.h - first.y + 8.0,
+        );
+        if popup.contains(mouse) {
+            let max_scroll = GTA_SA_COL_MATERIALS.len().saturating_sub(visible) as f32;
+            app.col_material_dropdown_scroll =
+                (app.col_material_dropdown_scroll - wheel * 3.0).clamp(0.0, max_scroll);
+            return;
+        }
     }
     if wheel.abs() > 0.0
         && app.active_tab == AppTab::Editing
@@ -7183,6 +7371,7 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
             if layout
                 .material_list
                 .is_some_and(|list| list.contains(mouse))
+                && app.editing.nested_scroll_focus == Some(EditingNestedScrollFocus::DffMaterials)
             {
                 let max_scroll =
                     dff.raw
@@ -7205,11 +7394,14 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
             if layout
                 .primitive_list
                 .is_some_and(|list| list.contains(mouse))
+                && app.editing.nested_scroll_focus == Some(EditingNestedScrollFocus::ColPrimitives)
             {
                 scroll_editing_col_primitives(col, wheel);
                 return;
             }
-            if layout.face_list.is_some_and(|list| list.contains(mouse)) {
+            if layout.face_list.is_some_and(|list| list.contains(mouse))
+                && app.editing.nested_scroll_focus == Some(EditingNestedScrollFocus::ColFaces)
+            {
                 scroll_editing_col_faces(col, wheel);
                 return;
             }
@@ -7261,19 +7453,27 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         return;
     }
     if wheel.abs() > 0.0 && viewport.contains(mouse) {
-        let factor = CAMERA_SPEED_WHEEL_FACTOR.powf(wheel);
-        set_camera_speed(app, app.camera_speed * factor);
+        let speed = camera_speed_after_wheel(
+            camera_speed_for_tab(app, app.active_tab),
+            wheel,
+            app.active_tab,
+        );
+        set_camera_speed(app, speed);
         return;
     }
     if app.active_tab != AppTab::Editing
         && wheel.abs() > 0.0
+        && left_sidebar_visible()
         && mouse.x < PANEL_W
         && mouse.y > TOP_H
     {
         app.scroll = (app.scroll - wheel * 7.0).max(0.0);
         app.scroll_interaction_until = get_time() + 0.18;
     }
-    if app.active_tab != AppTab::Editing && update_outliner_scroll_from_mouse(app, mouse) {
+    if app.active_tab != AppTab::Editing
+        && left_sidebar_visible()
+        && update_outliner_scroll_from_mouse(app, mouse)
+    {
         app.hovered = None;
         app.hovered_gizmo = None;
         return;
@@ -7577,11 +7777,15 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         rebuild_render_cells(app);
     }
     if app.active_tab == AppTab::Lights
+        && ctrl_down
         && viewport.contains(mouse)
         && is_mouse_button_pressed(MouseButton::Right)
     {
-        if let Some(idx) = pick_scene_light(app, viewport, mouse) {
+        if let Some((idx, placement)) = pick_scene_light(app, viewport, mouse) {
             app.selected_light = idx;
+            if let Some(placement) = placement {
+                app.selected = placement;
+            }
             app.camera.looking = false;
             set_cursor_grab(false);
             show_mouse(true);
@@ -7591,6 +7795,30 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
             });
             return;
         }
+        let position = pick_scene_geometry_point(app, viewport, mouse)
+            .map(|(_, position)| position)
+            .or_else(|| {
+                let (origin, direction) = viewport_ray(app, viewport, mouse)?;
+                if direction.z.abs() < 0.0001 {
+                    return None;
+                }
+                let t = -origin.z / direction.z;
+                (t >= 0.0).then_some(origin + direction * t)
+            })
+            .unwrap_or_else(|| {
+                let (forward, _) = camera_vectors(&app.camera);
+                app.camera.pos + forward * 500.0
+            });
+        app.camera.looking = false;
+        set_cursor_grab(false);
+        show_mouse(true);
+        app.context_menu = Some(ContextMenu {
+            pos: mouse,
+            target: ContextMenuTarget::Scene {
+                position: from_mq(position),
+            },
+        });
+        return;
     }
     if ctrl_down && viewport.contains(mouse) && is_mouse_button_pressed(MouseButton::Right) {
         let picked = if app.active_tab == AppTab::Collisions {
@@ -7681,6 +7909,10 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                     }
                 }
                 if let Some(light) = app.lights.get(app.selected_light) {
+                    let (start_pos, start_direction) = light_world_transform(
+                        light,
+                        light_reference_placement(app, light).map(|(_, placement)| placement),
+                    );
                     let drag_label = if alt_down {
                         label.clone()
                     } else {
@@ -7690,8 +7922,8 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                         target: GizmoTarget::Light,
                         axis,
                         start_mouse: mouse,
-                        start_pos: light.position,
-                        start_rot: light.direction,
+                        start_pos: from_mq(start_pos),
+                        start_rot: from_mq(start_direction),
                         element_start_positions: Vec::new(),
                         element_start_rots: Vec::new(),
                         before,
@@ -7921,6 +8153,7 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
 
     let box_select_viewport = transform_interaction_viewport(app, viewport);
     if ctrl_down
+        && (app.active_tab != AppTab::Lights || alt_down)
         && box_select_viewport.contains(mouse)
         && is_mouse_button_pressed(MouseButton::Left)
     {
@@ -7934,12 +8167,14 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         return;
     }
 
-    if !suppress_hover_pick && app.active_tab != AppTab::Race {
+    if !suppress_hover_pick && app.active_tab != AppTab::Race && left_sidebar_visible() {
         if let Some(row) = outliner_row_at(mouse) {
             if let Some(entry) = app.outliner_filter.get(app.scroll as usize + row).cloned() {
                 match entry {
                     OutlinerEntry::Group(group) => {
-                        if is_mouse_button_pressed(MouseButton::Left) {
+                        if is_mouse_button_pressed(MouseButton::Left)
+                            && (app.active_tab != AppTab::Lights || alt_down)
+                        {
                             let disclosure = Rect::new(
                                 20.0,
                                 outliner_list_top() + row as f32 * OUTLINER_ROW_H,
@@ -7959,7 +8194,9 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                     }
                     OutlinerEntry::Element(idx) | OutlinerEntry::GroupChild(idx) => {
                         app.hovered = Some(idx);
-                        if is_mouse_button_pressed(MouseButton::Left) {
+                        if is_mouse_button_pressed(MouseButton::Left)
+                            && (app.active_tab != AppTab::Lights || alt_down)
+                        {
                             select_element_with_mode(app, idx, shift_down);
                         }
                         if is_mouse_button_pressed(MouseButton::Right) {
@@ -7969,6 +8206,15 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                 }
             }
         } else if viewport.contains(mouse) && is_mouse_button_pressed(MouseButton::Left) {
+            if app.active_tab == AppTab::Lights && !alt_down {
+                if let Some((light, placement)) = pick_scene_light(app, viewport, mouse) {
+                    app.selected_light = light;
+                    if let Some(placement) = placement {
+                        app.selected = placement;
+                    }
+                }
+                return;
+            }
             let collision_vertex_pick = (app.active_tab == AppTab::Collisions
                 && app.collision_edit_mode)
                 .then(|| nearest_selected_collision_tab_screen_vertex(app, viewport, mouse))
@@ -8237,6 +8483,7 @@ pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
     };
     if app.context_menu.is_some() {
         app.camera.looking = false;
+        set_ui_interaction_suppressed(false);
         set_cursor_grab(false);
         show_mouse(true);
         return;
@@ -8259,6 +8506,7 @@ pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
         set_cursor_grab(false);
         show_mouse(true);
     }
+    set_ui_interaction_suppressed(app.camera.looking);
     // Hold middle mouse to pan the camera across the scene (grab-style drag).
     let mid_pan = !app.camera.looking && is_mouse_button_down(MouseButton::Middle) && in_view;
     if app.camera.looking {
@@ -8283,7 +8531,10 @@ pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
         app.camera.last_mouse = mouse;
         let (forward, right) = camera_vectors(&app.camera);
         let up = right.cross(forward).normalize_or_zero();
-        let pan_scale = (app.camera_speed * 0.01).max(0.01);
+        let pan_scale = (camera_speed_for_tab(app, app.active_tab)
+            * camera_translation_scale(app.active_tab)
+            * 0.01)
+            .max(0.01);
         let shift = (right * -delta.x + up * delta.y) * pan_scale;
         if shift.length_squared() > 0.0 {
             app.camera.pos += shift;
@@ -8297,11 +8548,12 @@ pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
     }
 
     let dt = get_frame_time();
+    let active_camera_speed = camera_speed_for_tab(app, app.active_tab);
     let speed = if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
-        app.camera_speed * 3.5
+        active_camera_speed * 3.5
     } else {
-        app.camera_speed
-    };
+        active_camera_speed
+    } * camera_translation_scale(app.active_tab);
     let step = speed * dt;
     let (forward, right) = camera_vectors(&app.camera);
     let mut movement = Vec3::ZERO;
@@ -8343,9 +8595,26 @@ pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
     }
 }
 
+fn camera_translation_scale(active_tab: AppTab) -> f32 {
+    // Vehicle models use a smaller working scale than the scene editor. Keep
+    // their freecam translation at half of the selected camera speed without
+    // changing the shared preference shown to the user.
+    if active_tab == AppTab::Vehicles {
+        0.5
+    } else {
+        1.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vehicle_freecam_translation_runs_at_half_speed() {
+        assert_eq!(camera_translation_scale(AppTab::Vehicles), 0.5);
+        assert_eq!(camera_translation_scale(AppTab::Editing), 1.0);
+    }
 
     #[test]
     fn inspector_float_parser_rejects_non_finite_values() {

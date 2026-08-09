@@ -2,7 +2,7 @@
 
 **A native 3D world and asset editor for Multi Theft Auto: San Andreas.**
 
-[![Release](https://img.shields.io/badge/release-v0.1.4-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.5-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-4b5563)](#download)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green)](LICENSE)
 
@@ -11,15 +11,25 @@ the complete map, inspect and edit RenderWare assets, build LODs, repair common
 asset problems, configure lighting and physics, and save the result back to the
 resource without moving between several separate tools.
 
-## What’s new in 0.1.4
+## What’s new in 0.1.5
 
-- **Hierarchy-safe DFF saving:** multi-frame RenderWare models now retain their
-  frame lists, parent links, and atomic bindings when edited or optimized.
-- **Reliable alpha-face repair:** transparent face order is preserved through
-  DFF export, including BinMesh data, so optimized models match their intended
-  in-game draw order.
-- **Viewport performance controls:** Preview uses tighter spatial VBO culling,
-  and draw distance is now a persistent 25%–200% preference (100% default).
+- **Safer asset replacement and export:** imported DFF payloads retain their
+  original hierarchy, plugins, BinMesh data, and face order, and staged IMG
+  replacements are used consistently when exporting or saving.
+- **Better camera behavior:** Preview, Editing, and Vehicles retain independent
+  cameras and speeds, detail views use a close near plane, and free-look input
+  no longer leaks into editor controls.
+- **Improved lighting tools:** lights can be placed directly on scene geometry,
+  attached lights follow every live model instance, and color-temperature and
+  popup controls are easier to use reliably.
+- **More accurate vehicle previews:** the default camera faces the model's
+  front, damaged-part visibility is controllable, transparent parts render in
+  a stable order, and coronas no longer wash out nearby geometry.
+- **More resilient project workflows:** completed saves invalidate stale
+  autosave recovery markers, the project picker supports filtering and long
+  paths, and external IMG archives can be selected from the asset editor.
+- **Responsive editor UI:** workspace navigation, toolbars, scrolling, Race and
+  validation panels, tooltips, and compact-window layouts have been refined.
 
 > [!IMPORTANT]
 > Eagle Editor is an early public release. Keep a backup or use version control for
@@ -72,8 +82,8 @@ code-signed. Verify the archive checksum below before choosing **Run anyway**.
 The Linux build requires an x86-64 desktop with X11 and OpenGL drivers.
 
 ```bash
-tar -xzf EagleEditor-v0.1.4-linux-x86_64.tar.gz
-cd EagleEditor-v0.1.4-linux-x86_64
+tar -xzf EagleEditor-v0.1.5-linux-x86_64.tar.gz
+cd EagleEditor-v0.1.5-linux-x86_64
 chmod +x EagleEditor
 ./EagleEditor
 ```

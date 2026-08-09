@@ -1441,6 +1441,7 @@ pub(crate) fn ensure_vehicle_preview(app: &mut AppState) {
         app.vehicle_browser.embedded_collision = None;
         app.vehicle_browser.hidden_parts.clear();
         app.vehicle_browser.hidden_components.clear();
+        app.vehicle_browser.forced_visible_components.clear();
         app.vehicle_browser.collapsed_components.clear();
         app.vehicle_browser.selected_component = None;
         app.vehicle_browser.component_rotations.clear();
@@ -2658,6 +2659,10 @@ fn draw_vehicle_photo_stage(mesh: &RenderMesh) {
     }
 }
 
+fn vehicle_light_fx_is_front(local_y: f32, center_y: f32) -> bool {
+    local_y >= center_y
+}
+
 fn vehicle_generated_light_coronas(
     app: &AppState,
     mesh: &RenderMesh,
@@ -2667,10 +2672,10 @@ fn vehicle_generated_light_coronas(
     let center = (mesh.bounds.min + mesh.bounds.max) * 0.5;
     let extents = (mesh.bounds.max - mesh.bounds.min) * 0.5;
     let local_camera = model.inverse().transform_point3(app.camera.pos);
-    // The default showcase angle looks at the vehicle's -Y/front side. Only
+    // GTA:SA vehicles face local +Y. Only
     // synthesize the pair on the side facing the camera so rear lamps cannot
     // bleed through the body while the corona layer intentionally ignores depth.
-    let camera_at_front = local_camera.y <= center.y;
+    let camera_at_front = vehicle_light_fx_is_front(local_camera.y, center.y);
     let mut sums = [Vec3::ZERO; 4];
     let mut counts = [0usize; 4];
     for part in mesh.parts.iter().filter(|part| {
@@ -2679,7 +2684,7 @@ fn vehicle_generated_light_coronas(
         let component = vehicle_component_preview_matrix(app, mesh, part.component, motion);
         for vertex in &part.cpu_vertices {
             let position = component.transform_point3(to_mq(vertex.pos));
-            let front = usize::from(position.y <= center.y);
+            let front = usize::from(vehicle_light_fx_is_front(position.y, center.y));
             let right = usize::from(position.x >= center.x);
             let bucket = front * 2 + right;
             sums[bucket] += position;
@@ -2853,7 +2858,14 @@ fn selected_vehicle_texture_name(app: &AppState) -> Option<String> {
     (!name.is_empty()).then(|| lower(name))
 }
 
-fn vehicle_component_hidden_by_options(app: &AppState, name: &str) -> bool {
+fn vehicle_component_hidden_by_options(app: &AppState, component: usize, name: &str) -> bool {
+    if app
+        .vehicle_browser
+        .forced_visible_components
+        .contains(&component)
+    {
+        return false;
+    }
     let key = lower(name.trim());
     (app.vehicle_browser.hide_damaged && key.contains("_dam"))
         || (app.vehicle_browser.hide_vlo && key.contains("_vlo"))
@@ -3026,7 +3038,7 @@ fn pick_vehicle_component(app: &AppState, mouse: Vec2) -> Option<usize> {
         // Honour the same visibility filters the viewport uses so you can only
         // click parts you can actually see.
         let component_name = vehicle_part_component_name(mesh, part);
-        if vehicle_component_hidden_by_options(app, component_name)
+        if vehicle_component_hidden_by_options(app, part.component, component_name)
             || app.vehicle_browser.hidden_parts.contains(&idx)
             || app
                 .vehicle_browser
@@ -3145,14 +3157,53 @@ fn draw_vehicle_render_mesh(
     let mut parts = 0usize;
     let mut vertices = 0usize;
     let selected_texture = selected_vehicle_texture_name(app);
+    // Rendering raw DFF part order lets opaque dashboard/interior geometry
+    // overwrite blended details that happened to be submitted first. Keep the
+    // authored order for solid parts, then draw alpha parts back-to-front.
+    let mut part_order = (0..mesh.parts.len()).collect::<Vec<_>>();
+    part_order.sort_by(|left, right| {
+        let left_part = &mesh.parts[*left];
+        let right_part = &mesh.parts[*right];
+        match (
+            left_part.transparency == TransparencyMode::Blend,
+            right_part.transparency == TransparencyMode::Blend,
+        ) {
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, false) => left.cmp(right),
+            (true, true) => {
+                let distance = |part: &RenderPart| {
+                    let component =
+                        vehicle_component_preview_matrix(app, mesh, part.component, motion);
+                    let world = model * component;
+                    let center = if part.cpu_vertices.is_empty() {
+                        Vec3::ZERO
+                    } else {
+                        part.cpu_vertices
+                            .iter()
+                            .fold(Vec3::ZERO, |sum, vertex| sum + to_mq(vertex.pos))
+                            / part.cpu_vertices.len() as f32
+                    };
+                    world
+                        .transform_point3(center)
+                        .distance_squared(app.camera.pos)
+                };
+                distance(right_part)
+                    .partial_cmp(&distance(left_part))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.cmp(right))
+            }
+        }
+    });
     unsafe {
         gl::Disable(gl::CULL_FACE);
         gl::LightModeli(gl::LIGHT_MODEL_TWO_SIDE, gl::TRUE as i32);
         gl::PushMatrix();
         gl::MultMatrixf(model_cols.as_ptr());
-        for (idx, part) in mesh.parts.iter().enumerate() {
+        for idx in part_order {
+            let part = &mesh.parts[idx];
             let component_name = vehicle_part_component_name(mesh, part);
-            if vehicle_component_hidden_by_options(app, component_name) {
+            if vehicle_component_hidden_by_options(app, part.component, component_name) {
                 continue;
             }
             if app.vehicle_browser.hidden_parts.contains(&idx) {
@@ -3682,6 +3733,20 @@ pub(crate) fn draw_vehicle_texture_match_highlight(part: &RenderPart) {
     }
 }
 
+fn vehicle_front_camera_pose(bounds: Bounds, model: Mat4) -> (Vec3, Vec3) {
+    let local_center = (bounds.min + bounds.max) * 0.5;
+    let half_extents = (bounds.max - bounds.min) * 0.5;
+    let radius = ((bounds.max - bounds.min).length() * 0.5).max(0.25);
+    // GTA vehicles face local +Y. Bias the look target toward the nose while
+    // retaining a three-quarter view that shows the front and one side.
+    let local_target = local_center + vec3(0.0, half_extents.y * 0.18, half_extents.z * 0.06);
+    let local_camera = local_center + vec3(-radius * 0.95, radius * 1.25, radius * 0.60);
+    (
+        model.transform_point3(local_camera),
+        model.transform_point3(local_target),
+    )
+}
+
 pub(crate) fn focus_selected_vehicle(app: &mut AppState) {
     let Some(mesh) = app.vehicle_browser.preview_mesh.as_ref() else {
         return;
@@ -3692,18 +3757,19 @@ pub(crate) fn focus_selected_vehicle(app: &mut AppState) {
     let motion = vehicle_preview_motion(vehicle, get_time() as f32);
     let placement = vehicle_preview_placement(vehicle);
     let model = vehicle_preview_model_matrix(&placement, mesh, motion);
-    let center = model.transform_point3((mesh.bounds.min + mesh.bounds.max) * 0.5);
-    let size = (mesh.bounds.max - mesh.bounds.min).length().max(8.0);
-    app.camera_focus = Some(center);
-    app.camera.pos = center + vec3(-size * 1.45, -size * 1.75, size * 0.75);
-    // Derive the camera angles from the actual showcase position. The previous
-    // approximate 45°/-20° angles did not point exactly at `camera_focus`, so
-    // the first orbit visibly swung around an offset pivot.
-    let toward_center = (center - app.camera.pos).normalize_or_zero();
-    app.camera.yaw = toward_center.x.atan2(toward_center.y);
-    app.camera.pitch = toward_center
+    let (camera_position, camera_target) = vehicle_front_camera_pose(mesh.bounds, model);
+    app.camera_focus = Some(camera_target);
+    // Vehicle selection frames the preview without silently changing
+    // right-drag from free-look into an orbit around the model.
+    app.camera_mode = CameraMode::Freeroam;
+    app.camera.pos = camera_position;
+    // Derive the camera angles from the actual showcase position so the
+    // initial view points exactly at the front-biased target.
+    let toward_target = (camera_target - app.camera.pos).normalize_or_zero();
+    app.camera.yaw = toward_target.x.atan2(toward_target.y);
+    app.camera.pitch = toward_target
         .z
-        .atan2(Vec2::new(toward_center.x, toward_center.y).length());
+        .atan2(Vec2::new(toward_target.x, toward_target.y).length());
 }
 
 pub(crate) fn set_vehicle_photo_mode(app: &mut AppState, enabled: bool) {
@@ -4604,7 +4670,7 @@ fn update_vehicle_collision_copy_dialog(app: &mut AppState, mouse: Vec2) -> bool
         dialog.scroll = dialog.scroll.min(max_scroll);
     }
 
-    let wheel = mouse_wheel().1;
+    let wheel = safe_mouse_wheel().1;
     if wheel.abs() > 0.0 && list.contains(mouse) {
         if let Some(dialog) = app.vehicle_browser.collision_copy_dialog.as_mut() {
             let max_scroll = indices.len().saturating_sub(visible_rows) as f32;
@@ -4721,6 +4787,46 @@ pub(crate) fn update_vehicle_browser(app: &mut AppState, mouse: Vec2) -> bool {
     if app.vehicle_browser.manage_dictionaries {
         return update_vehicle_dictionary_manager(app, mouse);
     }
+    let list = vehicle_list_rect();
+    let rows = (list.h / VEHICLE_ROW_H).floor().max(1.0) as usize;
+    let total = filtered_vehicle_indices(app).len();
+    let track = Rect::new(list.x + list.w - 6.0, list.y + 4.0, 3.0, list.h - 8.0);
+    let released_list_drag =
+        !is_mouse_button_down(MouseButton::Left) && app.vehicle_browser.list_scroll_drag;
+    if !is_mouse_button_down(MouseButton::Left) {
+        app.vehicle_browser.list_scroll_drag = false;
+    }
+    if released_list_drag {
+        return true;
+    }
+    if let Some(metrics) = scrollbar_metrics(
+        track,
+        rows as f32,
+        total as f32,
+        24.0,
+        app.vehicle_browser.scroll,
+    ) {
+        if !app.vehicle_browser.list_scroll_drag {
+            if is_mouse_button_pressed(MouseButton::Left)
+                && let Some(drag) = scrollbar_begin_drag(metrics, mouse)
+            {
+                app.vehicle_browser.list_scroll_drag = true;
+                app.vehicle_browser.list_scroll_grab_offset_y = drag.grab_offset_y;
+                app.scrollbar_pointer_captured = true;
+                set_scrollbar_hover_suppressed(true);
+            }
+        }
+        if app.vehicle_browser.list_scroll_drag && is_mouse_button_down(MouseButton::Left) {
+            app.vehicle_browser.scroll = scrollbar_scroll_for_drag(
+                metrics,
+                ScrollbarDrag {
+                    grab_offset_y: app.vehicle_browser.list_scroll_grab_offset_y,
+                },
+                mouse,
+            );
+            return true;
+        }
+    }
     let photo_mode = app.vehicle_browser.photo_mode;
     if photo_mode {
         if is_key_pressed(KeyCode::Escape)
@@ -4767,6 +4873,12 @@ pub(crate) fn update_vehicle_browser(app: &mut AppState, mouse: Vec2) -> bool {
     let panel = vehicle_panel_rect();
     let details_panel = vehicle_details_rect();
     let preview = vehicle_preview_viewport_rect(app);
+    let wheel = safe_mouse_wheel().1;
+    if wheel.abs() > f32::EPSILON && preview.contains(mouse) {
+        let speed = camera_speed_after_wheel(app.vehicle_camera_speed, wheel, AppTab::Vehicles);
+        set_camera_speed(app, speed);
+        return true;
+    }
     if !photo_mode
         && is_mouse_button_pressed(MouseButton::Left)
         && vehicle_photo_mode_rect(app).contains(mouse)
@@ -4950,6 +5062,56 @@ pub(crate) fn update_vehicle_browser(app: &mut AppState, mouse: Vec2) -> bool {
             }
         }
     }
+    if !photo_mode {
+        let component_list = vehicle_component_list_rect();
+        let component_rows = (component_list.h / VEHICLE_COMPONENT_ROW_H)
+            .floor()
+            .max(1.0) as usize;
+        let component_total = vehicle_component_rows(app).len();
+        let component_scrollbar_track = Rect::new(
+            component_list.x + component_list.w - 6.0,
+            component_list.y + 4.0,
+            3.0,
+            component_list.h - 8.0,
+        );
+        let released_component_drag =
+            !is_mouse_button_down(MouseButton::Left) && app.vehicle_browser.component_scroll_drag;
+        if !is_mouse_button_down(MouseButton::Left) {
+            app.vehicle_browser.component_scroll_drag = false;
+        }
+        if released_component_drag {
+            return true;
+        }
+        if let Some(metrics) = scrollbar_metrics(
+            component_scrollbar_track,
+            component_rows as f32,
+            component_total as f32,
+            24.0,
+            app.vehicle_browser.component_scroll,
+        ) {
+            if !app.vehicle_browser.component_scroll_drag {
+                if is_mouse_button_pressed(MouseButton::Left)
+                    && let Some(drag) = scrollbar_begin_drag(metrics, mouse)
+                {
+                    app.vehicle_browser.component_scroll_drag = true;
+                    app.vehicle_browser.component_scroll_grab_offset_y = drag.grab_offset_y;
+                    app.scrollbar_pointer_captured = true;
+                    set_scrollbar_hover_suppressed(true);
+                }
+            }
+            if app.vehicle_browser.component_scroll_drag && is_mouse_button_down(MouseButton::Left)
+            {
+                app.vehicle_browser.component_scroll = scrollbar_scroll_for_drag(
+                    metrics,
+                    ScrollbarDrag {
+                        grab_offset_y: app.vehicle_browser.component_scroll_grab_offset_y,
+                    },
+                    mouse,
+                );
+                return true;
+            }
+        }
+    }
     let details = vehicle_details_rect();
     if !photo_mode && details.contains(mouse) {
         if is_mouse_button_pressed(MouseButton::Left) {
@@ -4976,12 +5138,14 @@ pub(crate) fn update_vehicle_browser(app: &mut AppState, mouse: Vec2) -> bool {
             if vehicle_show_all_rect().contains(mouse) {
                 app.vehicle_browser.hidden_parts.clear();
                 app.vehicle_browser.hidden_components.clear();
+                app.vehicle_browser.forced_visible_components.clear();
                 return true;
             }
             if vehicle_hide_all_rect().contains(mouse) {
                 if let Some(mesh) = app.vehicle_browser.preview_mesh.as_ref() {
                     let component_count = mesh.components.len().max(1);
                     app.vehicle_browser.hidden_components = (0..component_count).collect();
+                    app.vehicle_browser.forced_visible_components.clear();
                 }
                 return true;
             }
@@ -5001,8 +5165,40 @@ pub(crate) fn update_vehicle_browser(app: &mut AppState, mouse: Vec2) -> bool {
                                     app.vehicle_browser.collapsed_components.remove(&component);
                                 }
                             } else if mouse.x < list.x + 44.0 {
-                                if !app.vehicle_browser.hidden_components.insert(component) {
+                                let name = app
+                                    .vehicle_browser
+                                    .preview_mesh
+                                    .as_ref()
+                                    .and_then(|mesh| mesh.components.get(component))
+                                    .map(String::as_str)
+                                    .unwrap_or_default();
+                                let visible = !app
+                                    .vehicle_browser
+                                    .hidden_components
+                                    .contains(&component)
+                                    && !vehicle_component_hidden_by_options(app, component, name);
+                                if visible {
+                                    app.vehicle_browser.hidden_components.insert(component);
+                                    app.vehicle_browser
+                                        .forced_visible_components
+                                        .remove(&component);
+                                } else {
                                     app.vehicle_browser.hidden_components.remove(&component);
+                                    let filtered = {
+                                        let key = lower(name.trim());
+                                        (app.vehicle_browser.hide_damaged && key.contains("_dam"))
+                                            || (app.vehicle_browser.hide_vlo
+                                                && key.contains("_vlo"))
+                                    };
+                                    if filtered {
+                                        app.vehicle_browser
+                                            .forced_visible_components
+                                            .insert(component);
+                                    } else {
+                                        app.vehicle_browser
+                                            .forced_visible_components
+                                            .remove(&component);
+                                    }
                                 }
                             } else {
                                 app.vehicle_browser.selected_component = Some(component);
@@ -5034,7 +5230,6 @@ pub(crate) fn update_vehicle_browser(app: &mut AppState, mouse: Vec2) -> bool {
                 return true;
             }
         }
-        let wheel = mouse_wheel().1;
         if wheel.abs() > 0.0 && vehicle_component_list_rect().contains(mouse) {
             let list = vehicle_component_list_rect();
             let rows = (list.h / VEHICLE_COMPONENT_ROW_H).floor().max(1.0) as usize;
@@ -5046,7 +5241,6 @@ pub(crate) fn update_vehicle_browser(app: &mut AppState, mouse: Vec2) -> bool {
         }
         return true;
     }
-    let wheel = mouse_wheel().1;
     if wheel.abs() > 0.0 && vehicle_list_rect().contains(mouse) {
         let rows = (vehicle_list_rect().h / VEHICLE_ROW_H).floor().max(1.0) as usize;
         let max_scroll = filtered_vehicle_indices(app).len().saturating_sub(rows) as f32;
@@ -5074,7 +5268,7 @@ fn update_vehicle_build_dialog(app: &mut AppState, mouse: Vec2) -> bool {
     let field_count = VEHICLE_BUILD_GENERAL_FIELDS + VEHICLE_HANDLING_FIELDS.len();
     let mut submit = false;
 
-    let wheel = mouse_wheel().1;
+    let wheel = safe_mouse_wheel().1;
     if wheel.abs() > 0.0 {
         let category_open = app
             .vehicle_browser
@@ -5377,7 +5571,7 @@ fn update_vehicle_category_manager(app: &mut AppState, mouse: Vec2) -> bool {
 
     let list = vehicle_category_manager_list_rect();
     let visible_rows = (list.h / 38.0).floor().max(1.0) as usize;
-    let wheel = mouse_wheel().1;
+    let wheel = safe_mouse_wheel().1;
     if wheel.abs() > 0.0 && list.contains(mouse) {
         if let Some(dialog) = app.vehicle_browser.build_dialog.as_mut() {
             let max_scroll = dialog.categories.len().saturating_sub(visible_rows) as f32;
@@ -5542,7 +5736,25 @@ pub(crate) fn update_vehicle_dictionary_manager(app: &mut AppState, mouse: Vec2)
         .saturating_sub(visible_rows) as f32;
     app.vehicle_browser.dictionary_scroll =
         app.vehicle_browser.dictionary_scroll.clamp(0.0, max_scroll);
-    let (_, wheel) = mouse_wheel();
+    let track = Rect::new(list.x + list.w - 8.0, list.y + 8.0, 3.0, list.h - 16.0);
+    let hit_area = Rect::new(track.x - 6.0, track.y, track.w + 12.0, track.h);
+    if !is_mouse_button_down(MouseButton::Left) {
+        app.vehicle_browser.dictionary_scroll_drag = false;
+    }
+    if is_mouse_button_down(MouseButton::Left)
+        && max_scroll > 0.0
+        && (app.vehicle_browser.dictionary_scroll_drag || hit_area.contains(mouse))
+    {
+        let thumb_h = (track.h * visible_rows as f32
+            / app.custom_vehicle_dictionaries.len() as f32)
+            .clamp(24.0, track.h);
+        let travel = (track.h - thumb_h).max(1.0);
+        app.vehicle_browser.dictionary_scroll =
+            ((mouse.y - track.y - thumb_h * 0.5).clamp(0.0, travel) / travel) * max_scroll;
+        app.vehicle_browser.dictionary_scroll_drag = true;
+        return true;
+    }
+    let (_, wheel) = safe_mouse_wheel();
     if list.contains(mouse) && wheel.abs() > 0.0 {
         app.vehicle_browser.dictionary_scroll =
             (app.vehicle_browser.dictionary_scroll - wheel).clamp(0.0, max_scroll);
@@ -5660,19 +5872,18 @@ pub(crate) fn draw_vehicle_dictionary_manager(app: &AppState) {
     }
     if app.custom_vehicle_dictionaries.len() > visible_rows {
         let track = Rect::new(list.x + list.w - 8.0, list.y + 8.0, 3.0, list.h - 16.0);
-        draw_rrect(
-            track.x,
-            track.y,
-            track.w,
-            track.h,
-            2.0,
-            Color::new(0.12, 0.14, 0.17, 1.0),
-        );
-        let thumb_h = (track.h * visible_rows as f32
-            / app.custom_vehicle_dictionaries.len() as f32)
-            .clamp(24.0, track.h);
-        let thumb_y = track.y + (track.h - thumb_h) * (scroll / max_scroll.max(1.0));
-        draw_rrect(track.x, thumb_y, track.w, thumb_h, 2.0, ui_accent());
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            visible_rows as f32,
+            app.custom_vehicle_dictionaries.len() as f32,
+            24.0,
+            scroll,
+        ) {
+            draw_scrollbar(
+                metrics,
+                scrollbar_visual_state(track, app.vehicle_browser.dictionary_scroll_drag),
+            );
+        }
     }
     if app.vehicle_dictionary_scan_rx.is_some() {
         ui_text(
@@ -6402,12 +6613,18 @@ pub(crate) fn vehicle_texture_rgba(
     }
     let key = lower(name);
     let txd_key = asset_key(txd, ".txd");
+    let sa_generic_txd_key = asset_key("vehicle", ".txd");
     app.txd_textures
         .get(&key)
         .and_then(|entries| {
             entries
                 .iter()
                 .find(|entry| entry.txd_name.eq_ignore_ascii_case(&txd_key))
+                .or_else(|| {
+                    entries
+                        .iter()
+                        .find(|entry| entry.txd_name.eq_ignore_ascii_case(&sa_generic_txd_key))
+                })
                 .or_else(|| entries.first())
         })
         .and_then(decode_txd_texture)
@@ -6943,7 +7160,7 @@ pub(crate) fn draw_vehicle_details_panel(app: &mut AppState) {
                     .get(component)
                     .cloned()
                     .unwrap_or_else(|| format!("geometry {component}"));
-                let option_hidden = vehicle_component_hidden_by_options(app, &name);
+                let option_hidden = vehicle_component_hidden_by_options(app, component, &name);
                 draw_visibility_dot(list.x + 26.0, y + 8.0, !hidden && !option_hidden);
                 let part_count = mesh
                     .parts
@@ -6980,6 +7197,7 @@ pub(crate) fn draw_vehicle_details_panel(app: &mut AppState) {
                     .contains(&part.component);
                 let option_hidden = vehicle_component_hidden_by_options(
                     app,
+                    part.component,
                     vehicle_part_component_name(mesh, part),
                 );
                 let group_visible = vehicle_part_visible_by_group(app, part);
@@ -7030,6 +7248,19 @@ pub(crate) fn draw_vehicle_details_panel(app: &mut AppState) {
                 );
             }
         }
+    }
+    let track = Rect::new(list.x + list.w - 6.0, list.y + 4.0, 3.0, list.h - 8.0);
+    if let Some(metrics) = scrollbar_metrics(
+        track,
+        visible_rows as f32,
+        all_rows.len() as f32,
+        24.0,
+        app.vehicle_browser.component_scroll,
+    ) {
+        draw_scrollbar(
+            metrics,
+            scrollbar_visual_state(track, app.vehicle_browser.component_scroll_drag),
+        );
     }
 
     draw_vehicle_texture_preview_pane(app, vehicle_txd);
@@ -7241,6 +7472,21 @@ pub(crate) fn draw_vehicle_panel(app: &mut AppState) {
             },
         );
     }
+    if max_scroll > 0.0 {
+        let track = Rect::new(list.x + list.w - 6.0, list.y + 4.0, 3.0, list.h - 8.0);
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            rows as f32,
+            indices.len() as f32,
+            24.0,
+            app.vehicle_browser.scroll,
+        ) {
+            draw_scrollbar(
+                metrics,
+                scrollbar_visual_state(track, app.vehicle_browser.list_scroll_drag),
+            );
+        }
+    }
     if let Some(vehicle) = selected_vehicle(app) {
         let info_y = panel.y + panel.h - 44.0;
         ui_text(
@@ -7281,6 +7527,27 @@ pub(crate) fn draw_vehicle_panel(app: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_vehicle_camera_uses_the_front_axis_and_front_biased_target() {
+        let bounds = Bounds {
+            min: vec3(-1.0, -2.0, 0.0),
+            max: vec3(1.0, 3.0, 2.0),
+        };
+        let center = (bounds.min + bounds.max) * 0.5;
+        let (camera, target) = vehicle_front_camera_pose(bounds, Mat4::IDENTITY);
+
+        assert!(camera.y > bounds.max.y);
+        assert!(camera.x < center.x);
+        assert!(target.y > center.y);
+        assert!((target - camera).y < 0.0);
+    }
+
+    #[test]
+    fn generated_vehicle_light_fx_use_positive_y_as_the_front() {
+        assert!(vehicle_light_fx_is_front(3.0, 0.5));
+        assert!(!vehicle_light_fx_is_front(-2.0, 0.5));
+    }
 
     #[test]
     fn vehicle_export_includes_only_referenced_missing_sa_generic_textures() {

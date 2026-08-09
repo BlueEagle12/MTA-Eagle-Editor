@@ -308,24 +308,15 @@ pub(crate) fn draw_lod_audit_panel(app: &AppState) {
     let max_scroll = lod_audit_scroll_max(app);
     if max_scroll > 0.5 {
         let track = Rect::new(list.x + list.w - 6.0, list.y + 4.0, 3.0, list.h - 8.0);
-        let thumb_h = (track.h * track.h / (track.h + max_scroll)).clamp(24.0, track.h);
-        let thumb_y = track.y + (track.h - thumb_h) * (app.properties_scroll / max_scroll);
-        draw_rrect(
-            track.x,
-            track.y,
-            track.w,
+        if let Some(metrics) = scrollbar_metrics(
+            track,
             track.h,
-            1.5,
-            Color::new(0.08, 0.09, 0.11, 1.0),
-        );
-        draw_rrect(
-            track.x,
-            thumb_y,
-            track.w,
-            thumb_h,
-            1.5,
-            Color::new(0.36, 0.38, 0.42, 1.0),
-        );
+            track.h + max_scroll,
+            24.0,
+            app.properties_scroll,
+        ) {
+            draw_scrollbar(metrics, scrollbar_visual_state(track, false));
+        }
     }
 
     let config_label = if result.loader_config_found {
@@ -353,6 +344,19 @@ pub(crate) fn draw_lod_audit_panel(app: &AppState) {
 pub(crate) fn handle_lod_audit_click(app: &mut AppState, mouse: Vec2) -> bool {
     if app.active_tab != AppTab::LodAudit {
         return false;
+    }
+    if is_mouse_button_down(MouseButton::Left) {
+        let list = lod_audit_list_rect();
+        let max_scroll = lod_audit_scroll_max(app);
+        let track = Rect::new(list.x + list.w - 6.0, list.y + 4.0, 3.0, list.h - 8.0);
+        let hit_area = Rect::new(track.x - 6.0, track.y, track.w + 12.0, track.h);
+        if max_scroll > 0.5 && hit_area.contains(mouse) {
+            let thumb_h = (track.h * track.h / (track.h + max_scroll)).clamp(24.0, track.h);
+            let travel = (track.h - thumb_h).max(1.0);
+            app.properties_scroll =
+                ((mouse.y - track.y - thumb_h * 0.5).clamp(0.0, travel) / travel) * max_scroll;
+            return true;
+        }
     }
     if lod_audit_run_rect().contains(mouse) {
         if is_mouse_button_pressed(MouseButton::Left) && app.lod_audit.rx.is_none() {

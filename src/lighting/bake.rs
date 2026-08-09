@@ -1207,6 +1207,7 @@ fn material_emitter_lights(
                                     lobe_name,
                                     group.faces,
                                 ),
+                                attached_to: None,
                                 kind: LightKind::Point,
                                 profile,
                                 position: V3 {
@@ -1261,6 +1262,7 @@ fn material_emitter_lights(
                             part.material_index,
                             sample + 1
                         ),
+                        attached_to: None,
                         kind: LightKind::Area,
                         profile,
                         position: V3 {
@@ -1299,7 +1301,11 @@ fn all_bake_lights_for_mode(
     face_emitters: &HashMap<(String, usize), MaterialEmitter>,
     mode: BakeLightMode,
 ) -> Vec<EditorLight> {
-    let mut lights = bake_lights_for_mode(&app.lights, mode);
+    let expanded = expanded_scene_lights(app)
+        .into_iter()
+        .map(|(_, _, light)| light)
+        .collect::<Vec<_>>();
+    let mut lights = bake_lights_for_mode(&expanded, mode);
     lights.extend(material_emitter_lights(app, face_emitters, mode));
     lights
 }
@@ -2673,6 +2679,7 @@ pub(crate) fn run_gpu_ao_pass(app: &mut AppState, scope: BakeScope) -> Result<()
             let dir = fibonacci_sphere_direction(sample, samples);
             let sky_light = EditorLight {
                 name: "AO Sky Sample".to_string(),
+                attached_to: None,
                 kind: LightKind::Directional,
                 profile: LightProfile::Both,
                 position: V3::default(),
@@ -3863,6 +3870,7 @@ mod emitter_tests {
     fn bounce_fill_reaches_surfaces_with_zero_direct_lambert_term() {
         let light = EditorLight {
             name: "Grazing sun".to_string(),
+            attached_to: None,
             kind: LightKind::Directional,
             profile: LightProfile::Day,
             position: V3::default(),
@@ -3906,6 +3914,7 @@ mod emitter_tests {
     fn test_area_sample(area: f32) -> EditorLight {
         EditorLight {
             name: "Area sample".to_string(),
+            attached_to: None,
             kind: LightKind::Area,
             profile: LightProfile::Both,
             position: V3::default(),
@@ -3956,6 +3965,7 @@ mod emitter_tests {
         }
         lights.push(EditorLight {
             name: "Global ambient".to_string(),
+            attached_to: None,
             kind: LightKind::Ambient,
             profile: LightProfile::Both,
             position: V3::default(),
@@ -4102,6 +4112,7 @@ mod emitter_tests {
         };
         let light = EditorLight {
             name: "Vertical sun".to_string(),
+            attached_to: None,
             kind: LightKind::Directional,
             profile: LightProfile::Day,
             position: V3::default(),
@@ -4160,6 +4171,7 @@ mod emitter_tests {
         };
         let light = EditorLight {
             name: "Downlight".to_string(),
+            attached_to: None,
             kind: LightKind::Spot,
             profile: LightProfile::Both,
             position: V3 {
@@ -4194,6 +4206,7 @@ mod emitter_tests {
     fn directional_vector_is_the_direction_light_travels() {
         let light = EditorLight {
             name: "Sun".to_string(),
+            attached_to: None,
             kind: LightKind::Directional,
             profile: LightProfile::Day,
             position: V3::default(),
@@ -4282,6 +4295,7 @@ mod emitter_tests {
     fn spotlight_only_lights_inside_its_forward_cone() {
         let light = EditorLight {
             name: "Spot".to_string(),
+            attached_to: None,
             kind: LightKind::Spot,
             profile: LightProfile::Both,
             position: V3::default(),

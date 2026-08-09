@@ -109,13 +109,19 @@ impl DffOptimizeReport {
             ));
         }
         if self.duplicate_faces_removed > 0 {
-            parts.push(format!("{} duplicate face(s)", self.duplicate_faces_removed));
+            parts.push(format!(
+                "{} duplicate face(s)",
+                self.duplicate_faces_removed
+            ));
         }
         if self.vertices_welded > 0 {
             parts.push(format!("{} vertex weld(s)", self.vertices_welded));
         }
         if self.unused_vertices_removed > 0 {
-            parts.push(format!("{} unused vertex(es)", self.unused_vertices_removed));
+            parts.push(format!(
+                "{} unused vertex(es)",
+                self.unused_vertices_removed
+            ));
         }
         if self.duplicate_materials_merged > 0 {
             parts.push(format!(
@@ -156,16 +162,15 @@ impl DffOptimizeReport {
 fn component_tri_ranges(raw: &RawMesh) -> Vec<(usize, usize)> {
     let total = raw.triangles.len();
     if raw.components.is_empty() {
-        return if total == 0 { Vec::new() } else { vec![(0, total)] };
+        return if total == 0 {
+            Vec::new()
+        } else {
+            vec![(0, total)]
+        };
     }
     raw.components
         .iter()
-        .map(|component| {
-            (
-                component.tri_start.min(total),
-                component.tri_end.min(total),
-            )
-        })
+        .map(|component| (component.tri_start.min(total), component.tri_end.min(total)))
         .filter(|(start, end)| start < end)
         .collect()
 }
@@ -175,7 +180,11 @@ fn component_tri_ranges(raw: &RawMesh) -> Vec<(usize, usize)> {
 fn component_vertex_ranges(raw: &RawMesh) -> Vec<(usize, usize)> {
     let total = raw.vertices.len();
     if raw.components.is_empty() {
-        return if total == 0 { Vec::new() } else { vec![(0, total)] };
+        return if total == 0 {
+            Vec::new()
+        } else {
+            vec![(0, total)]
+        };
     }
     raw.components
         .iter()
@@ -260,7 +269,7 @@ fn apply_triangle_order(raw: &mut RawMesh, start: usize, order: &[usize]) -> usi
 
 /// Drop the triangles whose `keep` flag is false, shifting component triangle
 /// ranges so they keep describing the same faces.
-fn retain_triangles(raw: &mut RawMesh, keep: &[bool]) -> usize {
+pub(crate) fn retain_raw_triangles(raw: &mut RawMesh, keep: &[bool]) -> usize {
     debug_assert_eq!(keep.len(), raw.triangles.len());
     let removed = keep.iter().filter(|flag| !**flag).count();
     if removed == 0 {
@@ -466,7 +475,9 @@ pub(crate) fn dff_remove_degenerate_faces(raw: &mut RawMesh) -> usize {
         .triangles
         .iter()
         .map(|triangle| {
-            if triangle.a >= vertex_count || triangle.b >= vertex_count || triangle.c >= vertex_count
+            if triangle.a >= vertex_count
+                || triangle.b >= vertex_count
+                || triangle.c >= vertex_count
             {
                 return false;
             }
@@ -481,7 +492,7 @@ pub(crate) fn dff_remove_degenerate_faces(raw: &mut RawMesh) -> usize {
             ka != kb && kb != kc && ka != kc
         })
         .collect::<Vec<_>>();
-    retain_triangles(raw, &keep)
+    retain_raw_triangles(raw, &keep)
 }
 
 /// Remove triangles that repeat an earlier triangle with the same material and
@@ -497,7 +508,7 @@ pub(crate) fn dff_remove_duplicate_faces(raw: &mut RawMesh) -> usize {
             seen.insert((triangle.material, corners))
         })
         .collect::<Vec<_>>();
-    retain_triangles(raw, &keep)
+    retain_raw_triangles(raw, &keep)
 }
 
 /// Collapse vertices inside the same component that agree on every stream.
@@ -538,11 +549,7 @@ pub(crate) fn dff_weld_vertices(raw: &mut RawMesh) -> usize {
             ]);
             if has_normals {
                 let normal = raw.normals[index];
-                key.extend([
-                    quantize(normal.x),
-                    quantize(normal.y),
-                    quantize(normal.z),
-                ]);
+                key.extend([quantize(normal.x), quantize(normal.y), quantize(normal.z)]);
             }
             if has_uvs {
                 let uv = raw.uvs[index];
@@ -947,19 +954,53 @@ mod tests {
         let mut raw = RawMesh::default();
         raw.vertices = vec![
             // glass, farther from centre
-            V3 { x: -1.0, y: 4.0, z: 0.0 },
-            V3 { x: 1.0, y: 4.0, z: 0.0 },
-            V3 { x: 0.0, y: 4.0, z: 1.0 },
+            V3 {
+                x: -1.0,
+                y: 4.0,
+                z: 0.0,
+            },
+            V3 {
+                x: 1.0,
+                y: 4.0,
+                z: 0.0,
+            },
+            V3 {
+                x: 0.0,
+                y: 4.0,
+                z: 1.0,
+            },
             // wall, nearer the centre
-            V3 { x: -1.0, y: 0.5, z: 0.0 },
-            V3 { x: 1.0, y: 0.5, z: 0.0 },
-            V3 { x: 0.0, y: 0.5, z: 1.0 },
+            V3 {
+                x: -1.0,
+                y: 0.5,
+                z: 0.0,
+            },
+            V3 {
+                x: 1.0,
+                y: 0.5,
+                z: 0.0,
+            },
+            V3 {
+                x: 0.0,
+                y: 0.5,
+                z: 1.0,
+            },
         ];
         raw.materials = vec![material(0.5), material(1.0)];
         raw.material_textures = vec!["glass".to_string(), "wall".to_string()];
         raw.triangles = vec![
-            Tri { a: 0, b: 1, c: 2, material: 0 },
-            Tri { a: 3, b: 4, c: 5, material: 1 },
+            Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 0,
+            },
+            Tri {
+                a: 3,
+                b: 4,
+                c: 5,
+                material: 1,
+            },
         ];
         raw
     }
@@ -970,7 +1011,10 @@ mod tests {
         let transparent = BTreeSet::from([0usize]);
         let moved = dff_reorder_transparent_faces(&mut raw, &transparent, false);
         assert_eq!(moved, 2);
-        assert_eq!(raw.triangles[0].material, 1, "opaque wall must render first");
+        assert_eq!(
+            raw.triangles[0].material, 1,
+            "opaque wall must render first"
+        );
         assert_eq!(raw.triangles[1].material, 0, "glass must render last");
     }
 
@@ -1061,8 +1105,18 @@ mod tests {
     #[test]
     fn degenerate_and_duplicate_faces_are_removed() {
         let mut raw = glass_before_wall();
-        raw.triangles.push(Tri { a: 0, b: 0, c: 2, material: 0 });
-        raw.triangles.push(Tri { a: 2, b: 1, c: 0, material: 0 });
+        raw.triangles.push(Tri {
+            a: 0,
+            b: 0,
+            c: 2,
+            material: 0,
+        });
+        raw.triangles.push(Tri {
+            a: 2,
+            b: 1,
+            c: 0,
+            material: 0,
+        });
         assert_eq!(dff_remove_degenerate_faces(&mut raw), 1);
         assert_eq!(dff_remove_duplicate_faces(&mut raw), 1);
         assert_eq!(raw.triangles.len(), 2);
@@ -1071,7 +1125,15 @@ mod tests {
     #[test]
     fn removing_triangles_shifts_component_ranges() {
         let mut raw = glass_before_wall();
-        raw.triangles.insert(0, Tri { a: 0, b: 0, c: 0, material: 0 });
+        raw.triangles.insert(
+            0,
+            Tri {
+                a: 0,
+                b: 0,
+                c: 0,
+                material: 0,
+            },
+        );
         raw.components = vec![RawMeshComponent {
             name: "a".to_string(),
             frame_index: None,
@@ -1100,14 +1162,35 @@ mod tests {
     fn welding_collapses_identical_vertices_and_compacts_them() {
         let mut raw = RawMesh::default();
         raw.vertices = vec![
-            V3 { x: 0.0, y: 0.0, z: 0.0 },
-            V3 { x: 1.0, y: 0.0, z: 0.0 },
-            V3 { x: 0.0, y: 1.0, z: 0.0 },
-            V3 { x: 0.0, y: 0.0, z: 0.0 },
+            V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            V3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            V3 {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
         ];
         raw.materials = vec![material(1.0)];
         raw.material_textures = vec!["wall".to_string()];
-        raw.triangles = vec![Tri { a: 3, b: 1, c: 2, material: 0 }];
+        raw.triangles = vec![Tri {
+            a: 3,
+            b: 1,
+            c: 2,
+            material: 0,
+        }];
         assert_eq!(dff_weld_vertices(&mut raw), 1);
         assert_eq!(dff_remove_unused_vertices(&mut raw), 1);
         assert_eq!(raw.vertices.len(), 3);

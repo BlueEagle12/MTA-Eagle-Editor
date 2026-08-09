@@ -622,7 +622,7 @@ pub(crate) fn update_asset_browser(app: &mut AppState, mouse: Vec2) -> bool {
         .floor()
         .max(1.0) as usize;
     let max_scroll = entries.len().div_ceil(cols).saturating_sub(visible_rows) as f32;
-    let (_, wheel) = mouse_wheel();
+    let (_, wheel) = safe_mouse_wheel();
     if wheel.abs() > 0.0 {
         app.asset_browser.scroll = (app.asset_browser.scroll - wheel).clamp(0.0, max_scroll);
         return true;

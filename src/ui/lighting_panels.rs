@@ -1,6 +1,8 @@
 use super::super::*;
 
-const LIGHT_LIST_VISIBLE_ROWS: usize = 7;
+pub(crate) const LIGHT_LIST_VISIBLE_ROWS: usize = 7;
+const LIGHT_TEMPERATURE_MIN: f32 = 1_000.0;
+const LIGHT_TEMPERATURE_MAX: f32 = 40_000.0;
 
 pub(crate) fn light_button_rect(app: &AppState, slot: usize) -> Rect {
     let panel_x = screen_width() - RIGHT_PANEL_W;
@@ -441,6 +443,44 @@ pub(crate) fn update_light_color_picker(app: &mut AppState, mouse: Vec2) -> bool
     false
 }
 
+fn light_temperature_from_fraction(fraction: f32) -> f32 {
+    ui_temperature_from_fraction(fraction, LIGHT_TEMPERATURE_MIN, LIGHT_TEMPERATURE_MAX)
+}
+
+pub(crate) fn update_light_temperature_slider(app: &mut AppState, mouse: Vec2) -> bool {
+    if !is_mouse_button_down(MouseButton::Left) {
+        if let Some(before) = app.light_temperature_drag_before.take() {
+            commit_light_history(app, "Set Light Temperature", before);
+            return true;
+        }
+        return false;
+    }
+    if app.active_tab != AppTab::Lights || app.selected_light >= app.lights.len() {
+        app.light_temperature_drag_before = None;
+        return false;
+    }
+    if !app.lights[app.selected_light].use_temperature {
+        app.light_temperature_drag_before = None;
+        return false;
+    }
+    let rect = inspector_field_rect(app, InspectorField::LightTemperature);
+    if app.light_temperature_drag_before.is_none() && !rect.contains(mouse) {
+        return false;
+    }
+    if app.light_temperature_drag_before.is_none() {
+        app.light_temperature_drag_before = Some(light_history_snapshot(app));
+        app.inspector_edit = None;
+        app.light_kind_dropdown_open = false;
+        app.light_profile_dropdown_open = false;
+    }
+    let fraction = ((mouse.x - rect.x) / rect.w).clamp(0.0, 1.0);
+    if let Some(light) = app.lights.get_mut(app.selected_light) {
+        light.temperature = light_temperature_from_fraction(fraction).round();
+        mark_lights_changed(app);
+    }
+    true
+}
+
 pub(crate) fn handle_lights_click(app: &mut AppState, mouse: Vec2) -> bool {
     if update_light_color_picker(app, mouse) {
         return true;
@@ -451,7 +491,7 @@ pub(crate) fn handle_lights_click(app: &mut AppState, mouse: Vec2) -> bool {
     if !inspector_panel_content_rect().contains(mouse) {
         return false;
     }
-    if is_mouse_button_pressed(MouseButton::Right) {
+    if ctrl_down() && is_mouse_button_pressed(MouseButton::Right) {
         if let Some(row) = light_row_at(app, mouse) {
             if row < app.lights.len() {
                 app.selected_light = row;
@@ -563,6 +603,59 @@ pub(crate) fn handle_lights_click(app: &mut AppState, mouse: Vec2) -> bool {
         }
     }
     false
+}
+
+/// Open light dropdowns are modal within the inspector: the first click is
+/// always handled by the popup, so controls visually underneath cannot fire.
+pub(crate) fn handle_open_light_dropdown_click(app: &mut AppState, mouse: Vec2) -> bool {
+    if app.active_tab != AppTab::Lights
+        || (!app.light_kind_dropdown_open && !app.light_profile_dropdown_open)
+        || !is_mouse_button_pressed(MouseButton::Left)
+    {
+        return false;
+    }
+    if app.light_kind_dropdown_open {
+        for (row, kind) in light_kind_options().into_iter().enumerate() {
+            if light_kind_option_rect(app, row).contains(mouse) {
+                let before = light_history_snapshot(app);
+                if let Some(light) = app.lights.get_mut(app.selected_light) {
+                    light.kind = kind;
+                    mark_lights_changed(app);
+                }
+                commit_light_history(app, "Set Light Kind", before);
+                app.light_kind_dropdown_open = false;
+                return true;
+            }
+        }
+        if inspector_field_rect(app, InspectorField::LightProfile).contains(mouse) {
+            app.light_kind_dropdown_open = false;
+            app.light_profile_dropdown_open = true;
+            app.inspector_edit = None;
+            return true;
+        }
+        app.light_kind_dropdown_open = false;
+        return true;
+    }
+    for (row, profile) in light_profile_options().into_iter().enumerate() {
+        if light_profile_option_rect(app, row).contains(mouse) {
+            let before = light_history_snapshot(app);
+            if let Some(light) = app.lights.get_mut(app.selected_light) {
+                light.profile = profile;
+                mark_lights_changed(app);
+            }
+            commit_light_history(app, "Set Light Profile", before);
+            app.light_profile_dropdown_open = false;
+            return true;
+        }
+    }
+    if inspector_field_rect(app, InspectorField::LightKind).contains(mouse) {
+        app.light_profile_dropdown_open = false;
+        app.light_kind_dropdown_open = true;
+        app.inspector_edit = None;
+        return true;
+    }
+    app.light_profile_dropdown_open = false;
+    true
 }
 
 pub(crate) fn handle_bake_click(app: &mut AppState, mouse: Vec2) -> bool {
@@ -815,7 +908,13 @@ pub(crate) fn draw_lights_panel(app: &AppState) {
         let light = &app.lights[row];
         ui_text(
             &app.ui_font,
-            &ellipsize(&light.name, 18),
+            &ellipsize(
+                &match light.attached_to.as_deref() {
+                    Some(model) => format!("{}  @ {}", light.name, model),
+                    None => light.name.clone(),
+                },
+                19,
+            ),
             row_rect.x + 8.0,
             row_rect.y + 17.0,
             WHITE,
@@ -823,14 +922,14 @@ pub(crate) fn draw_lights_panel(app: &AppState) {
         ui_text(
             &app.ui_font,
             light_kind_label(light.kind),
-            row_rect.x + 150.0,
+            row_rect.x + 190.0,
             row_rect.y + 17.0,
             ui_dim(),
         );
         ui_text(
             &app.ui_font,
             light_profile_label(light.profile),
-            row_rect.x + 238.0,
+            row_rect.x + 300.0,
             row_rect.y + 17.0,
             ui_muted(),
         );
@@ -838,19 +937,16 @@ pub(crate) fn draw_lights_panel(app: &AppState) {
     if app.lights.len() > LIGHT_LIST_VISIBLE_ROWS {
         let list = light_list_rect(app);
         let max_scroll = app.lights.len().saturating_sub(LIGHT_LIST_VISIBLE_ROWS) as f32;
-        let thumb_h =
-            (list.h * LIGHT_LIST_VISIBLE_ROWS as f32 / app.lights.len() as f32).clamp(24.0, list.h);
-        let thumb_y = list.y
-            + (list.h - thumb_h)
-                * (app.light_list_scroll.min(max_scroll) / max_scroll).clamp(0.0, 1.0);
-        draw_rrect(
-            list.x + list.w - 6.0,
-            thumb_y + 2.0,
-            4.0,
-            (thumb_h - 4.0).max(12.0),
-            3.0,
-            Color::new(0.34, 0.36, 0.40, 0.9),
-        );
+        let track = Rect::new(list.x + list.w - 6.0, list.y + 2.0, 4.0, list.h - 4.0);
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            LIGHT_LIST_VISIBLE_ROWS as f32,
+            app.lights.len() as f32,
+            24.0,
+            app.light_list_scroll.min(max_scroll),
+        ) {
+            draw_scrollbar(metrics, scrollbar_visual_state(track, false));
+        }
     }
     ui_text(
         &app.ui_font,
@@ -874,7 +970,9 @@ pub(crate) fn draw_lights_panel(app: &AppState) {
             _ => "Direction (Light Travel)",
         };
         draw_input_box(app, InspectorField::LightDirection, direction_label);
-        draw_input_box(app, InspectorField::LightTemperature, "Temperature K");
+        if app.lights[app.selected_light].use_temperature {
+            draw_light_temperature_slider(app);
+        }
         draw_input_box(app, InspectorField::LightRadius, "Radius");
         if let Some(light) = app.lights.get(app.selected_light) {
             draw_checkbox(
@@ -890,7 +988,12 @@ pub(crate) fn draw_lights_panel(app: &AppState) {
                 light.casts_shadow,
             );
         }
-        draw_light_color_picker(app);
+        if !app.lights[app.selected_light].use_temperature {
+            draw_light_color_picker(app);
+        }
+        // Popups are deliberately rendered last so later inspector controls do
+        // not paint over them.
+        draw_light_dropdown_overlays(app);
     }
     end_ui_clip();
     draw_inspector_scrollbar(app, lights_panel_scroll_max());
@@ -940,7 +1043,12 @@ pub(crate) fn draw_light_kind_dropdown(app: &AppState) {
         rect.y + 20.0,
         ui_dim(),
     );
+}
 
+pub(crate) fn draw_light_dropdown_overlays(app: &AppState) {
+    let Some(light) = app.lights.get(app.selected_light) else {
+        return;
+    };
     if app.light_kind_dropdown_open {
         for (row, kind) in light_kind_options().into_iter().enumerate() {
             let option = light_kind_option_rect(app, row);
@@ -966,6 +1074,42 @@ pub(crate) fn draw_light_kind_dropdown(app: &AppState) {
             ui_text(
                 &app.ui_font,
                 light_kind_label(kind),
+                option.x + 10.0,
+                option.y + 19.0,
+                if selected {
+                    Color::new(0.76, 0.78, 0.82, 1.0)
+                } else {
+                    WHITE
+                },
+            );
+        }
+        return;
+    }
+    if app.light_profile_dropdown_open {
+        for (row, profile) in light_profile_options().into_iter().enumerate() {
+            let option = light_profile_option_rect(app, row);
+            let option_hovered = option.contains(mouse_position().into());
+            let selected = profile == light.profile;
+            let bg = if selected {
+                ui_accent_soft()
+            } else if option_hovered {
+                ui_surface_hover()
+            } else {
+                ui_surface()
+            };
+            draw_rrect_bordered(
+                option.x,
+                option.y,
+                option.w,
+                option.h,
+                6.0,
+                1.0,
+                bg,
+                ui_border(),
+            );
+            ui_text(
+                &app.ui_font,
+                light_profile_label(profile),
                 option.x + 10.0,
                 option.y + 19.0,
                 if selected {
@@ -1018,42 +1162,29 @@ pub(crate) fn draw_light_profile_dropdown(app: &AppState) {
         rect.y + 20.0,
         ui_dim(),
     );
+}
 
-    if app.light_profile_dropdown_open {
-        for (row, profile) in light_profile_options().into_iter().enumerate() {
-            let option = light_profile_option_rect(app, row);
-            let option_hovered = option.contains(mouse_position().into());
-            let selected = profile == light.profile;
-            let bg = if selected {
-                ui_accent_soft()
-            } else if option_hovered {
-                ui_surface_hover()
-            } else {
-                ui_surface()
-            };
-            draw_rrect_bordered(
-                option.x,
-                option.y,
-                option.w,
-                option.h,
-                6.0,
-                1.0,
-                bg,
-                ui_border(),
-            );
-            ui_text(
-                &app.ui_font,
-                light_profile_label(profile),
-                option.x + 10.0,
-                option.y + 19.0,
-                if selected {
-                    Color::new(0.76, 0.78, 0.82, 1.0)
-                } else {
-                    WHITE
-                },
-            );
-        }
-    }
+pub(crate) fn draw_light_temperature_slider(app: &AppState) {
+    let Some(light) = app.lights.get(app.selected_light) else {
+        return;
+    };
+    let rect = inspector_field_rect(app, InspectorField::LightTemperature);
+    let alpha = if light.use_temperature { 1.0 } else { 0.45 };
+    ui_text_size(
+        &app.ui_font,
+        &format!("Temperature  {:.0} K", light.temperature),
+        rect.x,
+        rect.y - 7.0,
+        14,
+        Color::new(ui_dim().r, ui_dim().g, ui_dim().b, alpha),
+    );
+    draw_temperature_channel_slider(
+        rect,
+        light.temperature,
+        LIGHT_TEMPERATURE_MIN,
+        LIGHT_TEMPERATURE_MAX,
+        alpha,
+    );
 }
 
 pub(crate) fn draw_light_color_picker(app: &AppState) {
@@ -1087,37 +1218,7 @@ pub(crate) fn draw_light_color_picker(app: &AppState) {
             rect.y + 14.0,
             Color::new(LIGHTGRAY.r, LIGHTGRAY.g, LIGHTGRAY.b, alpha),
         );
-        draw_rrect_bordered(
-            rect.x,
-            rect.y,
-            rect.w,
-            rect.h,
-            6.0,
-            1.0,
-            Color::new(0.050, 0.058, 0.070, 1.0),
-            if light.use_temperature {
-                ui_muted()
-            } else {
-                ui_border()
-            },
-        );
-        let bar_color = Color::new(color.r, color.g, color.b, alpha);
-        draw_rrect(
-            rect.x,
-            rect.y,
-            rect.w * value.clamp(0.0, 1.0),
-            rect.h,
-            6.0,
-            bar_color,
-        );
-        draw_line(
-            rect.x + rect.w * value.clamp(0.0, 1.0),
-            rect.y - 2.0,
-            rect.x + rect.w * value.clamp(0.0, 1.0),
-            rect.y + rect.h + 2.0,
-            2.0,
-            Color::new(WHITE.r, WHITE.g, WHITE.b, alpha),
-        );
+        draw_color_channel_slider(rect, color, value, alpha);
     }
     let swatch = light_color_swatch_rect(app);
     draw_rrect_bordered(
@@ -1370,32 +1471,7 @@ pub(crate) fn draw_bake_panel(app: &AppState) {
     for (idx, (label, color, value)) in channels.into_iter().enumerate() {
         let rect = layout.color_bars[idx];
         ui_text(&app.ui_font, label, rect.x - 28.0, rect.y + 14.0, LIGHTGRAY);
-        draw_rrect_bordered(
-            rect.x,
-            rect.y,
-            rect.w,
-            rect.h,
-            6.0,
-            1.0,
-            Color::new(0.050, 0.058, 0.070, 1.0),
-            ui_border(),
-        );
-        draw_rrect(
-            rect.x,
-            rect.y,
-            rect.w * value.clamp(0.0, 1.0),
-            rect.h,
-            6.0,
-            color,
-        );
-        draw_line(
-            rect.x + rect.w * value.clamp(0.0, 1.0),
-            rect.y - 2.0,
-            rect.x + rect.w * value.clamp(0.0, 1.0),
-            rect.y + rect.h + 2.0,
-            2.0,
-            WHITE,
-        );
+        draw_color_channel_slider(rect, color, value, 1.0);
     }
     draw_input_box(app, InspectorField::VertexPaintTemperature, "Temp K");
     draw_input_box(app, InspectorField::VertexPaintRadius, "Radius");

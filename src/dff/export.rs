@@ -700,7 +700,11 @@ pub(crate) fn rewrite_dff_bin_mesh_face_order(
             {
                 return Err("DFF BinMesh indices are invalid".to_string());
             }
-            let triangle_count = if triangle_strip { index_count - 2 } else { index_count / 3 };
+            let triangle_count = if triangle_strip {
+                index_count - 2
+            } else {
+                index_count / 3
+            };
             out.extend(std::iter::repeat_n(material, triangle_count));
             offset += index_count * 4;
         }
@@ -802,7 +806,8 @@ pub(crate) fn rewrite_dff_bin_mesh_face_order(
         let mut groups = Vec::<(u16, Vec<u32>)>::new();
         for triangle in updated {
             let material = *material_map.get(&triangle.material).ok_or_else(|| {
-                "DFF face reorder introduced a material not present in the source BinMesh".to_string()
+                "DFF face reorder introduced a material not present in the source BinMesh"
+                    .to_string()
             })?;
             let indices = [triangle.b, triangle.a, triangle.c];
             if indices.iter().any(|index| {
@@ -820,7 +825,10 @@ pub(crate) fn rewrite_dff_bin_mesh_face_order(
                     .map(|index| index - updated_component.vertex_start as u32),
             );
         }
-        let total_indices = groups.iter().map(|(_, indices)| indices.len()).sum::<usize>();
+        let total_indices = groups
+            .iter()
+            .map(|(_, indices)| indices.len())
+            .sum::<usize>();
         let mut replacement = Vec::with_capacity(12 + total_indices * 4 + groups.len() * 8);
         replacement.extend_from_slice(&0u32.to_le_bytes());
         replacement.extend_from_slice(&(groups.len() as u32).to_le_bytes());
@@ -1771,12 +1779,13 @@ fn component_frame_index(raw: &RawMesh, component: &RawMeshComponent) -> usize {
         .frame_index
         .filter(|index| *index < raw.frames.len())
         .or_else(|| {
-            (!component.name.trim().is_empty()).then(|| {
-                raw.frames
-                    .iter()
-                    .position(|frame| frame.name.eq_ignore_ascii_case(&component.name))
-            })
-            .flatten()
+            (!component.name.trim().is_empty())
+                .then(|| {
+                    raw.frames
+                        .iter()
+                        .position(|frame| frame.name.eq_ignore_ascii_case(&component.name))
+                })
+                .flatten()
         })
         .unwrap_or(0)
 }
@@ -1795,12 +1804,14 @@ fn build_hierarchy_export_meshes(raw: &RawMesh, include_normals: bool) -> Vec<Hi
 
     let mut exports = Vec::new();
     for (component_index, component) in raw.components.iter().enumerate() {
-        if component.tri_start >= component.tri_end {
+        let tri_start = component.tri_start.min(raw.triangles.len());
+        let tri_end = component.tri_end.min(raw.triangles.len());
+        if tri_start >= tri_end {
             continue;
         }
         let frame_index = component_frame_index(raw, component);
         let mut component_raw = raw.clone();
-        component_raw.triangles = raw.triangles[component.tri_start..component.tri_end].to_vec();
+        component_raw.triangles = raw.triangles[tri_start..tri_end].to_vec();
         if let Some(frame) = raw.frames.get(frame_index) {
             for vertex in &mut component_raw.vertices {
                 *vertex = inverse_frame_point(frame, *vertex);
@@ -2267,9 +2278,21 @@ pub(crate) fn write_normalized_dff_with_options(
         vec![RawMeshFrame {
             name: frame_name.to_string(),
             parent: -1,
-            right: V3 { x: 1.0, y: 0.0, z: 0.0 },
-            up: V3 { x: 0.0, y: 1.0, z: 0.0 },
-            at: V3 { x: 0.0, y: 0.0, z: 1.0 },
+            right: V3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            up: V3 {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            at: V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
             pos: V3::default(),
         }]
     } else {
@@ -2280,8 +2303,18 @@ pub(crate) fn write_normalized_dff_with_options(
     let mut frame_struct = Vec::new();
     for frame in &output_frames {
         for value in [
-            frame.right.x, frame.right.y, frame.right.z, frame.up.x, frame.up.y, frame.up.z,
-            frame.at.x, frame.at.y, frame.at.z, frame.pos.x, frame.pos.y, frame.pos.z,
+            frame.right.x,
+            frame.right.y,
+            frame.right.z,
+            frame.up.x,
+            frame.up.y,
+            frame.up.z,
+            frame.at.x,
+            frame.at.y,
+            frame.at.z,
+            frame.pos.x,
+            frame.pos.y,
+            frame.pos.z,
         ] {
             frame_struct.extend_from_slice(&value.to_le_bytes());
         }
@@ -2335,7 +2368,9 @@ pub(crate) fn write_normalized_dff_with_options(
     clump.extend_from_slice(&rw_chunk(0x1a, geometry_list));
     for (geometry_idx, export) in exports.iter().enumerate() {
         clump.extend_from_slice(&write_atomic(
-            export.frame_index.min(output_frames.len().saturating_sub(1)) as u32,
+            export
+                .frame_index
+                .min(output_frames.len().saturating_sub(1)) as u32,
             geometry_idx as u32,
             has_material_animations,
         ));
@@ -3673,26 +3708,79 @@ mod tests {
         let identity = |name: &str, parent| RawMeshFrame {
             name: name.to_string(),
             parent,
-            right: V3 { x: 1.0, y: 0.0, z: 0.0 },
-            up: V3 { x: 0.0, y: 1.0, z: 0.0 },
-            at: V3 { x: 0.0, y: 0.0, z: 1.0 },
+            right: V3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            up: V3 {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            at: V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
             pos: V3::default(),
         };
         let mut child = identity("door_lf_dummy", 0);
         child.pos.x = 10.0;
         let raw = RawMesh {
             vertices: vec![
-                V3 { x: 0.0, y: 0.0, z: 0.0 },
-                V3 { x: 1.0, y: 0.0, z: 0.0 },
-                V3 { x: 0.0, y: 1.0, z: 0.0 },
-                V3 { x: 10.0, y: 0.0, z: 0.0 },
-                V3 { x: 11.0, y: 0.0, z: 0.0 },
-                V3 { x: 10.0, y: 1.0, z: 0.0 },
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 10.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 11.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 10.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
             ],
-            normals: vec![V3 { x: 0.0, y: 0.0, z: 1.0 }; 6],
+            normals: vec![
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0
+                };
+                6
+            ],
             triangles: vec![
-                Tri { a: 0, b: 1, c: 2, material: 0 },
-                Tri { a: 3, b: 4, c: 5, material: 0 },
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 5,
+                    material: 0,
+                },
             ],
             material_textures: vec!["shared".into()],
             components: vec![
@@ -3728,7 +3816,11 @@ mod tests {
         assert_eq!(parsed.components.len(), 2);
         assert_eq!(parsed.components[0].frame_index, Some(0));
         assert_eq!(parsed.components[1].frame_index, Some(1));
-        assert!(parsed.vertices.iter().any(|vertex| (vertex.x - 10.0).abs() < 0.001));
+        assert!(
+            parsed
+                .vertices
+                .iter()
+                .any(|vertex| (vertex.x - 10.0).abs() < 0.001)
+        );
     }
-
 }

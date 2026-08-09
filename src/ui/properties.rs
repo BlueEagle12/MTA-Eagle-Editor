@@ -31,11 +31,23 @@ pub(crate) fn right_panel_rect() -> Rect {
     )
 }
 
+/// The outliner is secondary to inspecting and manipulating the scene. On a
+/// narrow window it is hidden so the viewport retains enough room for direct
+/// selection and camera navigation.
+pub(crate) fn left_sidebar_visible() -> bool {
+    screen_width() >= LEFT_SIDEBAR_MIN_SCREEN_W
+}
+
+pub(crate) fn left_panel_width() -> f32 {
+    if left_sidebar_visible() { PANEL_W } else { 0.0 }
+}
+
 pub(crate) fn editor_viewport_rect() -> Rect {
+    let left = left_panel_width();
     Rect::new(
-        PANEL_W,
+        left,
         TOP_H,
-        (screen_width() - PANEL_W - RIGHT_PANEL_W).max(16.0),
+        (screen_width() - left - RIGHT_PANEL_W).max(16.0),
         (screen_height() - TOP_H - STATUS_H).max(16.0),
     )
 }
@@ -76,24 +88,65 @@ pub(crate) fn draw_inspector_scrollbar(app: &AppState, max_scroll: f32) {
         return;
     }
     let view = inspector_panel_content_rect();
-    let track = Rect::new(view.x + view.w - 7.0, view.y + 4.0, 4.0, view.h - 8.0);
-    let content_h = view.h + max_scroll;
-    let thumb_h = (track.h * view.h / content_h).clamp(28.0, track.h);
-    let thumb_y =
-        track.y + (track.h - thumb_h) * (app.properties_scroll / max_scroll).clamp(0.0, 1.0);
-    draw_rrect(
-        track.x,
-        thumb_y,
-        track.w,
-        thumb_h,
-        3.0,
-        Color::new(0.34, 0.36, 0.40, 0.9),
-    );
+    let track = inspector_scrollbar_track_rect();
+    if let Some(metrics) = scrollbar_metrics(
+        track,
+        view.h,
+        view.h + max_scroll,
+        28.0,
+        app.properties_scroll,
+    ) {
+        draw_scrollbar(metrics, scrollbar_visual_state(track, false));
+    }
+}
+
+pub(crate) fn inspector_scrollbar_track_rect() -> Rect {
+    let view = inspector_panel_content_rect();
+    Rect::new(view.x + view.w - 7.0, view.y + 4.0, 4.0, view.h - 8.0)
+}
+
+pub(crate) fn inspector_scroll_from_mouse(app: &AppState, mouse: Vec2) -> Option<f32> {
+    let max_scroll = properties_scroll_max(app);
+    let track = properties_scrollbar_track_rect(app);
+    let hit_area = Rect::new(track.x - 6.0, track.y, track.w + 12.0, track.h);
+    if max_scroll <= 0.0 || !hit_area.contains(mouse) {
+        return None;
+    }
+    let view = properties_scrollbar_view_rect(app);
+    let thumb_h = (track.h * view.h / (view.h + max_scroll)).clamp(28.0, track.h);
+    Some(scrollbar_scroll_from_pointer(
+        track, thumb_h, max_scroll, mouse,
+    ))
+}
+
+pub(crate) fn inspector_scroll_from_pointer(app: &AppState, mouse: Vec2) -> f32 {
+    let max_scroll = properties_scroll_max(app);
+    let track = properties_scrollbar_track_rect(app);
+    let view = properties_scrollbar_view_rect(app);
+    let thumb_h = (track.h * view.h / (view.h + max_scroll)).clamp(28.0, track.h);
+    scrollbar_scroll_from_pointer(track, thumb_h, max_scroll, mouse)
+}
+
+fn properties_scrollbar_view_rect(app: &AppState) -> Rect {
+    if app.active_tab == AppTab::Preview && app.properties_tab == PropertiesTab::Settings {
+        properties_content_rect()
+    } else {
+        inspector_panel_content_rect()
+    }
+}
+
+fn properties_scrollbar_track_rect(app: &AppState) -> Rect {
+    if app.active_tab == AppTab::Preview && app.properties_tab == PropertiesTab::Settings {
+        let view = properties_content_rect();
+        Rect::new(view.x + view.w - 5.0, view.y + 4.0, 3.0, view.h - 8.0)
+    } else {
+        inspector_scrollbar_track_rect()
+    }
 }
 
 pub(crate) fn properties_scroll_max(app: &AppState) -> f32 {
     if app.active_tab == AppTab::Validation {
-        return validation_scroll_max(app);
+        return 0.0;
     }
     if app.active_tab == AppTab::LodAudit {
         return lod_audit_scroll_max(app);
@@ -116,10 +169,14 @@ pub(crate) fn properties_scroll_max(app: &AppState) -> f32 {
     if app.active_tab == AppTab::Water {
         return water_panel_scroll_max();
     }
-    if app.active_tab != AppTab::Preview || app.properties_tab != PropertiesTab::Element {
+    if app.active_tab != AppTab::Preview {
         return 0.0;
     }
-    element_panel_max_scroll(&element_panel_layout(app))
+    match app.properties_tab {
+        PropertiesTab::Element => element_panel_max_scroll(&element_panel_layout(app)),
+        PropertiesTab::Settings => settings_panel_max_scroll(&settings_panel_layout(app)),
+        PropertiesTab::History => 0.0,
+    }
 }
 
 pub(crate) fn clamp_properties_scroll(app: &mut AppState) {
@@ -848,6 +905,7 @@ pub(crate) struct SettingsPanelLayout {
     pub(crate) global_reset: Option<Rect>,
     pub(crate) global_apply: Option<Rect>,
     pub(crate) hint_y: f32,
+    pub(crate) content_height: f32,
 }
 
 pub(crate) fn settings_panel_layout(app: &AppState) -> SettingsPanelLayout {
@@ -876,8 +934,9 @@ pub(crate) fn settings_panel_layout(app: &AppState) -> SettingsPanelLayout {
         global_reset: None,
         global_apply: None,
         hint_y: 0.0,
+        content_height: 0.0,
     };
-    let mut y = content.y + 6.0;
+    let mut y = content.y + 6.0 - app.properties_scroll;
 
     // Keep the project-wide operation at the top so it remains reachable on
     // shorter windows even when every settings section is expanded.
@@ -955,7 +1014,15 @@ pub(crate) fn settings_panel_layout(app: &AppState) -> SettingsPanelLayout {
     }
 
     layout.hint_y = y + 18.0;
+    // The footer is drawn below the final section. Measure through its
+    // baseline (plus bottom breathing room), otherwise max scroll stops while
+    // the footer is still clipped off the bottom of the panel.
+    layout.content_height = (layout.hint_y + app.properties_scroll) - content.y + 10.0;
     layout
+}
+
+pub(crate) fn settings_panel_max_scroll(layout: &SettingsPanelLayout) -> f32 {
+    (layout.content_height - properties_content_rect().h).max(0.0)
 }
 
 fn element_layout_rect(app: &AppState, pick: impl Fn(&ElementPanelLayout) -> Option<Rect>) -> Rect {
@@ -1559,18 +1626,9 @@ pub(crate) fn set_placement_override_flag(placement: &mut Placement, flag: &str,
     }
 }
 
-pub(crate) fn collision_edit_button_rect(app: &AppState) -> Rect {
-    Rect::new(
-        screen_width() - RIGHT_PANEL_W + 18.0,
-        TOP_H + 148.0 - app.properties_scroll,
-        140.0,
-        30.0,
-    )
-}
-
 pub(crate) fn collision_open_col_editor_rect(app: &AppState) -> Rect {
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 176.0,
+        screen_width() - RIGHT_PANEL_W + 18.0,
         TOP_H + 148.0 - app.properties_scroll,
         150.0,
         30.0,
@@ -2042,6 +2100,20 @@ pub(crate) fn col_material_option_rect(app: &AppState, row: usize) -> Rect {
     )
 }
 
+/// The material picker is a nested, scrollable control. Keeping its scrollbar
+/// geometry here makes drawing and pointer input agree exactly.
+pub(crate) fn col_material_dropdown_scrollbar_rect(app: &AppState) -> Rect {
+    let visible = COL_MATERIAL_DROPDOWN_VISIBLE.min(GTA_SA_COL_MATERIALS.len());
+    let first = col_material_option_rect(app, 0);
+    let last = col_material_option_rect(app, visible.saturating_sub(1));
+    let pad = 4.0;
+    let panel_x = first.x - pad;
+    let panel_y = first.y - pad;
+    let panel_w = first.w + pad * 2.0;
+    let panel_h = (last.y + last.h) - first.y + pad * 2.0;
+    Rect::new(panel_x + panel_w - 5.0, panel_y + 3.0, 3.0, panel_h - 6.0)
+}
+
 pub(crate) fn draw_col_material_dropdown(app: &AppState) {
     let rect = inspector_field_rect(app, InspectorField::CollisionFaceMaterial);
     let value = inspector_field_value(app, InspectorField::CollisionFaceMaterial)
@@ -2178,19 +2250,12 @@ pub(crate) fn draw_col_material_dropdown_popup(app: &AppState) {
 
     // Scrollbar indicator on the right edge of the popup.
     if total > visible {
-        let track_x = panel_x + panel_w - 5.0;
-        let track_y = panel_y + 3.0;
-        let track_h = panel_h - 6.0;
-        draw_rrect(track_x, track_y, 3.0, track_h, 1.5, ui_border());
-        let thumb_h = (track_h * visible as f32 / total as f32).max(14.0);
-        let max_start = total.saturating_sub(visible) as f32;
-        let frac = if max_start > 0.0 {
-            start as f32 / max_start
-        } else {
-            0.0
-        };
-        let thumb_y = track_y + (track_h - thumb_h) * frac;
-        draw_rrect(track_x, thumb_y, 3.0, thumb_h, 1.5, ui_accent());
+        let track = col_material_dropdown_scrollbar_rect(app);
+        if let Some(metrics) =
+            scrollbar_metrics(track, visible as f32, total as f32, 14.0, start as f32)
+        {
+            draw_scrollbar(metrics, scrollbar_visual_state(track, false));
+        }
     }
 }
 
@@ -3144,23 +3209,15 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
             3.0,
             content.h - 8.0,
         );
-        draw_rectangle(
-            track.x,
-            track.y,
-            track.w,
-            track.h,
-            Color::new(1.0, 1.0, 1.0, 0.06),
-        );
-        let thumb_h = (track.h * content.h / layout.content_height).max(24.0);
-        let frac = (app.properties_scroll / max_scroll).clamp(0.0, 1.0);
-        let thumb_y = track.y + frac * (track.h - thumb_h);
-        draw_rectangle(
-            track.x,
-            thumb_y,
-            track.w,
-            thumb_h,
-            Color::new(1.0, 1.0, 1.0, 0.25),
-        );
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            content.h,
+            layout.content_height,
+            24.0,
+            app.properties_scroll,
+        ) {
+            draw_scrollbar(metrics, scrollbar_visual_state(track, false));
+        }
     }
     draw_physics_root_dropdown_popup(app);
 }
@@ -3320,6 +3377,20 @@ pub(crate) fn draw_properties_settings(app: &AppState, _x: f32, _y: f32) {
         layout.hint_y,
         ui_muted(),
     );
+    let max_scroll = settings_panel_max_scroll(&layout);
+    if max_scroll > 0.0 {
+        let view = properties_content_rect();
+        let track = properties_scrollbar_track_rect(app);
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            view.h,
+            layout.content_height,
+            24.0,
+            app.properties_scroll,
+        ) {
+            draw_scrollbar(metrics, scrollbar_visual_state(track, false));
+        }
+    }
 }
 
 pub(crate) fn draw_properties_history(app: &AppState, x: f32, y: f32) {
@@ -3420,16 +3491,6 @@ pub(crate) fn draw_collision_panel(app: &AppState) {
     }
     text_button(
         &app.ui_font,
-        collision_edit_button_rect(app),
-        if app.collision_edit_mode {
-            "Edit Faces"
-        } else {
-            "View Only"
-        },
-        app.collision_edit_mode,
-    );
-    text_button(
-        &app.ui_font,
         collision_open_col_editor_rect(app),
         "COL Editor",
         false,
@@ -3446,62 +3507,34 @@ pub(crate) fn draw_collision_panel(app: &AppState) {
     }
     ui_text(
         &app.ui_font,
-        if app.collision_edit_mode {
-            "Click a COL face to edit material/light."
-        } else {
-            "Enable Edit Faces to pick individual triangles."
-        },
+        "View collision geometry here (read-only).",
         x + 14.0,
         y + 190.0,
         ui_muted(),
     );
-    if let Some(selected) = app.selected_col_face {
-        ui_text(&app.ui_font, "Selected Face", x + 14.0, y + 226.0, ui_dim());
-        ui_text(
-            &app.ui_font,
-            &format!("#{} on element {}", selected.face, selected.placement),
-            x + 14.0,
-            y + 248.0,
-            WHITE,
-        );
-        draw_input_box(app, InspectorField::CollisionFaceLight, "Light");
-        draw_input_box(app, InspectorField::CollisionVertexX, "Vertex X");
-        draw_input_box(app, InspectorField::CollisionVertexY, "Vertex Y");
-        draw_input_box(app, InspectorField::CollisionVertexZ, "Vertex Z");
-        draw_col_material_dropdown(app);
-        if let Some(p) = app.placements.get(selected.placement) {
-            if let Some(mesh) = element_collision_mesh(app, p) {
-                if let Some(face) = mesh.faces.get(selected.face) {
-                    ui_text(
-                        &app.ui_font,
-                        &format!("Verts {}, {}, {}", face.a, face.b, face.c),
-                        x + 14.0,
-                        TOP_H + 446.0 - app.properties_scroll,
-                        LIGHTGRAY,
-                    );
-                }
-            }
-        }
-    } else {
-        ui_text(
-            &app.ui_font,
-            "No face selected",
-            x + 14.0,
-            y + 226.0,
-            ui_dim(),
-        );
-    }
     ui_text(
         &app.ui_font,
-        "Moving/rotating the element moves its base model and COL together.",
+        "Open the COL Editor to make changes.",
         x + 14.0,
-        y + 550.0,
+        y + 212.0,
+        ui_muted(),
+    );
+    ui_text(
+        &app.ui_font,
+        "Element transforms keep its base model and",
+        x + 14.0,
+        y + 538.0,
+        ui_muted(),
+    );
+    ui_text(
+        &app.ui_font,
+        "and collision geometry together.",
+        x + 14.0,
+        y + 560.0,
         ui_muted(),
     );
     ui_text_size(&app.ui_font, "History", x + 14.0, y + 590.0, 18, WHITE);
     draw_properties_history(app, x, y + 600.0);
-    // Draw the material dropdown's expanded list last so it overlays content below.
-    draw_col_material_dropdown_popup(app);
     end_ui_clip();
     draw_inspector_scrollbar(app, collision_panel_scroll_max());
 }
@@ -3523,13 +3556,13 @@ pub(crate) fn draw_metric_row(
 
 pub(crate) fn timecyc_weather_button_rect(app: &AppState, slot: usize) -> Rect {
     let x = screen_width() - RIGHT_PANEL_W + 18.0;
-    let y = TOP_H + 650.0 - app.properties_scroll;
+    let y = TOP_H + 730.0 - app.properties_scroll;
     Rect::new(x + slot as f32 * 168.0, y, 150.0, 28.0)
 }
 
 pub(crate) fn timecyc_phase_button_rect(app: &AppState, slot: usize) -> Rect {
     let x = screen_width() - RIGHT_PANEL_W + 18.0;
-    let y = TOP_H + 708.0 - app.properties_scroll;
+    let y = TOP_H + 780.0 - app.properties_scroll;
     let col = slot % 2;
     let row = slot / 2;
     Rect::new(x + col as f32 * 168.0, y + row as f32 * 36.0, 150.0, 28.0)
@@ -3537,7 +3570,7 @@ pub(crate) fn timecyc_phase_button_rect(app: &AppState, slot: usize) -> Rect {
 
 pub(crate) fn fog_strength_button_rect(app: &AppState, slot: usize) -> Rect {
     let x = screen_width() - RIGHT_PANEL_W + 18.0;
-    let y = TOP_H + 814.0 - app.properties_scroll;
+    let y = TOP_H + 908.0 - app.properties_scroll;
     Rect::new(x + slot as f32 * 168.0, y, 150.0, 28.0)
 }
 
@@ -3799,55 +3832,55 @@ pub(crate) fn draw_scene_panel(app: &AppState) {
         app.duplicate_placement_scan_rx.is_some(),
     );
 
-    ui_text_size(&app.ui_font, "Selection", x + 14.0, y + 448.0, 18, WHITE);
+    ui_text_size(&app.ui_font, "Selection", x + 14.0, y + 472.0, 18, WHITE);
     if let Some(p) = app.placements.get(app.selected) {
         draw_metric_row(
             &app.ui_font,
             "ID",
             ellipsize(&p.id, 20),
             x + 14.0,
-            y + 462.0,
+            y + 508.0,
         );
-        draw_metric_row(&app.ui_font, "Type", &p.tag, x + 14.0, y + 488.0);
+        draw_metric_row(&app.ui_font, "Type", &p.tag, x + 14.0, y + 534.0);
         draw_metric_row(
             &app.ui_font,
             "Zone",
             ellipsize(&p.zone, 20),
             x + 14.0,
-            y + 514.0,
+            y + 560.0,
         );
         draw_metric_row(
             &app.ui_font,
             "DFF",
             ellipsize(&p.dff, 20),
             x + 14.0,
-            y + 540.0,
+            y + 586.0,
         );
     } else {
         ui_text(
             &app.ui_font,
             "No element selected",
             x + 14.0,
-            y + 462.0,
+            y + 508.0,
             ui_dim(),
         );
     }
 
     let sample = active_timecyc_sample(&app.timecyc);
-    ui_text_size(&app.ui_font, "Timecycle", x + 14.0, y + 600.0, 18, WHITE);
+    ui_text_size(&app.ui_font, "Timecycle", x + 14.0, y + 640.0, 18, WHITE);
     draw_metric_row(
         &app.ui_font,
         "Weather",
         ellipsize(active_timecyc_weather_name(&app.timecyc), 18),
         x + 14.0,
-        y + 636.0,
+        y + 676.0,
     );
     draw_metric_row(
         &app.ui_font,
         "Phase",
         active_timecyc_phase_label(app),
         x + 14.0,
-        y + 662.0,
+        y + 702.0,
     );
     text_button(
         &app.ui_font,
@@ -3894,17 +3927,17 @@ pub(crate) fn draw_scene_panel(app: &AppState) {
             sample.far_clip,
         ),
         x + 14.0,
-        y + 874.0,
+        y + 968.0,
         ui_muted(),
     );
-    ui_text_size(&app.ui_font, "History", x + 14.0, y + 930.0, 18, WHITE);
-    draw_properties_history(app, x, y + 940.0);
+    ui_text_size(&app.ui_font, "History", x + 14.0, y + 1_024.0, 18, WHITE);
+    draw_properties_history(app, x, y + 1_034.0);
     end_ui_clip();
     draw_inspector_scrollbar(app, scene_panel_scroll_max());
 }
 
 pub(crate) fn scene_panel_scroll_max() -> f32 {
-    panel_scroll_max_for_bottom(TOP_H + 12.0 + 1_560.0)
+    panel_scroll_max_for_bottom(TOP_H + 12.0 + 1_654.0)
 }
 
 #[allow(dead_code)]

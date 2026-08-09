@@ -1147,6 +1147,26 @@ mod tests {
     }
 
     #[test]
+    fn successful_resource_save_invalidates_the_autosave_commit_marker() {
+        let root = temp_resource_root("autosave_invalidated_by_save");
+        let autosave_root = autosave_root_path(&root);
+        fs::create_dir_all(autosave_root.join("zones").join("test")).unwrap();
+        fs::write(autosave_root.join("eagleZones.txt"), "test\n").unwrap();
+        fs::write(
+            autosave_root.join("zones").join("test").join("test.map"),
+            "<map>\n</map>\n",
+        )
+        .unwrap();
+        fs::write(autosave_meta_path(&root), "unix_millis=9999999999999\n").unwrap();
+
+        assert!(autosave_is_newer_than_saved(&root));
+        assert!(invalidate_autosave_after_resource_save(&root).unwrap());
+        assert!(!autosave_is_newer_than_saved(&root));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn incomplete_autosave_without_commit_marker_is_not_restorable() {
         let root = temp_resource_root("autosave_incomplete");
         let autosave_root = autosave_root_path(&root);
@@ -3034,11 +3054,13 @@ mod tests {
                 z: 0.0,
             },
         ]);
-        raw.normals.extend([V3 {
-            x: 0.0,
-            y: 0.0,
-            z: 1.0,
-        }; 3]);
+        raw.normals.extend(
+            [V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            }; 3],
+        );
         raw.uvs.extend([V2 { u: 0.0, v: 0.0 }; 3]);
         raw.materials = vec![
             RawMaterial {
@@ -4073,8 +4095,13 @@ fn optimize_dff_bytes(
         .any(|component| component.breakable.is_some())
     {
         let mut transparent = dff_transparent_material_set(&compacted, |_| false);
-        transparent.extend(transparent_materials.iter().map(|material| *material as usize));
-        transparent_faces_reordered = dff_reorder_transparent_faces(&mut compacted, &transparent, false);
+        transparent.extend(
+            transparent_materials
+                .iter()
+                .map(|material| *material as usize),
+        );
+        transparent_faces_reordered =
+            dff_reorder_transparent_faces(&mut compacted, &transparent, false);
     }
     let compaction_changed = compaction.vertices_removed != 0
         || compaction.invalid_triangles_removed != 0
@@ -5622,6 +5649,11 @@ fn write_manual_save_snapshot(snapshot: ManualSaveWriteSnapshot) -> ManualSaveRe
                         warnings.push(format!("Could not remove {}: {err}", path.display()));
                     }
                 }
+                if matches!(snapshot.mode, ManualSaveMode::Resource)
+                    && let Err(err) = invalidate_autosave_after_resource_save(&source_root)
+                {
+                    warnings.push(err);
+                }
             }
         }
     }
@@ -6665,6 +6697,22 @@ fn cleanup_autosaves(root: &Path) -> Result<bool, String> {
         .map_err(|err| format!("Could not remove {}: {err}", autosave_dir.display()))
 }
 
+/// A completed resource save contains every change captured by any older
+/// autosave.  Removing only the commit marker keeps the old recovery files
+/// available for diagnostics while making them ineligible for restoration.
+fn invalidate_autosave_after_resource_save(root: &Path) -> Result<bool, String> {
+    let marker = autosave_meta_path(root);
+    if !marker.is_file() {
+        return Ok(false);
+    }
+    fs::remove_file(&marker).map(|()| true).map_err(|err| {
+        format!(
+            "Could not clear obsolete autosave marker {}: {err}",
+            marker.display()
+        )
+    })
+}
+
 fn poll_autosave_cleanup(app: &mut AppState) -> bool {
     let Some(rx) = app.autosave_cleanup_rx.take() else {
         return false;
@@ -6802,11 +6850,11 @@ pub(crate) fn maybe_prompt_autosave_restore(app: &mut AppState) {
     }
     app.confirm_dialog = Some(ConfirmDialog {
         action: ConfirmAction::RestoreAutosave(app.root.clone()),
-        title: "Restore Autosave?".to_string(),
-        body: "An autosave newer than the saved resource was found.".to_string(),
-        detail: "Restore loads the autosave snapshot without modifying the main resource or WIP snapshot. Save or Save WIP afterward to keep it.".to_string(),
-        primary_label: "Restore".to_string(),
-        secondary_label: Some("Ignore".to_string()),
+        title: "Recovery Copy Available".to_string(),
+        body: "A recovery copy is available with unsaved changes made after the resource was last saved.".to_string(),
+        detail: "Open it to review the changes without altering the saved resource. Use Save to apply them, or Save WIP to keep the recovery copy separately.".to_string(),
+        primary_label: "Open Recovery Copy".to_string(),
+        secondary_label: Some("Keep Saved Version".to_string()),
         secondary_action: Some(ConfirmAction::DismissAutosave),
     });
 }
@@ -7435,8 +7483,7 @@ pub(crate) fn update_purge_unused_assets(app: &mut AppState) {
         summary.loose_dffs.retain(|key| !keys.contains(key));
         summary.loose_cols.retain(|key| !keys.contains(key));
         summary.loose_txds.retain(|key| !keys.contains(key));
-        let max_scroll = validation_scroll_max_cached(summary);
-        app.properties_scroll = app.properties_scroll.clamp(0.0, max_scroll);
+        clamp_validation_list_scroll(app);
     }
     let elapsed = job.started_at.elapsed().as_secs_f32();
     app.status_message = format!(
@@ -11424,6 +11471,8 @@ pub(crate) fn open_preferences_dialog(app: &mut AppState) {
         gta_sa_dir,
         gizmo_scale: clamp_gizmo_scale(app.gizmo_scale),
         camera_speed: clamp_camera_speed(app.camera_speed),
+        vehicle_camera_speed: clamp_detail_camera_speed(app.vehicle_camera_speed),
+        editing_camera_speed: clamp_editing_camera_speed(app.editing_camera_speed),
         camera_rotation_speed: clamp_camera_rotation_speed(app.camera_rotation_speed),
         // MSAA only takes effect at window creation, so the live value is the
         // saved preference rather than anything on AppState.
@@ -12286,19 +12335,19 @@ pub(crate) fn choose_gif_path(start_dir: PathBuf) -> Result<Option<PathBuf>, Str
 pub(crate) fn choose_editing_open_path(start_dir: PathBuf) -> Result<Option<PathBuf>, String> {
     #[cfg(windows)]
     return windows_pick_file(
-        "Open IMG or RenderWare Asset",
+        "Open RenderWare Asset",
         &start_dir,
-        "IMG or RenderWare assets",
-        &["img", "txd", "dff", "col"],
+        "RenderWare assets",
+        &["txd", "dff", "col"],
     );
 
     let mut kdialog = Command::new("kdialog");
     kdialog
         .arg("--title")
-        .arg("Open IMG or RenderWare Asset")
+        .arg("Open RenderWare Asset")
         .arg("--getopenfilename")
         .arg(start_dir.to_string_lossy().to_string())
-        .arg("*.img *.txd *.dff *.col *|IMG or RenderWare assets");
+        .arg("*.txd *.dff *.col|RenderWare assets");
     match run_folder_picker_command(kdialog) {
         Ok(result) => return Ok(result),
         Err(kdialog_err) => {
@@ -12310,9 +12359,42 @@ pub(crate) fn choose_editing_open_path(start_dir: PathBuf) -> Result<Option<Path
             };
             zenity
                 .arg("--file-selection")
-                .arg("--title=Open IMG or RenderWare Asset")
+                .arg("--title=Open RenderWare Asset")
                 .arg(format!("--filename={filename}"))
-                .arg("--file-filter=IMG or RenderWare assets | *.img *.txd *.dff *.col *");
+                .arg("--file-filter=RenderWare assets | *.txd *.dff *.col");
+            match run_folder_picker_command(zenity) {
+                Ok(result) => Ok(result),
+                Err(zenity_err) => Err(format!("{kdialog_err}; {zenity_err}")),
+            }
+        }
+    }
+}
+
+pub(crate) fn choose_editing_img_open_path(start_dir: PathBuf) -> Result<Option<PathBuf>, String> {
+    #[cfg(windows)]
+    return windows_pick_file("Open IMG Archive", &start_dir, "IMG archives", &["img"]);
+
+    let mut kdialog = Command::new("kdialog");
+    kdialog
+        .arg("--title")
+        .arg("Open IMG Archive")
+        .arg("--getopenfilename")
+        .arg(start_dir.to_string_lossy().to_string())
+        .arg("*.img|IMG archives");
+    match run_folder_picker_command(kdialog) {
+        Ok(result) => return Ok(result),
+        Err(kdialog_err) => {
+            let mut zenity = Command::new("zenity");
+            let filename = if start_dir.is_dir() {
+                format!("{}/", start_dir.to_string_lossy())
+            } else {
+                start_dir.to_string_lossy().to_string()
+            };
+            zenity
+                .arg("--file-selection")
+                .arg("--title=Open IMG Archive")
+                .arg(format!("--filename={filename}"))
+                .arg("--file-filter=IMG archives | *.img");
             match run_folder_picker_command(zenity) {
                 Ok(result) => Ok(result),
                 Err(zenity_err) => Err(format!("{kdialog_err}; {zenity_err}")),
@@ -12780,6 +12862,7 @@ pub(crate) fn poll_dff_picker(app: &mut AppState) {
             Ok(Some(path)),
         ) => replace_texture_in_archive(app, definition_id, txd_name, texture_name, path),
         (DffPickerKind::EditingOpenFile, Ok(Some(path))) => open_editing_file(app, path),
+        (DffPickerKind::EditingOpenImg, Ok(Some(path))) => open_editing_img(app, path),
         (DffPickerKind::EditingPairTxd, Ok(Some(path))) => editing_pair_dff_txd(app, path),
         (DffPickerKind::EditingPairTxd, Ok(None)) => {
             app.status_message = "TXD pairing cancelled".to_string();
@@ -12863,6 +12946,9 @@ pub(crate) fn poll_dff_picker(app: &mut AppState) {
         }
         (DffPickerKind::EditingOpenFile, Ok(None)) => {
             app.status_message = "Open file cancelled".to_string()
+        }
+        (DffPickerKind::EditingOpenImg, Ok(None)) => {
+            app.status_message = "Open IMG archive cancelled".to_string()
         }
         (DffPickerKind::EditingMergeImg, Ok(None)) => {
             app.status_message = "Merge IMG cancelled".to_string()
@@ -13031,6 +13117,12 @@ pub(crate) fn selected_col_name(app: &AppState) -> Option<String> {
 
 pub(crate) fn find_dff_entry(root: &Path, dff_name: &str) -> Option<ImgEntry> {
     let target = lower(with_ext(dff_name, ".dff"));
+    // An imported/replaced DFF remains staged in replacements.img until the
+    // resource is saved. Export must use that exact payload rather than falling
+    // back to the source IMG, whose data may no longer match the live asset.
+    if let Some(entry) = find_staged_replacement_entry(root, &target) {
+        return Some(entry);
+    }
     let mut img_files = collect_resource_img_files(root);
     img_files.extend(gta_sa_img_files(&load_gta_sa_dir_preference()));
     for path in img_files {

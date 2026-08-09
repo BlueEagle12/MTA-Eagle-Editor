@@ -133,6 +133,22 @@ pub(crate) fn ui_text_width(text: &str, size: u16) -> f32 {
     ui_text_width_with_font(font, text, size)
 }
 
+/// Returns a font size that keeps `text` within `max_width` without truncating it.
+pub(crate) fn ui_text_size_to_fit(text: &str, preferred_size: u16, max_width: f32) -> u16 {
+    if text.is_empty() || max_width <= 0.0 {
+        return preferred_size.max(1);
+    }
+    let preferred_width = ui_text_width(text, preferred_size);
+    if preferred_width <= max_width || preferred_width <= 0.0 {
+        return preferred_size;
+    }
+    let mut size = ((preferred_size as f32 * max_width / preferred_width).floor() as u16).max(1);
+    while size > 1 && ui_text_width(text, size) > max_width {
+        size -= 1;
+    }
+    size
+}
+
 pub(crate) fn glyph_advance(font: &UiFont, ch: char, scale: f32) -> f32 {
     if ch == '\t' {
         font.space_advance * scale * 4.0
@@ -235,12 +251,131 @@ pub(crate) fn draw_rrect_bordered(
     );
 }
 
+/// Canonical RGB(A) channel slider used by every editor color picker.
+pub(crate) fn draw_color_channel_slider(rect: Rect, tint: Color, value: f32, alpha: f32) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let value = value.clamp(0.0, 1.0);
+    draw_rrect_bordered(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        6.0,
+        1.0,
+        Color::new(0.050, 0.058, 0.070, 1.0),
+        if alpha < 0.999 {
+            ui_muted()
+        } else {
+            ui_border()
+        },
+    );
+    draw_rrect(
+        rect.x,
+        rect.y,
+        rect.w * value,
+        rect.h,
+        6.0,
+        Color::new(tint.r, tint.g, tint.b, alpha),
+    );
+    let marker_x = rect.x + rect.w * value;
+    draw_line(
+        marker_x,
+        rect.y - 2.0,
+        marker_x,
+        rect.y + rect.h + 2.0,
+        2.0,
+        Color::new(WHITE.r, WHITE.g, WHITE.b, alpha),
+    );
+}
+
+pub(crate) fn ui_temperature_fraction(temperature: f32, minimum: f32, maximum: f32) -> f32 {
+    let minimum_log = minimum.max(1.0).ln();
+    let maximum_log = maximum.max(minimum + 1.0).ln();
+    ((temperature.clamp(minimum, maximum).ln() - minimum_log) / (maximum_log - minimum_log))
+        .clamp(0.0, 1.0)
+}
+
+pub(crate) fn ui_temperature_from_fraction(fraction: f32, minimum: f32, maximum: f32) -> f32 {
+    let minimum_log = minimum.max(1.0).ln();
+    let maximum_log = maximum.max(minimum + 1.0).ln();
+    (minimum_log + fraction.clamp(0.0, 1.0) * (maximum_log - minimum_log)).exp()
+}
+
+/// Canonical warm-to-cool temperature slider matching the RGB slider geometry.
+pub(crate) fn draw_temperature_channel_slider(
+    rect: Rect,
+    temperature: f32,
+    minimum: f32,
+    maximum: f32,
+    alpha: f32,
+) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let background = Color::new(0.050, 0.058, 0.070, 1.0);
+    draw_rrect_bordered(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        6.0,
+        1.0,
+        background,
+        if alpha < 0.999 {
+            ui_muted()
+        } else {
+            ui_border()
+        },
+    );
+    const SEGMENTS: usize = 96;
+    let radius = 6.0f32.min(rect.h * 0.5);
+    for segment in 0..SEGMENTS {
+        let start = segment as f32 / SEGMENTS as f32;
+        let end = (segment + 1) as f32 / SEGMENTS as f32;
+        let sample = ui_temperature_from_fraction((start + end) * 0.5, minimum, maximum);
+        let source = color_from_temperature(sample);
+        let color = Color::new(
+            source.x * alpha + background.r * (1.0 - alpha),
+            source.y * alpha + background.g * (1.0 - alpha),
+            source.z * alpha + background.b * (1.0 - alpha),
+            1.0,
+        );
+        let midpoint_x = rect.w * (start + end) * 0.5;
+        let edge_distance = midpoint_x.min(rect.w - midpoint_x);
+        let vertical_inset = if edge_distance < radius {
+            let dx = radius - edge_distance;
+            radius - (radius * radius - dx * dx).max(0.0).sqrt()
+        } else {
+            0.0
+        };
+        draw_rectangle(
+            rect.x + rect.w * start,
+            rect.y + vertical_inset,
+            rect.w * (end - start) + 0.5,
+            (rect.h - vertical_inset * 2.0).max(0.0),
+            color,
+        );
+    }
+    let marker_x = rect.x + rect.w * ui_temperature_fraction(temperature, minimum, maximum);
+    draw_line(
+        marker_x,
+        rect.y - 2.0,
+        marker_x,
+        rect.y + rect.h + 2.0,
+        2.0,
+        Color::new(WHITE.r, WHITE.g, WHITE.b, alpha),
+    );
+}
+
 pub(crate) fn ui_dim() -> Color {
-    Color::new(0.64, 0.66, 0.70, 1.0)
+    // Secondary text is used extensively in inspectors and tables. Keep it
+    // distinctly subordinate to white without making it disappear on dark
+    // surfaces.
+    Color::new(0.70, 0.72, 0.77, 1.0)
 }
 
 pub(crate) fn ui_muted() -> Color {
-    Color::new(0.42, 0.44, 0.48, 1.0)
+    // Muted copy still needs to be readable at the small sizes used for
+    // descriptions, paths, and inactive metadata.
+    Color::new(0.54, 0.56, 0.61, 1.0)
 }
 
 pub(crate) fn ui_panel_bg() -> Color {
@@ -268,7 +403,11 @@ pub(crate) fn ui_surface() -> Color {
 }
 
 pub(crate) fn ui_surface_hover() -> Color {
-    Color::new(0.140, 0.147, 0.158, 1.0)
+    if ui_interaction_suppressed() {
+        ui_surface()
+    } else {
+        Color::new(0.140, 0.147, 0.158, 1.0)
+    }
 }
 
 pub(crate) fn ui_surface_active() -> Color {
@@ -285,6 +424,28 @@ pub(crate) fn ui_accent_soft() -> Color {
 
 pub(crate) fn ui_shadow() -> Color {
     Color::new(0.0, 0.0, 0.0, 0.28)
+}
+
+/// A compact, high-contrast warning with a consistent semantic treatment.
+/// `title` identifies the decision while `detail` explains its consequence.
+pub(crate) fn draw_ui_warning_alert(font: &Font, rect: Rect, title: &str, detail: &str) {
+    let border = Color::new(0.88, 0.62, 0.16, 1.0);
+    let heading = Color::new(1.0, 0.82, 0.39, 1.0);
+    draw_rrect_bordered(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        7.0,
+        1.0,
+        Color::new(0.19, 0.135, 0.035, 0.96),
+        border,
+    );
+    // The colored marker makes the severity recognizable before reading.
+    draw_circle(rect.x + 17.0, rect.y + 17.0, 9.0, border);
+    ui_text_bold("!", rect.x + 14.6, rect.y + 21.5, 13, ui_input_bg());
+    ui_text_bold(title, rect.x + 32.0, rect.y + 18.0, 14, heading);
+    ui_text_size(font, detail, rect.x + 32.0, rect.y + 36.0, 13, ui_dim());
 }
 
 pub(crate) fn draw_panel_rect(_font: &Font, rect: Rect, title: Option<&str>) {

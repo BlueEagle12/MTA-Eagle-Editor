@@ -1476,27 +1476,6 @@ pub(crate) fn replace_or_append_texture_native_in_txd_exact(
     replace_or_append_texture_native_in_txd_impl(txd_bytes, &texture_native, texture_name)
 }
 
-/// Copy an existing native texture without normalizing its legacy RenderWare
-/// name. GTA dictionaries can contain names with spaces (for example
-/// `new road`), and a DFF lookup must keep matching that name byte-for-byte
-/// apart from case. Import/rename flows intentionally use the sanitized helper
-/// above; dictionary-to-dictionary repair must preserve the source identifier.
-pub(crate) fn replace_or_append_matching_texture_native_in_txd(
-    txd_bytes: Vec<u8>,
-    texture_native: &[u8],
-    texture_name: &str,
-) -> Result<Vec<u8>, String> {
-    let expected = lower(texture_name.trim());
-    let actual = texture_native_name(texture_native, 0, texture_native.len())
-        .ok_or_else(|| "Source texture native has no readable texture name".to_string())?;
-    if actual != expected {
-        return Err(format!(
-            "Source texture name '{actual}' does not match requested texture '{expected}'"
-        ));
-    }
-    replace_or_append_texture_native_in_txd_impl(txd_bytes, texture_native, &expected)
-}
-
 fn replace_or_append_texture_native_in_txd_impl(
     txd_bytes: Vec<u8>,
     texture_native: &[u8],
@@ -2646,7 +2625,7 @@ mod txd_import_tests {
         let source = raw_bgra_native("new road", *b"DXT1");
 
         let updated =
-            replace_or_append_matching_texture_native_in_txd(destination, &source, "new road")
+            replace_or_append_texture_native_in_txd_exact(destination, &source, "new road")
                 .unwrap();
 
         assert!(txd_contains_texture_native(&updated, "new road"));
@@ -3719,8 +3698,7 @@ pub(crate) fn invalidate_validation_cache(app: &mut AppState) {
 
 pub(crate) fn refresh_validation_cache(app: &mut AppState) {
     app.validation_cache = Some(validation_summary(app));
-    let max_scroll = validation_scroll_max_cached(app.validation_cache.as_ref().unwrap());
-    app.properties_scroll = app.properties_scroll.clamp(0.0, max_scroll);
+    clamp_validation_list_scroll(app);
 }
 
 #[derive(Clone, Debug)]

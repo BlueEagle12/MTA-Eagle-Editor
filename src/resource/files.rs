@@ -640,6 +640,7 @@ pub(crate) fn default_lights() -> Vec<EditorLight> {
     vec![
         EditorLight {
             name: "Sun".to_string(),
+            attached_to: None,
             kind: LightKind::Directional,
             profile: LightProfile::Day,
             position: V3::default(),
@@ -662,6 +663,7 @@ pub(crate) fn default_lights() -> Vec<EditorLight> {
         },
         EditorLight {
             name: "Moon".to_string(),
+            attached_to: None,
             kind: LightKind::Directional,
             profile: LightProfile::Night,
             position: V3::default(),
@@ -1849,6 +1851,7 @@ mod material_emitter_tests {
         fs::create_dir_all(&root).unwrap();
         let lights = vec![EditorLight {
             name: "Side Lamp".to_string(),
+            attached_to: Some("streetlight".to_string()),
             kind: LightKind::Point,
             profile: LightProfile::Night,
             position: V3 {
@@ -2161,6 +2164,11 @@ pub(crate) fn light_from_attrs(attrs: &BTreeMap<String, String>, index: usize) -
             .get("name")
             .cloned()
             .unwrap_or_else(|| format!("Light {}", index + 1)),
+        attached_to: attrs
+            .get("attachedTo")
+            .or_else(|| attrs.get("attached_to"))
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
         kind: parse_light_kind(
             attrs
                 .get("kind")
@@ -2222,6 +2230,7 @@ pub(crate) fn light_from_attrs(attrs: &BTreeMap<String, String>, index: usize) -
 fn editor_light_to_json(light: &EditorLight) -> serde_json::Value {
     serde_json::json!({
         "name": light.name,
+        "attachedTo": light.attached_to,
         "kind": light_kind_label(light.kind),
         "profile": light_profile_label(light.profile),
         "position": [light.position.x, light.position.y, light.position.z],
@@ -2249,6 +2258,12 @@ fn editor_light_from_json(value: &serde_json::Value, index: usize) -> Option<Edi
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("Light {}", index + 1)),
+        attached_to: value
+            .get("attachedTo")
+            .or_else(|| value.get("attached_to"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string),
         kind: parse_light_kind(
             value
                 .get("kind")
@@ -2407,8 +2422,9 @@ pub(crate) fn save_lights_xml(path: &Path, lights: &[EditorLight]) -> Result<(),
     let mut out = String::from("<Light_List version=\"1\">\n");
     for light in lights {
         out.push_str(&format!(
-            "    <light name=\"{}\" kind=\"{}\" profile=\"{}\" posX=\"{:.3}\" posY=\"{:.3}\" posZ=\"{:.3}\" dirX=\"{:.5}\" dirY=\"{:.5}\" dirZ=\"{:.5}\" colorX=\"{:.4}\" colorY=\"{:.4}\" colorZ=\"{:.4}\" temperature=\"{:.0}\" useTemperature=\"{}\" intensity=\"{:.4}\" radius=\"{:.3}\" castsShadow=\"{}\" pointLobe=\"{}\" />\n",
+            "    <light name=\"{}\" attachedTo=\"{}\" kind=\"{}\" profile=\"{}\" posX=\"{:.3}\" posY=\"{:.3}\" posZ=\"{:.3}\" dirX=\"{:.5}\" dirY=\"{:.5}\" dirZ=\"{:.5}\" colorX=\"{:.4}\" colorY=\"{:.4}\" colorZ=\"{:.4}\" temperature=\"{:.0}\" useTemperature=\"{}\" intensity=\"{:.4}\" radius=\"{:.3}\" castsShadow=\"{}\" pointLobe=\"{}\" />\n",
             xml_escape(&light.name),
+            xml_escape(light.attached_to.as_deref().unwrap_or("")),
             light_kind_label(light.kind),
             light_profile_label(light.profile),
             light.position.x,

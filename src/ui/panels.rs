@@ -303,10 +303,14 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     let sh = screen_height();
     let right_x = sw - RIGHT_PANEL_W;
     draw_rectangle(0.0, 0.0, sw, TOP_H, ui_shell_bg());
-    draw_rectangle(0.0, 76.0, sw, TOP_H - 76.0, ui_canvas_bg());
+    draw_rectangle(0.0, 76.0, sw, 36.0, ui_canvas_bg());
+    draw_rectangle(0.0, 112.0, sw, TOP_H - 112.0, ui_shell_bg());
     draw_line(0.0, 75.0, sw, 75.0, 1.0, ui_border());
+    draw_line(0.0, 112.0, sw, 112.0, 1.0, ui_border());
     if app.active_tab != AppTab::Editing && app.active_tab != AppTab::Vehicles {
-        draw_rectangle(0.0, TOP_H, PANEL_W, sh - TOP_H - STATUS_H, ui_canvas_bg());
+        if left_sidebar_visible() {
+            draw_rectangle(0.0, TOP_H, PANEL_W, sh - TOP_H - STATUS_H, ui_canvas_bg());
+        }
         draw_rectangle(
             right_x,
             TOP_H,
@@ -325,7 +329,9 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     draw_line(0.0, TOP_H, sw, TOP_H, 1.0, ui_border());
     draw_line(0.0, sh - STATUS_H, sw, sh - STATUS_H, 1.0, ui_border());
     if app.active_tab != AppTab::Editing && app.active_tab != AppTab::Vehicles {
-        draw_line(PANEL_W, TOP_H, PANEL_W, sh - STATUS_H, 1.0, ui_border());
+        if left_sidebar_visible() {
+            draw_line(PANEL_W, TOP_H, PANEL_W, sh - STATUS_H, 1.0, ui_border());
+        }
         draw_line(right_x, TOP_H, right_x, sh - STATUS_H, 1.0, ui_border());
     }
     if !(app.active_tab == AppTab::Vehicles && app.vehicle_browser.photo_mode) {
@@ -352,14 +358,10 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
 
     draw_rrect(12.0, 10.0, 3.0, 38.0, 1.5, ui_accent());
     ui_text_bold("MTA:SA Eagle Edit", 24.0, 24.0, 19, WHITE);
-    ui_text(
-        &app.ui_font,
-        &ellipsize(app.root.to_string_lossy().as_ref(), 34),
-        24.0,
-        46.0,
-        ui_dim(),
-    );
-    for tab in app_tabs_for_mode(app.options.launch_mode) {
+    let path = app.root.to_string_lossy();
+    let path_size = ui_text_size_to_fit(&path, 16, (snap_mode_rect().x - 34.0).max(1.0));
+    ui_text_size(&app.ui_font, &path, 24.0, 46.0, path_size, ui_dim());
+    for tab in primary_app_tabs_for_mode(app.options.launch_mode) {
         let label = app_tab_label(tab);
         let active = app.active_tab == tab;
         let rect = app_tab_rect(app, tab);
@@ -404,6 +406,45 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
             },
         );
     }
+    let more_rect = more_tabs_rect(app);
+    let more_active = overflow_app_tabs_for_mode(app.options.launch_mode).contains(&app.active_tab);
+    let more_hovered = more_rect.contains(mouse_position().into());
+    if more_active || more_hovered || app.navigation_menu_open {
+        draw_rrect(
+            more_rect.x,
+            more_rect.y + 2.0,
+            more_rect.w,
+            more_rect.h - 4.0,
+            8.0,
+            if more_active || app.navigation_menu_open {
+                ui_surface_active()
+            } else {
+                ui_surface_hover()
+            },
+        );
+    }
+    ui_text(
+        &app.ui_font,
+        "More",
+        more_rect.x + 10.0,
+        96.0,
+        if more_active { WHITE } else { ui_dim() },
+    );
+    let more_label_w = ui_text_width("More", 16);
+    ui_text(
+        &app.ui_font,
+        "v",
+        more_rect.x + 10.0 + more_label_w + 6.0,
+        96.0,
+        if more_active { WHITE } else { ui_dim() },
+    );
+    if more_hovered {
+        draw_text_tooltip(
+            &app.ui_font,
+            more_rect,
+            "More tools, including LOD audits, texture review, and vertex lighting.",
+        );
+    }
 
     let has_selection = has_active_selection(app);
     let selected_deleted = active_selection_deleted(app);
@@ -446,9 +487,9 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
         false,
         has_selection,
         if selected_deleted {
-            "Restore"
+            "Restore selected item"
         } else {
-            "Delete"
+            "Delete selected item"
         },
     );
     icon_button(
@@ -467,15 +508,44 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
         !app.redo_stack.is_empty(),
         "Redo",
     );
-    icon_button(
-        &app.ui_font,
-        toolbar_button_rect(7),
-        &app.icons.save,
-        false,
-        true,
-        "Save Project",
-    );
+    for slot in [2_usize, 4, 6] {
+        let rect = toolbar_button_rect(slot);
+        draw_line(
+            rect.x + rect.w + 3.0,
+            TOP_H - 34.0,
+            rect.x + rect.w + 3.0,
+            TOP_H - 8.0,
+            1.0,
+            ui_border(),
+        );
+    }
+    draw_line(318.0, TOP_H - 34.0, 318.0, TOP_H - 8.0, 1.0, ui_border());
     text_button(&app.ui_font, snap_mode_rect(), "Snap", app.snap_enabled);
+    if snap_mode_rect().contains(mouse_position().into()) {
+        draw_text_tooltip(
+            &app.ui_font,
+            snap_mode_rect(),
+            "Snap: constrain move and rotate operations to the configured increments.",
+        );
+    }
+    text_button(
+        &app.ui_font,
+        transform_space_rect(),
+        if app.transform_space == TransformSpace::World {
+            "World"
+        } else {
+            "Local"
+        },
+        app.transform_space == TransformSpace::Local,
+    );
+    if transform_space_rect().contains(mouse_position().into()) {
+        draw_text_tooltip(
+            &app.ui_font,
+            transform_space_rect(),
+            "World / Local: use global axes or the selected object's own axes for transforms.",
+        );
+    }
+    toolbar_primary_button(&app.ui_font, file_save_rect(), "Save");
     text_button(&app.ui_font, load_resource_rect(), "Load", false);
     text_button(&app.ui_font, save_as_rect(), "Save As", false);
     if app.manual_save_job.is_some() {
@@ -483,12 +553,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     } else {
         text_button(&app.ui_font, save_wip_rect(), "Save WIP", false);
     }
-    text_button(
-        &app.ui_font,
-        generate_txd_button_rect(),
-        "Build TXD from Folder",
-        false,
-    );
+    text_button(&app.ui_font, generate_txd_button_rect(), "Build TXD", false);
     if SHOW_BLENDER_IMPORT {
         if app.blender_import_rx.is_some() {
             text_button_busy(&app.ui_font, import_blender_button_rect(), "Import Blender");
@@ -506,16 +571,6 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
         preferences_button_rect(),
         "Preferences",
         app.preferences_dialog.is_some(),
-    );
-    text_button(
-        &app.ui_font,
-        transform_space_rect(),
-        if app.transform_space == TransformSpace::World {
-            "World"
-        } else {
-            "Local"
-        },
-        app.transform_space == TransformSpace::Local,
     );
     let hint_x = preferences_button_rect().x + preferences_button_rect().w + 12.0;
     let hint_w = (sw - hint_x - 12.0).max(0.0);
@@ -537,6 +592,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
         && app.active_tab != AppTab::Race
         && app.active_tab != AppTab::Vehicles
         && app.active_tab != AppTab::TextureReview
+        && left_sidebar_visible()
     {
         let out_x = 10.0;
         let out_y = TOP_H + 12.0;
@@ -892,26 +948,22 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
             }
         }
         let track = outliner_scrollbar_track();
-        draw_rrect(
-            track.x,
-            track.y,
-            track.w,
-            track.h,
-            4.0,
-            Color::new(0.050, 0.058, 0.070, 1.0),
-        );
         if let Some(thumb) = outliner_scrollbar_thumb(app) {
-            let hovered =
-                thumb.contains(mouse_position().into()) || app.outliner_scroll_drag.is_some();
-            let color = if hovered {
-                Color::new(0.42, 0.44, 0.48, 1.0)
-            } else {
-                Color::new(0.30, 0.31, 0.34, 1.0)
+            let metrics = ScrollbarMetrics {
+                track,
+                thumb,
+                max_scroll: 1.0,
             };
-            draw_rrect(thumb.x, thumb.y, thumb.w, thumb.h, 4.0, color);
+            draw_scrollbar(
+                metrics,
+                scrollbar_visual_state(track, app.outliner_scroll_drag.is_some()),
+            );
         }
     }
-    let loaded_w = if app.active_tab != AppTab::Editing && app.active_tab != AppTab::Vehicles {
+    let loaded_w = if app.active_tab != AppTab::Editing
+        && app.active_tab != AppTab::Vehicles
+        && left_sidebar_visible()
+    {
         PANEL_W
     } else {
         0.0
@@ -1038,13 +1090,64 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     draw_race_overlay_toggle(app);
     draw_race_minimap_overlay(app);
     draw_viewport_render_mode_control(app, viewport);
-    for tab in app_tabs_for_mode(app.options.launch_mode) {
+    for tab in primary_app_tabs_for_mode(app.options.launch_mode) {
         let rect = app_tab_rect(app, tab);
-        let label = app_tab_label(tab);
-        if rect.contains(mouse_position().into())
-            && ellipsize_width(label, 16, (rect.w - 12.0).max(1.0)) != label
-        {
-            draw_text_tooltip(&app.ui_font, rect, label);
+        if rect.contains(mouse_position().into()) {
+            draw_text_tooltip(&app.ui_font, rect, app_tab_tooltip(tab));
+        }
+    }
+    if app.navigation_menu_open {
+        let bounds = navigation_menu_bounds(app);
+        draw_rrect(
+            bounds.x + 2.0,
+            bounds.y + 3.0,
+            bounds.w,
+            bounds.h,
+            9.0,
+            Color::new(0.0, 0.0, 0.0, 0.32),
+        );
+        draw_rrect_bordered(
+            bounds.x,
+            bounds.y,
+            bounds.w,
+            bounds.h,
+            9.0,
+            1.0,
+            Color::new(0.045, 0.058, 0.078, 0.99),
+            ui_border(),
+        );
+        for tab in overflow_app_tabs_for_mode(app.options.launch_mode) {
+            let rect = overflow_tab_rect(app, tab);
+            let active = app.active_tab == tab;
+            let hovered = rect.contains(mouse_position().into());
+            if active || hovered {
+                draw_rrect(
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    rect.h,
+                    6.0,
+                    if active {
+                        ui_surface_active()
+                    } else {
+                        ui_surface_hover()
+                    },
+                );
+            }
+            ui_text(
+                &app.ui_font,
+                app_tab_label(tab),
+                rect.x + 11.0,
+                rect.y + 19.0,
+                if active {
+                    WHITE
+                } else {
+                    Color::new(0.80, 0.86, 0.93, 1.0)
+                },
+            );
+            if hovered {
+                draw_text_tooltip(&app.ui_font, rect, app_tab_tooltip(tab));
+            }
         }
     }
     draw_context_menu(app);

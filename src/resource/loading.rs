@@ -567,7 +567,15 @@ fn run_load_asset_worker(
 
     if load_textures {
         let standalone_txds = collect_scene_txd_files(&root, source);
-        let standalone_total = standalone_txds.len() + 2;
+        let gta_standalone_txds = [
+            gta_sa_dir.join("models").join("particle.txd"),
+            gta_sa_dir.join("models").join("effectsPC.txd"),
+            gta_sa_dir
+                .join("models")
+                .join("generic")
+                .join("vehicle.txd"),
+        ];
+        let standalone_total = standalone_txds.len() + gta_standalone_txds.len();
         for (index, path) in standalone_txds.into_iter().enumerate() {
             if path.starts_with(&overlay_root)
                 && let Some(name) = path.file_name().and_then(|name| name.to_str())
@@ -580,8 +588,7 @@ fn run_load_asset_worker(
                 index + 1
             ));
         }
-        for (index, name) in ["particle.txd", "effectsPC.txd"].into_iter().enumerate() {
-            let path = gta_sa_dir.join("models").join(name);
+        for (index, path) in gta_standalone_txds.into_iter().enumerate() {
             if path.is_file() {
                 index_standalone_txd_file(&path, &mut txd_textures);
             }
@@ -767,7 +774,9 @@ impl LoadJob {
             loaded_wip,
         ) = load_scene_source_with_source(&root, &attr_re, source);
         let texture_files = collect_scene_texture_files(&root, source);
-        let camera_speed = load_camera_speed_preference();
+        // Translation speed belongs to this window and is intentionally not
+        // loaded from the shared preferences file.
+        let camera_speed = DEFAULT_CAMERA_SPEED;
         let gta_sa_dir = load_gta_sa_dir_preference();
         let physics_root_properties = load_physics_root_properties(&gta_sa_dir);
         let bake_settings = load_bake_settings_preference();
@@ -1066,6 +1075,7 @@ impl LoadJob {
             eagle_zone_offsets,
             meshes,
             collisions,
+            collision_render_cache: HashMap::new(),
             lod_ids: all_lod_ids,
             scene_cells,
             world_cells,
@@ -1135,6 +1145,9 @@ impl LoadJob {
             editing: EditingState::default(),
             properties_tab: PropertiesTab::Element,
             properties_scroll: 0.0,
+            validation_list_scroll: [0.0; 3],
+            validation_list_scroll_drag: None,
+            validation_list_scroll_grab_offset_y: 0.0,
             element_panel_collapsed: element_default_collapsed(),
             preview_selected_material: None,
             texture_match_selection_job: None,
@@ -1164,6 +1177,10 @@ impl LoadJob {
             scroll: 0.0,
             scroll_interaction_until: 0.0,
             outliner_scroll_drag: None,
+            scrollbar_pointer_captured: false,
+            inspector_scroll_drag: false,
+            water_list_scroll_drag: false,
+            light_list_scroll_drag: false,
             box_select_drag: None,
             box_select_distance: DEFAULT_BOX_SELECT_DISTANCE,
             box_select_mode: BoxSelectMode::Add,
@@ -1202,6 +1219,7 @@ impl LoadJob {
             asset_optimization_job: None,
             asset_optimization_scope: AssetOptimizationScope::default(),
             asset_optimization_menu_open: false,
+            navigation_menu_open: false,
             purge_unused_job: None,
             img_archive_rebalance_job: None,
             object_bounds_fix_job: None,
@@ -1225,6 +1243,9 @@ impl LoadJob {
                 last_mouse: mouse_position().into(),
                 looking: false,
             },
+            gameworld_camera: None,
+            gameworld_camera_mode: None,
+            gameworld_camera_focus: None,
             camera_mode: CameraMode::Freeroam,
             camera_focus: None,
             loaded_message: String::new(),
@@ -1248,6 +1269,8 @@ impl LoadJob {
             save_log_scroll: 0.0,
             save_log_follow_tail: true,
             camera_speed,
+            vehicle_camera_speed: DEFAULT_DETAIL_CAMERA_SPEED,
+            editing_camera_speed: DEFAULT_DETAIL_CAMERA_SPEED,
             camera_rotation_speed: load_camera_rotation_speed_preference(),
             gizmo_scale: load_gizmo_scale_preference(),
             gta_sa_dir,
@@ -1277,6 +1300,7 @@ impl LoadJob {
             light_kind_dropdown_open: false,
             light_profile_dropdown_open: false,
             light_color_drag_before: None,
+            light_temperature_drag_before: None,
             timecyc,
             fog_strength: load_fog_strength_preference(),
             sim: SimState::default(),
@@ -1295,6 +1319,9 @@ impl LoadJob {
             sim_editor_camera: None,
             pending_camera_restore: None,
         };
+        app.gameworld_camera = Some(app.camera);
+        app.gameworld_camera_mode = Some(app.camera_mode);
+        app.gameworld_camera_focus = Some(app.camera_focus);
         schedule_project_camera_restore(&mut app);
         restore_project_editing_session(&mut app);
         for diagnostic in material_class_diagnostics {
@@ -1305,7 +1332,8 @@ impl LoadJob {
         app.autosave_dirty_snapshot = Some(autosave_dirty_snapshot(&app));
         if source == LoadSceneSource::Autosave {
             app.status_message =
-                "Restored autosave snapshot. Save or Save WIP to keep it.".to_string();
+                "Recovery copy restored. Save writes it into the resource; Save WIP keeps a separate working copy."
+                    .to_string();
         } else if loaded_wip {
             app.status_message =
                 "Loaded saved WIP snapshot. Save writes it back to the resource.".to_string();
@@ -1397,8 +1425,14 @@ pub(crate) async fn load_app_with_source(
             }
             index_standalone_txd_file(&path, &mut txd_textures);
         }
-        for name in ["particle.txd", "effectsPC.txd"] {
-            let path = gta_sa_dir.join("models").join(name);
+        for path in [
+            gta_sa_dir.join("models").join("particle.txd"),
+            gta_sa_dir.join("models").join("effectsPC.txd"),
+            gta_sa_dir
+                .join("models")
+                .join("generic")
+                .join("vehicle.txd"),
+        ] {
             if path.is_file() {
                 index_standalone_txd_file(&path, &mut txd_textures);
             }
@@ -1501,7 +1535,9 @@ pub(crate) async fn load_app_with_source(
         true,
         true,
     );
-    let camera_speed = load_camera_speed_preference();
+    // Translation speed belongs to this window and is intentionally not
+    // loaded from the shared preferences file.
+    let camera_speed = DEFAULT_CAMERA_SPEED;
     let bake_settings = load_bake_settings_preference();
     let vertex_paint = load_vertex_paint_settings_preference();
     let water_planes = load_water_dat_for_source(&root, source);
@@ -1525,6 +1561,7 @@ pub(crate) async fn load_app_with_source(
         eagle_zone_offsets,
         meshes,
         collisions,
+        collision_render_cache: HashMap::new(),
         lod_ids: all_lod_ids,
         scene_cells,
         world_cells,
@@ -1594,6 +1631,9 @@ pub(crate) async fn load_app_with_source(
         editing: EditingState::default(),
         properties_tab: PropertiesTab::Element,
         properties_scroll: 0.0,
+        validation_list_scroll: [0.0; 3],
+        validation_list_scroll_drag: None,
+        validation_list_scroll_grab_offset_y: 0.0,
         element_panel_collapsed: element_default_collapsed(),
         preview_selected_material: None,
         texture_match_selection_job: None,
@@ -1623,6 +1663,10 @@ pub(crate) async fn load_app_with_source(
         scroll: 0.0,
         scroll_interaction_until: 0.0,
         outliner_scroll_drag: None,
+        scrollbar_pointer_captured: false,
+        inspector_scroll_drag: false,
+        water_list_scroll_drag: false,
+        light_list_scroll_drag: false,
         box_select_drag: None,
         box_select_distance: DEFAULT_BOX_SELECT_DISTANCE,
         box_select_mode: BoxSelectMode::Add,
@@ -1661,6 +1705,7 @@ pub(crate) async fn load_app_with_source(
         asset_optimization_job: None,
         asset_optimization_scope: AssetOptimizationScope::default(),
         asset_optimization_menu_open: false,
+        navigation_menu_open: false,
         purge_unused_job: None,
         img_archive_rebalance_job: None,
         object_bounds_fix_job: None,
@@ -1684,6 +1729,9 @@ pub(crate) async fn load_app_with_source(
             last_mouse: mouse_position().into(),
             looking: false,
         },
+        gameworld_camera: None,
+        gameworld_camera_mode: None,
+        gameworld_camera_focus: None,
         camera_mode: CameraMode::Freeroam,
         camera_focus: None,
         loaded_message: String::new(),
@@ -1707,6 +1755,8 @@ pub(crate) async fn load_app_with_source(
         save_log_scroll: 0.0,
         save_log_follow_tail: true,
         camera_speed,
+        vehicle_camera_speed: DEFAULT_DETAIL_CAMERA_SPEED,
+        editing_camera_speed: DEFAULT_DETAIL_CAMERA_SPEED,
         camera_rotation_speed: load_camera_rotation_speed_preference(),
         gizmo_scale: load_gizmo_scale_preference(),
         gta_sa_dir,
@@ -1736,6 +1786,7 @@ pub(crate) async fn load_app_with_source(
         light_kind_dropdown_open: false,
         light_profile_dropdown_open: false,
         light_color_drag_before: None,
+        light_temperature_drag_before: None,
         timecyc,
         fog_strength: load_fog_strength_preference(),
         sim: SimState::default(),
@@ -1754,6 +1805,9 @@ pub(crate) async fn load_app_with_source(
         sim_editor_camera: None,
         pending_camera_restore: None,
     };
+    app.gameworld_camera = Some(app.camera);
+    app.gameworld_camera_mode = Some(app.camera_mode);
+    app.gameworld_camera_focus = Some(app.camera_focus);
     schedule_project_camera_restore(&mut app);
     restore_project_editing_session(&mut app);
     for diagnostic in material_class_diagnostics {
@@ -1763,7 +1817,9 @@ pub(crate) async fn load_app_with_source(
     app.saved_snapshot = Some(saved_content_snapshot(&app));
     app.autosave_dirty_snapshot = Some(autosave_dirty_snapshot(&app));
     if source == LoadSceneSource::Autosave {
-        app.status_message = "Restored autosave snapshot. Save or Save WIP to keep it.".to_string();
+        app.status_message =
+            "Recovery copy restored. Save writes it into the resource; Save WIP keeps a separate working copy."
+                .to_string();
     } else if loaded_wip {
         app.status_message =
             "Loaded saved WIP snapshot. Save writes it back to the resource.".to_string();
@@ -1848,5 +1904,12 @@ pub(crate) async fn load_icons() -> IconSet {
         save: load_icon(asset_path("icons/save.png").to_string_lossy().into_owned()).await,
         undo: load_icon(asset_path("icons/undo.png").to_string_lossy().into_owned()).await,
         redo: load_icon(asset_path("icons/redo.png").to_string_lossy().into_owned()).await,
+        texture: load_icon(
+            asset_path("icons/texture.png")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await,
+        tool: load_icon(asset_path("icons/tool.png").to_string_lossy().into_owned()).await,
     }
 }

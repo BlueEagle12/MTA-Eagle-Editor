@@ -81,8 +81,10 @@ pub(crate) fn apply_global_transform(app: &mut AppState) {
             sync_placement_attrs(placement);
         }
         for light in &mut app.lights {
-            light.position = transform_v3(matrix, light.position);
-            light.direction = transform_direction(rotation, light.direction);
+            if light.attached_to.is_none() {
+                light.position = transform_v3(matrix, light.position);
+                light.direction = transform_direction(rotation, light.direction);
+            }
         }
         for track in &mut app.race.tracks {
             track.commit_active_subtrack();
@@ -143,6 +145,11 @@ pub(crate) fn delete_app_gl_resources(app: &AppState) {
     delete_render_cells(&app.scene_cells, &app.world_cells);
     delete_render_cells(&app.lod_scene_cells, &app.lod_world_cells);
     unsafe {
+        for cache in app.collision_render_cache.values() {
+            if cache.list != 0 {
+                gl::DeleteLists(cache.list, 1);
+            }
+        }
         for mesh in app.meshes.values() {
             for part in &mesh.parts {
                 if part.list != 0 {
@@ -232,6 +239,7 @@ pub(crate) fn release_loaded_resource(app: &mut AppState) {
     app.zones = Vec::new();
     app.meshes = HashMap::new();
     app.collisions = HashMap::new();
+    app.collision_render_cache.clear();
     app.scene_cells = Vec::new();
     app.world_cells = Vec::new();
     app.lod_scene_cells = Vec::new();
@@ -834,6 +842,7 @@ fn apply_light_history_snapshot(app: &mut AppState, snapshot: LightHistorySnapsh
     app.lights = snapshot.lights;
     app.selected_light = snapshot.selected.min(app.lights.len().saturating_sub(1));
     app.light_color_drag_before = None;
+    app.light_temperature_drag_before = None;
     invalidate_validation_cache(app);
 }
 

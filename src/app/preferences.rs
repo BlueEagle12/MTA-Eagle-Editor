@@ -122,6 +122,22 @@ pub(crate) fn clamp_camera_speed(value: f32) -> f32 {
     }
 }
 
+pub(crate) fn clamp_detail_camera_speed(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(MIN_DETAIL_CAMERA_SPEED, MAX_CAMERA_SPEED)
+    } else {
+        DEFAULT_DETAIL_CAMERA_SPEED
+    }
+}
+
+pub(crate) fn clamp_editing_camera_speed(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(MIN_EDITING_CAMERA_SPEED, MAX_CAMERA_SPEED)
+    } else {
+        DEFAULT_DETAIL_CAMERA_SPEED
+    }
+}
+
 pub(crate) fn clamp_gizmo_scale(value: f32) -> f32 {
     if value.is_finite() {
         value.clamp(MIN_GIZMO_SCALE, MAX_GIZMO_SCALE)
@@ -509,17 +525,13 @@ pub(crate) fn project_camera_to_persist(app: &AppState) -> CameraState {
     if let Some((camera, _)) = app.pending_camera_restore {
         return camera;
     }
-    if app.active_tab == AppTab::Editing {
-        if let Some(camera) = app.editing.return_camera {
-            return camera;
+    app.sim_editor_camera.unwrap_or_else(|| {
+        if matches!(app.active_tab, AppTab::Editing | AppTab::Vehicles) {
+            app.gameworld_camera.unwrap_or(app.camera)
+        } else {
+            app.camera
         }
-    }
-    if app.active_tab == AppTab::Vehicles {
-        if let Some(camera) = app.vehicle_browser.return_camera {
-            return camera;
-        }
-    }
-    app.sim_editor_camera.unwrap_or(app.camera)
+    })
 }
 
 fn editing_asset_name(asset: &EditingAsset) -> &str {
@@ -622,6 +634,7 @@ fn apply_project_session_camera(app: &mut AppState, json: &serde_json::Value) ->
         return false;
     };
     app.camera = camera;
+    app.gameworld_camera = Some(camera);
     true
 }
 
@@ -708,6 +721,7 @@ pub(crate) fn apply_project_camera_state(app: &mut AppState) -> bool {
     app.camera.yaw = yaw;
     app.camera.pitch = pitch.clamp(-1.54, 1.54);
     app.camera.last_mouse = mouse_position().into();
+    app.gameworld_camera = Some(app.camera);
     true
 }
 
@@ -767,34 +781,18 @@ pub(crate) fn apply_pending_project_camera_restore(app: &mut AppState) {
         return;
     }
     app.pending_camera_restore = None;
-    if app.active_tab == AppTab::Editing {
-        app.editing.return_camera = Some(camera);
+    if matches!(app.active_tab, AppTab::Editing | AppTab::Vehicles) {
+        app.gameworld_camera = Some(camera);
         app.last_camera_persist_at = get_time();
         return;
     }
     app.camera = camera;
+    app.gameworld_camera = Some(camera);
     app.camera.looking = false;
     app.camera.last_mouse = mouse_position().into();
     app.last_camera_persist_at = get_time();
     set_cursor_grab(false);
     show_mouse(true);
-}
-
-pub(crate) fn load_camera_speed_preference() -> f32 {
-    load_preferences()
-        .get("camera_speed")
-        .and_then(|value| value.parse::<f32>().ok())
-        .map(clamp_camera_speed)
-        .unwrap_or(DEFAULT_CAMERA_SPEED)
-}
-
-pub(crate) fn save_camera_speed_preference(speed: f32) {
-    let mut values = load_preferences();
-    values.insert(
-        "camera_speed".to_string(),
-        format!("{:.3}", clamp_camera_speed(speed)),
-    );
-    save_preferences(&values);
 }
 
 pub(crate) fn load_camera_rotation_speed_preference() -> f32 {

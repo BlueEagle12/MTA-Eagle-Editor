@@ -437,9 +437,9 @@ pub(crate) fn draw_scene_lights(app: &AppState) {
         gl::Disable(gl::DEPTH_TEST);
         gl::Enable(gl::BLEND);
         gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
-        for (idx, light) in app.lights.iter().enumerate() {
+        for (idx, _, light) in expanded_scene_lights(app) {
             let pos = vec3(light.position.x, light.position.y, light.position.z);
-            let light_color = light_effective_color(light);
+            let light_color = light_effective_color(&light);
             let selected = app.active_tab == AppTab::Lights && idx == app.selected_light;
             gl::PointSize(if selected { 14.0 } else { 8.0 });
             gl::Color4f(

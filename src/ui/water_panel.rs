@@ -714,22 +714,16 @@ pub(crate) fn draw_water_panel(app: &AppState) {
     }
     if app.water_planes.len() > water_visible_rows() {
         let max_scroll = app.water_planes.len().saturating_sub(water_visible_rows()) as f32;
-        let thumb_h = (list.h * water_visible_rows() as f32 / app.water_planes.len() as f32)
-            .clamp(28.0, list.h);
-        let thumb_y = list.y
-            + if max_scroll > 0.0 {
-                (list.h - thumb_h) * (app.water_scroll / max_scroll)
-            } else {
-                0.0
-            };
-        draw_rrect(
-            list.x + list.w - 8.0,
-            thumb_y + 4.0,
-            4.0,
-            (thumb_h - 8.0).max(12.0),
-            3.0,
-            Color::new(0.34, 0.36, 0.40, 0.9),
-        );
+        let track = Rect::new(list.x + list.w - 8.0, list.y + 4.0, 4.0, list.h - 8.0);
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            water_visible_rows() as f32,
+            app.water_planes.len() as f32,
+            28.0,
+            app.water_scroll.min(max_scroll),
+        ) {
+            draw_scrollbar(metrics, scrollbar_visual_state(track, false));
+        }
     }
 
     ui_text_size(

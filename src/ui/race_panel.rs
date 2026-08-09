@@ -60,25 +60,76 @@ fn race_track_visible_rows() -> usize {
     ((race_track_list_rect().h - 12.0) / 26.0).floor().max(1.0) as usize
 }
 
-/// Right-panel grid button rect. `row` counts from the top button row.
-fn race_grid_rect(row: usize, col: usize, cols: usize) -> Rect {
+/// Placement modes remain immediately available at the top of the Track panel.
+/// Two roomy columns prevent the mode names from being ellipsized.
+fn race_placement_rect(row: usize, col: usize) -> Rect {
+    race_panel_button_rect(TOP_H + 62.0 + row as f32 * 34.0, col, 2)
+}
+
+/// Compact selector for the active control group below the placement modes.
+fn race_panel_tab_rect(col: usize) -> Rect {
+    race_panel_button_rect(TOP_H + 136.0, col, 3)
+}
+
+fn race_panel_button_rect(y: f32, col: usize, cols: usize) -> Rect {
     let px = screen_width() - RIGHT_PANEL_W + 22.0;
     let total = RIGHT_PANEL_W - 44.0;
     let gap = 6.0;
     let w = (total - gap * (cols as f32 - 1.0)) / cols as f32;
     let x = px + col as f32 * (w + gap);
-    let y = TOP_H + 54.0 + row as f32 * 34.0;
     Rect::new(x, y, w, 28.0)
 }
 
-/// Y of the info-text block under the button grid (rows 0-8 used).
+/// Selector tabs deliberately do not use the regular action-button treatment:
+/// their flatter shape and persistent accent marker make their navigation role
+/// clear at a glance.
+fn draw_race_panel_tab(font: &Font, rect: Rect, label: &str, active: bool) {
+    let mouse: Vec2 = mouse_position().into();
+    let hovered = !scrollbar_hover_suppressed() && rect.contains(mouse);
+    let fill = if active {
+        Color::new(0.090, 0.165, 0.255, 1.0)
+    } else if hovered {
+        Color::new(0.105, 0.118, 0.140, 1.0)
+    } else {
+        Color::new(0.070, 0.076, 0.086, 1.0)
+    };
+    let border = if active { ui_accent() } else { ui_border() };
+    draw_rrect_bordered(rect.x, rect.y, rect.w, rect.h, 5.0, 1.0, fill, border);
+    if active {
+        draw_rrect(
+            rect.x + 7.0,
+            rect.y + 3.0,
+            rect.w - 14.0,
+            2.0,
+            1.0,
+            ui_accent(),
+        );
+    }
+    let text_w = ui_text_width(label, 14);
+    ui_text_size(
+        font,
+        label,
+        rect.x + ((rect.w - text_w) * 0.5).max(7.0),
+        rect.y + 20.0,
+        14,
+        if active { WHITE } else { ui_dim() },
+    );
+}
+
+/// Right-panel detail control rect. The current panel section determines what
+/// each row contains; only one group is visible at a time.
+fn race_grid_rect(row: usize, col: usize, cols: usize) -> Rect {
+    race_panel_button_rect(TOP_H + 174.0 + row as f32 * 34.0, col, cols)
+}
+
+/// Y of the info-text block under the compact control group.
 fn race_info_y() -> f32 {
-    TOP_H + 54.0 + 9.0 * 34.0 + 8.0
+    TOP_H + 366.0
 }
 
 fn race_list_rect() -> Rect {
     let px = screen_width() - RIGHT_PANEL_W + 22.0;
-    // Below the button grid (9 rows) + 4 info lines.
+    // Below the grouped controls + 4 info lines.
     let y = race_info_y() + 4.0 * 18.0 + 10.0;
     let h = (screen_height() - STATUS_H - y - 12.0).max(120.0);
     Rect::new(px, y, RIGHT_PANEL_W - 44.0, h)
@@ -1088,7 +1139,7 @@ pub(crate) fn handle_race_click(app: &mut AppState, mouse: Vec2) -> bool {
     }
 
     // ---- Right "Track" panel ----
-    // Row 0: placement modes.
+    // Placement modes are always available.
     let modes = [
         RacePlaceMode::Start,
         RacePlaceMode::Checkpoint,
@@ -1096,98 +1147,111 @@ pub(crate) fn handle_race_click(app: &mut AppState, mouse: Vec2) -> bool {
         RacePlaceMode::Path,
     ];
     for (i, m) in modes.iter().enumerate() {
-        if race_grid_rect(0, i, 4).contains(mouse) {
+        if race_placement_rect(i / 2, i % 2).contains(mouse) {
             set_mode(app, *m);
             return true;
         }
     }
-    // Row 1: point ops.
-    if race_grid_rect(1, 0, 4).contains(mouse) {
-        delete_selected_point(app);
-        return true;
+    for (i, section) in [
+        RacePanelSection::Track,
+        RacePanelSection::Points,
+        RacePanelSection::Output,
+    ]
+    .iter()
+    .enumerate()
+    {
+        if race_panel_tab_rect(i).contains(mouse) {
+            app.race.panel_section = *section;
+            return true;
+        }
     }
-    if race_grid_rect(1, 1, 4).contains(mouse) {
-        clear_active(app);
-        return true;
-    }
-    if race_grid_rect(1, 2, 4).contains(mouse) {
-        nudge_point_z(app, -1.0);
-        return true;
-    }
-    if race_grid_rect(1, 3, 4).contains(mouse) {
-        nudge_point_z(app, 1.0);
-        return true;
-    }
-    // Row 2: laps / radius.
-    if race_grid_rect(2, 0, 4).contains(mouse) {
-        adjust_laps(app, -1);
-        return true;
-    }
-    if race_grid_rect(2, 1, 4).contains(mouse) {
-        adjust_laps(app, 1);
-        return true;
-    }
-    if race_grid_rect(2, 2, 4).contains(mouse) {
-        adjust_radius(app, -1.0);
-        return true;
-    }
-    if race_grid_rect(2, 3, 4).contains(mouse) {
-        adjust_radius(app, 1.0);
-        return true;
-    }
-    // Row 3: radar backdrop.
-    if race_grid_rect(3, 0, 2).contains(mouse) {
-        start_race_radar_browse(app);
-        return true;
-    }
-    if race_grid_rect(3, 1, 2).contains(mouse) {
-        auto_radar(app);
-        return true;
-    }
-    // Row 4: generate the full-map radar backdrop.
-    if race_grid_rect(4, 0, 1).contains(mouse) {
-        generate_radar_image(app);
-        return true;
-    }
-    // Row 5: generate preview.
-    if race_grid_rect(5, 0, 1).contains(mouse) {
-        generate_preview(app);
-        return true;
-    }
-    // Row 6: reorder selected point.
-    if race_grid_rect(6, 0, 2).contains(mouse) {
-        move_selected_point_order(app, -1);
-        return true;
-    }
-    if race_grid_rect(6, 1, 2).contains(mouse) {
-        move_selected_point_order(app, 1);
-        return true;
-    }
-    // Row 7: subtrack navigation + add/delete.
-    if race_grid_rect(7, 0, 4).contains(mouse) {
-        cycle_subtrack(app, -1);
-        return true;
-    }
-    if race_grid_rect(7, 1, 4).contains(mouse) {
-        cycle_subtrack(app, 1);
-        return true;
-    }
-    if race_grid_rect(7, 2, 4).contains(mouse) {
-        add_subtrack(app);
-        return true;
-    }
-    if race_grid_rect(7, 3, 4).contains(mouse) {
-        delete_subtrack(app);
-        return true;
-    }
-    // Row 8: rename track / subtrack.
-    if race_grid_rect(8, 0, 2).contains(mouse) {
-        start_race_name_edit(app, RaceNameTarget::Track);
-        return true;
-    }
-    if race_grid_rect(8, 1, 2).contains(mouse) {
-        start_race_name_edit(app, RaceNameTarget::Subtrack);
-        return true;
+    match app.race.panel_section {
+        RacePanelSection::Track => {
+            if race_grid_rect(0, 0, 2).contains(mouse) {
+                adjust_laps(app, -1);
+                return true;
+            }
+            if race_grid_rect(0, 1, 2).contains(mouse) {
+                adjust_laps(app, 1);
+                return true;
+            }
+            if race_grid_rect(1, 0, 2).contains(mouse) {
+                adjust_radius(app, -1.0);
+                return true;
+            }
+            if race_grid_rect(1, 1, 2).contains(mouse) {
+                adjust_radius(app, 1.0);
+                return true;
+            }
+            if race_grid_rect(2, 0, 2).contains(mouse) {
+                cycle_subtrack(app, -1);
+                return true;
+            }
+            if race_grid_rect(2, 1, 2).contains(mouse) {
+                cycle_subtrack(app, 1);
+                return true;
+            }
+            if race_grid_rect(3, 0, 2).contains(mouse) {
+                add_subtrack(app);
+                return true;
+            }
+            if race_grid_rect(3, 1, 2).contains(mouse) {
+                delete_subtrack(app);
+                return true;
+            }
+            if race_grid_rect(4, 0, 2).contains(mouse) {
+                start_race_name_edit(app, RaceNameTarget::Track);
+                return true;
+            }
+            if race_grid_rect(4, 1, 2).contains(mouse) {
+                start_race_name_edit(app, RaceNameTarget::Subtrack);
+                return true;
+            }
+        }
+        RacePanelSection::Points => {
+            if race_grid_rect(0, 0, 2).contains(mouse) {
+                delete_selected_point(app);
+                return true;
+            }
+            if race_grid_rect(0, 1, 2).contains(mouse) {
+                clear_active(app);
+                return true;
+            }
+            if race_grid_rect(1, 0, 2).contains(mouse) {
+                nudge_point_z(app, -1.0);
+                return true;
+            }
+            if race_grid_rect(1, 1, 2).contains(mouse) {
+                nudge_point_z(app, 1.0);
+                return true;
+            }
+            if race_grid_rect(2, 0, 2).contains(mouse) {
+                move_selected_point_order(app, -1);
+                return true;
+            }
+            if race_grid_rect(2, 1, 2).contains(mouse) {
+                move_selected_point_order(app, 1);
+                return true;
+            }
+        }
+        RacePanelSection::Output => {
+            if race_grid_rect(0, 0, 2).contains(mouse) {
+                start_race_radar_browse(app);
+                return true;
+            }
+            if race_grid_rect(0, 1, 2).contains(mouse) {
+                auto_radar(app);
+                return true;
+            }
+            if race_grid_rect(1, 0, 1).contains(mouse) {
+                generate_radar_image(app);
+                return true;
+            }
+            if race_grid_rect(2, 0, 1).contains(mouse) {
+                generate_preview(app);
+                return true;
+            }
+        }
     }
     // Point list row selection.
     if let Some(row) = race_row_at(app, mouse) {
@@ -1471,7 +1535,15 @@ fn draw_race_right_panel(app: &AppState) {
 
     let track = app.race.tracks.get(app.race.selected_track);
 
-    // Row 0: placement modes (active highlighted).
+    ui_text_size(
+        &app.ui_font,
+        "Placement",
+        x + 14.0,
+        TOP_H + 55.0,
+        13,
+        ui_accent(),
+    );
+    // Placement modes stay visible while working in any control group.
     let modes = [
         (RacePlaceMode::Start, "Start"),
         (RacePlaceMode::Checkpoint, "Checkpoint"),
@@ -1481,60 +1553,28 @@ fn draw_race_right_panel(app: &AppState) {
     for (i, (m, label)) in modes.iter().enumerate() {
         text_button(
             &app.ui_font,
-            race_grid_rect(0, i, 4),
+            race_placement_rect(i / 2, i % 2),
             label,
             app.race.place_mode == *m,
         );
     }
 
-    // Row 1: point ops.
-    text_button(&app.ui_font, race_grid_rect(1, 0, 4), "Delete Point", false);
-    text_button(&app.ui_font, race_grid_rect(1, 1, 4), "Clear Points", false);
-    text_button(&app.ui_font, race_grid_rect(1, 2, 4), "Lower Z", false);
-    text_button(&app.ui_font, race_grid_rect(1, 3, 4), "Raise Z", false);
+    for (i, (section, label)) in [
+        (RacePanelSection::Track, "Track"),
+        (RacePanelSection::Points, "Points"),
+        (RacePanelSection::Output, "Output"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        draw_race_panel_tab(
+            &app.ui_font,
+            race_panel_tab_rect(i),
+            label,
+            app.race.panel_section == *section,
+        );
+    }
 
-    // Row 2: laps / radius.
-    text_button(&app.ui_font, race_grid_rect(2, 0, 4), "Lap -", false);
-    text_button(&app.ui_font, race_grid_rect(2, 1, 4), "Lap +", false);
-    text_button(&app.ui_font, race_grid_rect(2, 2, 4), "Radius -", false);
-    text_button(&app.ui_font, race_grid_rect(2, 3, 4), "Radius +", false);
-
-    // Row 3: radar backdrop.
-    text_button(&app.ui_font, race_grid_rect(3, 0, 2), "Browse Radar", false);
-    text_button(&app.ui_font, race_grid_rect(3, 1, 2), "Auto Radar", false);
-
-    // Row 4: generate the full-map radar backdrop.
-    text_button(
-        &app.ui_font,
-        race_grid_rect(4, 0, 1),
-        "Generate Radar Image",
-        false,
-    );
-
-    // Row 5: generate the selected race preview.
-    text_button(
-        &app.ui_font,
-        race_grid_rect(5, 0, 1),
-        "Generate Preview",
-        false,
-    );
-
-    // Row 6: reorder selected point.
-    text_button(&app.ui_font, race_grid_rect(6, 0, 2), "Move Up", false);
-    text_button(&app.ui_font, race_grid_rect(6, 1, 2), "Move Down", false);
-
-    // Row 7: subtrack navigation + add/delete.
-    text_button(&app.ui_font, race_grid_rect(7, 0, 4), "Previous", false);
-    text_button(&app.ui_font, race_grid_rect(7, 1, 4), "Next", false);
-    text_button(&app.ui_font, race_grid_rect(7, 2, 4), "Add Subtrack", false);
-    text_button(
-        &app.ui_font,
-        race_grid_rect(7, 3, 4),
-        "Delete Subtrack",
-        false,
-    );
-
-    // Row 8: rename track / subtrack.
     let renaming_track = app
         .race_name_edit
         .as_ref()
@@ -1543,18 +1583,59 @@ fn draw_race_right_panel(app: &AppState) {
         .race_name_edit
         .as_ref()
         .is_some_and(|e| e.target == RaceNameTarget::Subtrack);
-    text_button(
-        &app.ui_font,
-        race_grid_rect(8, 0, 2),
-        "Rename Track",
-        renaming_track,
-    );
-    text_button(
-        &app.ui_font,
-        race_grid_rect(8, 1, 2),
-        "Rename Sub",
-        renaming_sub,
-    );
+    match app.race.panel_section {
+        RacePanelSection::Track => {
+            text_button(&app.ui_font, race_grid_rect(0, 0, 2), "Laps -", false);
+            text_button(&app.ui_font, race_grid_rect(0, 1, 2), "Laps +", false);
+            text_button(&app.ui_font, race_grid_rect(1, 0, 2), "Radius -", false);
+            text_button(&app.ui_font, race_grid_rect(1, 1, 2), "Radius +", false);
+            text_button(&app.ui_font, race_grid_rect(2, 0, 2), "Previous", false);
+            text_button(&app.ui_font, race_grid_rect(2, 1, 2), "Next", false);
+            text_button(&app.ui_font, race_grid_rect(3, 0, 2), "Add Subtrack", false);
+            text_button(
+                &app.ui_font,
+                race_grid_rect(3, 1, 2),
+                "Delete Subtrack",
+                false,
+            );
+            text_button(
+                &app.ui_font,
+                race_grid_rect(4, 0, 2),
+                "Rename Track",
+                renaming_track,
+            );
+            text_button(
+                &app.ui_font,
+                race_grid_rect(4, 1, 2),
+                "Rename Subtrack",
+                renaming_sub,
+            );
+        }
+        RacePanelSection::Points => {
+            text_button(&app.ui_font, race_grid_rect(0, 0, 2), "Delete Point", false);
+            text_button(&app.ui_font, race_grid_rect(0, 1, 2), "Clear Points", false);
+            text_button(&app.ui_font, race_grid_rect(1, 0, 2), "Lower Z", false);
+            text_button(&app.ui_font, race_grid_rect(1, 1, 2), "Raise Z", false);
+            text_button(&app.ui_font, race_grid_rect(2, 0, 2), "Move Up", false);
+            text_button(&app.ui_font, race_grid_rect(2, 1, 2), "Move Down", false);
+        }
+        RacePanelSection::Output => {
+            text_button(&app.ui_font, race_grid_rect(0, 0, 2), "Browse Radar", false);
+            text_button(&app.ui_font, race_grid_rect(0, 1, 2), "Auto Radar", false);
+            text_button(
+                &app.ui_font,
+                race_grid_rect(1, 0, 1),
+                "Generate Radar Image",
+                false,
+            );
+            text_button(
+                &app.ui_font,
+                race_grid_rect(2, 0, 1),
+                "Generate Preview",
+                false,
+            );
+        }
+    }
 
     // Info lines.
     let info_y = race_info_y();

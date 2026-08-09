@@ -16,14 +16,103 @@ pub(crate) const PICK_HERO_H: f32 = 140.0;
 pub(crate) const PICK_BROWSE_Y: f32 = PICK_HERO_Y + PICK_HERO_H + 26.0; // 222
 pub(crate) const PICK_BROWSE_H: f32 = 42.0;
 pub(crate) const PICK_STATUS_Y: f32 = PICK_BROWSE_Y + PICK_BROWSE_H + 22.0; // 286
-pub(crate) const PICK_HEADER_Y: f32 = PICK_STATUS_Y + 36.0; // 322
-pub(crate) const PICK_GRID_Y: f32 = PICK_HEADER_Y + 30.0; // 352
+pub(crate) const PICK_FILTER_Y: f32 = PICK_STATUS_Y + 22.0; // 308
+pub(crate) const PICK_HEADER_Y: f32 = PICK_FILTER_Y + 48.0; // 356
+pub(crate) const PICK_GRID_Y: f32 = PICK_HEADER_Y + 30.0; // 386
 
 // The launcher shows project creation, browse, and editor-only actions together.
 const LAUNCH_BTN_GAP: f32 = 18.0;
 const SHOW_NEW_PROJECT: bool = true;
-const PROJECT_CARD_H: f32 = 150.0;
+// The full project path may wrap to three lines below the preview.
+const PROJECT_CARD_H: f32 = 190.0;
 const PROJECT_CARD_GAP: f32 = 22.0;
+
+#[derive(Default)]
+struct ProjectFilter {
+    query: String,
+    cursor: usize,
+    selection_anchor: Option<usize>,
+    focused: bool,
+}
+
+// The picker is constructed before the application's long-lived UI state is
+// available. Keep this tiny, launcher-only input state here instead of making
+// project loading carry transient search state into the editor.
+static PROJECT_FILTER: OnceLock<Mutex<ProjectFilter>> = OnceLock::new();
+
+fn project_filter() -> std::sync::MutexGuard<'static, ProjectFilter> {
+    PROJECT_FILTER
+        .get_or_init(|| Mutex::new(ProjectFilter::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn project_filter_rect() -> Rect {
+    let w = 420.0_f32.min(screen_width() - 88.0);
+    Rect::new((screen_width() - w) * 0.5, PICK_FILTER_Y, w, 32.0)
+}
+
+fn filtered_project_paths(picker: &ProjectPicker) -> Vec<PathBuf> {
+    let query = project_filter().query.trim().to_lowercase();
+    if query.is_empty() {
+        return picker.projects.clone();
+    }
+    picker
+        .projects
+        .iter()
+        .filter(|path| {
+            project_name(path).to_lowercase().contains(&query)
+                || path.to_string_lossy().to_lowercase().contains(&query)
+        })
+        .cloned()
+        .collect()
+}
+
+fn project_source_label(picker: &ProjectPicker, path: &Path) -> String {
+    picker
+        .project_roots
+        .iter()
+        .find(|root| path.starts_with(root))
+        .map(|root| format!("Root: {}", project_name(root)))
+        .unwrap_or_else(|| "Recent project".to_string())
+}
+
+/// Wraps filesystem paths at separators when possible, preserving the full path
+/// instead of replacing its middle with an ellipsis.
+fn wrap_project_path(path: &str, size: u16, max_width: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for ch in path.chars() {
+        current.push(ch);
+        if ui_text_width(&current, size) <= max_width || current.len() == ch.len_utf8() {
+            continue;
+        }
+        let split_at = current
+            .char_indices()
+            .filter_map(|(index, candidate)| {
+                matches!(candidate, '/' | '\\').then_some(index + candidate.len_utf8())
+            })
+            .filter(|index| *index < current.len())
+            .last()
+            .unwrap_or_else(|| current.len() - ch.len_utf8());
+        lines.push(current[..split_at].to_string());
+        current = current[split_at..].to_string();
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn project_path_layout(path: &str, max_width: f32) -> (u16, Vec<String>) {
+    let mut size = 12;
+    let mut lines = wrap_project_path(path, size, max_width);
+    while lines.len() > 3 && size > 1 {
+        size -= 1;
+        lines = wrap_project_path(path, size, max_width);
+    }
+    (size, lines)
+}
 
 pub(crate) fn project_grid_cols() -> usize {
     if screen_width() >= 1280.0 {
@@ -89,17 +178,16 @@ fn project_scroll_track_rect() -> Rect {
     )
 }
 
-fn project_scroll_thumb_rect(picker: &ProjectPicker) -> Option<Rect> {
-    let total_rows = project_total_rows(picker.projects.len());
+fn project_scroll_thumb_rect(project_count: usize, scroll_row: usize) -> Option<Rect> {
+    let total_rows = project_total_rows(project_count);
     let visible_rows = project_visible_rows();
     if total_rows <= visible_rows {
         return None;
     }
     let track = project_scroll_track_rect();
     let thumb_h = (track.h * visible_rows as f32 / total_rows as f32).clamp(28.0, track.h);
-    let max_scroll = project_max_scroll_row(picker.projects.len()).max(1);
-    let thumb_y =
-        track.y + (track.h - thumb_h) * picker.project_scroll_row as f32 / max_scroll as f32;
+    let max_scroll = project_max_scroll_row(project_count).max(1);
+    let thumb_y = track.y + (track.h - thumb_h) * scroll_row as f32 / max_scroll as f32;
     Some(Rect::new(track.x, thumb_y, track.w, thumb_h))
 }
 
@@ -187,6 +275,7 @@ pub(crate) fn new_project_picker(options: Options, ui_font: Font, icons: IconSet
         new_project_dialog: None,
         project_roots_dialog: false,
         project_scroll_row: 0,
+        project_scroll_drag: false,
         status: "Create a project, choose a recent one, browse, or open the editor.".to_string(),
     };
     start_project_discovery(&mut picker);
@@ -743,6 +832,107 @@ pub(crate) fn project_picker_start_load(
     Some(LoadJob::new(options, Font::default(), picker.icons.clone()))
 }
 
+fn update_project_filter(picker: &mut ProjectPicker, mouse: Vec2) {
+    let rect = project_filter_rect();
+    let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+    let mut filter_guard = project_filter();
+    let filter: &mut ProjectFilter = &mut filter_guard;
+    if is_mouse_button_pressed(MouseButton::Left) {
+        filter.focused = rect.contains(mouse);
+        if filter.focused {
+            filter.cursor = filter.query.len();
+            filter.selection_anchor = None;
+            drain_text_input();
+        }
+    }
+    if ctrl && is_key_pressed(KeyCode::F) {
+        filter.focused = true;
+        filter.cursor = filter.query.len();
+        filter.selection_anchor = None;
+        drain_text_input();
+    }
+    if !filter.focused {
+        return;
+    }
+    if is_key_pressed(KeyCode::Escape) {
+        filter.focused = false;
+        return;
+    }
+    filter.cursor = clamp_char_boundary(&filter.query, filter.cursor);
+    if handle_text_clipboard_shortcuts(
+        &mut filter.query,
+        &mut filter.cursor,
+        &mut filter.selection_anchor,
+    ) {
+        picker.project_scroll_row = 0;
+        drain_text_input();
+        return;
+    }
+    if is_key_pressed(KeyCode::Home) {
+        filter.cursor = 0;
+        filter.selection_anchor = None;
+    }
+    if is_key_pressed(KeyCode::End) {
+        filter.cursor = filter.query.len();
+        filter.selection_anchor = None;
+    }
+    if is_key_pressed(KeyCode::Left) {
+        filter.cursor = prev_char_boundary(&filter.query, filter.cursor);
+        filter.selection_anchor = None;
+    }
+    if is_key_pressed(KeyCode::Right) {
+        filter.cursor = next_char_boundary(&filter.query, filter.cursor);
+        filter.selection_anchor = None;
+    }
+    let mut changed = false;
+    if is_key_pressed(KeyCode::Backspace)
+        && !delete_text_selection(
+            &mut filter.query,
+            &mut filter.cursor,
+            &mut filter.selection_anchor,
+        )
+        && filter.cursor > 0
+    {
+        let previous = prev_char_boundary(&filter.query, filter.cursor);
+        filter.query.replace_range(previous..filter.cursor, "");
+        filter.cursor = previous;
+        changed = true;
+    }
+    if is_key_pressed(KeyCode::Delete)
+        && !delete_text_selection(
+            &mut filter.query,
+            &mut filter.cursor,
+            &mut filter.selection_anchor,
+        )
+        && filter.cursor < filter.query.len()
+    {
+        let next = next_char_boundary(&filter.query, filter.cursor);
+        filter.query.replace_range(filter.cursor..next, "");
+        changed = true;
+    }
+    while let Some(ch) = get_char_pressed() {
+        if handle_text_control_char(
+            &mut filter.query,
+            &mut filter.cursor,
+            &mut filter.selection_anchor,
+            ch,
+        ) {
+            changed = true;
+        } else if !ch.is_control() {
+            insert_text_at_cursor(
+                &mut filter.query,
+                &mut filter.cursor,
+                &mut filter.selection_anchor,
+                &ch.to_string(),
+            );
+            changed = true;
+        }
+    }
+    if changed {
+        picker.project_scroll_row = 0;
+    }
+}
+
 pub(crate) fn update_project_picker(picker: &mut ProjectPicker) -> Option<LoadJob> {
     poll_project_discovery(picker);
     if let Some(rx) = picker.project_root_picker_rx.as_ref() {
@@ -830,17 +1020,48 @@ pub(crate) fn update_project_picker(picker: &mut ProjectPicker) -> Option<LoadJo
     if picker.project_roots_dialog {
         return update_project_roots_dialog(picker);
     }
+    let mouse: Vec2 = mouse_position().into();
+    update_project_filter(picker, mouse);
+    let filtered_projects = filtered_project_paths(picker);
     picker.project_scroll_row = picker
         .project_scroll_row
-        .min(project_max_scroll_row(picker.projects.len()));
-    let mouse: Vec2 = mouse_position().into();
-    let wheel = mouse_wheel().1;
+        .min(project_max_scroll_row(filtered_projects.len()));
+    let wheel = safe_mouse_wheel().1;
     if wheel.abs() > f32::EPSILON && mouse.y >= PICK_HEADER_Y {
-        let max_scroll = project_max_scroll_row(picker.projects.len());
+        let max_scroll = project_max_scroll_row(filtered_projects.len());
         if wheel > 0.0 {
             picker.project_scroll_row = picker.project_scroll_row.saturating_sub(1);
         } else {
             picker.project_scroll_row = (picker.project_scroll_row + 1).min(max_scroll);
+        }
+    }
+    let scroll_track = project_scroll_track_rect();
+    if !is_mouse_button_down(MouseButton::Left) {
+        picker.project_scroll_drag = false;
+    }
+    if is_mouse_button_down(MouseButton::Left)
+        && (picker.project_scroll_drag
+            || project_scroll_thumb_rect(filtered_projects.len(), picker.project_scroll_row)
+                .is_some())
+    {
+        let hit_area = Rect::new(
+            scroll_track.x - 6.0,
+            scroll_track.y,
+            scroll_track.w + 12.0,
+            scroll_track.h,
+        );
+        if picker.project_scroll_drag || hit_area.contains(mouse) {
+            let max_scroll = project_max_scroll_row(filtered_projects.len());
+            let thumb_h =
+                project_scroll_thumb_rect(filtered_projects.len(), picker.project_scroll_row)
+                    .map_or(28.0, |thumb| thumb.h);
+            let travel = (scroll_track.h - thumb_h).max(1.0);
+            picker.project_scroll_row =
+                (((mouse.y - scroll_track.y - thumb_h * 0.5).clamp(0.0, travel) / travel)
+                    * max_scroll as f32)
+                    .round() as usize;
+            picker.project_scroll_drag = true;
+            return None;
         }
     }
     let page_rows = project_visible_rows().max(1);
@@ -849,7 +1070,7 @@ pub(crate) fn update_project_picker(picker: &mut ProjectPicker) -> Option<LoadJo
     }
     if is_key_pressed(KeyCode::PageDown) {
         picker.project_scroll_row = (picker.project_scroll_row + page_rows)
-            .min(project_max_scroll_row(picker.projects.len()));
+            .min(project_max_scroll_row(filtered_projects.len()));
     }
     if is_mouse_button_pressed(MouseButton::Left) {
         if SHOW_NEW_PROJECT && project_new_rect().contains(mouse) {
@@ -867,9 +1088,10 @@ pub(crate) fn update_project_picker(picker: &mut ProjectPicker) -> Option<LoadJo
             project_picker_open_roots_dialog(picker);
             return None;
         }
-        let scroll_track = project_scroll_track_rect();
-        if project_scroll_thumb_rect(picker).is_some() && scroll_track.contains(mouse) {
-            let max_scroll = project_max_scroll_row(picker.projects.len());
+        if project_scroll_thumb_rect(filtered_projects.len(), picker.project_scroll_row).is_some()
+            && scroll_track.contains(mouse)
+        {
+            let max_scroll = project_max_scroll_row(filtered_projects.len());
             let t = ((mouse.y - scroll_track.y) / scroll_track.h).clamp(0.0, 1.0);
             picker.project_scroll_row = (t * max_scroll as f32).round() as usize;
             return None;
@@ -877,9 +1099,7 @@ pub(crate) fn update_project_picker(picker: &mut ProjectPicker) -> Option<LoadJo
         let cols = project_grid_cols();
         let first = picker.project_scroll_row * cols;
         let visible_count = project_visible_rows() * cols;
-        for (slot, path) in picker
-            .projects
-            .clone()
+        for (slot, path) in filtered_projects
             .into_iter()
             .skip(first)
             .take(visible_count)
@@ -1158,28 +1378,82 @@ pub(crate) fn draw_project_picker(picker: &mut ProjectPicker) {
         ui_muted(),
     );
 
+    let filter_rect = project_filter_rect();
+    let filter = project_filter();
+    let filter_border = if filter.focused {
+        ui_accent()
+    } else {
+        ui_border()
+    };
+    draw_rrect_bordered(
+        filter_rect.x,
+        filter_rect.y,
+        filter_rect.w,
+        filter_rect.h,
+        7.0,
+        1.0,
+        Color::new(0.055, 0.064, 0.078, 1.0),
+        filter_border,
+    );
+    let filter_text = if filter.query.is_empty() {
+        "Search projects... (Ctrl+F)".to_string()
+    } else {
+        filter.query.clone()
+    };
+    ui_text_size(
+        &picker.ui_font,
+        &ellipsize_width(&filter_text, 14, filter_rect.w - 20.0),
+        filter_rect.x + 10.0,
+        filter_rect.y + 21.0,
+        14,
+        if filter.query.is_empty() {
+            ui_muted()
+        } else {
+            WHITE
+        },
+    );
+    if filter.focused && (get_time() * 2.0) as i32 % 2 == 0 {
+        let cursor = clamp_char_boundary(&filter.query, filter.cursor);
+        let caret_x = (filter_rect.x + 10.0 + ui_text_width(&filter.query[..cursor], 14))
+            .min(filter_rect.x + filter_rect.w - 8.0);
+        draw_line(
+            caret_x,
+            filter_rect.y + 7.0,
+            caret_x,
+            filter_rect.y + filter_rect.h - 7.0,
+            1.0,
+            WHITE,
+        );
+    }
+    drop(filter);
+
     // Section header, left-aligned to the card grid.
+    let filtered_projects = filtered_project_paths(picker);
     let grid_x = project_grid_start_x();
     let cols = project_grid_cols();
     let first = picker.project_scroll_row * cols;
     let visible_count = project_visible_rows() * cols;
-    let visible_end = (first + visible_count).min(picker.projects.len());
-    let project_heading = if picker.projects.is_empty() {
+    let visible_end = (first + visible_count).min(filtered_projects.len());
+    let project_heading = if filtered_projects.is_empty() {
         "Projects".to_string()
     } else {
         format!(
             "Projects  {}-{} of {}",
             first + 1,
             visible_end,
-            picker.projects.len()
+            filtered_projects.len()
         )
     };
     ui_text_bold(&project_heading, grid_x, PICK_HEADER_Y, 18, WHITE);
 
-    if picker.projects.is_empty() {
+    if filtered_projects.is_empty() {
         ui_text_size(
             &picker.ui_font,
-            "No projects found. Add a Project Root or browse to open one.",
+            if picker.projects.is_empty() {
+                "No projects found. Add a Project Root or browse to open one."
+            } else {
+                "No projects match this search. Try a different name or path."
+            },
             grid_x,
             PICK_GRID_Y + 28.0,
             15,
@@ -1187,9 +1461,7 @@ pub(crate) fn draw_project_picker(picker: &mut ProjectPicker) {
         );
     }
 
-    for (slot, path) in picker
-        .projects
-        .clone()
+    for (slot, path) in filtered_projects
         .iter()
         .skip(first)
         .take(visible_count)
@@ -1216,7 +1488,7 @@ pub(crate) fn draw_project_picker(picker: &mut ProjectPicker) {
             draw_rrect(rect.x + 14.0, rect.y, rect.w - 28.0, 3.0, 1.5, ui_accent());
         }
 
-        let thumb = Rect::new(rect.x + 14.0, rect.y + 14.0, rect.w - 28.0, 80.0);
+        let thumb = Rect::new(rect.x + 14.0, rect.y + 14.0, rect.w - 28.0, 76.0);
         if let Some(texture) = project_thumbnail_texture(picker, path) {
             draw_texture_ex(
                 &texture,
@@ -1244,43 +1516,54 @@ pub(crate) fn draw_project_picker(picker: &mut ProjectPicker) {
         ui_text_bold(
             &ellipsize_width(&name, 18, rect.w - 32.0),
             rect.x + 16.0,
-            rect.y + 118.0,
+            rect.y + 114.0,
             18,
             WHITE,
         );
+        let path_label = path.to_string_lossy();
+        let (path_size, path_lines) = project_path_layout(&path_label, rect.w - 32.0);
+        for (line_index, line) in path_lines.iter().enumerate() {
+            ui_text_size(
+                &picker.ui_font,
+                line,
+                rect.x + 16.0,
+                rect.y + 135.0 + line_index as f32 * 14.0,
+                path_size,
+                ui_muted(),
+            );
+        }
         ui_text_size(
             &picker.ui_font,
-            &ellipsize_width(path.to_string_lossy().as_ref(), 13, rect.w - 32.0),
+            &ellipsize_width(&project_source_label(picker, path), 12, rect.w - 32.0),
             rect.x + 16.0,
-            rect.y + 138.0,
-            13,
-            ui_muted(),
+            rect.y + 178.0,
+            12,
+            Color::new(0.56, 0.62, 0.70, 1.0),
         );
     }
 
-    let total_rows = project_total_rows(picker.projects.len());
+    let total_rows = project_total_rows(filtered_projects.len());
     let visible_rows = project_visible_rows();
     if total_rows > visible_rows {
         let track = project_scroll_track_rect();
-        draw_rrect(track.x, track.y, track.w, track.h, 4.0, ui_input_bg());
-        if let Some(thumb) = project_scroll_thumb_rect(picker) {
-            draw_rrect(
-                thumb.x,
-                thumb.y,
-                thumb.w,
-                thumb.h,
-                4.0,
-                if thumb.contains(mouse_position().into()) {
-                    ui_accent()
-                } else {
-                    Color::new(0.30, 0.32, 0.35, 1.0)
-                },
+        if let Some(thumb) =
+            project_scroll_thumb_rect(filtered_projects.len(), picker.project_scroll_row)
+        {
+            let metrics = ScrollbarMetrics {
+                track,
+                thumb,
+                max_scroll: project_max_scroll_row(filtered_projects.len()) as f32,
+            };
+            draw_scrollbar(
+                metrics,
+                scrollbar_visual_state(track, picker.project_scroll_drag),
             );
         }
     }
 
     draw_new_project_dialog(picker);
     draw_project_roots_dialog(picker);
+    draw_pending_ui_tooltip(&picker.ui_font);
 }
 
 fn draw_project_roots_dialog(picker: &ProjectPicker) {
@@ -1320,12 +1603,14 @@ fn draw_project_roots_dialog(picker: &ProjectPicker) {
             Color::new(0.055, 0.064, 0.078, 1.0),
             ui_border(),
         );
+        let root_label = root.to_string_lossy();
+        let root_size = ui_text_size_to_fit(&root_label, 14, rect.w - 164.0);
         ui_text_size(
             &picker.ui_font,
-            &ellipsize_width(root.to_string_lossy().as_ref(), 14, rect.w - 164.0),
+            &root_label,
             rect.x + 32.0,
             y + 19.0,
-            14,
+            root_size,
             LIGHTGRAY,
         );
         draw_dialog_button(

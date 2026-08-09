@@ -158,6 +158,16 @@ pub(crate) enum ValidationListKind {
     Warnings,
 }
 
+impl ValidationListKind {
+    const fn slot(self) -> usize {
+        match self {
+            Self::Missing => 0,
+            Self::Unused => 1,
+            Self::Warnings => 2,
+        }
+    }
+}
+
 pub(crate) fn validation_list_count(
     summary: &ValidationSummary,
     kind: ValidationListKind,
@@ -347,54 +357,59 @@ pub(crate) fn validation_list_height(count: usize) -> f32 {
     12.0 + count.max(1) as f32 * 24.0
 }
 
-pub(crate) fn validation_scroll_max_cached(summary: &ValidationSummary) -> f32 {
-    let content_h =
-        validation_list_height(validation_list_count(summary, ValidationListKind::Missing))
-            .max(validation_list_height(validation_list_count(
-                summary,
-                ValidationListKind::Unused,
-            )))
-            .max(validation_list_height(validation_list_count(
-                summary,
-                ValidationListKind::Warnings,
-            )));
-    let lists = validation_lists_rect();
-    (content_h - (lists.h - 66.0).max(1.0)).max(0.0)
+fn validation_list_scroll_max(
+    summary: &ValidationSummary,
+    kind: ValidationListKind,
+    rect: Rect,
+) -> f32 {
+    (validation_list_height(validation_list_count(summary, kind)) - (rect.h - 66.0).max(1.0))
+        .max(0.0)
 }
 
-pub(crate) fn validation_scroll_max(app: &AppState) -> f32 {
-    if let Some(summary) = app.validation_cache.as_ref() {
-        validation_scroll_max_cached(summary)
-    } else {
-        let summary = validation_summary(app);
-        validation_scroll_max_cached(&summary)
+pub(crate) fn clamp_validation_list_scroll(app: &mut AppState) {
+    let Some(summary) = app.validation_cache.as_ref() else {
+        return;
+    };
+    for (kind, rect) in [
+        (
+            ValidationListKind::Missing,
+            validation_list_column_rects()[0],
+        ),
+        (
+            ValidationListKind::Unused,
+            validation_list_column_rects()[1],
+        ),
+        (
+            ValidationListKind::Warnings,
+            validation_list_column_rects()[2],
+        ),
+    ] {
+        let slot = kind.slot();
+        app.validation_list_scroll[slot] = app.validation_list_scroll[slot]
+            .clamp(0.0, validation_list_scroll_max(summary, kind, rect));
     }
 }
 
-pub(crate) fn draw_validation_scrollbar(app: &AppState, clip_top: f32, clip_bottom: f32) {
-    let max_scroll = validation_scroll_max(app);
+fn validation_list_scrollbar(
+    summary: &ValidationSummary,
+    kind: ValidationListKind,
+    rect: Rect,
+    scroll: f32,
+    dragging: bool,
+) {
+    let max_scroll = validation_list_scroll_max(summary, kind, rect);
     if max_scroll <= 0.5 {
         return;
     }
     let track = Rect::new(
-        validation_panel_rect().x + validation_panel_rect().w - 18.0,
-        clip_top,
+        rect.x + rect.w - 10.0,
+        rect.y + 54.0,
         5.0,
-        (clip_bottom - clip_top).max(20.0),
+        (rect.h - 64.0).max(20.0),
     );
-    draw_rrect(track.x, track.y, track.w, track.h, 2.5, ui_input_bg());
-    let visible = track.h;
-    let content = visible + max_scroll;
-    let thumb_h = (visible * visible / content).clamp(24.0, visible);
-    let thumb_y = track.y + (track.h - thumb_h) * (app.properties_scroll / max_scroll);
-    draw_rrect(
-        track.x,
-        thumb_y,
-        track.w,
-        thumb_h,
-        2.5,
-        Color::new(0.26, 0.51, 0.74, 1.0),
-    );
+    if let Some(metrics) = scrollbar_metrics(track, track.h, track.h + max_scroll, 24.0, scroll) {
+        draw_scrollbar(metrics, scrollbar_visual_state(track, dragging));
+    }
 }
 
 pub(crate) fn draw_validation_list(
@@ -682,9 +697,6 @@ pub(crate) fn draw_validation_panel(app: &mut AppState) {
         Color::new(0.84, 0.68, 0.34, 1.0),
     );
 
-    let lists = validation_lists_rect();
-    let clip_top = lists.y + 54.0;
-    let clip_bottom = lists.y + lists.h - 10.0;
     let [missing_rect, unused_rect, warnings_rect] = validation_list_column_rects();
     draw_validation_list(
         &app.ui_font,
@@ -692,9 +704,9 @@ pub(crate) fn draw_validation_panel(app: &mut AppState) {
         "Missing",
         ValidationListKind::Missing,
         missing_rect,
-        app.properties_scroll,
-        clip_top,
-        clip_bottom,
+        app.validation_list_scroll[ValidationListKind::Missing.slot()],
+        missing_rect.y + 54.0,
+        missing_rect.y + missing_rect.h - 10.0,
     );
 
     draw_validation_list(
@@ -703,9 +715,9 @@ pub(crate) fn draw_validation_panel(app: &mut AppState) {
         "Unused",
         ValidationListKind::Unused,
         unused_rect,
-        app.properties_scroll,
-        clip_top,
-        clip_bottom,
+        app.validation_list_scroll[ValidationListKind::Unused.slot()],
+        unused_rect.y + 54.0,
+        unused_rect.y + unused_rect.h - 10.0,
     );
 
     draw_validation_list(
@@ -714,11 +726,31 @@ pub(crate) fn draw_validation_panel(app: &mut AppState) {
         "Warnings",
         ValidationListKind::Warnings,
         warnings_rect,
-        app.properties_scroll,
-        clip_top,
-        clip_bottom,
+        app.validation_list_scroll[ValidationListKind::Warnings.slot()],
+        warnings_rect.y + 54.0,
+        warnings_rect.y + warnings_rect.h - 10.0,
     );
-    draw_validation_scrollbar(app, clip_top, clip_bottom);
+    validation_list_scrollbar(
+        summary,
+        ValidationListKind::Missing,
+        missing_rect,
+        app.validation_list_scroll[ValidationListKind::Missing.slot()],
+        app.validation_list_scroll_drag == Some(ValidationListKind::Missing.slot()),
+    );
+    validation_list_scrollbar(
+        summary,
+        ValidationListKind::Unused,
+        unused_rect,
+        app.validation_list_scroll[ValidationListKind::Unused.slot()],
+        app.validation_list_scroll_drag == Some(ValidationListKind::Unused.slot()),
+    );
+    validation_list_scrollbar(
+        summary,
+        ValidationListKind::Warnings,
+        warnings_rect,
+        app.validation_list_scroll[ValidationListKind::Warnings.slot()],
+        app.validation_list_scroll_drag == Some(ValidationListKind::Warnings.slot()),
+    );
 
     for (slot, category) in VALIDATION_CATEGORIES.iter().copied().enumerate() {
         text_button(
@@ -878,7 +910,7 @@ pub(crate) fn validation_missing_item_at(
     let lists = validation_lists_rect();
     let [missing, _, _] = validation_list_column_rects();
     let x = missing.x + 8.0;
-    let y = lists.y + 64.0 - app.properties_scroll;
+    let y = lists.y + 64.0 - app.validation_list_scroll[ValidationListKind::Missing.slot()];
     let clip_top = lists.y + 54.0;
     let clip_bottom = lists.y + lists.h - 10.0;
     let count = validation_list_count(summary, ValidationListKind::Missing);
@@ -949,9 +981,122 @@ pub(crate) fn snap_to_validation_missing_item(app: &mut AppState, item: Validati
     }
 }
 
+pub(crate) fn handle_validation_scroll(app: &mut AppState, mouse: Vec2, wheel: f32) -> bool {
+    if app.active_tab != AppTab::Validation || wheel.abs() <= 0.0 {
+        return false;
+    }
+    ensure_validation_cache(app);
+    let summary = app.validation_cache.as_ref().unwrap();
+    for (kind, rect) in [
+        (
+            ValidationListKind::Missing,
+            validation_list_column_rects()[0],
+        ),
+        (
+            ValidationListKind::Unused,
+            validation_list_column_rects()[1],
+        ),
+        (
+            ValidationListKind::Warnings,
+            validation_list_column_rects()[2],
+        ),
+    ] {
+        if rect.contains(mouse) {
+            let max_scroll = validation_list_scroll_max(summary, kind, rect);
+            let slot = kind.slot();
+            app.validation_list_scroll[slot] =
+                (app.validation_list_scroll[slot] - wheel * 36.0).clamp(0.0, max_scroll);
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn handle_validation_scrollbar_drag(app: &mut AppState, mouse: Vec2) -> bool {
+    let Some(slot) = app.validation_list_scroll_drag else {
+        return false;
+    };
+    if !is_mouse_button_down(MouseButton::Left) {
+        app.validation_list_scroll_drag = None;
+        return true;
+    }
+    ensure_validation_cache(app);
+    let summary = app.validation_cache.as_ref().unwrap();
+    let kind = match slot {
+        0 => ValidationListKind::Missing,
+        1 => ValidationListKind::Unused,
+        2 => ValidationListKind::Warnings,
+        _ => return false,
+    };
+    let rect = validation_list_column_rects()[slot];
+    let track = Rect::new(
+        rect.x + rect.w - 10.0,
+        rect.y + 54.0,
+        5.0,
+        (rect.h - 64.0).max(20.0),
+    );
+    let max_scroll = validation_list_scroll_max(summary, kind, rect);
+    if let Some(metrics) = scrollbar_metrics(
+        track,
+        track.h,
+        track.h + max_scroll,
+        24.0,
+        app.validation_list_scroll[slot],
+    ) {
+        app.validation_list_scroll[slot] = scrollbar_scroll_for_drag(
+            metrics,
+            ScrollbarDrag {
+                grab_offset_y: app.validation_list_scroll_grab_offset_y,
+            },
+            mouse,
+        );
+    }
+    true
+}
+
 pub(crate) fn handle_validation_click(app: &mut AppState, mouse: Vec2) -> bool {
     if app.active_tab != AppTab::Validation {
         return false;
+    }
+    if is_mouse_button_pressed(MouseButton::Left) {
+        ensure_validation_cache(app);
+        let summary = app.validation_cache.as_ref().unwrap();
+        for (kind, rect) in [
+            (
+                ValidationListKind::Missing,
+                validation_list_column_rects()[0],
+            ),
+            (
+                ValidationListKind::Unused,
+                validation_list_column_rects()[1],
+            ),
+            (
+                ValidationListKind::Warnings,
+                validation_list_column_rects()[2],
+            ),
+        ] {
+            let track = Rect::new(
+                rect.x + rect.w - 10.0,
+                rect.y + 54.0,
+                5.0,
+                (rect.h - 64.0).max(20.0),
+            );
+            let max_scroll = validation_list_scroll_max(summary, kind, rect);
+            if let Some(metrics) = scrollbar_metrics(
+                track,
+                track.h,
+                track.h + max_scroll,
+                24.0,
+                app.validation_list_scroll[kind.slot()],
+            ) && let Some(drag) = scrollbar_begin_drag(metrics, mouse)
+            {
+                app.validation_list_scroll_drag = Some(kind.slot());
+                app.validation_list_scroll_grab_offset_y = drag.grab_offset_y;
+                app.scrollbar_pointer_captured = true;
+                set_scrollbar_hover_suppressed(true);
+                return true;
+            }
+        }
     }
     let left_clicked = is_mouse_button_pressed(MouseButton::Left);
     if app.dff_repair_menu_open && left_clicked {

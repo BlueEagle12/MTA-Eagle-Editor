@@ -5,6 +5,13 @@ const EDIT_VERTEX_PICK_RADIUS: f32 = 7.0;
 const COLLISION_TAB_VERTEX_PICK_RADIUS: f32 = 7.0;
 const VERTEX_OCCLUSION_TOLERANCE: f32 = 6.0;
 const MERGE_BY_DISTANCE_DEFAULT: f32 = 0.0001;
+/// The browser and asset inspector together otherwise leave too little room
+/// for meaningful mesh work on common laptop displays.
+const EDITING_ARCHIVE_MIN_SCREEN_W: f32 = 1200.0;
+
+pub(crate) fn editing_archive_visible() -> bool {
+    screen_width() >= EDITING_ARCHIVE_MIN_SCREEN_W
+}
 
 pub(crate) fn editing_panel_rect() -> Rect {
     Rect::new(14.0, TOP_H + 10.0, screen_width() - 28.0, 36.0)
@@ -30,34 +37,53 @@ pub(crate) fn editing_asset_rect() -> Rect {
 }
 
 pub(crate) fn editing_center_rect() -> Rect {
-    let left = editing_archive_rect();
     let right = editing_asset_rect();
+    let left_edge = if editing_archive_visible() {
+        let left = editing_archive_rect();
+        left.x + left.w + 18.0
+    } else {
+        14.0
+    };
     Rect::new(
-        left.x + left.w + 18.0,
+        left_edge,
         TOP_H + 54.0,
-        (right.x - left.x - left.w - 36.0).max(1.0),
+        (right.x - left_edge - 18.0).max(1.0),
         screen_height() - TOP_H - STATUS_H - 66.0,
     )
 }
 
-pub(crate) fn editing_img_prev_rect() -> Rect {
+pub(crate) fn editing_archive_picker_rect() -> Rect {
     let panel = editing_panel_rect();
-    Rect::new(panel.x + 92.0, panel.y + 4.0, 34.0, 28.0)
+    Rect::new(panel.x + 92.0, panel.y + 4.0, 200.0, 28.0)
 }
 
-pub(crate) fn editing_img_next_rect() -> Rect {
-    let panel = editing_panel_rect();
-    Rect::new(panel.x + 132.0, panel.y + 4.0, 34.0, 28.0)
+fn editing_archive_picker_option_rect(row: usize) -> Rect {
+    let picker = editing_archive_picker_rect();
+    Rect::new(
+        picker.x,
+        picker.y + picker.h + 4.0 + row as f32 * 30.0,
+        picker.w,
+        28.0,
+    )
 }
 
-pub(crate) fn editing_img_open_rect() -> Rect {
-    let panel = editing_panel_rect();
-    Rect::new(panel.x + 176.0, panel.y + 4.0, 118.0, 28.0)
+fn editing_archive_picker_visible_rows(app: &AppState) -> usize {
+    app.editing.img_paths.len().min(8)
+}
+
+fn editing_archive_picker_browse_rect(app: &AppState) -> Option<Rect> {
+    (app.editing.img_paths.len() > editing_archive_picker_visible_rows(app))
+        .then(|| editing_archive_picker_option_rect(editing_archive_picker_visible_rows(app)))
 }
 
 pub(crate) fn editing_img_choose_rect() -> Rect {
     let panel = editing_panel_rect();
-    Rect::new(panel.x + 304.0, panel.y + 4.0, 132.0, 28.0)
+    Rect::new(panel.x + 302.0, panel.y + 4.0, 132.0, 28.0)
+}
+
+pub(crate) fn editing_img_open_archive_rect() -> Rect {
+    let asset = editing_img_choose_rect();
+    Rect::new(asset.x + asset.w + 8.0, asset.y, 156.0, asset.h)
 }
 
 pub(crate) fn editing_img_save_rect() -> Rect {
@@ -337,6 +363,10 @@ fn dff_ctl_x2(right: Rect) -> f32 {
 // ---------------------------------------------------------------------------
 
 pub(crate) const DFF_SECTION_COUNT: usize = 11;
+pub(crate) const DFF_TAB_COUNT: usize = 5;
+
+const DFF_TAB_TITLES: [&str; DFF_TAB_COUNT] = ["Asset", "Material", "UV", "Mesh", "Tools"];
+const DFF_TAB_RAIL_W: f32 = 48.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DffSection {
@@ -383,6 +413,16 @@ impl DffSection {
             DffSection::Optimize => "Optimize & Repair",
         }
     }
+
+    const fn tab(self) -> usize {
+        match self {
+            Self::Effects | Self::Lighting | Self::Fractures => 0,
+            Self::Materials | Self::FaceTexture | Self::MaterialAnim => 1,
+            Self::UvTools => 2,
+            Self::Mesh | Self::Cutter => 3,
+            Self::Lod | Self::Optimize => 4,
+        }
+    }
 }
 
 pub(crate) fn dff_default_collapsed() -> [bool; DFF_SECTION_COUNT] {
@@ -418,6 +458,7 @@ pub(crate) const DFF_2DFX_VISIBLE_MAX: usize = 8;
 pub(crate) struct DffPanelLayout {
     pub(crate) content: Rect,
     pub(crate) content_height: f32,
+    pub(crate) tabs: [Rect; DFF_TAB_COUNT],
     pub(crate) headers: [Rect; DFF_SECTION_COUNT],
     pub(crate) rows_2dfx: Vec<Rect>,
     pub(crate) lighting_rows: Vec<Rect>,
@@ -476,6 +517,7 @@ pub(crate) struct DffPanelLayout {
     pub(crate) uv_rotate: Option<[Rect; 2]>,
     pub(crate) uv_unwrap_face: Option<Rect>,
     pub(crate) uv_unwrap_material: Option<Rect>,
+    pub(crate) mesh_import_set: Option<Rect>,
     pub(crate) make_face: Option<Rect>,
     pub(crate) delete_face: Option<Rect>,
     pub(crate) delete_vertex: Option<Rect>,
@@ -501,7 +543,18 @@ pub(crate) struct DffPanelLayout {
 }
 
 pub(crate) fn dff_panel_header_height(dff: &EditingDffState) -> f32 {
-    if dff.normalized_warning { 184.0 } else { 144.0 }
+    if dff.normalized_warning { 182.0 } else { 144.0 }
+}
+
+fn dff_tab_rail_rect(panel: Rect) -> Rect {
+    let tab_h = 36.0;
+    let gaps = (DFF_TAB_COUNT - 1) as f32 * 5.0;
+    Rect::new(
+        panel.x - DFF_TAB_RAIL_W - 10.0,
+        panel.y + 8.0,
+        DFF_TAB_RAIL_W,
+        DFF_TAB_COUNT as f32 * tab_h + gaps + 16.0,
+    )
 }
 
 pub(crate) fn dff_panel_layout(
@@ -525,9 +578,20 @@ pub(crate) fn dff_panel_layout(
     );
     let gap = 10.0;
     let zero = Rect::new(0.0, 0.0, 0.0, 0.0);
+    let rail = dff_tab_rail_rect(panel);
+    let tab_x = rail.x + 6.0;
+    let tab_y = rail.y + 8.0;
+    let mut tabs = [zero; DFF_TAB_COUNT];
+    let mut tab_offset = 0.0;
+    for tab in &mut tabs {
+        let tab_h = 36.0;
+        *tab = Rect::new(tab_x, tab_y + tab_offset, rail.w - 12.0, tab_h);
+        tab_offset += tab_h + 5.0;
+    }
     let mut layout = DffPanelLayout {
         content,
         content_height: 0.0,
+        tabs,
         headers: [zero; DFF_SECTION_COUNT],
         rows_2dfx: Vec::new(),
         lighting_rows: Vec::new(),
@@ -586,6 +650,7 @@ pub(crate) fn dff_panel_layout(
         uv_rotate: None,
         uv_unwrap_face: None,
         uv_unwrap_material: None,
+        mesh_import_set: None,
         make_face: None,
         delete_face: None,
         delete_vertex: None,
@@ -622,6 +687,9 @@ pub(crate) fn dff_panel_layout(
     let mut y = content.y + 4.0 - dff.panel_scroll;
     for section in DFF_SECTIONS {
         let idx = section as usize;
+        if section.tab() != dff.panel_tab.min(DFF_TAB_COUNT - 1) {
+            continue;
+        }
         layout.headers[idx] = Rect::new(x0, y, fullw, DFF_SEC_HEADER_H);
         y += DFF_SEC_HEADER_H + 6.0;
         if dff.panel_collapsed[idx] {
@@ -712,11 +780,10 @@ pub(crate) fn dff_panel_layout(
                 layout.assign_material_to_faces = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
                 y += DFF_BTN_H + DFF_ROW_GAP;
                 layout.delete_unused_material = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                // "Material Colour" caption, then the four RGBA drag bars.
+                // "Color" caption, then the four RGBA drag bars.
                 y += DFF_BTN_H + 20.0 + DFF_FIELD_LABEL_H;
                 let bar_x = x0 + DFF_COLOR_LABEL_W;
-                let bar_w =
-                    (fullw - DFF_COLOR_LABEL_W - DFF_COLOR_VALUE_W).max(80.0);
+                let bar_w = (fullw - DFF_COLOR_LABEL_W - DFF_COLOR_VALUE_W).max(80.0);
                 let mut color = [zero; 4];
                 for rect in &mut color {
                     *rect = Rect::new(bar_x, y, bar_w, DFF_COLOR_BAR_H);
@@ -848,6 +915,8 @@ pub(crate) fn dff_panel_layout(
                 y += DFF_BTN_H + gap;
             }
             DffSection::Mesh => {
+                layout.mesh_import_set = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
                 layout.make_face = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                 layout.delete_face = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
                 y += DFF_BTN_H + 6.0;
@@ -894,6 +963,9 @@ pub(crate) fn dff_panel_layout(
             }
         }
     }
+    // `y` includes the scroll translation, so compensate for it here. The
+    // scroll range must describe the full unscrolled content, not shrink as
+    // the user moves down the panel.
     layout.content_height = (y + dff.panel_scroll) - (content.y + 4.0) + 8.0;
     layout
 }
@@ -1555,13 +1627,20 @@ fn editing_key(name: &str) -> String {
 
 pub(crate) fn frame_editing_camera(app: &mut AppState, bounds: Bounds) {
     let center = (bounds.min + bounds.max) * 0.5;
-    let radius = (bounds.max - bounds.min).length().max(8.0);
-    app.camera.pos = center + vec3(-radius * 1.55, -radius * 2.15, radius * 1.15);
+    // Detail assets are commonly only a few world units across. Treating every
+    // asset as at least eight units wide leaves vehicles and props tiny in the
+    // viewport, so only retain a small floor for degenerate bounds.
+    let radius = ((bounds.max - bounds.min).length() * 0.5).max(0.25);
+    app.camera.pos = center + vec3(-radius * 0.90, -radius * 1.35, radius * 0.75);
     let dir = (center - app.camera.pos).normalize_or_zero();
     if dir.length_squared() > 0.0001 {
-        app.camera.yaw = dir.y.atan2(dir.x);
-        app.camera.pitch = dir.z.asin();
+        app.camera.yaw = dir.x.atan2(dir.y);
+        app.camera.pitch = dir.z.atan2(Vec2::new(dir.x, dir.y).length());
     }
+    // Framing an asset establishes a useful optional orbit target, but the
+    // default right-drag interaction in the editor is still free-look.
+    app.camera_mode = CameraMode::Freeroam;
+    app.camera_focus = Some(center);
     app.camera.looking = false;
     set_cursor_grab(false);
     show_mouse(true);
@@ -1960,6 +2039,146 @@ pub(crate) fn refresh_editing_img_paths(app: &mut AppState) {
         .min(app.editing.img_paths.len().saturating_sub(1));
 }
 
+fn editing_archive_picker_label(app: &AppState) -> String {
+    let Some(path) = app
+        .editing
+        .img_path
+        .as_ref()
+        .or_else(|| app.editing.img_paths.get(app.editing.selected_img_path))
+    else {
+        return "Choose project IMG".to_string();
+    };
+    path.strip_prefix(&app.root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn draw_editing_archive_picker(app: &AppState) {
+    let picker = editing_archive_picker_rect();
+    let hovered = picker.contains(mouse_position().into());
+    draw_rrect_bordered(
+        picker.x,
+        picker.y,
+        picker.w,
+        picker.h,
+        7.0,
+        1.0,
+        ui_input_bg(),
+        if app.editing.archive_picker_open || hovered {
+            ui_accent()
+        } else {
+            ui_border()
+        },
+    );
+    ui_text(
+        &app.ui_font,
+        &ellipsize_width(&editing_archive_picker_label(app), 16, picker.w - 30.0),
+        picker.x + 10.0,
+        picker.y + 20.0,
+        WHITE,
+    );
+    ui_text(
+        &app.ui_font,
+        if app.editing.archive_picker_open {
+            "^"
+        } else {
+            "v"
+        },
+        picker.x + picker.w - 20.0,
+        picker.y + 20.0,
+        ui_dim(),
+    );
+
+    if !app.editing.archive_picker_open {
+        return;
+    }
+    for row in 0..editing_archive_picker_visible_rows(app) {
+        let option = editing_archive_picker_option_rect(row);
+        let selected = app.editing.img_paths.get(row) == app.editing.img_path.as_ref();
+        let bg = if selected {
+            ui_accent_soft()
+        } else if option.contains(mouse_position().into()) {
+            ui_surface_hover()
+        } else {
+            ui_surface()
+        };
+        draw_rrect_bordered(
+            option.x,
+            option.y,
+            option.w,
+            option.h,
+            6.0,
+            1.0,
+            bg,
+            ui_border(),
+        );
+        if let Some(path) = app.editing.img_paths.get(row) {
+            let label = path
+                .strip_prefix(&app.root)
+                .unwrap_or(path)
+                .to_string_lossy();
+            ui_text(
+                &app.ui_font,
+                &ellipsize_width(&label, 16, option.w - 20.0),
+                option.x + 10.0,
+                option.y + 19.0,
+                if selected { LIGHTGRAY } else { WHITE },
+            );
+        }
+    }
+    if let Some(option) = editing_archive_picker_browse_rect(app) {
+        let hovered = option.contains(mouse_position().into());
+        draw_rrect_bordered(
+            option.x,
+            option.y,
+            option.w,
+            option.h,
+            6.0,
+            1.0,
+            if hovered {
+                ui_surface_hover()
+            } else {
+                ui_surface()
+            },
+            ui_border(),
+        );
+        ui_text(
+            &app.ui_font,
+            "Browse all project archives…",
+            option.x + 10.0,
+            option.y + 19.0,
+            ui_dim(),
+        );
+    }
+}
+
+fn handle_editing_archive_picker(app: &mut AppState, mouse: Vec2) -> bool {
+    if app.editing.archive_picker_open {
+        for row in 0..editing_archive_picker_visible_rows(app) {
+            if editing_archive_picker_option_rect(row).contains(mouse) {
+                let path = app.editing.img_paths[row].clone();
+                app.editing.selected_img_path = row;
+                app.editing.archive_picker_open = false;
+                open_editing_img(app, path);
+                return true;
+            }
+        }
+        if editing_archive_picker_browse_rect(app).is_some_and(|rect| rect.contains(mouse)) {
+            app.editing.archive_picker_open = false;
+            open_external_editing_img_picker(app);
+            return true;
+        }
+        app.editing.archive_picker_open = false;
+        return true;
+    }
+    if editing_archive_picker_rect().contains(mouse) {
+        app.editing.archive_picker_open = true;
+        return true;
+    }
+    false
+}
+
 fn load_editing_img_rows(path: &Path) -> Result<Vec<EditingImgRow>, String> {
     let rows: Vec<EditingImgRow> = parse_img(path)
         .into_iter()
@@ -2056,6 +2275,14 @@ pub(crate) fn open_editing_img_unchecked(app: &mut AppState, path: PathBuf) {
         }
     };
     app.editing.img_path = Some(path.clone());
+    if let Some(index) = app
+        .editing
+        .img_paths
+        .iter()
+        .position(|candidate| candidate == &path)
+    {
+        app.editing.selected_img_path = index;
+    }
     app.editing.rows = rows;
     app.editing.selected_row = 0;
     app.editing.scroll = 0.0;
@@ -2155,20 +2382,6 @@ pub(crate) fn open_editing_file_unchecked(app: &mut AppState, path: PathBuf) {
     }
 }
 
-pub(crate) fn open_selected_editing_img(app: &mut AppState) {
-    refresh_editing_img_paths(app);
-    if let Some(path) = app
-        .editing
-        .img_paths
-        .get(app.editing.selected_img_path)
-        .cloned()
-    {
-        open_editing_img(app, path);
-    } else {
-        app.status_message = "No IMG archives found under this resource".to_string();
-    }
-}
-
 pub(crate) fn editing_open_selected_asset(app: &mut AppState) {
     let Some(row) = editing_selected_row(app).cloned() else {
         app.status_message = "Select an IMG entry first".to_string();
@@ -2211,6 +2424,8 @@ pub(crate) fn editing_open_asset_row(app: &mut AppState, row: EditingImgRow) {
         }
     };
     let key = lower(&row.entry.name);
+    app.editing.nested_scroll_focus = None;
+    app.editing.scrollbar_drag = None;
     if key.ends_with(".txd") {
         let textures = txd_entries_from_bytes(&row.entry.name, &bytes);
         clear_editing_history(app);
@@ -2291,6 +2506,7 @@ pub(crate) fn editing_open_asset_row(app: &mut AppState, row: EditingImgRow) {
             dff_2dfx_payload_active_field: None,
             dff_2dfx_payload_field_scroll: 0.0,
             dff_2dfx_particle_picker_scroll: 0.0,
+            panel_tab: 0,
             panel_scroll: 0.0,
             panel_collapsed: dff_default_collapsed(),
         }));
@@ -4325,10 +4541,11 @@ pub(crate) fn editing_pair_dff_txd(app: &mut AppState, path: PathBuf) {
     let before = app.txd_textures.len();
     index_standalone_txd_file(&path, &mut app.txd_textures);
     if app.txd_textures.len() == before
-        && !app
-            .txd_textures
-            .values()
-            .any(|entries| entries.iter().any(|e| e.txd_name.eq_ignore_ascii_case(&txd_name)))
+        && !app.txd_textures.values().any(|entries| {
+            entries
+                .iter()
+                .any(|e| e.txd_name.eq_ignore_ascii_case(&txd_name))
+        })
     {
         app.status_message = format!("No textures could be read from {}", path.display());
         return;
@@ -11975,10 +12192,7 @@ fn validate_normalized_dff_stage(raw: &RawMesh, frame: &str) -> Result<(), Strin
     if raw_mesh_is_safe_for_hierarchy_rewrite(raw, frame) {
         Ok(())
     } else {
-        Err(
-            "the model has an invalid or unsupported frame/component hierarchy"
-                .to_string(),
-        )
+        Err("the model has an invalid or unsupported frame/component hierarchy".to_string())
     }
 }
 
@@ -12023,7 +12237,10 @@ pub(crate) fn editing_stage_dff_asset(app: &mut AppState) -> bool {
                 .rows
                 .iter()
                 .find(|row| editing_key(&row.entry.name) == key)
-                .map(|row| read_img_entry(&row.entry)[..row.logical_size.min(row.entry.size as usize)].to_vec())
+                .map(|row| {
+                    read_img_entry(&row.entry)[..row.logical_size.min(row.entry.size as usize)]
+                        .to_vec()
+                })
         })
     });
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
@@ -15974,6 +16191,24 @@ pub(crate) fn open_editing_img_picker(app: &mut AppState) {
     });
 }
 
+pub(crate) fn open_external_editing_img_picker(app: &mut AppState) {
+    drain_text_input();
+    if app.dff_picker_rx.is_some() {
+        app.status_message = "File browser is already open".to_string();
+        return;
+    }
+    let start_dir = app.root.join("imgs");
+    let (tx, rx) = mpsc::channel();
+    app.dff_picker_rx = Some(rx);
+    app.status_message = "Choose an external IMG archive...".to_string();
+    thread::spawn(move || {
+        let _ = tx.send((
+            DffPickerKind::EditingOpenImg,
+            choose_editing_img_open_path(start_dir),
+        ));
+    });
+}
+
 pub(crate) fn open_editing_merge_img_picker(app: &mut AppState) {
     if app.editing.img_path.is_none() {
         app.status_message = "Open the destination IMG before merging another archive".to_string();
@@ -18418,10 +18653,430 @@ pub(crate) fn update_editing_linked_selection_job(app: &mut AppState) {
     );
 }
 
+fn scroll_from_scrollbar(track: Rect, total: usize, visible: usize, mouse: Vec2) -> Option<f32> {
+    // The visible bar stays compact, but it gets a forgiving hit target so it
+    // remains practical to grab at any UI scale.
+    let hit_area = scrollbar_hit_area(track);
+    if !hit_area.contains(mouse) {
+        return None;
+    }
+    let max_scroll = total.saturating_sub(visible) as f32;
+    if max_scroll <= 0.0 {
+        return Some(0.0);
+    }
+    let metrics = scrollbar_metrics(track, visible as f32, total as f32, 16.0, 0.0)?;
+    let drag = scrollbar_begin_drag(metrics, mouse)?;
+    Some(scrollbar_scroll_for_drag(metrics, drag, mouse))
+}
+
+fn scroll_offset_from_scrollbar(
+    track: Rect,
+    max_scroll: f32,
+    thumb_h: f32,
+    mouse: Vec2,
+) -> Option<f32> {
+    let hit_area = scrollbar_hit_area(track);
+    if !hit_area.contains(mouse) || max_scroll <= 0.0 {
+        return None;
+    }
+    Some(scrollbar_scroll_from_pointer(
+        track, thumb_h, max_scroll, mouse,
+    ))
+}
+
+fn scrollbar_position(track: Rect, thumb_h: f32, max_scroll: f32, mouse: Vec2) -> f32 {
+    scrollbar_scroll_from_pointer(track, thumb_h, max_scroll, mouse)
+}
+
+fn handle_editing_nested_scrollbar_drag(app: &mut AppState, mouse: Vec2) -> bool {
+    if !editing_archive_visible()
+        && app.editing.scrollbar_drag == Some(EditingScrollbarDrag::ImgArchive)
+    {
+        app.editing.scrollbar_drag = None;
+        return false;
+    }
+    if !is_mouse_button_down(MouseButton::Left) {
+        let captured = app.editing.scrollbar_drag.is_some();
+        app.editing.scrollbar_drag = None;
+        // Consume the release too, so controls beneath the pointer cannot act
+        // when a scrollbar drag ends over them.
+        return captured;
+    }
+    // A drag owns the pointer until release, even if it leaves the narrow rail.
+    if let Some(drag) = app.editing.scrollbar_drag {
+        if drag == EditingScrollbarDrag::ImgArchive {
+            let left = editing_archive_rect();
+            let visible = ((left.h - 154.0) / EDIT_ROW_H).floor().max(1.0) as usize;
+            let total = editing_filtered_indices(app).len();
+            let track = Rect::new(
+                left.x + left.w - 6.0,
+                left.y + 106.0,
+                3.0,
+                visible as f32 * EDIT_ROW_H,
+            );
+            let thumb = (track.h * visible as f32 / total.max(1) as f32).clamp(20.0, track.h);
+            app.editing.scroll = scrollbar_scroll_for_drag(
+                ScrollbarMetrics {
+                    track,
+                    thumb: Rect::new(track.x, track.y, track.w, thumb),
+                    max_scroll: total.saturating_sub(visible) as f32,
+                },
+                ScrollbarDrag {
+                    grab_offset_y: app.editing.scrollbar_drag_grab_offset_y,
+                },
+                mouse,
+            );
+            return true;
+        }
+        let selected_emitter = selected_material_emitter(app);
+        let lighting_entry_count = match app.editing.asset.as_ref() {
+            Some(EditingAsset::Dff(dff)) => dff_face_emitter_entry_count(app, &dff.name),
+            _ => 0,
+        };
+        match (drag, app.editing.asset.as_mut()) {
+            (EditingScrollbarDrag::DffMaterials, Some(EditingAsset::Dff(dff))) => {
+                let layout = dff_panel_layout(dff, selected_emitter, lighting_entry_count);
+                if let Some(list) = layout.material_list {
+                    let total = dff_material_slot_count(&dff.raw);
+                    let visible = layout.material_visible.max(1);
+                    let track = Rect::new(list.x + list.w - 4.0, list.y + 2.0, 3.0, list.h - 6.0);
+                    let thumb =
+                        (track.h * visible as f32 / total.max(1) as f32).clamp(16.0, track.h);
+                    dff.material_scroll = scrollbar_position(
+                        track,
+                        thumb,
+                        total.saturating_sub(visible) as f32,
+                        mouse,
+                    );
+                }
+            }
+            (EditingScrollbarDrag::DffPanel, Some(EditingAsset::Dff(dff))) => {
+                let layout = dff_panel_layout(dff, selected_emitter, lighting_entry_count);
+                let max = dff_panel_max_scroll(&layout);
+                let track = Rect::new(
+                    layout.content.x + layout.content.w - 5.0,
+                    layout.content.y + 2.0,
+                    3.0,
+                    layout.content.h - 4.0,
+                );
+                let thumb = (track.h * layout.content.h / layout.content_height.max(1.0))
+                    .clamp(24.0, track.h);
+                dff.panel_scroll = scrollbar_position(track, thumb, max, mouse);
+            }
+            (EditingScrollbarDrag::TxdTextures, Some(EditingAsset::Txd(txd))) => {
+                let list = editing_txd_list_rect();
+                let total = editing_txd_filtered_indices(txd).len();
+                let visible = (list.h / 32.0).floor().max(1.0) as usize;
+                let track = Rect::new(list.x + list.w - 5.0, list.y, 3.0, list.h - 4.0);
+                let thumb = (track.h * visible as f32 / total.max(1) as f32).clamp(16.0, track.h);
+                txd.scroll =
+                    scrollbar_position(track, thumb, total.saturating_sub(visible) as f32, mouse);
+            }
+            (EditingScrollbarDrag::ColPrimitives, Some(EditingAsset::Col(col))) => {
+                let layout = col_panel_layout(col);
+                if let Some(list) = layout.primitive_list {
+                    let total = col_primitive_selections(col).len();
+                    let visible = layout.primitive_visible.max(1);
+                    let track = Rect::new(list.x + list.w - 4.0, list.y + 2.0, 3.0, list.h - 6.0);
+                    let thumb =
+                        (track.h * visible as f32 / total.max(1) as f32).clamp(16.0, track.h);
+                    col.primitive_scroll = scrollbar_position(
+                        track,
+                        thumb,
+                        total.saturating_sub(visible) as f32,
+                        mouse,
+                    );
+                }
+            }
+            (EditingScrollbarDrag::ColFaces, Some(EditingAsset::Col(col))) => {
+                let layout = col_panel_layout(col);
+                if let Some(list) = layout.face_list {
+                    let total = col.mesh.faces.len();
+                    let visible = layout.face_visible.max(1);
+                    let track = Rect::new(list.x + list.w - 4.0, list.y + 2.0, 3.0, list.h - 6.0);
+                    let thumb =
+                        (track.h * visible as f32 / total.max(1) as f32).clamp(16.0, track.h);
+                    col.face_scroll = scrollbar_position(
+                        track,
+                        thumb,
+                        total.saturating_sub(visible) as f32,
+                        mouse,
+                    );
+                }
+            }
+            (EditingScrollbarDrag::ColPanel, Some(EditingAsset::Col(col))) => {
+                let layout = col_panel_layout(col);
+                let max = col_panel_max_scroll(&layout);
+                let track = Rect::new(
+                    layout.content.x + layout.content.w - 5.0,
+                    layout.content.y + 2.0,
+                    3.0,
+                    layout.content.h - 4.0,
+                );
+                let thumb = (track.h * layout.content.h / layout.content_height.max(1.0))
+                    .clamp(24.0, track.h);
+                col.panel_scroll = scrollbar_position(track, thumb, max, mouse);
+            }
+            _ => {}
+        }
+        return true;
+    }
+    if editing_archive_visible() {
+        let left = editing_archive_rect();
+        let visible = ((left.h - 154.0) / EDIT_ROW_H).floor().max(1.0) as usize;
+        let total = editing_filtered_indices(app).len();
+        let track = Rect::new(
+            left.x + left.w - 6.0,
+            left.y + 106.0,
+            3.0,
+            visible as f32 * EDIT_ROW_H,
+        );
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            visible as f32,
+            total as f32,
+            20.0,
+            app.editing.scroll,
+        ) {
+            if let Some(drag) = scrollbar_begin_drag(metrics, mouse) {
+                app.editing.scroll = scrollbar_scroll_for_drag(metrics, drag, mouse);
+                app.editing.scrollbar_drag = Some(EditingScrollbarDrag::ImgArchive);
+                app.editing.scrollbar_drag_grab_offset_y = drag.grab_offset_y;
+                return true;
+            }
+        }
+    }
+    if let Some((list, total, visible)) = app.editing.asset.as_ref().and_then(|asset| match asset {
+        EditingAsset::Txd(txd) => {
+            let list = editing_txd_list_rect();
+            Some((
+                list,
+                editing_txd_filtered_indices(txd).len(),
+                (list.h / 32.0).floor().max(1.0) as usize,
+            ))
+        }
+        _ => None,
+    }) {
+        let track = Rect::new(list.x + list.w - 5.0, list.y, 3.0, list.h - 4.0);
+        if let Some(scroll) = scroll_from_scrollbar(track, total, visible, mouse) {
+            if let Some(EditingAsset::Txd(txd)) = app.editing.asset.as_mut() {
+                txd.scroll = scroll;
+            }
+            app.editing.scrollbar_drag = Some(EditingScrollbarDrag::TxdTextures);
+            return true;
+        }
+    }
+    if let Some((list, total, visible)) = app.editing.asset.as_ref().and_then(|asset| match asset {
+        EditingAsset::Dff(dff) => {
+            let layout = dff_panel_layout(
+                dff,
+                selected_material_emitter(app),
+                dff_face_emitter_entry_count(app, &dff.name),
+            );
+            layout.material_list.map(|list| {
+                (
+                    list,
+                    dff_material_slot_count(&dff.raw),
+                    layout.material_visible.max(1),
+                )
+            })
+        }
+        _ => None,
+    }) {
+        let track = Rect::new(list.x + list.w - 4.0, list.y + 2.0, 3.0, list.h - 6.0);
+        if let Some(scroll) = scroll_from_scrollbar(track, total, visible, mouse) {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.material_scroll = scroll;
+            }
+            app.editing.nested_scroll_focus = Some(EditingNestedScrollFocus::DffMaterials);
+            app.editing.scrollbar_drag = Some(EditingScrollbarDrag::DffMaterials);
+            return true;
+        }
+    }
+    if let Some((track, max_scroll, thumb_h)) =
+        app.editing.asset.as_ref().and_then(|asset| match asset {
+            EditingAsset::Dff(dff) => {
+                let layout = dff_panel_layout(
+                    dff,
+                    selected_material_emitter(app),
+                    dff_face_emitter_entry_count(app, &dff.name),
+                );
+                let max_scroll = dff_panel_max_scroll(&layout);
+                (max_scroll > 0.0).then(|| {
+                    let track = Rect::new(
+                        layout.content.x + layout.content.w - 5.0,
+                        layout.content.y + 2.0,
+                        3.0,
+                        layout.content.h - 4.0,
+                    );
+                    let thumb_h = (track.h * layout.content.h / layout.content_height.max(1.0))
+                        .clamp(24.0, track.h);
+                    (track, max_scroll, thumb_h)
+                })
+            }
+            _ => None,
+        })
+    {
+        if let Some(scroll) = scroll_offset_from_scrollbar(track, max_scroll, thumb_h, mouse) {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.panel_scroll = scroll;
+            }
+            app.editing.nested_scroll_focus = None;
+            app.editing.scrollbar_drag = Some(EditingScrollbarDrag::DffPanel);
+            return true;
+        }
+    }
+    if let Some((list, total, visible, focus)) =
+        app.editing.asset.as_ref().and_then(|asset| match asset {
+            EditingAsset::Col(col) => {
+                let layout = col_panel_layout(col);
+                if let Some(list) = layout.primitive_list {
+                    let total = col_primitive_selections(col).len();
+                    let visible = layout.primitive_visible.max(1);
+                    let track = Rect::new(list.x + list.w - 4.0, list.y + 2.0, 3.0, list.h - 6.0);
+                    if track.contains(mouse) {
+                        return Some((
+                            list,
+                            total,
+                            visible,
+                            EditingNestedScrollFocus::ColPrimitives,
+                        ));
+                    }
+                }
+                layout.face_list.map(|list| {
+                    (
+                        list,
+                        col.mesh.faces.len(),
+                        layout.face_visible.max(1),
+                        EditingNestedScrollFocus::ColFaces,
+                    )
+                })
+            }
+            _ => None,
+        })
+    {
+        let track = Rect::new(list.x + list.w - 4.0, list.y + 2.0, 3.0, list.h - 6.0);
+        if let Some(scroll) = scroll_from_scrollbar(track, total, visible, mouse) {
+            if let Some(EditingAsset::Col(col)) = app.editing.asset.as_mut() {
+                match focus {
+                    EditingNestedScrollFocus::ColPrimitives => col.primitive_scroll = scroll,
+                    EditingNestedScrollFocus::ColFaces => col.face_scroll = scroll,
+                    EditingNestedScrollFocus::DffMaterials => unreachable!(),
+                }
+            }
+            app.editing.nested_scroll_focus = Some(focus);
+            app.editing.scrollbar_drag = Some(match focus {
+                EditingNestedScrollFocus::ColPrimitives => EditingScrollbarDrag::ColPrimitives,
+                EditingNestedScrollFocus::ColFaces => EditingScrollbarDrag::ColFaces,
+                EditingNestedScrollFocus::DffMaterials => unreachable!(),
+            });
+            return true;
+        }
+    }
+    if let Some((track, max_scroll, thumb_h)) =
+        app.editing.asset.as_ref().and_then(|asset| match asset {
+            EditingAsset::Col(col) => {
+                let layout = col_panel_layout(col);
+                let max_scroll = col_panel_max_scroll(&layout);
+                (max_scroll > 0.0).then(|| {
+                    let track = Rect::new(
+                        layout.content.x + layout.content.w - 5.0,
+                        layout.content.y + 2.0,
+                        3.0,
+                        layout.content.h - 4.0,
+                    );
+                    let thumb_h = (track.h * layout.content.h / layout.content_height.max(1.0))
+                        .clamp(24.0, track.h);
+                    (track, max_scroll, thumb_h)
+                })
+            }
+            _ => None,
+        })
+    {
+        if let Some(scroll) = scroll_offset_from_scrollbar(track, max_scroll, thumb_h, mouse) {
+            if let Some(EditingAsset::Col(col)) = app.editing.asset.as_mut() {
+                col.panel_scroll = scroll;
+            }
+            app.editing.nested_scroll_focus = None;
+            app.editing.scrollbar_drag = Some(EditingScrollbarDrag::ColPanel);
+            return true;
+        }
+    }
+    false
+}
+
+fn clear_nested_scroll_focus_on_parent_click(app: &mut AppState, mouse: Vec2) {
+    if !is_mouse_button_pressed(MouseButton::Left) {
+        return;
+    }
+    let clicked_parent = match app.editing.asset.as_ref() {
+        Some(EditingAsset::Dff(dff)) => {
+            let layout = dff_panel_layout(
+                dff,
+                selected_material_emitter(app),
+                dff_face_emitter_entry_count(app, &dff.name),
+            );
+            layout.content.contains(mouse)
+                && !layout
+                    .material_list
+                    .is_some_and(|list| list.contains(mouse))
+        }
+        Some(EditingAsset::Col(col)) => {
+            let layout = col_panel_layout(col);
+            layout.content.contains(mouse)
+                && !layout
+                    .primitive_list
+                    .is_some_and(|list| list.contains(mouse))
+                && !layout.face_list.is_some_and(|list| list.contains(mouse))
+        }
+        _ => false,
+    };
+    if clicked_parent {
+        app.editing.nested_scroll_focus = None;
+    }
+}
+
 pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
     if app.active_tab != AppTab::Editing {
         return false;
     }
+    refresh_editing_img_paths(app);
+    // The archive menu overlaps the viewport, so it must receive clicks before
+    // scene selection and camera controls.
+    if handle_editing_archive_picker(app, mouse) {
+        return true;
+    }
+    // The DFF category rail intentionally floats over the viewport rather than
+    // living inside the asset panel. Claim it before any viewport, list, or
+    // drag handler gets a chance to interpret the click.
+    let clicked_dff_tab = is_mouse_button_pressed(MouseButton::Left)
+        .then(|| {
+            app.editing.asset.as_ref().and_then(|asset| match asset {
+                EditingAsset::Dff(dff) => {
+                    let layout = dff_panel_layout(
+                        dff,
+                        selected_material_emitter(app),
+                        dff_face_emitter_entries(app, &dff.name).len(),
+                    );
+                    layout.tabs.iter().position(|rect| rect.contains(mouse))
+                }
+                _ => None,
+            })
+        })
+        .flatten();
+    if let Some(tab) = clicked_dff_tab {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.panel_tab = tab;
+            dff.panel_scroll = 0.0;
+        }
+        return true;
+    }
+    if handle_editing_nested_scrollbar_drag(app, mouse) {
+        app.scrollbar_pointer_captured = is_mouse_button_down(MouseButton::Left);
+        set_scrollbar_hover_suppressed(app.scrollbar_pointer_captured);
+        return true;
+    }
+    clear_nested_scroll_focus_on_parent_click(app, mouse);
     if handle_editing_txd_material_picker(app, mouse) {
         return true;
     }
@@ -18432,15 +19087,15 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         persist_material_emitter_edit(app, "Updated emitter RGB color");
     }
     refresh_editing_img_paths(app);
-    if update_editing_search_input(app, mouse) {
+    if editing_archive_visible() && update_editing_search_input(app, mouse) {
         return true;
     }
     if update_editing_txd_search_input(app, mouse) {
         return true;
     }
     let left = editing_archive_rect();
-    if left.contains(mouse) {
-        let (_x, wheel_y) = mouse_wheel();
+    if editing_archive_visible() && left.contains(mouse) {
+        let (_x, wheel_y) = safe_mouse_wheel();
         if wheel_y.abs() > 0.0 {
             let visible = ((left.h - 154.0) / EDIT_ROW_H).floor().max(1.0) as usize;
             let max_scroll = editing_filtered_indices(app).len().saturating_sub(visible) as f32;
@@ -18481,12 +19136,12 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             return true;
         }
     }
-    if is_key_pressed(KeyCode::Up) {
+    if editing_archive_visible() && is_key_pressed(KeyCode::Up) {
         app.editing.selected_row = app.editing.selected_row.saturating_sub(1);
         app.editing.scroll = app.editing.scroll.min(app.editing.selected_row as f32);
         return true;
     }
-    if is_key_pressed(KeyCode::Down) {
+    if editing_archive_visible() && is_key_pressed(KeyCode::Down) {
         let filtered_len = editing_filtered_indices(app).len();
         app.editing.selected_row =
             (app.editing.selected_row + 1).min(filtered_len.saturating_sub(1));
@@ -18518,10 +19173,12 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         }
     }
     if let Some(EditingAsset::Col(col)) = app.editing.asset.as_mut() {
-        let (_, wheel_y) = mouse_wheel();
+        let (_, wheel_y) = safe_mouse_wheel();
         if wheel_y.abs() > 0.0 {
             let layout = col_panel_layout(col);
-            if layout.face_list.is_some_and(|list| list.contains(mouse)) {
+            if layout.face_list.is_some_and(|list| list.contains(mouse))
+                && app.editing.nested_scroll_focus == Some(EditingNestedScrollFocus::ColFaces)
+            {
                 scroll_editing_col_faces(col, wheel_y);
                 return true;
             }
@@ -18529,6 +19186,38 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 col.panel_scroll =
                     (col.panel_scroll - wheel_y * 24.0).clamp(0.0, col_panel_max_scroll(&layout));
                 return true;
+            }
+        }
+    }
+    if matches!(app.editing.asset, Some(EditingAsset::Dff(_))) {
+        let (_, wheel_y) = safe_mouse_wheel();
+        if wheel_y.abs() > 0.0 {
+            let emitter = selected_material_emitter(app);
+            let lighting_entry_count = match app.editing.asset.as_ref() {
+                Some(EditingAsset::Dff(dff)) => dff_face_emitter_entry_count(app, &dff.name),
+                _ => 0,
+            };
+            let material_list_focused =
+                app.editing.nested_scroll_focus == Some(EditingNestedScrollFocus::DffMaterials);
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                let layout = dff_panel_layout(dff, emitter, lighting_entry_count);
+                if material_list_focused
+                    && layout
+                        .material_list
+                        .is_some_and(|list| list.contains(mouse))
+                {
+                    let max_scroll = dff_material_slot_count(&dff.raw)
+                        .saturating_sub(layout.material_visible.max(1))
+                        as f32;
+                    dff.material_scroll =
+                        (dff.material_scroll - wheel_y * 3.0).clamp(0.0, max_scroll);
+                    return true;
+                }
+                if layout.content.contains(mouse) {
+                    dff.panel_scroll = (dff.panel_scroll - wheel_y * 24.0)
+                        .clamp(0.0, dff_panel_max_scroll(&layout));
+                    return true;
+                }
             }
         }
     }
@@ -18608,8 +19297,8 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         if let Some((channel, color, alpha)) = material_color_drag {
             // Snapshot only on the frame the drag starts, so a whole drag
             // collapses into a single undo step.
-            let before = is_mouse_button_pressed(MouseButton::Left)
-                .then(|| editing_history_snapshot(app));
+            let before =
+                is_mouse_button_pressed(MouseButton::Left).then(|| editing_history_snapshot(app));
             if editing_apply_dff_material_preset(app, color, alpha) {
                 if let Some(before) = before {
                     commit_editing_history(app, "Set DFF Material Color", before);
@@ -18626,6 +19315,21 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 );
             }
             return true;
+        }
+        if let Some(rect) = layout.emitter_temperature {
+            if rect.contains(mouse) {
+                let fraction = ((mouse.x - rect.x) / rect.w).clamp(0.0, 1.0);
+                let temperature = ui_temperature_from_fraction(fraction, 1_000.0, 40_000.0).round();
+                if update_selected_emitters(app, |emitter| {
+                    emitter.use_material_color = false;
+                    emitter.use_temperature = true;
+                    emitter.temperature = temperature;
+                }) {
+                    app.material_emitters_dirty = true;
+                    app.status_message = format!("Emitter temperature {temperature:.0} K");
+                }
+                return true;
+            }
         }
         if let Some(bars) = layout.emitter_color {
             for (channel, rect) in bars.iter().enumerate() {
@@ -19003,28 +19707,19 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             return true;
         }
     }
-    if editing_img_prev_rect().contains(mouse) {
-        app.editing.selected_img_path = app.editing.selected_img_path.saturating_sub(1);
-        return true;
-    }
-    if editing_img_next_rect().contains(mouse) {
-        app.editing.selected_img_path =
-            (app.editing.selected_img_path + 1).min(app.editing.img_paths.len().saturating_sub(1));
-        return true;
-    }
-    if editing_img_open_rect().contains(mouse) {
-        open_selected_editing_img(app);
-        return true;
-    }
     if editing_img_choose_rect().contains(mouse) {
         open_editing_img_picker(app);
+        return true;
+    }
+    if editing_img_open_archive_rect().contains(mouse) {
+        open_external_editing_img_picker(app);
         return true;
     }
     if editing_img_save_rect().contains(mouse) {
         editing_save_img(app);
         return true;
     }
-    if editing_merge_img_rect().contains(mouse) {
+    if editing_archive_visible() && editing_merge_img_rect().contains(mouse) {
         open_editing_merge_img_picker(app);
         return true;
     }
@@ -19058,7 +19753,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
     let filtered = editing_filtered_indices(app);
     let visible = ((left.h - 154.0) / EDIT_ROW_H).floor().max(1.0) as usize;
     for row in 0..visible {
-        if editing_row_rect(row).contains(mouse) {
+        if editing_archive_visible() && editing_row_rect(row).contains(mouse) {
             let idx = app.editing.scroll.floor() as usize + row;
             if idx < filtered.len() {
                 app.editing.selected_row = idx;
@@ -19066,23 +19761,23 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             return true;
         }
     }
-    if editing_open_entry_rect().contains(mouse) {
+    if editing_archive_visible() && editing_open_entry_rect().contains(mouse) {
         editing_open_selected_asset(app);
         return true;
     }
-    if editing_add_entry_rect().contains(mouse) {
+    if editing_archive_visible() && editing_add_entry_rect().contains(mouse) {
         open_editing_add_entry_picker(app);
         return true;
     }
-    if editing_replace_entry_rect().contains(mouse) {
+    if editing_archive_visible() && editing_replace_entry_rect().contains(mouse) {
         open_editing_replace_entry_picker(app);
         return true;
     }
-    if editing_delete_entry_rect().contains(mouse) {
+    if editing_archive_visible() && editing_delete_entry_rect().contains(mouse) {
         editing_delete_selected_entry(app);
         return true;
     }
-    if editing_extract_entry_rect().contains(mouse) {
+    if editing_archive_visible() && editing_extract_entry_rect().contains(mouse) {
         open_editing_extract_entry_picker(app);
         return true;
     }
@@ -19612,6 +20307,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             // Material rows.
             if let Some(list) = layout.material_list {
                 if list.contains(mouse) {
+                    app.editing.nested_scroll_focus = Some(EditingNestedScrollFocus::DffMaterials);
                     if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
                         let total = dff_material_slot_count(&dff.raw);
                         let visible = layout.material_visible.max(1);
@@ -19945,6 +20641,13 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 return true;
             }
             // Mesh tools.
+            if layout
+                .mesh_import_set
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                start_dff_face_texture_browse(app);
+                return true;
+            }
             if layout.make_face.is_some_and(|rect| rect.contains(mouse)) {
                 let before = editing_history_snapshot(app);
                 if editing_make_face_from_selected_vertices(app) {
@@ -20094,6 +20797,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             // Primitive rows.
             for (row, rect) in layout.primitive_rows.iter().enumerate() {
                 if rect.contains(mouse) {
+                    app.editing.nested_scroll_focus = Some(EditingNestedScrollFocus::ColPrimitives);
                     if let Some(EditingAsset::Col(col)) = app.editing.asset.as_mut() {
                         let visible = layout.primitive_visible.max(1);
                         let primitives = col_primitive_selections(col);
@@ -20116,6 +20820,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             // Face rows.
             if let Some(list) = layout.face_list {
                 if list.contains(mouse) {
+                    app.editing.nested_scroll_focus = Some(EditingNestedScrollFocus::ColFaces);
                     if let Some(EditingAsset::Col(col)) = app.editing.asset.as_mut() {
                         let visible = layout.face_visible.max(1);
                         let start = col
@@ -20340,7 +21045,7 @@ fn handle_editing_txd_material_picker(app: &mut AppState, mouse: Vec2) -> bool {
             txd.material_picker_scroll = scroll;
             return true;
         }
-        let (_, wheel) = mouse_wheel();
+        let (_, wheel) = safe_mouse_wheel();
         if wheel.abs() > 0.0 && editing_txd_material_list_rect().contains(mouse) {
             let visible = (editing_txd_material_list_rect().h / 26.0).floor().max(1.0) as usize;
             let max_scroll = editing_txd_material_filtered(&txd.material_picker_search)
@@ -20669,7 +21374,7 @@ fn handle_editing_dff_material_picker(app: &mut AppState, mouse: Vec2) -> bool {
             dff.collision_material_picker_scroll = scroll;
             return true;
         }
-        let (_, wheel) = mouse_wheel();
+        let (_, wheel) = safe_mouse_wheel();
         if wheel.abs() > 0.0 && editing_txd_material_list_rect().contains(mouse) {
             let visible = (editing_txd_material_list_rect().h / 26.0).floor().max(1.0) as usize;
             let max_scroll = editing_txd_material_filtered(&dff.collision_material_picker_search)
@@ -20991,7 +21696,11 @@ pub(crate) fn poll_editing_img_save(app: &mut AppState) {
             }
             app.editing.img_path = Some(outcome.path);
             app.editing.rows = outcome.rows;
-            app.camera = outcome.camera;
+            if app.active_tab == AppTab::Editing {
+                app.editing.camera = Some(app.camera);
+            } else {
+                app.editing.camera = Some(outcome.camera);
+            }
             if let Some(name) = outcome.selected_name {
                 if let Some(row_idx) = app
                     .editing
@@ -21131,36 +21840,13 @@ pub(crate) fn draw_editing_panel(app: &AppState) {
     );
     let dirty = editing_dirty(app);
     ui_text_bold("Editing", panel.x + 14.0, panel.y + 24.0, 18, WHITE);
-    let archive_label = app
-        .editing
-        .img_path
-        .as_ref()
-        .map(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| path.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| {
-            app.editing
-                .rows
-                .first()
-                .map(|row| row.entry.img_path.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "No archive open".to_string())
-        });
-    let label_x = editing_img_choose_rect().x + editing_img_choose_rect().w + 16.0;
-    let label_w = (editing_select_vertex_mode_rect().x - label_x - 16.0).max(80.0);
-    ui_text(
-        &app.ui_font,
-        &ellipsize_width(&archive_label, 16, label_w),
-        label_x,
-        panel.y + 24.0,
-        if dirty { YELLOW } else { LIGHTGRAY },
-    );
-    text_button(&app.ui_font, editing_img_prev_rect(), "<", false);
-    text_button(&app.ui_font, editing_img_next_rect(), ">", false);
-    text_button(&app.ui_font, editing_img_open_rect(), "Open IMG", false);
     text_button(&app.ui_font, editing_img_choose_rect(), "Open Asset", false);
+    text_button(
+        &app.ui_font,
+        editing_img_open_archive_rect(),
+        "Open IMG Archive",
+        false,
+    );
     text_button(
         &app.ui_font,
         editing_img_save_rect(),
@@ -21176,8 +21862,13 @@ pub(crate) fn draw_editing_panel(app: &AppState) {
     draw_editing_box_select_controls(app);
 
     draw_editing_center_overlay(app);
-    draw_archive_browser(app);
+    if editing_archive_visible() {
+        draw_archive_browser(app);
+    }
     draw_active_asset_editor(app);
+    // This menu intentionally renders after every Editing surface because its
+    // options overlap the archive browser, viewport, and asset inspector.
+    draw_editing_archive_picker(app);
 }
 
 fn draw_editing_center_overlay(app: &AppState) {
@@ -21516,28 +22207,20 @@ fn draw_collision_material_picker(
     let track = editing_txd_material_scrollbar_rect();
     let max_scroll = options.len().saturating_sub(visible) as f32;
     if max_scroll > 0.0 {
-        draw_rrect(
-            track.x,
-            track.y,
-            track.w,
-            track.h,
-            4.0,
-            Color::new(0.08, 0.10, 0.13, 0.92),
-        );
-        let thumb_h = (track.h * visible as f32 / options.len() as f32).clamp(24.0, track.h);
-        let thumb_y = track.y + (track.h - thumb_h) * (start as f32 / max_scroll);
-        draw_rrect(
-            track.x,
-            thumb_y,
-            track.w,
-            thumb_h,
-            4.0,
-            if track.contains(mouse_position().into()) {
-                ui_accent()
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            visible as f32,
+            options.len() as f32,
+            24.0,
+            start as f32,
+        ) {
+            let state = if scrollbar_hit_area(track).contains(mouse_position().into()) {
+                ScrollbarVisualState::Hovered
             } else {
-                Color::new(0.36, 0.43, 0.52, 1.0)
-            },
-        );
+                ScrollbarVisualState::Idle
+            };
+            draw_scrollbar(metrics, state);
+        }
     }
     ui_text_size(
         &app.ui_font,
@@ -21624,7 +22307,8 @@ fn draw_archive_browser(app: &AppState) {
         let selected = app.editing.selected_row == start + row_slot;
         let key = editing_key(&row.entry.name);
         let staged = app.editing.modified_entries.contains_key(&key);
-        if selected || row_rect.contains(mouse_position().into()) {
+        if selected || (!scrollbar_hover_suppressed() && row_rect.contains(mouse_position().into()))
+        {
             draw_rrect(
                 row_rect.x,
                 row_rect.y,
@@ -21659,6 +22343,31 @@ fn draw_archive_browser(app: &AppState) {
             row_rect.y + 20.0,
             ui_muted(),
         );
+    }
+    let max_scroll = filtered.len().saturating_sub(visible) as f32;
+    if max_scroll > 0.0 {
+        let track = Rect::new(
+            left.x + left.w - 6.0,
+            left.y + 106.0,
+            3.0,
+            visible as f32 * EDIT_ROW_H,
+        );
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            visible as f32,
+            filtered.len() as f32,
+            20.0,
+            app.editing.scroll,
+        ) {
+            let state = if app.editing.scrollbar_drag == Some(EditingScrollbarDrag::ImgArchive) {
+                ScrollbarVisualState::Dragging
+            } else if scrollbar_hit_area(track).contains(mouse_position().into()) {
+                ScrollbarVisualState::Hovered
+            } else {
+                ScrollbarVisualState::Idle
+            };
+            draw_scrollbar(metrics, state);
+        }
     }
     icon_button(
         &app.ui_font,
@@ -21872,17 +22581,22 @@ fn draw_txd_asset(app: &AppState, right: Rect, txd: &EditingTxdState) {
             3.0,
             visible as f32 * 32.0 - 4.0,
         );
-        let thumb_h = (track.h * visible as f32 / filtered.len() as f32).max(24.0);
-        let thumb_y = track.y + (track.h - thumb_h) * (start as f32 / max_start as f32);
-        draw_rrect(
-            track.x,
-            track.y,
-            track.w,
-            track.h,
-            2.0,
-            Color::new(0.12, 0.14, 0.17, 1.0),
-        );
-        draw_rrect(track.x, thumb_y, track.w, thumb_h, 2.0, ui_dim());
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            visible as f32,
+            filtered.len() as f32,
+            24.0,
+            start as f32,
+        ) {
+            let state = if app.editing.scrollbar_drag == Some(EditingScrollbarDrag::TxdTextures) {
+                ScrollbarVisualState::Dragging
+            } else if scrollbar_hit_area(track).contains(mouse_position().into()) {
+                ScrollbarVisualState::Hovered
+            } else {
+                ScrollbarVisualState::Idle
+            };
+            draw_scrollbar(metrics, state);
+        }
     }
     text_button(&app.ui_font, editing_txd_add_rect(), "Add Texture", false);
     text_button(&app.ui_font, editing_txd_replace_rect(), "Replace", false);
@@ -21904,7 +22618,7 @@ fn editing_action_button(
     danger: bool,
 ) {
     let mouse: Vec2 = mouse_position().into();
-    let hovered = rect.contains(mouse);
+    let hovered = !scrollbar_hover_suppressed() && rect.contains(mouse);
     let bg = if active {
         ui_surface_active()
     } else if danger && hovered {
@@ -22029,16 +22743,21 @@ pub(crate) fn dff_section_header_button(
     hint: &str,
 ) {
     let mouse: Vec2 = mouse_position().into();
-    let hovered = rect.contains(mouse);
+    let hovered = !scrollbar_hover_suppressed() && rect.contains(mouse);
+    // Headers deliberately use a cooler, lighter surface than the controls
+    // inside them. This keeps grouped editor sections readable at a glance,
+    // even when their child controls use the standard neutral surface.
+    let section_surface = Color::new(0.125, 0.142, 0.170, 1.0);
+    let section_hover = Color::new(0.165, 0.190, 0.230, 1.0);
     let bg = if hovered {
-        ui_surface_hover()
+        section_hover
     } else {
-        ui_surface()
+        section_surface
     };
     let border = if hovered {
-        Color::new(0.34, 0.36, 0.40, 1.0)
+        Color::new(0.38, 0.48, 0.60, 1.0)
     } else {
-        ui_border()
+        Color::new(0.255, 0.305, 0.375, 1.0)
     };
     draw_rrect_bordered(rect.x, rect.y, rect.w, rect.h, 8.0, 1.0, bg, border);
     ui_text_size(
@@ -22069,6 +22788,33 @@ pub(crate) fn dff_section_header_button(
     }
 }
 
+/// Draw a compact Blender-style icon tab. Rotated text is difficult to read
+/// with the editor font, so category names are surfaced in a hover tooltip.
+fn dff_side_tab_button(rect: Rect, icon: &Texture2D, active: bool) -> bool {
+    let mouse: Vec2 = mouse_position().into();
+    let hovered = !scrollbar_hover_suppressed() && rect.contains(mouse);
+    let bg = if active {
+        ui_surface_active()
+    } else if hovered {
+        ui_surface_hover()
+    } else {
+        ui_surface()
+    };
+    let border = if active { ui_accent() } else { ui_border() };
+    draw_rrect_bordered(rect.x, rect.y, rect.w, rect.h, 6.0, 1.0, bg, border);
+    draw_texture_ex(
+        icon,
+        rect.x + (rect.w - 18.0) * 0.5,
+        rect.y + (rect.h - 18.0) * 0.5,
+        if active { WHITE } else { ui_dim() },
+        DrawTextureParams {
+            dest_size: Some(vec2(18.0, 18.0)),
+            ..Default::default()
+        },
+    );
+    hovered
+}
+
 fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
     draw_editing_select_mode_toggle(app, dff.select_mode);
     let mouse: Vec2 = mouse_position().into();
@@ -22078,11 +22824,13 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         .ok()
         .and_then(|index| dff.raw.components.get(index))
         .and_then(|component| component.breakable.as_ref());
+    let header_x = right.x + 16.0;
+    let header_w = right.w - 32.0;
 
     // Fixed header.
     ui_text_bold(
         &dff.name,
-        right.x + 16.0,
+        header_x,
         right.y + 30.0,
         18,
         if dff.dirty { YELLOW } else { WHITE },
@@ -22112,16 +22860,16 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
     };
     ui_text_size(
         &app.ui_font,
-        &ellipsize_width(&asset_counts, 15, right.w - 32.0),
-        right.x + 16.0,
+        &ellipsize_width(&asset_counts, 15, header_w),
+        header_x,
         right.y + 56.0,
         15,
         ui_dim(),
     );
     ui_text(
         &app.ui_font,
-        &ellipsize_width(&dff.txd_source_label, 16, right.w - 32.0),
-        right.x + 16.0,
+        &ellipsize_width(&dff.txd_source_label, 16, header_w),
+        header_x,
         right.y + 78.0,
         if dff.txd_context.is_some() {
             ui_accent()
@@ -22151,8 +22899,8 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
     };
     ui_text(
         &app.ui_font,
-        &ellipsize_width(&selected_label, 16, right.w - 32.0),
-        right.x + 16.0,
+        &ellipsize_width(&selected_label, 16, header_w),
+        header_x,
         right.y + 100.0,
         LIGHTGRAY,
     );
@@ -22177,39 +22925,68 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             cutter.half_extents.z * 2.0
         ));
     }
-    if !hover_line.is_empty() {
+    if !hover_line.is_empty() && !dff.normalized_warning {
         ui_text_size(
             &app.ui_font,
-            &ellipsize_width(&hover_line, 14, right.w - 32.0),
-            right.x + 16.0,
+            &ellipsize_width(&hover_line, 14, header_w),
+            header_x,
             right.y + 122.0,
             14,
             ui_accent(),
         );
     }
     if dff.normalized_warning {
-        ui_text_size(
+        let warning = Rect::new(header_x, right.y + 116.0, header_w, 56.0);
+        draw_ui_warning_alert(
             &app.ui_font,
-            "Staging rewrites this DFF with Eagle's normalized mesh writer.",
-            right.x + 16.0,
-            right.y + 144.0,
-            14,
-            YELLOW,
+            warning,
+            "Rewrite confirmation required",
+            "Staging may discard unsupported RenderWare extensions.",
         );
         ui_text_size(
             &app.ui_font,
-            "Unknown RenderWare extensions may not be preserved.",
-            right.x + 16.0,
-            right.y + 163.0,
-            14,
-            YELLOW,
+            "Use Confirm & Stage below to continue.",
+            warning.x + 32.0,
+            warning.y + 51.0,
+            13,
+            ui_dim(),
         );
     }
 
-    // Scrollable section stack.
+    // Blender-style category rail. Tabs describe what is selected; action
+    // availability never uses this selected styling.
+    let rail = dff_tab_rail_rect(right);
+    draw_rrect_bordered(
+        rail.x,
+        rail.y,
+        rail.w,
+        rail.h,
+        9.0,
+        1.0,
+        Color::new(0.035, 0.043, 0.054, 0.98),
+        ui_border(),
+    );
+    let mut hovered_tab = None;
+    for (index, rect) in layout.tabs.iter().enumerate() {
+        let icon = match index {
+            0 => &app.icons.cube,
+            1 => &app.icons.texture,
+            2 => &app.icons.vertex,
+            3 => &app.icons.face,
+            _ => &app.icons.tool,
+        };
+        if dff_side_tab_button(*rect, icon, dff.panel_tab.min(DFF_TAB_COUNT - 1) == index) {
+            hovered_tab = Some((*rect, DFF_TAB_TITLES[index]));
+        }
+    }
+
+    // Scrollable section stack for the active category.
     begin_ui_clip(layout.content);
     for section in DFF_SECTIONS {
         let idx = section as usize;
+        if section.tab() != dff.panel_tab.min(DFF_TAB_COUNT - 1) {
+            continue;
+        }
         let hint = match section {
             DffSection::Effects => format!("{}", dff.raw.effects_2dfx.len()),
             DffSection::Lighting => format!("{}", layout.lighting_rows.len()),
@@ -22733,21 +23510,24 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         if total > visible {
             let track_x = list.x + list.w - 4.0;
             let track_h = list.h - 6.0;
-            draw_rrect(track_x, list.y + 2.0, 3.0, track_h, 1.5, ui_border());
-            let thumb_h = (track_h * visible as f32 / total as f32).max(16.0);
-            let frac = if max_start > 0 {
-                start as f32 / max_start as f32
-            } else {
-                0.0
-            };
-            draw_rrect(
-                track_x,
-                list.y + 2.0 + frac * (track_h - thumb_h),
-                3.0,
-                thumb_h,
-                1.5,
-                ui_accent(),
-            );
+            let track = Rect::new(track_x, list.y + 2.0, 3.0, track_h);
+            if let Some(metrics) = scrollbar_metrics(
+                track,
+                visible as f32,
+                total as f32,
+                16.0,
+                dff.material_scroll,
+            ) {
+                let state =
+                    if app.editing.scrollbar_drag == Some(EditingScrollbarDrag::DffMaterials) {
+                        ScrollbarVisualState::Dragging
+                    } else if scrollbar_hit_area(track).contains(mouse) {
+                        ScrollbarVisualState::Hovered
+                    } else {
+                        ScrollbarVisualState::Idle
+                    };
+                draw_scrollbar(metrics, state);
+            }
         }
     }
 
@@ -22756,7 +23536,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             &app.ui_font,
             rect,
             &app.icons.select,
-            "View Full Size",
+            "Preview",
             false,
             false,
         );
@@ -22766,7 +23546,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             &app.ui_font,
             rect,
             &app.icons.duplicate,
-            "Rename Texture",
+            "Rename",
             false,
             false,
         );
@@ -22776,7 +23556,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             &app.ui_font,
             rect,
             &app.icons.duplicate,
-            "Duplicate Texture",
+            "Duplicate",
             false,
             false,
         );
@@ -22786,7 +23566,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             &app.ui_font,
             rect,
             &app.icons.select,
-            "Set from TXD",
+            "Use TXD",
             dff.texture_picker_open && dff.texture_picker_edits_material,
             false,
         );
@@ -22806,7 +23586,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             &app.ui_font,
             rect,
             &app.icons.duplicate,
-            "New for Faces",
+            "New from Faces",
             false,
             false,
         );
@@ -22816,7 +23596,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             &app.ui_font,
             rect,
             &app.icons.face,
-            "Assign to Faces",
+            "Assign Faces",
             false,
             false,
         );
@@ -22826,7 +23606,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             &app.ui_font,
             rect,
             &app.icons.delete,
-            "Remove Unused Materials",
+            "Remove Unused",
             false,
             true,
         );
@@ -22842,7 +23622,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         // the two colour controls behave identically.
         ui_text_size(
             &app.ui_font,
-            "Material Colour (drag to adjust)",
+            "Color · drag to adjust",
             bars[0].x - DFF_COLOR_LABEL_W,
             bars[0].y - 10.0,
             14,
@@ -22864,25 +23644,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
                 rect.y + rect.h - 7.0,
                 LIGHTGRAY,
             );
-            draw_rrect_bordered(
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                6.0,
-                1.0,
-                Color::new(0.050, 0.058, 0.070, 1.0),
-                ui_border(),
-            );
-            draw_rrect(rect.x, rect.y, rect.w * value, rect.h, 6.0, color);
-            draw_line(
-                rect.x + rect.w * value,
-                rect.y - 2.0,
-                rect.x + rect.w * value,
-                rect.y + rect.h + 2.0,
-                2.0,
-                WHITE,
-            );
+            draw_color_channel_slider(rect, color, value, 1.0);
             ui_text_size(
                 &app.ui_font,
                 &format!("{:.0}", (value * 255.0).round()),
@@ -23184,12 +23946,15 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         draw_input_box(app, InspectorField::DffEmitterFalloff, "Falloff Distance");
     }
     if let Some(temperature) = layout.emitter_temperature {
-        let _ = temperature;
-        draw_input_box(
-            app,
-            InspectorField::DffEmitterTemperature,
-            "Temperature (K)",
+        ui_text_size(
+            &app.ui_font,
+            &format!("Temperature  {:.0} K", emitter.temperature),
+            temperature.x,
+            temperature.y - 7.0,
+            14,
+            ui_dim(),
         );
+        draw_temperature_channel_slider(temperature, emitter.temperature, 1_000.0, 40_000.0, 1.0);
     }
     if let Some(color) = layout.emitter_color {
         for (idx, rect) in color.iter().enumerate() {
@@ -23199,37 +23964,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
                 _ => ("B", BLUE, emitter.color.z),
             };
             ui_text(&app.ui_font, channel, rect.x - 25.0, rect.y + 17.0, tint);
-            draw_rrect_bordered(
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                6.0,
-                1.0,
-                Color::new(0.04, 0.05, 0.06, 1.0),
-                ui_border(),
-            );
-            const STEPS: usize = 48;
-            for step in 0..STEPS {
-                let t = step as f32 / (STEPS - 1) as f32;
-                let x = rect.x + rect.w * step as f32 / STEPS as f32;
-                draw_rectangle(
-                    x,
-                    rect.y + 2.0,
-                    rect.w / STEPS as f32 + 1.0,
-                    rect.h - 4.0,
-                    Color::new(t * tint.r, t * tint.g, t * tint.b, 1.0),
-                );
-            }
-            let marker_x = rect.x + rect.w * value.clamp(0.0, 1.0);
-            draw_line(
-                marker_x,
-                rect.y - 2.0,
-                marker_x,
-                rect.y + rect.h + 2.0,
-                2.0,
-                WHITE,
-            );
+            draw_color_channel_slider(*rect, tint, value, 1.0);
             ui_text_size(
                 &app.ui_font,
                 &format!("{value:.2}"),
@@ -23257,7 +23992,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             &app.ui_font,
             rect,
             &app.icons.duplicate,
-            "New from File",
+            "Import + Set",
             false,
             false,
         );
@@ -23330,14 +24065,23 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
     }
 
     // Mesh tools.
+    if let Some(rect) = layout.mesh_import_set {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.duplicate,
+            "Import + Set Texture",
+            false,
+            false,
+        );
+    }
     if let Some(rect) = layout.make_face {
         editing_action_button(
             &app.ui_font,
             rect,
             &app.icons.duplicate,
             "Make Face",
-            matches!(dff_selected_vertex_set(dff).len(), 3 | 4)
-                || dff_selected_edge_set(dff).len() == 2,
+            false,
             false,
         );
     }
@@ -23377,9 +24121,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             rect,
             &app.icons.duplicate,
             "Extrude Selection",
-            !dff_selected_vertex_set(dff).is_empty()
-                || !dff_selected_edge_set(dff).is_empty()
-                || !dff_selected_face_set(dff).is_empty(),
+            false,
             false,
         );
     }
@@ -23389,7 +24131,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             rect,
             &app.icons.vertex,
             "Merge Selected",
-            dff_selected_vertex_set(dff).len() >= 2,
+            false,
             false,
         );
     }
@@ -23409,7 +24151,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             rect,
             &app.icons.face,
             "Subdivide",
-            !dff_selected_face_set(dff).is_empty(),
+            false,
             false,
         );
     }
@@ -23439,7 +24181,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             rect,
             &app.icons.duplicate,
             "Separate from Object",
-            !dff_selected_face_set(dff).is_empty(),
+            false,
             false,
         );
     }
@@ -23449,7 +24191,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             rect,
             &app.icons.vertex,
             "Pivot to Selection",
-            selected_dff_geometry_pivot(dff).is_some(),
+            false,
             false,
         );
     }
@@ -23459,7 +24201,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             rect,
             &app.icons.cube,
             "Pivot to Bounds",
-            !dff.raw.vertices.is_empty(),
+            false,
             false,
         );
     }
@@ -23493,17 +24235,23 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         let track_x = layout.content.x + layout.content.w - 5.0;
         let track_y = layout.content.y + 2.0;
         let track_h = layout.content.h - 4.0;
-        draw_rrect(track_x, track_y, 3.0, track_h, 1.5, ui_border());
-        let thumb_h = (track_h * layout.content.h / layout.content_height.max(1.0)).max(24.0);
-        let frac = (dff.panel_scroll / max_scroll).clamp(0.0, 1.0);
-        draw_rrect(
-            track_x,
-            track_y + frac * (track_h - thumb_h),
-            3.0,
-            thumb_h,
-            1.5,
-            ui_accent(),
-        );
+        let track = Rect::new(track_x, track_y, 3.0, track_h);
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            layout.content.h,
+            layout.content_height,
+            24.0,
+            dff.panel_scroll,
+        ) {
+            let state = if app.editing.scrollbar_drag == Some(EditingScrollbarDrag::DffPanel) {
+                ScrollbarVisualState::Dragging
+            } else if scrollbar_hit_area(track).contains(mouse) {
+                ScrollbarVisualState::Hovered
+            } else {
+                ScrollbarVisualState::Idle
+            };
+            draw_scrollbar(metrics, state);
+        }
     }
 
     // Pinned footer.
@@ -23539,7 +24287,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         layout.stage,
         &app.icons.save,
         if dff.normalized_warning && !dff.normalized_rewrite_confirmed {
-            "Confirm Rewrite & Stage"
+            "Confirm"
         } else if dff.dirty {
             "Stage for Project Save *"
         } else {
@@ -23554,6 +24302,9 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
     draw_dff_2dfx_corona_preset_popup(app, dff);
     draw_dff_2dfx_payload_editor_popup(app, dff);
     draw_dff_collision_material_picker(app, dff);
+    if let Some((rect, label)) = hovered_tab {
+        draw_text_tooltip(&app.ui_font, rect, label);
+    }
 }
 
 fn draw_dff_2dfx_corona_preset_popup(app: &AppState, dff: &EditingDffState) {
@@ -23597,7 +24348,7 @@ fn draw_dff_2dfx_corona_preset_popup(app: &AppState, dff: &EditingDffState) {
     let mouse: Vec2 = mouse_position().into();
     for (row, preset) in DFF_CORONA_PRESETS.iter().enumerate() {
         let rect = Rect::new(list.x, list.y + row as f32 * row_h, list.w, row_h - 4.0);
-        let hovered = rect.contains(mouse);
+        let hovered = !scrollbar_hover_suppressed() && rect.contains(mouse);
         draw_rrect_bordered(
             rect.x,
             rect.y,
@@ -23824,33 +24575,7 @@ fn draw_dff_2dfx_payload_editor_popup(app: &AppState, dff: &EditingDffState) {
         for (idx, (label, color, value)) in channels.into_iter().enumerate() {
             let rect = editing_dff_2dfx_light_color_bar_rect(idx);
             ui_text(&app.ui_font, label, rect.x - 28.0, rect.y + 13.0, LIGHTGRAY);
-            draw_rrect_bordered(
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                6.0,
-                1.0,
-                Color::new(0.050, 0.058, 0.070, 1.0),
-                ui_border(),
-            );
-            draw_rrect(
-                rect.x,
-                rect.y,
-                rect.w * value.clamp(0.0, 1.0),
-                rect.h,
-                6.0,
-                color,
-            );
-            let marker_x = rect.x + rect.w * value.clamp(0.0, 1.0);
-            draw_line(
-                marker_x,
-                rect.y - 2.0,
-                marker_x,
-                rect.y + rect.h + 2.0,
-                2.0,
-                WHITE,
-            );
+            draw_color_channel_slider(rect, color, value, 1.0);
         }
     }
     let text = editing_dff_2dfx_payload_text_rect();
@@ -23919,17 +24644,21 @@ fn draw_dff_2dfx_payload_editor_popup(app: &AppState, dff: &EditingDffState) {
         }
     }
     if dff.dff_2dfx_payload_fields.len() > visible {
-        let track_x = text.x + text.w - 4.0;
-        draw_rrect(track_x, text.y, 3.0, text.h, 1.5, ui_border());
-        let thumb_h =
-            (text.h * visible as f32 / dff.dff_2dfx_payload_fields.len() as f32).max(16.0);
-        let frac = if max_start > 0.0 {
-            start as f32 / max_start
-        } else {
-            0.0
-        };
-        let thumb_y = text.y + frac * (text.h - thumb_h);
-        draw_rrect(track_x, thumb_y, 3.0, thumb_h, 1.5, ui_accent());
+        let track = Rect::new(text.x + text.w - 4.0, text.y, 3.0, text.h);
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            visible as f32,
+            dff.dff_2dfx_payload_fields.len() as f32,
+            16.0,
+            dff.dff_2dfx_payload_field_scroll,
+        ) {
+            let state = if scrollbar_hit_area(track).contains(mouse_position().into()) {
+                ScrollbarVisualState::Hovered
+            } else {
+                ScrollbarVisualState::Idle
+            };
+            draw_scrollbar(metrics, state);
+        }
     }
     if dff_2dfx_active_payload_is_particle_name(dff) {
         let picker = editing_dff_2dfx_particle_picker_rect();
@@ -24143,16 +24872,21 @@ fn draw_dff_uv_anim_picker_popup(app: &AppState, dff: &EditingDffState) {
         );
     }
     if names.len() > visible {
-        let track_x = list.x + list.w - 4.0;
-        draw_rrect(track_x, list.y, 3.0, list.h, 1.5, ui_border());
-        let thumb_h = (list.h * visible as f32 / names.len() as f32).max(14.0);
-        let frac = if max_start > 0.0 {
-            start as f32 / max_start
-        } else {
-            0.0
-        };
-        let thumb_y = list.y + frac * (list.h - thumb_h);
-        draw_rrect(track_x, thumb_y, 3.0, thumb_h, 1.5, ui_accent());
+        let track = Rect::new(list.x + list.w - 4.0, list.y, 3.0, list.h);
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            visible as f32,
+            names.len() as f32,
+            14.0,
+            dff.uv_anim_picker_scroll,
+        ) {
+            let state = if scrollbar_hit_area(track).contains(mouse_position().into()) {
+                ScrollbarVisualState::Hovered
+            } else {
+                ScrollbarVisualState::Idle
+            };
+            draw_scrollbar(metrics, state);
+        }
     }
     text_button(
         &app.ui_font,
@@ -24254,16 +24988,21 @@ fn draw_dff_texture_picker_popup(app: &AppState, dff: &EditingDffState) {
         );
     }
     if names.len() > visible {
-        let track_x = list.x + list.w - 4.0;
-        draw_rrect(track_x, list.y, 3.0, list.h, 1.5, ui_border());
-        let thumb_h = (list.h * visible as f32 / names.len() as f32).max(14.0);
-        let frac = if max_start > 0.0 {
-            start as f32 / max_start
-        } else {
-            0.0
-        };
-        let thumb_y = list.y + frac * (list.h - thumb_h);
-        draw_rrect(track_x, thumb_y, 3.0, thumb_h, 1.5, ui_accent());
+        let track = Rect::new(list.x + list.w - 4.0, list.y, 3.0, list.h);
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            visible as f32,
+            names.len() as f32,
+            14.0,
+            dff.texture_picker_scroll,
+        ) {
+            let state = if scrollbar_hit_area(track).contains(mouse_position().into()) {
+                ScrollbarVisualState::Hovered
+            } else {
+                ScrollbarVisualState::Idle
+            };
+            draw_scrollbar(metrics, state);
+        }
     }
 }
 
@@ -24660,19 +25399,24 @@ fn draw_col_asset(app: &AppState, right: Rect, col: &EditingColState) {
         if primitive_total > primitive_visible {
             let track_x = list.x + list.w - 4.0;
             let track_h = list.h - 6.0;
-            draw_rrect(track_x, list.y + 2.0, 3.0, track_h, 1.5, ui_border());
-            let max_scroll = primitive_total.saturating_sub(primitive_visible).max(1) as f32;
-            let thumb_h =
-                (track_h * primitive_visible as f32 / primitive_total.max(1) as f32).max(16.0);
-            let frac = (col.primitive_scroll / max_scroll).clamp(0.0, 1.0);
-            draw_rrect(
-                track_x,
-                list.y + 2.0 + frac * (track_h - thumb_h),
-                3.0,
-                thumb_h,
-                1.5,
-                ui_accent(),
-            );
+            let track = Rect::new(track_x, list.y + 2.0, 3.0, track_h);
+            if let Some(metrics) = scrollbar_metrics(
+                track,
+                primitive_visible as f32,
+                primitive_total as f32,
+                16.0,
+                col.primitive_scroll,
+            ) {
+                let state =
+                    if app.editing.scrollbar_drag == Some(EditingScrollbarDrag::ColPrimitives) {
+                        ScrollbarVisualState::Dragging
+                    } else if scrollbar_hit_area(track).contains(mouse) {
+                        ScrollbarVisualState::Hovered
+                    } else {
+                        ScrollbarVisualState::Idle
+                    };
+                draw_scrollbar(metrics, state);
+            }
         }
     }
     if let Some(rect) = layout.add_sphere {
@@ -24808,18 +25552,23 @@ fn draw_col_asset(app: &AppState, right: Rect, col: &EditingColState) {
         if col.mesh.faces.len() > visible {
             let track_x = list.x + list.w - 4.0;
             let track_h = list.h - 6.0;
-            draw_rrect(track_x, list.y + 2.0, 3.0, track_h, 1.5, ui_border());
-            let max_scroll = col.mesh.faces.len().saturating_sub(visible).max(1) as f32;
-            let thumb_h = (track_h * visible as f32 / col.mesh.faces.len().max(1) as f32).max(16.0);
-            let frac = (col.face_scroll / max_scroll).clamp(0.0, 1.0);
-            draw_rrect(
-                track_x,
-                list.y + 2.0 + frac * (track_h - thumb_h),
-                3.0,
-                thumb_h,
-                1.5,
-                ui_accent(),
-            );
+            let track = Rect::new(track_x, list.y + 2.0, 3.0, track_h);
+            if let Some(metrics) = scrollbar_metrics(
+                track,
+                visible as f32,
+                col.mesh.faces.len() as f32,
+                16.0,
+                col.face_scroll,
+            ) {
+                let state = if app.editing.scrollbar_drag == Some(EditingScrollbarDrag::ColFaces) {
+                    ScrollbarVisualState::Dragging
+                } else if scrollbar_hit_area(track).contains(mouse) {
+                    ScrollbarVisualState::Hovered
+                } else {
+                    ScrollbarVisualState::Idle
+                };
+                draw_scrollbar(metrics, state);
+            }
         }
     }
 
@@ -24932,17 +25681,23 @@ fn draw_col_asset(app: &AppState, right: Rect, col: &EditingColState) {
         let track_x = layout.content.x + layout.content.w - 5.0;
         let track_y = layout.content.y + 2.0;
         let track_h = layout.content.h - 4.0;
-        draw_rrect(track_x, track_y, 3.0, track_h, 1.5, ui_border());
-        let thumb_h = (track_h * layout.content.h / layout.content_height.max(1.0)).max(24.0);
-        let frac = (col.panel_scroll / max_scroll).clamp(0.0, 1.0);
-        draw_rrect(
-            track_x,
-            track_y + frac * (track_h - thumb_h),
-            3.0,
-            thumb_h,
-            1.5,
-            ui_accent(),
-        );
+        let track = Rect::new(track_x, track_y, 3.0, track_h);
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            layout.content.h,
+            layout.content_height,
+            24.0,
+            col.panel_scroll,
+        ) {
+            let state = if app.editing.scrollbar_drag == Some(EditingScrollbarDrag::ColPanel) {
+                ScrollbarVisualState::Dragging
+            } else if scrollbar_hit_area(track).contains(mouse) {
+                ScrollbarVisualState::Hovered
+            } else {
+                ScrollbarVisualState::Idle
+            };
+            draw_scrollbar(metrics, state);
+        }
     }
 
     // Pinned footer.

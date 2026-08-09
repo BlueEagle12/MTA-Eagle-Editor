@@ -990,10 +990,12 @@ pub(crate) fn update_img_archive_rebalance(app: &mut AppState) {
             );
             clear_history_for_external_change(app);
             let editing_camera = app.editing.camera.clone();
-            let editing_return_camera = app.editing.return_camera.clone();
+            let editing_camera_mode = app.editing.camera_mode;
+            let editing_camera_focus = app.editing.camera_focus;
             app.editing = EditingState::default();
             app.editing.camera = editing_camera;
-            app.editing.return_camera = editing_return_camera;
+            app.editing.camera_mode = editing_camera_mode;
+            app.editing.camera_focus = editing_camera_focus;
             app.editing.img_paths = result.archive_paths.clone();
             mark_saved_snapshot(app);
             let mut parts = Vec::new();

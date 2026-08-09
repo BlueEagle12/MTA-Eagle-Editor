@@ -48,7 +48,13 @@ unsafe extern "system" {
 const BROWSE_ROOT: &str = ".";
 const PANEL_W: f32 = 384.0;
 const RIGHT_PANEL_W: f32 = 420.0;
-const TOP_H: f32 = 112.0;
+/// Keep the 3D workspace usable on laptop-sized displays. The inspector stays
+/// available because it is where most edits are committed; the outliner is
+/// automatically tucked away below this threshold instead of squeezing the
+/// viewport into an unusable strip.
+const LEFT_SIDEBAR_MIN_SCREEN_W: f32 = 920.0;
+// Header rows: project/file controls, workspace navigation, then editing actions.
+const TOP_H: f32 = 154.0;
 const STATUS_H: f32 = 34.0;
 const EDITOR_GROUP_ATTR: &str = "editorGroup";
 const DEFAULT_BOX_SELECT_DISTANCE: f32 = 6000.0;
@@ -61,9 +67,12 @@ const AUTOSAVE_INTERVAL_SECONDS: f64 = 60.0;
 const SETTLE_VERTEX_BUDGET: usize = 1_200_000;
 const LIVE_RESOURCE_REFRESH_BATCH_LIMIT: usize = 256;
 const LIVE_RESOURCE_REFRESH_FRAME_BUDGET: Duration = Duration::from_millis(5);
-const DEFAULT_CAMERA_SPEED: f32 = 360.0;
+const DEFAULT_CAMERA_SPEED: f32 = 50.0;
 const MIN_CAMERA_SPEED: f32 = 20.0;
 const MAX_CAMERA_SPEED: f32 = 5000.0;
+const DEFAULT_DETAIL_CAMERA_SPEED: f32 = 20.0;
+const MIN_DETAIL_CAMERA_SPEED: f32 = 2.0;
+const MIN_EDITING_CAMERA_SPEED: f32 = 2.0;
 /// Multiplier applied to every transform gimbal/gizmo's world-space size. The
 /// gimbals are sized from camera distance, which reads far too small on small
 /// or low-resolution displays, so this is user tunable.
@@ -81,6 +90,7 @@ const CAMERA_LOOK_SENSITIVITY: f32 = 0.003;
 /// Factor used by the Preferences dialog's speed steppers.
 const CAMERA_SPEED_STEP_FACTOR: f32 = 1.25;
 const CAMERA_SPEED_WHEEL_FACTOR: f32 = 1.15;
+const DETAIL_CAMERA_SPEED_WHEEL_FACTOR: f32 = 1.05;
 const DEFAULT_FOG_STRENGTH: f32 = 1.0;
 const MIN_FOG_STRENGTH: f32 = 0.0;
 const MAX_FOG_STRENGTH: f32 = 3.0;
@@ -1805,6 +1815,11 @@ struct WorldCellBuild {
     blend_data: Vec<WorldBlendData>,
 }
 
+struct CollisionRenderCache {
+    mesh: CollisionMesh,
+    list: u32,
+}
+
 #[derive(Clone, Copy)]
 struct CameraState {
     pos: Vec3,
@@ -2401,9 +2416,13 @@ enum InspectorField {
     CollisionPrimitiveRotX,
     CollisionPrimitiveRotY,
     CollisionPrimitiveRotZ,
+    #[allow(dead_code)] // Material RGBA is edited with drag bars, not text fields.
     DffMaterialRed,
+    #[allow(dead_code)]
     DffMaterialGreen,
+    #[allow(dead_code)]
     DffMaterialBlue,
+    #[allow(dead_code)]
     DffMaterialAlpha,
     DffMaterialAmbient,
     DffMaterialDiffuse,
@@ -2552,6 +2571,9 @@ struct BakeSettings {
 #[derive(Clone, PartialEq)]
 struct EditorLight {
     name: String,
+    /// Model id this light is attached to. Attached light transforms are stored
+    /// in model-local space and expanded over every live instance at runtime.
+    attached_to: Option<String>,
     kind: LightKind,
     profile: LightProfile,
     position: V3,
@@ -2664,6 +2686,8 @@ impl BoxSelectMode {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ContextAction {
+    AddLight,
+    AddLightToInstance,
     CopyId,
     CopyDff,
     ExportDff,
@@ -2705,6 +2729,7 @@ struct ContextMenu {
 #[derive(Clone, Copy)]
 enum ContextMenuTarget {
     Selection,
+    Scene { position: V3 },
     LodAuditIssue(usize),
     PreviewTexture { placement: usize, material: usize },
 }
@@ -2790,6 +2815,8 @@ struct PreferencesDialog {
     /// Cancel discards them along with the path edit.
     gizmo_scale: f32,
     camera_speed: f32,
+    vehicle_camera_speed: f32,
+    editing_camera_speed: f32,
     camera_rotation_speed: f32,
     msaa_samples: i32,
     draw_distance_percent: u16,
@@ -2839,6 +2866,7 @@ enum DffPickerKind {
         texture_name: String,
     },
     EditingOpenFile,
+    EditingOpenImg,
     /// Pick a loose `.txd` to pair with the DFF open in the editor.
     EditingPairTxd,
     EditingMergeImg,
@@ -3082,6 +3110,10 @@ struct EditingDffState {
     dff_2dfx_payload_active_field: Option<usize>,
     dff_2dfx_payload_field_scroll: f32,
     dff_2dfx_particle_picker_scroll: f32,
+    /// The currently visible DFF editor category (Material, UV, Mesh, etc.).
+    /// Kept separately from section collapse state so switching tabs does not
+    /// discard the user's expanded sections.
+    panel_tab: usize,
     panel_scroll: f32,
     panel_collapsed: [bool; DFF_SECTION_COUNT],
 }
@@ -3202,6 +3234,24 @@ enum EditingAsset {
     Col(EditingColState),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditingNestedScrollFocus {
+    DffMaterials,
+    ColPrimitives,
+    ColFaces,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditingScrollbarDrag {
+    ImgArchive,
+    DffMaterials,
+    DffPanel,
+    ColPrimitives,
+    ColFaces,
+    ColPanel,
+    TxdTextures,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditingLinkedAssetKind {
     Dff,
@@ -3228,6 +3278,7 @@ struct EditingLinkedSelectionJob {
 struct EditingState {
     img_paths: Vec<PathBuf>,
     selected_img_path: usize,
+    archive_picker_open: bool,
     img_path: Option<PathBuf>,
     rows: Vec<EditingImgRow>,
     selected_row: usize,
@@ -3241,7 +3292,8 @@ struct EditingState {
     added_entries: BTreeSet<String>,
     asset: Option<EditingAsset>,
     camera: Option<CameraState>,
-    return_camera: Option<CameraState>,
+    camera_mode: Option<CameraMode>,
+    camera_focus: Option<Option<Vec3>>,
     message: String,
     save_rx: Option<mpsc::Receiver<Result<EditingImgSaveOutcome, String>>>,
     merge_rx: Option<mpsc::Receiver<Result<EditingImgMergePlan, String>>>,
@@ -3249,6 +3301,11 @@ struct EditingState {
     txd_import_rx: Option<mpsc::Receiver<EditingTxdImportResult>>,
     txd_refresh_job: Option<EditingTxdRefreshJob>,
     linked_selection_job: Option<EditingLinkedSelectionJob>,
+    /// Child lists must be clicked before their wheel input takes precedence
+    /// over their containing editor panel.
+    nested_scroll_focus: Option<EditingNestedScrollFocus>,
+    scrollbar_drag: Option<EditingScrollbarDrag>,
+    scrollbar_drag_grab_offset_y: f32,
 }
 
 struct EditingTxdImportResult {
@@ -3292,6 +3349,7 @@ impl Default for EditingState {
         Self {
             img_paths: Vec::new(),
             selected_img_path: 0,
+            archive_picker_open: false,
             img_path: None,
             rows: Vec::new(),
             selected_row: 0,
@@ -3305,7 +3363,8 @@ impl Default for EditingState {
             added_entries: BTreeSet::new(),
             asset: None,
             camera: None,
-            return_camera: None,
+            camera_mode: None,
+            camera_focus: None,
             message: "Open an IMG archive to begin editing.".to_string(),
             save_rx: None,
             merge_rx: None,
@@ -3313,6 +3372,9 @@ impl Default for EditingState {
             txd_import_rx: None,
             txd_refresh_job: None,
             linked_selection_job: None,
+            nested_scroll_focus: None,
+            scrollbar_drag: None,
+            scrollbar_drag_grab_offset_y: 0.0,
         }
     }
 }
@@ -3502,6 +3564,9 @@ struct VehicleBrowserState {
     scroll: f32,
     manage_dictionaries: bool,
     dictionary_scroll: f32,
+    dictionary_scroll_drag: bool,
+    list_scroll_drag: bool,
+    list_scroll_grab_offset_y: f32,
     build_dialog: Option<VehicleBuildDialog>,
     preview_mesh: Option<RenderMesh>,
     embedded_collision: Option<CollisionMesh>,
@@ -3529,6 +3594,9 @@ struct VehicleBrowserState {
     photo_reflection_failed: bool,
     hidden_parts: HashSet<usize>,
     hidden_components: HashSet<usize>,
+    /// Components explicitly shown from the list despite an active name-based
+    /// visibility filter, such as "Hide Damaged".
+    forced_visible_components: HashSet<usize>,
     collapsed_components: HashSet<usize>,
     selected_component: Option<usize>,
     component_rotations: HashMap<usize, V3>,
@@ -3537,11 +3605,13 @@ struct VehicleBrowserState {
     selected_part: Option<usize>,
     texture_previews: HashMap<String, Option<(Texture2D, u32, u32)>>,
     component_scroll: f32,
+    component_scroll_drag: bool,
+    component_scroll_grab_offset_y: f32,
     /// Camera used for the vehicle preview viewport. Kept separate from the main
     /// `AppState.camera` so orbiting the preview doesn't move the world camera.
     camera: Option<CameraState>,
-    /// World camera stashed on entering the Vehicles tab, restored on leaving.
-    return_camera: Option<CameraState>,
+    camera_mode: Option<CameraMode>,
+    camera_focus: Option<Option<Vec3>>,
     /// DFF parsing and TXD indexing happen off the render thread. The completed
     /// CPU-side assets are installed (and uploaded to GL) from the main loop.
     reload_rx: Option<mpsc::Receiver<VehicleReloadResult>>,
@@ -3569,6 +3639,9 @@ impl Default for VehicleBrowserState {
             scroll: 0.0,
             manage_dictionaries: false,
             dictionary_scroll: 0.0,
+            dictionary_scroll_drag: false,
+            list_scroll_drag: false,
+            list_scroll_grab_offset_y: 0.0,
             build_dialog: None,
             preview_mesh: None,
             embedded_collision: None,
@@ -3580,7 +3653,7 @@ impl Default for VehicleBrowserState {
             show_collision_volumes: false,
             show_textures: true,
             lights_on: false,
-            hide_damaged: false,
+            hide_damaged: true,
             hide_vlo: true,
             body_color_a: V3 {
                 x: 0.075,
@@ -3601,6 +3674,7 @@ impl Default for VehicleBrowserState {
             photo_reflection_failed: false,
             hidden_parts: HashSet::new(),
             hidden_components: HashSet::new(),
+            forced_visible_components: HashSet::new(),
             collapsed_components: HashSet::new(),
             selected_component: None,
             component_rotations: HashMap::new(),
@@ -3609,8 +3683,11 @@ impl Default for VehicleBrowserState {
             selected_part: None,
             texture_previews: HashMap::new(),
             component_scroll: 0.0,
+            component_scroll_drag: false,
+            component_scroll_grab_offset_y: 0.0,
             camera: None,
-            return_camera: None,
+            camera_mode: None,
+            camera_focus: None,
             reload_rx: None,
             texture_export_rx: None,
             texture_replace_rx: None,
@@ -3634,6 +3711,7 @@ struct ProjectPicker {
     new_project_dialog: Option<NewProjectDialog>,
     project_roots_dialog: bool,
     project_scroll_row: usize,
+    project_scroll_drag: bool,
     status: String,
 }
 
@@ -3959,6 +4037,8 @@ struct IconSet {
     save: Texture2D,
     undo: Texture2D,
     redo: Texture2D,
+    texture: Texture2D,
+    tool: Texture2D,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3981,6 +4061,7 @@ struct AppState {
     eagle_zone_offsets: EagleZoneOffsets,
     meshes: HashMap<String, RenderMesh>,
     collisions: HashMap<String, CollisionMesh>,
+    collision_render_cache: HashMap<String, CollisionRenderCache>,
     lod_ids: HashSet<String>,
     scene_cells: Vec<SceneCell>,
     world_cells: Vec<WorldCell>,
@@ -4049,6 +4130,9 @@ struct AppState {
     editing: EditingState,
     properties_tab: PropertiesTab,
     properties_scroll: f32,
+    validation_list_scroll: [f32; 3],
+    validation_list_scroll_drag: Option<usize>,
+    validation_list_scroll_grab_offset_y: f32,
     element_panel_collapsed: [bool; ELEM_SECTION_COUNT],
     preview_selected_material: Option<(usize, usize)>,
     texture_match_selection_job: Option<TextureMatchSelectionJob>,
@@ -4078,6 +4162,10 @@ struct AppState {
     scroll: f32,
     scroll_interaction_until: f64,
     outliner_scroll_drag: Option<OutlinerScrollDrag>,
+    scrollbar_pointer_captured: bool,
+    inspector_scroll_drag: bool,
+    water_list_scroll_drag: bool,
+    light_list_scroll_drag: bool,
     box_select_drag: Option<BoxSelectDrag>,
     box_select_distance: f32,
     box_select_mode: BoxSelectMode,
@@ -4117,6 +4205,7 @@ struct AppState {
     asset_optimization_job: Option<AssetOptimizationJob>,
     asset_optimization_scope: AssetOptimizationScope,
     asset_optimization_menu_open: bool,
+    navigation_menu_open: bool,
     purge_unused_job: Option<PurgeUnusedJob>,
     img_archive_rebalance_job: Option<ImgArchiveRebalanceJob>,
     object_bounds_fix_job: Option<ObjectBoundsFixJob>,
@@ -4134,6 +4223,11 @@ struct AppState {
     collision_generation_preset: CollisionGenerationPreset,
     collision_generation_fallback_material: u8,
     camera: CameraState,
+    /// Camera owned by the gameworld tabs. Editing and Vehicles keep their
+    /// cameras in their respective tab state instead.
+    gameworld_camera: Option<CameraState>,
+    gameworld_camera_mode: Option<CameraMode>,
+    gameworld_camera_focus: Option<Option<Vec3>>,
     camera_mode: CameraMode,
     camera_focus: Option<Vec3>,
     loaded_message: String,
@@ -4157,6 +4251,8 @@ struct AppState {
     save_log_scroll: f32,
     save_log_follow_tail: bool,
     camera_speed: f32,
+    vehicle_camera_speed: f32,
+    editing_camera_speed: f32,
     camera_rotation_speed: f32,
     gizmo_scale: f32,
     gta_sa_dir: PathBuf,
@@ -4178,6 +4274,7 @@ struct AppState {
     light_kind_dropdown_open: bool,
     light_profile_dropdown_open: bool,
     light_color_drag_before: Option<LightHistorySnapshot>,
+    light_temperature_drag_before: Option<LightHistorySnapshot>,
     water_planes: Vec<WaterPlane>,
     selected_water: usize,
     selected_water_planes: BTreeSet<usize>,
@@ -4383,10 +4480,19 @@ enum RacePlaceMode {
     Path,
 }
 
+/// The compact control group currently shown in the Race tab's Track panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RacePanelSection {
+    Track,
+    Points,
+    Output,
+}
+
 struct RaceEditorState {
     tracks: Vec<RaceTrack>,
     selected_track: usize,
     place_mode: RacePlaceMode,
+    panel_section: RacePanelSection,
     /// Selected point index within the list matching `place_mode`.
     selected_point: Option<usize>,
     /// Z height used for the ground plane when placing points by clicking.
@@ -4440,6 +4546,7 @@ impl Default for RaceEditorState {
             tracks: Vec::new(),
             selected_track: NO_SELECTION,
             place_mode: RacePlaceMode::None,
+            panel_section: RacePanelSection::Track,
             selected_point: None,
             place_z: 0.0,
             default_radius: 8.0,
@@ -4909,6 +5016,7 @@ async fn main() {
                     draw_lod_batch_dialog(app);
                     draw_confirm_dialog(app);
                     draw_save_log_dialog(app);
+                    draw_pending_ui_tooltip(&app.ui_font);
                 }
                 let ui_ms = t_ui.elapsed().as_secs_f32() * 1000.0;
                 // Resize / slow-frame diagnostics: log whenever the window size

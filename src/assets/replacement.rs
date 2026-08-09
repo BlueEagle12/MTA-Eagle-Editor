@@ -1023,23 +1023,12 @@ pub(crate) fn replace_selected_dff(app: &mut AppState, path: PathBuf, make_uniqu
         .unwrap_or_else(|| app.placements[selected_idx].dff.clone());
     let dff_ref = normalize_legacy_light_mapper_asset_stem(&dff_ref);
     let dff_name = with_ext(&dff_ref, ".dff");
-    let frame_name = Path::new(&dff_name)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("replacement");
-    let normalized = match write_normalized_dff_with_options(
-        &raw,
-        frame_name,
-        dff_write_options_for_asset(app, &dff_name),
-    ) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            app.status_message = format!("Failed to normalize replacement DFF: {err}");
-            return;
-        }
-    };
     let asset_root = replacement_asset_root(app);
-    if let Err(err) = upsert_replacement_dff(&asset_root, &dff_name, &normalized) {
+    // Replacement is a file transfer, not an edit.  DFFs can contain hierarchy,
+    // plugin, and BinMesh data that the normalized writer cannot reproduce
+    // byte-for-byte (including the original face order), so retain the imported
+    // payload exactly as supplied.
+    if let Err(err) = upsert_replacement_dff(&asset_root, &dff_name, &bytes) {
         app.status_message = err;
         return;
     }
@@ -2229,7 +2218,8 @@ pub(crate) fn update_outliner_scroll_from_mouse(app: &mut AppState, mouse: Vec2)
                 return true;
             }
         }
-        if track.contains(mouse) {
+        let hit_area = Rect::new(track.x - 6.0, track.y, track.w + 12.0, track.h);
+        if hit_area.contains(mouse) {
             let thumb_h = thumb.map(|thumb| thumb.h).unwrap_or(28.0);
             app.outliner_scroll_drag = Some(OutlinerScrollDrag {
                 grab_offset: thumb_h * 0.5,
@@ -2245,43 +2235,36 @@ pub(crate) fn update_outliner_scroll_from_mouse(app: &mut AppState, mouse: Vec2)
     false
 }
 
-const TOOLBAR_SNAP: usize = 8;
 const TOOLBAR_LOAD: usize = 9;
 const TOOLBAR_SAVE_AS: usize = 10;
 const TOOLBAR_SAVE_WIP: usize = 11;
-const TOOLBAR_TRANSFORM_SPACE: usize = 12;
 const TOOLBAR_GENERATE_TXD: usize = 13;
 const TOOLBAR_IMPORT_BLENDER: usize = 14;
 const TOOLBAR_PREFERENCES: usize = 15;
 
 fn toolbar_control_rect(control: usize) -> Rect {
-    let start_x = PANEL_W + 20.0;
+    // File/project actions live in the top row. Transform actions have their
+    // own strip below workspace navigation, so this row never fights the
+    // project identity for horizontal space.
+    let start_x = file_save_rect().x + file_save_rect().w + 10.0;
     let available = (screen_width() - start_x - 18.0).max(1.0);
-    let gap = if available < 760.0 { 4.0 } else { 8.0 };
-    let desired_widths = [
-        36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 62.0, 70.0, 82.0, 90.0, 86.0, 132.0, 132.0,
-        132.0,
+    let gap = 8.0;
+    let controls = [
+        (TOOLBAR_LOAD, 70.0),
+        (TOOLBAR_SAVE_AS, 92.0),
+        (TOOLBAR_SAVE_WIP, 104.0),
+        (TOOLBAR_GENERATE_TXD, 120.0),
+        (TOOLBAR_PREFERENCES, 118.0),
     ];
-    let is_visible = |id: usize| id != TOOLBAR_IMPORT_BLENDER || SHOW_BLENDER_IMPORT;
-    let visible_count = (0..desired_widths.len())
-        .filter(|id| is_visible(*id))
-        .count();
+    let visible_count = controls.len();
     let gap_total = gap * visible_count.saturating_sub(1) as f32;
-    let desired_total: f32 = desired_widths
-        .iter()
-        .enumerate()
-        .filter(|(id, _)| is_visible(*id))
-        .map(|(_, width)| *width)
-        .sum();
+    let desired_total: f32 = controls.iter().map(|(_, width)| *width).sum();
     let scale = ((available - gap_total).max(1.0) / desired_total).min(1.0);
     let mut x = start_x;
-    for (id, desired_w) in desired_widths.into_iter().enumerate() {
-        if !is_visible(id) {
-            continue;
-        }
+    for (id, desired_w) in controls {
         let width = desired_w * scale;
         if id == control {
-            return Rect::new(x, 34.0, width, 36.0);
+            return Rect::new(x, 18.0, width, 36.0);
         }
         x += width + gap;
     }
@@ -2289,15 +2272,19 @@ fn toolbar_control_rect(control: usize) -> Rect {
 }
 
 pub(crate) fn toolbar_button_rect(slot: usize) -> Rect {
-    toolbar_control_rect(slot)
+    Rect::new(14.0 + slot as f32 * 44.0, TOP_H - 38.0, 36.0, 36.0)
 }
 
 pub(crate) fn snap_mode_rect() -> Rect {
-    toolbar_control_rect(TOOLBAR_SNAP)
+    Rect::new(330.0, TOP_H - 38.0, 66.0, 36.0)
 }
 
 pub(crate) fn transform_space_rect() -> Rect {
-    toolbar_control_rect(TOOLBAR_TRANSFORM_SPACE)
+    Rect::new(404.0, TOP_H - 38.0, 78.0, 36.0)
+}
+
+pub(crate) fn file_save_rect() -> Rect {
+    Rect::new(400.0, 18.0, 72.0, 36.0)
 }
 
 pub(crate) fn load_resource_rect() -> Rect {
@@ -2326,6 +2313,18 @@ pub(crate) fn generate_txd_button_rect() -> Rect {
 
 pub(crate) const SHOW_BLENDER_IMPORT: bool = false;
 
+/// Tooltips are queued while controls are drawn, then flushed after dialogs
+/// and menus. Macroquad uses draw order for layering, so this is the UI
+/// equivalent of a dedicated, always-on-top tooltip layer.
+static PENDING_UI_TOOLTIP: OnceLock<Mutex<Option<(Rect, String)>>> = OnceLock::new();
+
+fn pending_ui_tooltip() -> std::sync::MutexGuard<'static, Option<(Rect, String)>> {
+    PENDING_UI_TOOLTIP
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) fn icon_button(
     font: &Font,
     rect: Rect,
@@ -2335,7 +2334,7 @@ pub(crate) fn icon_button(
     label: &str,
 ) {
     let mouse: Vec2 = mouse_position().into();
-    let pointer_over = rect.contains(mouse);
+    let pointer_over = !scrollbar_hover_suppressed() && rect.contains(mouse);
     let hovered = enabled && pointer_over;
     let bg = if !enabled {
         ui_input_bg()
@@ -2396,34 +2395,14 @@ pub(crate) fn icon_button(
         } else {
             format!("{label} — unavailable")
         };
-        let tip_w = (ui_text_width(&tooltip, 14) + 18.0)
-            .min(screen_width() - 16.0)
-            .max(42.0);
-        draw_rrect_bordered(
-            rect.x.min(screen_width() - tip_w - 8.0).max(8.0),
-            rect.y + rect.h + 8.0,
-            tip_w,
-            24.0,
-            8.0,
-            1.0,
-            Color::new(0.025, 0.035, 0.050, 0.98),
-            Color::new(0.25, 0.27, 0.30, 1.0),
-        );
-        let tip_x = rect.x.min(screen_width() - tip_w - 8.0).max(8.0);
-        ui_text_size(
-            font,
-            &tooltip,
-            tip_x + 9.0,
-            rect.y + rect.h + 25.0,
-            14,
-            LIGHTGRAY,
-        );
+        draw_text_tooltip(font, rect, &tooltip);
     }
 }
 
 pub(crate) fn toolbar_contains(mouse: Vec2) -> bool {
-    (0..8).any(|slot| toolbar_button_rect(slot).contains(mouse))
+    (0..7).any(|slot| toolbar_button_rect(slot).contains(mouse))
         || snap_mode_rect().contains(mouse)
+        || file_save_rect().contains(mouse)
         || load_resource_rect().contains(mouse)
         || save_as_rect().contains(mouse)
         || save_wip_rect().contains(mouse)
@@ -2435,7 +2414,7 @@ pub(crate) fn toolbar_contains(mouse: Vec2) -> bool {
 
 pub(crate) fn app_tab_label(tab: AppTab) -> &'static str {
     match tab {
-        AppTab::Preview => "Preview",
+        AppTab::Preview => "Game World",
         AppTab::LodAudit => "LOD Audit",
         AppTab::TextureReview => "Texture Review",
         AppTab::Scene => "Scene",
@@ -2448,6 +2427,24 @@ pub(crate) fn app_tab_label(tab: AppTab) -> &'static str {
         AppTab::Water => "Water",
         AppTab::Race => "Race",
         AppTab::Simulate => "Simulate",
+    }
+}
+
+pub(crate) fn app_tab_tooltip(tab: AppTab) -> &'static str {
+    match tab {
+        AppTab::Preview => "Browse and place map elements in the game world.",
+        AppTab::LodAudit => "Review level-of-detail assignments and find LOD issues.",
+        AppTab::TextureReview => "Find and resolve missing or mismatched textures.",
+        AppTab::Scene => "Manage scene elements, selection, and asset placement.",
+        AppTab::Vehicles => "Browse and edit vehicle models and their assets.",
+        AppTab::Validation => "Check the project for problems and apply available fixes.",
+        AppTab::Editing => "Edit an asset's geometry, materials, and textures.",
+        AppTab::Collisions => "View collision geometry (read-only).",
+        AppTab::Lights => "Place and configure scene lighting.",
+        AppTab::Bake => "Bake vertex lighting for the current project.",
+        AppTab::Water => "Create and adjust water planes.",
+        AppTab::Race => "Create and edit race tracks, checkpoints, and radar settings.",
+        AppTab::Simulate => "Test the project in simulation mode.",
     }
 }
 
@@ -2465,16 +2462,41 @@ pub(crate) fn app_tabs_for_mode(mode: LaunchMode) -> Vec<AppTab> {
         AppTab::Bake,
         AppTab::Water,
         AppTab::Race,
-        AppTab::Simulate,
     ];
     tabs.into_iter()
         .filter(|tab| mode == LaunchMode::Project || !matches!(tab, AppTab::Preview | AppTab::Bake))
         .collect()
 }
 
+/// The top-level workspaces are deliberately limited to the tasks used while
+/// authoring. Audits and specialised tools remain one click away in More.
+pub(crate) fn primary_app_tabs_for_mode(mode: LaunchMode) -> Vec<AppTab> {
+    app_tabs_for_mode(mode)
+        .into_iter()
+        .filter(|tab| {
+            matches!(
+                tab,
+                AppTab::Preview
+                    | AppTab::Scene
+                    | AppTab::Vehicles
+                    | AppTab::Editing
+                    | AppTab::Collisions
+                    | AppTab::Lights
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn overflow_app_tabs_for_mode(mode: LaunchMode) -> Vec<AppTab> {
+    app_tabs_for_mode(mode)
+        .into_iter()
+        .filter(|tab| !primary_app_tabs_for_mode(mode).contains(tab))
+        .collect()
+}
+
 pub(crate) fn app_tab_rect(app: &AppState, tab: AppTab) -> Rect {
     let tab_y = 96.0;
-    let tabs = app_tabs_for_mode(app.options.launch_mode);
+    let tabs = primary_app_tabs_for_mode(app.options.launch_mode);
     let gap = if screen_width() < 1000.0 { 3.0 } else { 6.0 };
     let available = (screen_width() - 12.0 - gap * tabs.len().saturating_sub(1) as f32).max(1.0);
     let natural_widths: Vec<f32> = tabs
@@ -2494,42 +2516,107 @@ pub(crate) fn app_tab_rect(app: &AppState, tab: AppTab) -> Rect {
     Rect::new(0.0, 0.0, 0.0, 0.0)
 }
 
+pub(crate) fn more_tabs_rect(app: &AppState) -> Rect {
+    let tabs = primary_app_tabs_for_mode(app.options.launch_mode);
+    let gap = if screen_width() < 1000.0 { 3.0 } else { 6.0 };
+    let last_right = tabs
+        .last()
+        .map(|tab| {
+            let rect = app_tab_rect(app, *tab);
+            rect.x + rect.w
+        })
+        .unwrap_or(6.0);
+    Rect::new(last_right + gap, 78.0, 72.0, 26.0)
+}
+
+pub(crate) fn overflow_tab_rect(app: &AppState, tab: AppTab) -> Rect {
+    let tabs = overflow_app_tabs_for_mode(app.options.launch_mode);
+    let menu = more_tabs_rect(app);
+    let row = tabs
+        .iter()
+        .position(|candidate| *candidate == tab)
+        .unwrap_or(0) as f32;
+    Rect::new(
+        menu.x - 112.0,
+        menu.y + menu.h + 8.0 + row * 32.0,
+        176.0,
+        28.0,
+    )
+}
+
+pub(crate) fn navigation_menu_bounds(app: &AppState) -> Rect {
+    let tabs = overflow_app_tabs_for_mode(app.options.launch_mode);
+    let first = overflow_tab_rect(app, tabs.first().copied().unwrap_or(AppTab::Validation));
+    Rect::new(
+        first.x - 5.0,
+        first.y - 5.0,
+        first.w + 10.0,
+        tabs.len() as f32 * 32.0 + 10.0,
+    )
+}
+
 pub(crate) fn handle_tab_click(app: &mut AppState, mouse: Vec2) -> bool {
     if !is_mouse_button_pressed(MouseButton::Left) {
         return false;
     }
-    for tab in app_tabs_for_mode(app.options.launch_mode) {
+    if more_tabs_rect(app).contains(mouse) {
+        app.navigation_menu_open = !app.navigation_menu_open;
+        return true;
+    }
+    if app.navigation_menu_open {
+        for tab in overflow_app_tabs_for_mode(app.options.launch_mode) {
+            if overflow_tab_rect(app, tab).contains(mouse) {
+                activate_app_tab(app, tab);
+                app.navigation_menu_open = false;
+                return true;
+            }
+        }
+        app.navigation_menu_open = false;
+        return navigation_menu_bounds(app).contains(mouse);
+    }
+    for tab in primary_app_tabs_for_mode(app.options.launch_mode) {
         if app_tab_rect(app, tab).contains(mouse) {
-            if app.active_tab == AppTab::Simulate && tab != AppTab::Simulate {
-                app.sim.playing = false;
-                restore_sim_editor_camera(app);
-            }
-            switch_app_tab(app, tab);
-            app.inspector_edit = None;
-            app.properties_scroll = 0.0;
-            if tab == AppTab::Validation {
-                refresh_validation_cache(app);
-            }
-            if tab == AppTab::LodAudit
-                && app.lod_audit.rx.is_none()
-                && (app.lod_audit.result.is_none() || app.lod_audit.stale)
-            {
-                request_lod_audit(app);
-            }
-            if tab == AppTab::TextureReview
-                && app.missing_texture_review.rx.is_none()
-                && (app.missing_texture_review.result.is_none() || app.missing_texture_review.stale)
-            {
-                request_missing_texture_review(app);
-            }
+            activate_app_tab(app, tab);
             return true;
         }
     }
     false
 }
 
-fn apply_camera_after_tab_restore(app: &mut AppState, camera: CameraState) {
+fn activate_app_tab(app: &mut AppState, tab: AppTab) {
+    if app.active_tab == AppTab::Simulate && tab != AppTab::Simulate {
+        app.sim.playing = false;
+        restore_sim_editor_camera(app);
+    }
+    switch_app_tab(app, tab);
+    app.inspector_edit = None;
+    app.properties_scroll = 0.0;
+    if tab == AppTab::Validation {
+        refresh_validation_cache(app);
+    }
+    if tab == AppTab::LodAudit
+        && app.lod_audit.rx.is_none()
+        && (app.lod_audit.result.is_none() || app.lod_audit.stale)
+    {
+        request_lod_audit(app);
+    }
+    if tab == AppTab::TextureReview
+        && app.missing_texture_review.rx.is_none()
+        && (app.missing_texture_review.result.is_none() || app.missing_texture_review.stale)
+    {
+        request_missing_texture_review(app);
+    }
+}
+
+fn apply_camera_after_tab_restore(
+    app: &mut AppState,
+    camera: CameraState,
+    mode: CameraMode,
+    focus: Option<Vec3>,
+) {
     app.camera = camera;
+    app.camera_mode = mode;
+    app.camera_focus = focus;
     app.camera.looking = false;
     app.camera.last_mouse = mouse_position().into();
     set_cursor_grab(false);
@@ -2538,7 +2625,27 @@ fn apply_camera_after_tab_restore(app: &mut AppState, camera: CameraState) {
 
 pub(crate) fn remember_world_camera_before_editing(app: &mut AppState) {
     if app.active_tab != AppTab::Editing {
-        app.editing.return_camera = Some(app.camera);
+        remember_active_tab_camera(app);
+    }
+}
+
+fn remember_active_tab_camera(app: &mut AppState) {
+    match app.active_tab {
+        AppTab::Editing => {
+            app.editing.camera = Some(app.camera);
+            app.editing.camera_mode = Some(app.camera_mode);
+            app.editing.camera_focus = Some(app.camera_focus);
+        }
+        AppTab::Vehicles => {
+            app.vehicle_browser.camera = Some(app.camera);
+            app.vehicle_browser.camera_mode = Some(app.camera_mode);
+            app.vehicle_browser.camera_focus = Some(app.camera_focus);
+        }
+        _ => {
+            app.gameworld_camera = Some(app.camera);
+            app.gameworld_camera_mode = Some(app.camera_mode);
+            app.gameworld_camera_focus = Some(app.camera_focus);
+        }
     }
 }
 
@@ -2549,42 +2656,48 @@ pub(crate) fn switch_app_tab(app: &mut AppState, tab: AppTab) {
     if app.active_tab == AppTab::Validation {
         app.asset_optimization_menu_open = false;
     }
-    if app.active_tab == AppTab::Editing {
-        app.editing.camera = Some(app.camera);
-        if let Some(camera) = app.editing.return_camera.take() {
-            apply_camera_after_tab_restore(app, camera);
-        }
-    }
-    // Leaving Vehicles: stash the preview camera and restore the world camera so
-    // the main viewport is unaffected by orbiting the vehicle preview.
     if app.active_tab == AppTab::Vehicles {
         if app.vehicle_browser.photo_mode {
             set_vehicle_photo_mode(app, false);
         }
-        app.vehicle_browser.camera = Some(app.camera);
-        if let Some(camera) = app.vehicle_browser.return_camera.take() {
-            apply_camera_after_tab_restore(app, camera);
-        }
     }
-    if tab == AppTab::Editing {
-        remember_world_camera_before_editing(app);
-        if let Some(camera) = app.editing.camera {
-            apply_camera_after_tab_restore(app, camera);
-        }
+    remember_active_tab_camera(app);
+    let camera = match tab {
+        AppTab::Editing => app.editing.camera.or(app.gameworld_camera),
+        AppTab::Vehicles => app.vehicle_browser.camera.or(app.gameworld_camera),
+        _ => app.gameworld_camera,
     }
-    // Entering Vehicles: remember the world camera, then swap in the vehicle
-    // preview's own camera (if it has one from a previous visit).
-    if tab == AppTab::Vehicles {
-        app.vehicle_browser.return_camera = Some(app.camera);
-        if let Some(camera) = app.vehicle_browser.camera {
-            apply_camera_after_tab_restore(app, camera);
-        }
-    }
+    .unwrap_or(app.camera);
+    let (mode, focus) = match tab {
+        AppTab::Editing => (
+            app.editing.camera_mode.unwrap_or(CameraMode::Freeroam),
+            app.editing.camera_focus.unwrap_or(None),
+        ),
+        AppTab::Vehicles => (
+            app.vehicle_browser
+                .camera_mode
+                .unwrap_or(CameraMode::Freeroam),
+            app.vehicle_browser.camera_focus.unwrap_or(None),
+        ),
+        _ => (
+            app.gameworld_camera_mode.unwrap_or(app.camera_mode),
+            app.gameworld_camera_focus.unwrap_or(app.camera_focus),
+        ),
+    };
+    apply_camera_after_tab_restore(app, camera, mode, focus);
     app.active_tab = tab;
 }
 
 pub(crate) fn draw_text_tooltip(font: &Font, anchor: Rect, label: &str) {
-    let tip_w = (ui_text_width(label, 14) + 20.0)
+    let _ = font;
+    *pending_ui_tooltip() = Some((anchor, label.to_string()));
+}
+
+pub(crate) fn draw_pending_ui_tooltip(font: &Font) {
+    let Some((anchor, label)) = pending_ui_tooltip().take() else {
+        return;
+    };
+    let tip_w = (ui_text_width(&label, 14) + 20.0)
         .min(screen_width() - 16.0)
         .max(48.0);
     let tip_x = anchor.x.min(screen_width() - tip_w - 8.0).max(8.0);
@@ -2604,7 +2717,7 @@ pub(crate) fn draw_text_tooltip(font: &Font, anchor: Rect, label: &str) {
         Color::new(0.025, 0.035, 0.050, 0.98),
         Color::new(0.25, 0.27, 0.30, 1.0),
     );
-    let visible = ellipsize_width(label, 14, tip_w - 16.0);
+    let visible = ellipsize_width(&label, 14, tip_w - 16.0);
     ui_text_size(font, &visible, tip_x + 8.0, tip_y + 18.0, 14, WHITE);
 }
 
@@ -2618,7 +2731,7 @@ fn draw_text_button_state(
     disabled_reason: Option<&str>,
 ) {
     let mouse: Vec2 = mouse_position().into();
-    let hovered = rect.contains(mouse);
+    let hovered = !scrollbar_hover_suppressed() && rect.contains(mouse);
     let bg = if !enabled && !busy {
         Color::new(0.045, 0.058, 0.078, 1.0)
     } else if active || busy {
@@ -2692,6 +2805,28 @@ pub(crate) fn text_button_busy(font: &Font, rect: Rect, label: &str) {
     draw_text_button_state(font, rect, label, true, false, true, Some("Working..."));
 }
 
+pub(crate) fn toolbar_primary_button(font: &Font, rect: Rect, label: &str) {
+    let mouse: Vec2 = mouse_position().into();
+    let hovered = !scrollbar_hover_suppressed() && rect.contains(mouse);
+    let fill = if hovered {
+        Color::new(0.19, 0.48, 0.78, 1.0)
+    } else {
+        Color::new(0.12, 0.38, 0.67, 1.0)
+    };
+    draw_rrect_bordered(rect.x, rect.y, rect.w, rect.h, 9.0, 1.0, fill, ui_accent());
+    let tw = ui_text_width(label, 16);
+    ui_text(
+        font,
+        label,
+        rect.x + (rect.w - tw) * 0.5,
+        rect.y + 23.0,
+        WHITE,
+    );
+    if hovered {
+        draw_text_tooltip(font, rect, "Save project (Ctrl+S)");
+    }
+}
+
 pub(crate) fn handle_toolbar_click(app: &mut AppState, mouse: Vec2) -> bool {
     if !toolbar_contains(mouse) {
         return false;
@@ -2733,7 +2868,7 @@ pub(crate) fn handle_toolbar_click(app: &mut AppState, mouse: Vec2) -> bool {
         undo(app);
     } else if toolbar_button_rect(6).contains(mouse) {
         redo(app);
-    } else if toolbar_button_rect(7).contains(mouse) {
+    } else if file_save_rect().contains(mouse) {
         save_scene(app);
     } else if snap_mode_rect().contains(mouse) {
         app.snap_enabled = !app.snap_enabled;
@@ -3652,7 +3787,11 @@ pub(crate) fn selected_axis_vector(app: &AppState, axis: GizmoAxis) -> Vec3 {
     if app.active_tab == AppTab::Lights {
         if app.transform_space == TransformSpace::Local {
             if let Some(light) = app.lights.get(app.selected_light) {
-                return light_local_axis(light.direction, axis);
+                let (_, direction) = light_world_transform(
+                    light,
+                    light_reference_placement(app, light).map(|(_, placement)| placement),
+                );
+                return light_local_axis(from_mq(direction), axis);
             }
         }
         return base;
@@ -3681,7 +3820,11 @@ pub(crate) fn selected_ring_basis(app: &AppState, axis: GizmoAxis) -> (Vec3, Vec
     };
     if app.active_tab == AppTab::Lights && app.transform_space == TransformSpace::Local {
         if let Some(light) = app.lights.get(app.selected_light) {
-            let (x, y, z) = light_local_basis(light.direction);
+            let (_, direction) = light_world_transform(
+                light,
+                light_reference_placement(app, light).map(|(_, placement)| placement),
+            );
+            let (x, y, z) = light_local_basis(from_mq(direction));
             return match axis {
                 GizmoAxis::X => (y, z),
                 GizmoAxis::Y => (x, z),
@@ -3753,10 +3896,13 @@ pub(crate) fn gizmo_visual_length(app: &AppState, origin: Vec3) -> f32 {
 
 pub(crate) fn selected_origin(app: &AppState) -> Option<Vec3> {
     if app.active_tab == AppTab::Lights {
-        return app
-            .lights
-            .get(app.selected_light)
-            .map(|light| vec3(light.position.x, light.position.y, light.position.z));
+        return app.lights.get(app.selected_light).map(|light| {
+            light_world_transform(
+                light,
+                light_reference_placement(app, light).map(|(_, placement)| placement),
+            )
+            .0
+        });
     }
     if app.active_tab == AppTab::Collisions && app.collision_edit_mode {
         return selected_collision_tab_vertex_position(app);
@@ -3999,10 +4145,123 @@ pub(crate) fn pick_scene_element(app: &AppState, viewport: Rect, mouse: Vec2) ->
     best
 }
 
-pub(crate) fn pick_scene_light(app: &AppState, viewport: Rect, mouse: Vec2) -> Option<usize> {
+/// Returns the closest exact geometry hit under the pointer, with its placement.
+pub(crate) fn pick_scene_geometry_point(
+    app: &AppState,
+    viewport: Rect,
+    mouse: Vec2,
+) -> Option<(usize, Vec3)> {
+    let (origin, dir) = viewport_ray(app, viewport, mouse)?;
+    let mut best: Option<(usize, Vec3, f32)> = None;
+    for (idx, state) in app.element_states.iter().enumerate() {
+        if state.deleted || state.hidden {
+            continue;
+        }
+        let Some(placement) = app.placements.get(idx) else {
+            continue;
+        };
+        let Some(mesh) = element_mesh(app, placement) else {
+            continue;
+        };
+        let model = placement_matrix(placement);
+        let inv = model.inverse().to_cols_array();
+        let local_origin = transform_point_gl(&inv, from_mq(origin));
+        let local_far = transform_point_gl(&inv, from_mq(origin + dir));
+        let local_dir = (local_far - local_origin).normalize_or_zero();
+        if local_dir.length_squared() < 0.0001
+            || ray_aabb(local_origin, local_dir, mesh.bounds.min, mesh.bounds.max).is_none()
+        {
+            continue;
+        }
+        let Some(local_t) = ray_mesh_triangles(local_origin, local_dir, mesh) else {
+            continue;
+        };
+        let world = model.transform_point3(local_origin + local_dir * local_t);
+        let world_t = (world - origin).dot(dir);
+        if world_t >= 0.0 && best.as_ref().is_none_or(|(_, _, t)| world_t < *t) {
+            best = Some((idx, world, world_t));
+        }
+    }
+    best.map(|(idx, point, _)| (idx, point))
+}
+
+pub(crate) fn light_reference_placement<'a>(
+    app: &'a AppState,
+    light: &EditorLight,
+) -> Option<(usize, &'a Placement)> {
+    let model = light.attached_to.as_deref()?;
+    let usable = |idx: usize, placement: &Placement| {
+        placement.id == model
+            && !app
+                .element_states
+                .get(idx)
+                .is_some_and(|state| state.deleted)
+    };
+    app.placements
+        .get(app.selected)
+        .filter(|placement| usable(app.selected, placement))
+        .map(|placement| (app.selected, placement))
+        .or_else(|| {
+            app.placements
+                .iter()
+                .enumerate()
+                .find(|(idx, placement)| usable(*idx, placement))
+        })
+}
+
+pub(crate) fn light_world_transform(
+    light: &EditorLight,
+    placement: Option<&Placement>,
+) -> (Vec3, Vec3) {
+    let position = to_mq(light.position);
+    let direction = to_mq(light.direction);
+    if light.attached_to.is_some() {
+        if let Some(placement) = placement {
+            let model = placement_matrix(placement);
+            return (
+                model.transform_point3(position),
+                model.transform_vector3(direction).normalize_or_zero(),
+            );
+        }
+    }
+    (position, direction)
+}
+
+/// Expands shared model-local lights into transient world-space occurrences.
+pub(crate) fn expanded_scene_lights(app: &AppState) -> Vec<(usize, Option<usize>, EditorLight)> {
+    let mut expanded = Vec::new();
+    for (light_idx, light) in app.lights.iter().enumerate() {
+        if let Some(model) = light.attached_to.as_deref() {
+            for (placement_idx, placement) in app.placements.iter().enumerate() {
+                if placement.id != model
+                    || app
+                        .element_states
+                        .get(placement_idx)
+                        .is_some_and(|state| state.deleted)
+                {
+                    continue;
+                }
+                let (position, direction) = light_world_transform(light, Some(placement));
+                let mut world = light.clone();
+                world.position = from_mq(position);
+                world.direction = from_mq(direction);
+                expanded.push((light_idx, Some(placement_idx), world));
+            }
+        } else {
+            expanded.push((light_idx, None, light.clone()));
+        }
+    }
+    expanded
+}
+
+pub(crate) fn pick_scene_light(
+    app: &AppState,
+    viewport: Rect,
+    mouse: Vec2,
+) -> Option<(usize, Option<usize>)> {
     let mut best = None;
     let mut best_dist = 16.0f32;
-    for (idx, light) in app.lights.iter().enumerate() {
+    for (idx, placement, light) in expanded_scene_lights(app) {
         let pos = vec3(light.position.x, light.position.y, light.position.z);
         let Some(screen) = world_to_screen(app, viewport, pos) else {
             continue;
@@ -4010,7 +4269,7 @@ pub(crate) fn pick_scene_light(app: &AppState, viewport: Rect, mouse: Vec2) -> O
         let dist = screen.distance(mouse);
         if dist < best_dist {
             best_dist = dist;
-            best = Some(idx);
+            best = Some((idx, placement));
         }
     }
     best
@@ -4535,10 +4794,12 @@ fn convert_water_texture(
         );
     }
 
-    let before = raw.triangles.len();
-    raw.triangles
-        .retain(|tri| tri.material as usize != material);
-    let removed_faces = before.saturating_sub(raw.triangles.len());
+    let keep = raw
+        .triangles
+        .iter()
+        .map(|tri| tri.material as usize != material)
+        .collect::<Vec<_>>();
+    let removed_faces = retain_raw_triangles(&mut raw, &keep);
     if removed_faces == 0 {
         return Err(format!("{dff_name}: material {material} has no faces"));
     }
@@ -5112,6 +5373,12 @@ pub(crate) fn cancel_texture_match_selection_for_undo(app: &mut AppState) -> boo
 }
 
 pub(crate) fn context_menu_items(app: &AppState) -> Vec<(ContextAction, &'static str, bool)> {
+    if matches!(
+        app.context_menu.as_ref().map(|menu| menu.target),
+        Some(ContextMenuTarget::Scene { .. })
+    ) {
+        return vec![(ContextAction::AddLight, "Add a light", true)];
+    }
     if let Some(ContextMenuTarget::PreviewTexture {
         placement,
         material,
@@ -5169,6 +5436,16 @@ pub(crate) fn context_menu_items(app: &AppState) -> Vec<(ContextAction, &'static
     if app.active_tab == AppTab::Lights {
         let has_selection = selected_light(app).is_some();
         return vec![
+            (
+                ContextAction::AddLightToInstance,
+                "Add to instance",
+                has_selection
+                    && app.placements.get(app.selected).is_some()
+                    && !app
+                        .element_states
+                        .get(app.selected)
+                        .is_some_and(|state| state.deleted),
+            ),
             (ContextAction::CopyId, "Copy Name", has_selection),
             (ContextAction::CopyPosition, "Copy Position", has_selection),
             (ContextAction::Duplicate, "Duplicate", has_selection),
@@ -5272,6 +5549,14 @@ pub(crate) fn context_action_at(app: &AppState, mouse: Vec2) -> Option<ContextAc
 }
 
 pub(crate) fn run_context_action(app: &mut AppState, action: ContextAction) {
+    if let Some(ContextMenuTarget::Scene { position }) =
+        app.context_menu.as_ref().map(|menu| menu.target)
+    {
+        if action == ContextAction::AddLight {
+            add_light_at(app, to_mq(position));
+        }
+        return;
+    }
     if let Some(ContextMenuTarget::PreviewTexture {
         placement,
         material,
@@ -5328,6 +5613,9 @@ pub(crate) fn run_context_action(app: &mut AppState, action: ContextAction) {
     }
     if app.active_tab == AppTab::Lights {
         match action {
+            ContextAction::AddLightToInstance => {
+                attach_selected_light_to_instance(app);
+            }
             ContextAction::CopyId => {
                 if let Some(light) = selected_light(app) {
                     copy_to_clipboard(app, "light name", light.name.clone());
@@ -5351,7 +5639,8 @@ pub(crate) fn run_context_action(app: &mut AppState, action: ContextAction) {
                 app.selected_light = app.lights.len();
                 app.hovered_gizmo = None;
             }
-            ContextAction::CopyDff
+            ContextAction::AddLight
+            | ContextAction::CopyDff
             | ContextAction::ExportDff
             | ContextAction::ExportCol
             | ContextAction::ReplaceDff
@@ -5372,6 +5661,7 @@ pub(crate) fn run_context_action(app: &mut AppState, action: ContextAction) {
         return;
     }
     match action {
+        ContextAction::AddLight | ContextAction::AddLightToInstance => {}
         ContextAction::CopyId => {
             if let Some(p) = selected_placement(app) {
                 copy_to_clipboard(app, "ID", p.id.clone());
@@ -5702,14 +5992,74 @@ pub(crate) fn unhide_all(app: &mut AppState) {
     app.status_message = format!("Unhidden {changed} asset(s)");
 }
 
-pub(crate) fn set_camera_speed(app: &mut AppState, speed: f32) {
-    let speed = clamp_camera_speed(speed);
-    if (app.camera_speed - speed).abs() < 0.01 {
+pub(crate) fn camera_speed_for_tab(app: &AppState, tab: AppTab) -> f32 {
+    match tab {
+        AppTab::Vehicles => app.vehicle_camera_speed,
+        AppTab::Editing => app.editing_camera_speed,
+        _ => app.camera_speed,
+    }
+}
+
+fn clamp_camera_speed_for_tab(speed: f32, tab: AppTab) -> f32 {
+    match tab {
+        AppTab::Vehicles => clamp_detail_camera_speed(speed),
+        AppTab::Editing => clamp_editing_camera_speed(speed),
+        _ => clamp_camera_speed(speed),
+    }
+}
+
+pub(crate) fn set_camera_speed_for_tab(app: &mut AppState, tab: AppTab, speed: f32) {
+    let speed = clamp_camera_speed_for_tab(speed, tab);
+    let target = match tab {
+        AppTab::Vehicles => &mut app.vehicle_camera_speed,
+        AppTab::Editing => &mut app.editing_camera_speed,
+        _ => &mut app.camera_speed,
+    };
+    if (*target - speed).abs() < 0.01 {
         return;
     }
-    app.camera_speed = speed;
-    save_camera_speed_preference(speed);
+    *target = speed;
     app.status_message = format!("Camera speed {:.0}", speed);
+}
+
+pub(crate) fn set_camera_speed(app: &mut AppState, speed: f32) {
+    let active_tab = app.active_tab;
+    set_camera_speed_for_tab(app, active_tab, speed);
+}
+
+pub(crate) fn camera_speed_after_wheel(speed: f32, wheel: f32, tab: AppTab) -> f32 {
+    let factor = if matches!(tab, AppTab::Vehicles | AppTab::Editing) {
+        DETAIL_CAMERA_SPEED_WHEEL_FACTOR
+    } else {
+        CAMERA_SPEED_WHEEL_FACTOR
+    };
+    clamp_camera_speed_for_tab(speed * factor.powf(wheel), tab)
+}
+
+#[cfg(test)]
+#[test]
+fn camera_wheel_adjustment_handles_both_directions() {
+    let speed = 360.0;
+    let faster = camera_speed_after_wheel(speed, 1.0, AppTab::Preview);
+    let slower = camera_speed_after_wheel(speed, -1.0, AppTab::Preview);
+    assert!(faster > speed);
+    assert!(slower < speed);
+    assert!((camera_speed_after_wheel(faster, -1.0, AppTab::Preview) - speed).abs() < 0.001);
+}
+
+#[cfg(test)]
+#[test]
+fn camera_speed_defaults_match_viewport_scope() {
+    assert_eq!(DEFAULT_CAMERA_SPEED, 50.0);
+    assert_eq!(DEFAULT_DETAIL_CAMERA_SPEED, 20.0);
+    assert_eq!(MIN_DETAIL_CAMERA_SPEED, 2.0);
+    assert_eq!(MIN_EDITING_CAMERA_SPEED, 2.0);
+    assert!(
+        camera_speed_after_wheel(20.0, 1.0, AppTab::Editing)
+            < camera_speed_after_wheel(20.0, 1.0, AppTab::Preview)
+    );
+    assert_eq!(camera_speed_after_wheel(2.0, -1.0, AppTab::Vehicles), 2.0);
+    assert_eq!(camera_speed_after_wheel(2.0, -1.0, AppTab::Editing), 2.0);
 }
 
 pub(crate) fn set_camera_rotation_speed(app: &mut AppState, speed: f32) {
@@ -5789,12 +6139,17 @@ pub(crate) fn update_dropped_light_files(app: &mut AppState) {
 }
 
 pub(crate) fn add_light(app: &mut AppState) {
+    add_light_at(app, Vec3::ZERO);
+}
+
+pub(crate) fn add_light_at(app: &mut AppState, position: Vec3) {
     let before = light_history_snapshot(app);
     app.lights.push(EditorLight {
         name: format!("Light {}", app.lights.len() + 1),
+        attached_to: None,
         kind: LightKind::Point,
         profile: LightProfile::Both,
-        position: V3::default(),
+        position: from_mq(position),
         direction: V3 {
             x: 0.0,
             y: 0.0,
@@ -5815,6 +6170,38 @@ pub(crate) fn add_light(app: &mut AppState) {
     app.selected_light = app.lights.len() - 1;
     mark_lights_changed(app);
     commit_light_history(app, "Add Light", before);
+}
+
+pub(crate) fn attach_selected_light_to_instance(app: &mut AppState) -> bool {
+    let Some(placement) = app.placements.get(app.selected).cloned() else {
+        app.status_message = "ALT-select a scene instance before attaching the light".to_string();
+        return false;
+    };
+    if app
+        .element_states
+        .get(app.selected)
+        .is_some_and(|state| state.deleted)
+    {
+        return false;
+    }
+    let Some(light) = app.lights.get(app.selected_light).cloned() else {
+        return false;
+    };
+    let before = light_history_snapshot(app);
+    let (world_position, world_direction) = light_world_transform(
+        &light,
+        light_reference_placement(app, &light).map(|(_, placement)| placement),
+    );
+    let inv = placement_matrix(&placement).inverse();
+    if let Some(light) = app.lights.get_mut(app.selected_light) {
+        light.position = from_mq(inv.transform_point3(world_position));
+        light.direction = from_mq(inv.transform_vector3(world_direction).normalize_or_zero());
+        light.attached_to = Some(placement.id.clone());
+    }
+    mark_lights_changed(app);
+    commit_light_history(app, "Add Light to Instance", before);
+    app.status_message = format!("Light attached to every instance of {}", placement.id);
+    true
 }
 
 pub(crate) fn duplicate_selected_light_with_offset(
@@ -5850,6 +6237,59 @@ pub(crate) fn delete_selected_light(app: &mut AppState) {
     app.selected_light = idx.min(app.lights.len().saturating_sub(1));
     mark_lights_changed(app);
     commit_light_history(app, "Delete Light", before);
+}
+
+#[cfg(test)]
+mod light_instance_tests {
+    use super::*;
+
+    #[test]
+    fn attached_light_transform_follows_instance_position_and_rotation() {
+        let placement = Placement {
+            id: "streetlight".to_string(),
+            dff: "streetlight".to_string(),
+            zone: "test".to_string(),
+            tag: "object".to_string(),
+            attrs: BTreeMap::new(),
+            pos: V3 {
+                x: 100.0,
+                y: 200.0,
+                z: 5.0,
+            },
+            rot: V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 90.0,
+            },
+        };
+        let light = EditorLight {
+            name: "Lamp".to_string(),
+            attached_to: Some("streetlight".to_string()),
+            kind: LightKind::Point,
+            profile: LightProfile::Both,
+            position: V3 {
+                x: 10.0,
+                y: 0.0,
+                z: 3.0,
+            },
+            direction: V3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            color: V3::default(),
+            temperature: 6500.0,
+            use_temperature: false,
+            intensity: 1.0,
+            radius: 50.0,
+            casts_shadow: false,
+            point_lobe: PointLightLobe::Omni,
+        };
+
+        let (position, direction) = light_world_transform(&light, Some(&placement));
+        assert!((position - vec3(100.0, 210.0, 8.0)).length() < 0.001);
+        assert!((direction - Vec3::Y).length() < 0.001);
+    }
 }
 
 #[cfg(test)]
@@ -6146,6 +6586,9 @@ mod water_texture_conversion_tests {
         assert_eq!(result.raw.triangles.len(), 1);
         assert_eq!(result.raw.triangles[0].material, 1);
         assert_eq!(result.raw.vertices.len(), 3);
+        assert_eq!(result.raw.components.len(), 1);
+        assert_eq!(result.raw.components[0].tri_start, 0);
+        assert_eq!(result.raw.components[0].tri_end, 1);
         assert!(!result.dff_bytes.is_empty());
         let round_trip = parse_dff_mesh(&result.dff_bytes);
         assert_eq!(round_trip.triangles.len(), 1);

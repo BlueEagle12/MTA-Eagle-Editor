@@ -87,7 +87,7 @@ pub(crate) fn draw_save_as_dialog(app: &AppState) {
     draw_panel_rect(&app.ui_font, rect, Some("Save As"));
     ui_text(
         &app.ui_font,
-        "Write a new MTA resource folder using the loaded meta/resource files.",
+        "Create a separate resource copy. Your currently loaded resource is not changed.",
         rect.x + 24.0,
         rect.y + 58.0,
         LIGHTGRAY,
@@ -143,7 +143,7 @@ pub(crate) fn draw_save_as_dialog(app: &AppState) {
     }
     ui_text(
         &app.ui_font,
-        "Enter saves   Esc cancels   Existing IMG files are copied",
+        "Enter creates the copy   Esc cancels   Existing IMG files are copied",
         rect.x + 24.0,
         rect.y + 128.0,
         ui_muted(),
@@ -213,18 +213,11 @@ pub(crate) fn draw_save_log_dialog(app: &AppState) {
     }
     if rows.len() > visible_rows {
         let track = Rect::new(list.x + list.w - 10.0, list.y + 8.0, 4.0, list.h - 16.0);
-        draw_rrect(
-            track.x,
-            track.y,
-            track.w,
-            track.h,
-            2.0,
-            Color::new(0.12, 0.14, 0.17, 1.0),
-        );
-        let max_scroll = max_scroll.max(1.0);
-        let thumb_h = (track.h * (visible_rows as f32 / rows.len() as f32)).clamp(24.0, track.h);
-        let thumb_y = track.y + (track.h - thumb_h) * (scroll / max_scroll);
-        draw_rrect(track.x, thumb_y, track.w, thumb_h, 2.0, ui_accent());
+        if let Some(metrics) =
+            scrollbar_metrics(track, visible_rows as f32, rows.len() as f32, 24.0, scroll)
+        {
+            draw_scrollbar(metrics, scrollbar_visual_state(track, false));
+        }
     }
     draw_dialog_button(&app.ui_font, activity_console_clear_rect(), "Clear", false);
     draw_dialog_button(&app.ui_font, save_log_close_rect(), "Close", false);
@@ -513,7 +506,7 @@ fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog,
     draw_preferences_stepper(
         app,
         1,
-        "Camera Speed",
+        "World Camera Speed",
         &format!("{:.0}", dialog.camera_speed),
         dialog.camera_speed > MIN_CAMERA_SPEED,
         dialog.camera_speed < MAX_CAMERA_SPEED,
@@ -521,6 +514,22 @@ fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog,
     draw_preferences_stepper(
         app,
         2,
+        "Vehicle Camera Speed",
+        &format!("{:.0}", dialog.vehicle_camera_speed),
+        dialog.vehicle_camera_speed > MIN_DETAIL_CAMERA_SPEED,
+        dialog.vehicle_camera_speed < MAX_CAMERA_SPEED,
+    );
+    draw_preferences_stepper(
+        app,
+        3,
+        "Editing Camera Speed",
+        &format!("{:.0}", dialog.editing_camera_speed),
+        dialog.editing_camera_speed > MIN_EDITING_CAMERA_SPEED,
+        dialog.editing_camera_speed < MAX_CAMERA_SPEED,
+    );
+    draw_preferences_stepper(
+        app,
+        4,
         "Camera Rotation Speed",
         &format!("{:.2}x", dialog.camera_rotation_speed),
         dialog.camera_rotation_speed > MIN_CAMERA_ROTATION_SPEED,
@@ -1078,24 +1087,15 @@ pub(crate) fn draw_dff_prelight_import_dialog(app: &AppState) {
             4.0,
             list_rect.h - 16.0,
         );
-        draw_rrect(
-            track.x,
-            track.y,
-            track.w,
-            track.h,
-            2.0,
-            Color::new(0.12, 0.14, 0.17, 1.0),
-        );
-        let max_scroll = dialog.entries.len().saturating_sub(visible_rows) as f32;
-        let thumb_h =
-            (track.h * visible_rows as f32 / dialog.entries.len() as f32).clamp(24.0, track.h);
-        let thumb_y = track.y
-            + if max_scroll > 0.0 {
-                (track.h - thumb_h) * (dialog.scroll / max_scroll).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-        draw_rrect(track.x, thumb_y, track.w, thumb_h, 2.0, ui_accent());
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            visible_rows as f32,
+            dialog.entries.len() as f32,
+            24.0,
+            dialog.scroll,
+        ) {
+            draw_scrollbar(metrics, scrollbar_visual_state(track, false));
+        }
     }
 
     draw_dialog_button(
@@ -1296,16 +1296,15 @@ pub(crate) fn draw_lod_batch_dialog(app: &AppState) {
     }
     if dialog.candidates.len() > visible_rows {
         let track = Rect::new(list.x + list.w - 8.0, list.y + 7.0, 3.0, list.h - 14.0);
-        let thumb_h =
-            (track.h * visible_rows as f32 / dialog.candidates.len() as f32).clamp(24.0, track.h);
-        let thumb_y = track.y
-            + if max_scroll > 0.0 {
-                (track.h - thumb_h) * (scroll / max_scroll)
-            } else {
-                0.0
-            };
-        draw_rrect(track.x, track.y, track.w, track.h, 2.0, ui_border());
-        draw_rrect(track.x, thumb_y, track.w, thumb_h, 2.0, ui_accent());
+        if let Some(metrics) = scrollbar_metrics(
+            track,
+            visible_rows as f32,
+            dialog.candidates.len() as f32,
+            24.0,
+            scroll,
+        ) {
+            draw_scrollbar(metrics, scrollbar_visual_state(track, false));
+        }
     }
     ui_text(
         &app.ui_font,

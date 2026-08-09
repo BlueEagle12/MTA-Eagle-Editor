@@ -782,27 +782,26 @@ fn draw_preview_view_mode_scene(
             continue;
         }
         let double_sided = placement_disable_backface_culling(placement, &app.definitions);
-        let (drawn_parts, drawn_vertices) = if app.viewport_render_mode
-            == ViewportRenderMode::ShadedTextured
-        {
-            draw_placement_render_mesh(
-                placement,
-                mesh,
-                double_sided,
-                scene_ambient_lift_from_timecyc(&app.timecyc),
-            )
-        } else {
-            let txd_name = definition_txd_name(&app.definitions, &placement.id);
-            draw_placement_render_mesh_view_mode(
-                placement,
-                mesh,
-                double_sided,
-                app.viewport_render_mode,
-                &app.material_classes,
-                txd_name,
-                app.collision_generation_fallback_material,
-            )
-        };
+        let (drawn_parts, drawn_vertices) =
+            if app.viewport_render_mode == ViewportRenderMode::ShadedTextured {
+                draw_placement_render_mesh(
+                    placement,
+                    mesh,
+                    double_sided,
+                    scene_ambient_lift_from_timecyc(&app.timecyc),
+                )
+            } else {
+                let txd_name = definition_txd_name(&app.definitions, &placement.id);
+                draw_placement_render_mesh_view_mode(
+                    placement,
+                    mesh,
+                    double_sided,
+                    app.viewport_render_mode,
+                    &app.material_classes,
+                    txd_name,
+                    app.collision_generation_fallback_material,
+                )
+            };
         placements += 1;
         parts += drawn_parts;
         vertices += drawn_vertices;
@@ -2178,8 +2177,110 @@ pub(crate) fn draw_collision_mesh_with_options(
     }
 }
 
+fn collision_render_vertices(mesh: &CollisionMesh) -> usize {
+    // Filled faces plus their three wireframe edges. Primitive counts mirror
+    // the fixed tessellation in draw_collision_primitives.
+    mesh.faces.len().saturating_mul(9)
+        + mesh.spheres.len().saturating_mul(1_392)
+        + mesh.boxes.len().saturating_mul(60)
+}
+
+fn delete_collision_render_lists(cache: &CollisionRenderCache) {
+    unsafe {
+        if cache.list != 0 {
+            gl::DeleteLists(cache.list, 1);
+        }
+    }
+}
+
+fn collision_world_list(
+    caches: &mut HashMap<String, CollisionRenderCache>,
+    collision_key: &str,
+    mesh: &CollisionMesh,
+) -> u32 {
+    let stale = caches
+        .get(collision_key)
+        .is_some_and(|cache| cache.mesh != *mesh);
+    if stale {
+        if let Some(cache) = caches.remove(collision_key) {
+            delete_collision_render_lists(&cache);
+        }
+    }
+    let cache = caches
+        .entry(collision_key.to_string())
+        .or_insert_with(|| CollisionRenderCache {
+            mesh: mesh.clone(),
+            list: 0,
+        });
+    if cache.list != 0 {
+        return cache.list;
+    }
+
+    let list = unsafe { gl::GenLists(1) };
+    if list == 0 {
+        return 0;
+    }
+    unsafe {
+        gl::NewList(list, gl::COMPILE);
+    }
+    draw_collision_mesh(
+        mesh,
+        None,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        None,
+        &Mat4::IDENTITY.to_cols_array(),
+        Vec3::ZERO,
+        false,
+        false,
+        false,
+    );
+    unsafe {
+        gl::EndList();
+    }
+    cache.list = list;
+    list
+}
+
 pub(crate) fn draw_collision_world(app: &mut AppState, frustum: &[Plane; 6]) {
     let far = app.options.draw_radius;
+    let mut visible = Vec::<(f32, String, [f32; 16])>::new();
+    for (idx, placement) in app.placements.iter().enumerate() {
+        if app
+            .element_states
+            .get(idx)
+            .is_some_and(|state| state.deleted || state.hidden)
+        {
+            continue;
+        }
+        let collision_key = element_collision_key(app, placement);
+        let Some(mesh) = app.collisions.get(&collision_key) else {
+            continue;
+        };
+        if placement_disable_collisions(placement, &app.definitions) {
+            continue;
+        }
+        let model_cols = placement_matrix(placement).to_cols_array();
+        let bounds = transformed_bounds(mesh.bounds, &model_cols);
+        let center = (bounds.min + bounds.max) * 0.5;
+        let radius = (bounds.max - center).length();
+        let distance_squared = (center - app.camera.pos).length_squared();
+        let far_edge = far + radius;
+        if distance_squared > far_edge * far_edge
+            || !aabb_in_frustum(frustum, bounds.min, bounds.max)
+        {
+            continue;
+        }
+        visible.push((distance_squared, collision_key, model_cols));
+    }
+    visible.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let vertex_budget = app.options.vertex_budget;
+    let mut submitted_vertices = 0usize;
+    let mut prepared_lists = HashMap::<String, u32>::new();
     unsafe {
         gl::Disable(gl::TEXTURE_2D);
         gl::Disable(gl::LIGHTING);
@@ -2187,57 +2288,51 @@ pub(crate) fn draw_collision_world(app: &mut AppState, frustum: &[Plane; 6]) {
         gl::Disable(gl::BLEND);
         gl::DepthMask(gl::TRUE);
         gl::Disable(gl::CULL_FACE);
-        for (idx, placement) in app.placements.iter().enumerate() {
-            if app
-                .element_states
-                .get(idx)
-                .is_some_and(|state| state.deleted || state.hidden)
-            {
-                continue;
-            }
-            let Some(mesh) = element_collision_mesh(app, placement) else {
+        for (_, collision_key, model_cols) in visible {
+            let Some(mesh) = app.collisions.get(&collision_key) else {
                 continue;
             };
-            let origin = to_mq(placement.pos);
-            let radius = (mesh.bounds.max - mesh.bounds.min).length().max(32.0);
-            if (origin - app.camera.pos).length() > far + radius {
+            let vertices = collision_render_vertices(mesh);
+            if submitted_vertices.saturating_add(vertices) > vertex_budget {
+                if submitted_vertices > 0 {
+                    break;
+                }
                 continue;
             }
-            if !sphere_in_frustum(frustum, origin, radius + 256.0) {
-                continue;
-            }
-            let face_count = mesh.faces.len();
-            let selected_face = app
-                .selected_col_face
-                .filter(|face| face.placement == idx)
-                .map(|face| face.face);
-            let selected_vertex = selected_face.map(|_| app.selected_col_vertex % 3);
-            let selected_vertices = BTreeSet::new();
-            let hovered = app.hovered_col_face.filter(|face| face.placement == idx);
-            let hovered_face = hovered.map(|face| face.face);
-            let hovered_vertex = hovered.and(app.hovered_col_vertex);
-            let model_cols = placement_matrix(placement).to_cols_array();
+            let list = if let Some(list) = prepared_lists.get(&collision_key) {
+                *list
+            } else {
+                let list =
+                    collision_world_list(&mut app.collision_render_cache, &collision_key, mesh);
+                prepared_lists.insert(collision_key.clone(), list);
+                list
+            };
             gl::PushMatrix();
             gl::MultMatrixf(model_cols.as_ptr());
-            draw_collision_mesh(
-                mesh,
-                selected_face,
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                selected_vertex,
-                &selected_vertices,
-                hovered_face,
-                hovered_vertex,
-                &model_cols,
-                app.camera.pos,
-                false,
-                false,
-                false,
-            );
+            if list != 0 {
+                gl::CallList(list);
+            } else {
+                draw_collision_mesh(
+                    mesh,
+                    None,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    None,
+                    &BTreeSet::new(),
+                    None,
+                    None,
+                    &model_cols,
+                    app.camera.pos,
+                    false,
+                    false,
+                    false,
+                );
+            }
             gl::PopMatrix();
+            submitted_vertices = submitted_vertices.saturating_add(vertices);
             app.last_drawn_placements += 1;
             app.last_drawn_parts += 1;
-            app.last_drawn_vertices += face_count * 3;
+            app.last_drawn_vertices += vertices;
         }
         gl::DepthMask(gl::TRUE);
         gl::Disable(gl::BLEND);
@@ -3964,6 +4059,10 @@ fn preload_dff_2dfx_preview_textures(app: &mut AppState, effects: &[Dff2dEffect]
     }
 }
 
+fn vehicle_preview_corona_alpha(alpha: u8) -> u8 {
+    (alpha.max(128) as f32 * 0.65).round() as u8
+}
+
 pub(crate) fn draw_vehicle_2dfx_coronas(app: &mut AppState, effects: &[Dff2dEffect], model: Mat4) {
     let coronas = effects
         .iter()
@@ -3974,7 +4073,11 @@ pub(crate) fn draw_vehicle_2dfx_coronas(app: &mut AppState, effects: &[Dff2dEffe
         .map(|effect| {
             let mut effect = transform_dff_2dfx_effect(effect, model);
             if let Some(alpha) = effect.payload.get_mut(3) {
-                *alpha = (*alpha).max(192);
+                // The vehicle preview draws coronas additively and without a
+                // depth test. Keep them visible when authored with low alpha,
+                // but soften the result so the flare does not wash out the
+                // lamp and surrounding bodywork.
+                *alpha = vehicle_preview_corona_alpha(*alpha);
             }
             effect
         })
@@ -4282,38 +4385,38 @@ fn draw_editing_render_mesh_preview(
                 }
             }
             gl::DepthMask(gl::TRUE);
-                if mode != ViewportRenderMode::ShadedTextured {
-                    gl::Disable(gl::FOG);
-                    let classification = collision_classification_color(
-                        classes,
-                        txd_name,
-                        &part.texture_name,
-                        part.texture_fingerprint,
-                        fallback_material,
-                    );
-                    draw_render_part_view_mode(part, 1.0, mode, classification);
-                    continue;
-                }
-                if part.use_lighting {
-                    gl::Enable(gl::LIGHTING);
-                } else {
-                    gl::Disable(gl::LIGHTING);
-                }
-                if part.texture != 0 {
-                    gl::Enable(gl::TEXTURE_2D);
-                    gl::BindTexture(gl::TEXTURE_2D, part.texture);
-                    gl::Color3f(1.0, 1.0, 1.0);
-                } else {
-                    gl::Disable(gl::TEXTURE_2D);
-                    gl::Color3f(0.78, 0.78, 0.74);
-                }
-                if let Some(matrix) = editing_part_uv_anim(mesh, part.material_index)
-                    .and_then(sample_uv_animation_transform)
-                {
-                    draw_editing_part_dynamic(part, matrix);
-                } else {
-                    draw_render_part_buffer(part);
-                }
+            if mode != ViewportRenderMode::ShadedTextured {
+                gl::Disable(gl::FOG);
+                let classification = collision_classification_color(
+                    classes,
+                    txd_name,
+                    &part.texture_name,
+                    part.texture_fingerprint,
+                    fallback_material,
+                );
+                draw_render_part_view_mode(part, 1.0, mode, classification);
+                continue;
+            }
+            if part.use_lighting {
+                gl::Enable(gl::LIGHTING);
+            } else {
+                gl::Disable(gl::LIGHTING);
+            }
+            if part.texture != 0 {
+                gl::Enable(gl::TEXTURE_2D);
+                gl::BindTexture(gl::TEXTURE_2D, part.texture);
+                gl::Color3f(1.0, 1.0, 1.0);
+            } else {
+                gl::Disable(gl::TEXTURE_2D);
+                gl::Color3f(0.78, 0.78, 0.74);
+            }
+            if let Some(matrix) = editing_part_uv_anim(mesh, part.material_index)
+                .and_then(sample_uv_animation_transform)
+            {
+                draw_editing_part_dynamic(part, matrix);
+            } else {
+                draw_render_part_buffer(part);
+            }
         }
         if mode == ViewportRenderMode::ShadedTextured {
             draw_editing_material_specular_preview(mesh, raw, camera_pos);
@@ -4718,6 +4821,10 @@ pub(crate) unsafe fn configure_viewport_light(app: &AppState, timecyc_sample: &T
 
         if app.active_tab == AppTab::Lights {
             if let Some(light) = app.lights.get(app.selected_light) {
+                let (world_position, world_direction) = light_world_transform(
+                    light,
+                    light_reference_placement(app, light).map(|(_, placement)| placement),
+                );
                 let effective = light_effective_color(light);
                 let intensity = light.intensity.max(0.0);
                 let rgb = [
@@ -4740,8 +4847,7 @@ pub(crate) unsafe fn configure_viewport_light(app: &AppState, timecyc_sample: &T
                         light_ambient = rgb;
                     }
                     LightKind::Directional => {
-                        let dir = vec3(light.direction.x, light.direction.y, light.direction.z)
-                            .normalize_or_zero();
+                        let dir = world_direction.normalize_or_zero();
                         if dir.length_squared() > 0.0001 {
                             // OpenGL's w=0 position points from the scene back
                             // toward the source; stored direction is instead
@@ -4751,7 +4857,7 @@ pub(crate) unsafe fn configure_viewport_light(app: &AppState, timecyc_sample: &T
                         }
                     }
                     LightKind::Point | LightKind::Spot | LightKind::Area => {
-                        position = [light.position.x, light.position.y, light.position.z, 1.0];
+                        position = [world_position.x, world_position.y, world_position.z, 1.0];
                         diffuse = rgb;
                         let radius = light.radius.max(1.0);
                         // Fast approximation of the baker's smooth radius fade.
@@ -4762,8 +4868,7 @@ pub(crate) unsafe fn configure_viewport_light(app: &AppState, timecyc_sample: &T
                             4.0 / (radius * radius),
                         );
                         if matches!(light.kind, LightKind::Spot) {
-                            let dir = vec3(light.direction.x, light.direction.y, light.direction.z)
-                                .normalize_or_zero();
+                            let dir = world_direction.normalize_or_zero();
                             if dir.length_squared() > 0.0001 {
                                 let spot_direction = [dir.x, dir.y, dir.z];
                                 gl::Lightfv(
@@ -4922,15 +5027,7 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
         return;
     }
     let (forward, _) = camera_vectors(&app.camera);
-    // Small audit targets can fit entirely inside the regular one-unit near
-    // plane as the reviewer approaches them, which looks like an LOD handoff
-    // failure. Keep the normal world precision elsewhere and only pull the
-    // audit near plane inward.
-    let near_clip = if app.active_tab == AppTab::LodAudit {
-        0.25
-    } else {
-        1.0
-    };
+    let near_clip = camera_near_clip_for_tab(app.active_tab);
     let projection = Mat4::perspective_rh_gl(
         70.0_f32.to_radians(),
         viewport.w / viewport.h.max(1.0),
@@ -5230,6 +5327,17 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
     draw_editor_outlines(app);
     draw_vertex_paint_marker(app, viewport);
     reset_gl_for_ui();
+}
+
+fn camera_near_clip_for_tab(tab: AppTab) -> f32 {
+    match tab {
+        // These viewports inspect individual assets at close range, so their
+        // near plane must stay well inside small model details.
+        AppTab::Editing | AppTab::Vehicles => 0.05,
+        // Small audit targets can otherwise fit inside the world near plane.
+        AppTab::LodAudit => 0.25,
+        _ => 1.0,
+    }
 }
 
 /// Draws the currently selected race track in the 3D viewport: the start point,
@@ -5586,6 +5694,22 @@ fn draw_global_transform_bounds(app: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detail_viewports_use_a_close_camera_near_plane() {
+        assert_eq!(camera_near_clip_for_tab(AppTab::Editing), 0.05);
+        assert_eq!(camera_near_clip_for_tab(AppTab::Vehicles), 0.05);
+        assert_eq!(camera_near_clip_for_tab(AppTab::Preview), 1.0);
+        assert_eq!(camera_near_clip_for_tab(AppTab::Lights), 1.0);
+        assert_eq!(camera_near_clip_for_tab(AppTab::LodAudit), 0.25);
+    }
+
+    #[test]
+    fn vehicle_preview_coronas_are_softened() {
+        assert_eq!(vehicle_preview_corona_alpha(255), 166);
+        assert_eq!(vehicle_preview_corona_alpha(192), 125);
+        assert_eq!(vehicle_preview_corona_alpha(0), 83);
+    }
 
     fn point_light_effect(position: V3, radius: f32, color: [u8; 3]) -> Dff2dEffect {
         let mut payload = vec![0u8; 12];
