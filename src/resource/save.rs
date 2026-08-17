@@ -189,13 +189,21 @@ fn canonicalize_definition_asset_attrs(
     attrs: &mut BTreeMap<String, String>,
     index: &AssetCaseIndex,
 ) {
+    let implicit_col_fallback = attrs
+        .get("dff")
+        .or_else(|| attrs.get("model"))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_legacy_light_mapper_asset_stem)
+        .unwrap_or_else(|| def.id.clone());
     if let Some(dff) = dff_override_stem(&def.id, attrs.get("dff").map(String::as_str)) {
         let canonical = index.canonical_stem(&dff, ".dff").unwrap_or(&dff);
         attrs.insert("dff".to_string(), canonical.to_string());
     } else {
         attrs.remove("dff");
     }
-    canonicalize_asset_attr(attrs, "col", &def.id, ".col", index);
+    canonicalize_asset_attr(attrs, "col", &implicit_col_fallback, ".col", index);
     canonicalize_txd_attr(attrs, index);
 }
 
@@ -369,6 +377,62 @@ pub(crate) fn write_scene_files(app: &AppState, root: &Path) -> Result<(), Vec<S
     )
 }
 
+fn insert_level_xml_entry(path: &Path, root_tag: &str, entry: &str) -> Result<(), String> {
+    let closing = format!("</{root_tag}>");
+    let mut document =
+        fs::read_to_string(path).unwrap_or_else(|_| format!("<{root_tag}>\n{closing}\n"));
+    let at = document
+        .rfind(&closing)
+        .ok_or_else(|| format!("{} has no {closing} closing tag", path.display()))?;
+    document.insert_str(at, entry);
+    fs::write(path, document).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+pub(crate) fn stage_imported_level_asset(
+    root: &Path,
+    definition: &Definition,
+    placement: Option<&Placement>,
+) -> Result<(), String> {
+    if !is_safe_zone_name(&definition.zone) {
+        return Err(format!("Unsafe level zone name {:?}", definition.zone));
+    }
+    let zone_dir = root.join("zones").join(&definition.zone);
+    fs::create_dir_all(&zone_dir).map_err(|err| format!("{}: {err}", zone_dir.display()))?;
+
+    let mut attrs = definition.attrs.clone();
+    attrs.insert("id".to_string(), definition.id.clone());
+    canonicalize_definition_asset_attrs(definition, &mut attrs, &AssetCaseIndex::build(root));
+    let definition_entry = write_tag("definition", &attrs);
+    insert_level_xml_entry(
+        &zone_dir.join(format!("{}.definition", definition.zone)),
+        "zoneDefinitions",
+        &definition_entry,
+    )?;
+
+    if let Some(placement) = placement {
+        let mut attrs = placement.attrs.clone();
+        attrs.insert("id".to_string(), placement.id.clone());
+        let map_entry = write_tag(&placement.tag, &attrs);
+        insert_level_xml_entry(
+            &zone_dir.join(format!("{}.map", definition.zone)),
+            "map",
+            &map_entry,
+        )?;
+    }
+
+    let zones_path = root.join("eagleZones.txt");
+    let mut zones = fs::read_to_string(&zones_path).unwrap_or_default();
+    if !zones.lines().any(|line| line.trim() == definition.zone) {
+        if !zones.is_empty() && !zones.ends_with('\n') {
+            zones.push('\n');
+        }
+        zones.push_str(&definition.zone);
+        zones.push('\n');
+        fs::write(&zones_path, zones).map_err(|err| format!("{}: {err}", zones_path.display()))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn replacement_asset_root(app: &AppState) -> PathBuf {
     if app.loaded_wip {
         wip_root_path(&app.root)
@@ -415,6 +479,24 @@ mod tests {
         root
     }
 
+    #[test]
+    fn img_write_refuses_an_entry_that_overflows_the_directory_size_field() {
+        let root = temp_resource_root("img_entry_overflow");
+        let path = root.join("imgs").join("txd.img");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // One sector past the 16-bit streaming-size field. Writing it used to
+        // wrap the sector count, which silently truncated the asset on the next
+        // read and dropped every texture past the wrap point.
+        let oversized = vec![0u8; (u16::MAX as usize + 1) * 2048];
+
+        let error = write_img_archive(&path, &[("world_lod.txd".to_string(), oversized)])
+            .expect_err("an oversized entry must be refused");
+
+        assert!(error.contains("world_lod.txd"), "{error}");
+        assert!(!path.exists(), "the archive must not be written");
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn empty_manual_save_snapshot(root: PathBuf) -> ManualSaveWriteSnapshot {
         ManualSaveWriteSnapshot {
             mode: ManualSaveMode::Resource,
@@ -431,6 +513,7 @@ mod tests {
             safe_collisions: SafeCollisions::default(),
             shadow_casting: HashMap::new(),
             water_planes: Vec::new(),
+            cull_zones: Vec::new(),
             race_loaded: false,
             race_tracks: Vec::new(),
             race_radar_path: String::new(),
@@ -442,6 +525,91 @@ mod tests {
             vertex_meshes: Vec::new(),
             col_writes: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn imported_level_asset_stages_definition_and_placement_in_real_zone_files() {
+        let root = temp_resource_root("imported_level_asset");
+        fs::write(
+            root.join("zones/test/test.definition"),
+            "<zoneDefinitions>\n</zoneDefinitions>\n",
+        )
+        .unwrap();
+        let definition = Definition {
+            id: "tower_asset".to_string(),
+            zone: "test".to_string(),
+            attrs: BTreeMap::from([
+                ("id".to_string(), "tower_asset".to_string()),
+                ("dff".to_string(), "tower_model".to_string()),
+                ("txd".to_string(), "tower_model".to_string()),
+            ]),
+        };
+        let mut placement = Placement {
+            id: definition.id.clone(),
+            dff: "tower_model".to_string(),
+            zone: definition.zone.clone(),
+            tag: "object".to_string(),
+            attrs: BTreeMap::new(),
+            pos: V3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            rot: V3::default(),
+        };
+        sync_placement_attrs(&mut placement);
+
+        stage_imported_level_asset(&root, &definition, Some(&placement)).unwrap();
+
+        let definitions = fs::read_to_string(root.join("zones/test/test.definition")).unwrap();
+        assert!(definitions.contains("id=\"tower_asset\""));
+        assert!(definitions.contains("dff=\"tower_model\""));
+        assert!(definitions.contains("txd=\"tower_model\""));
+        let map = fs::read_to_string(root.join("zones/test/test.map")).unwrap();
+        assert!(map.contains("<object"));
+        assert!(map.contains("id=\"tower_asset\""));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn picker_import_stages_definition_without_touching_map() {
+        let root = temp_resource_root("picker_import_definition_only");
+        fs::write(
+            root.join("zones/test/test.definition"),
+            "<zoneDefinitions>\n</zoneDefinitions>\n",
+        )
+        .unwrap();
+        let map_path = root.join("zones/test/test.map");
+        let original_map = fs::read(&map_path).unwrap();
+        let definition = Definition {
+            id: "picker_asset".to_string(),
+            zone: "test".to_string(),
+            attrs: BTreeMap::from([
+                ("id".to_string(), "picker_asset".to_string()),
+                ("dff".to_string(), "picker_model".to_string()),
+            ]),
+        };
+
+        stage_imported_level_asset(&root, &definition, None).unwrap();
+
+        let definitions = fs::read_to_string(root.join("zones/test/test.definition")).unwrap();
+        assert!(definitions.contains("id=\"picker_asset\""));
+        assert_eq!(fs::read(map_path).unwrap(), original_map);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn imported_hierarchical_dff_payload_stays_byte_exact() {
+        let root = temp_resource_root("imported_hierarchy_exact");
+        let original = include_bytes!("../../assets/player_vehicle/player_1.dff");
+        upsert_replacement_dff(&root, "player_1.dff", original).unwrap();
+        let entries = replacement_archive_entries(&root).unwrap();
+        let (_, staged) = entries
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("player_1.dff"))
+            .unwrap();
+        assert_eq!(staged.as_slice(), original);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -919,6 +1087,56 @@ mod tests {
         assert!((reparsed.vertices[0].x - 37.5).abs() < 1.0e-6);
     }
 
+    #[test]
+    fn autosave_preserves_a_valid_single_frame_with_an_authored_name() {
+        let mut raw = test_raw_dff_mesh();
+        raw.frames = vec![RawMeshFrame {
+            // DFF exporters commonly retain the authored object name instead
+            // of renaming the only frame to match the output file stem.
+            name: "logo_mesh".to_string(),
+            parent: -1,
+            right: V3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            up: V3 {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            at: V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+            pos: V3::default(),
+        }];
+        raw.components = vec![RawMeshComponent {
+            name: "logo_mesh".to_string(),
+            frame_index: Some(0),
+            vertex_start: 0,
+            vertex_end: raw.vertices.len(),
+            tri_start: 0,
+            tri_end: raw.triangles.len(),
+            breakable: None,
+        }];
+        let asset = AutosaveEditingAsset::Dff {
+            name: "logo.dff".to_string(),
+            raw,
+            boolean_box: None,
+        };
+
+        let (_, bytes) = serialize_autosave_editing_asset(asset).unwrap();
+        let reparsed = parse_dff_mesh(&bytes);
+
+        assert_eq!(reparsed.frames.len(), 1);
+        assert_eq!(reparsed.frames[0].name, "logo_mesh");
+        assert_eq!(reparsed.frames[0].parent, -1);
+        assert_eq!(reparsed.components.len(), 1);
+        assert_eq!(reparsed.components[0].frame_index, Some(0));
+    }
+
     fn contains_dff_chunk(bytes: &[u8], target: u32) -> bool {
         fn scan(bytes: &[u8], start: usize, end: usize, target: u32) -> bool {
             let mut o = start;
@@ -1295,6 +1513,100 @@ mod tests {
     }
 
     #[test]
+    fn replacement_promotion_moves_live_and_wip_entries_then_clears_staging_only() {
+        let root = temp_resource_root("replacement_promotion_cleanup");
+        let wip_root = wip_root_path(&root);
+        let live_staging = root.join("imgs").join(REPLACEMENT_IMG);
+        let wip_staging = wip_root.join("imgs").join(REPLACEMENT_IMG);
+        let live_backup = root
+            .join("imgs")
+            .join(format!("{REPLACEMENT_IMG}.eagle_backup_1"));
+        let wip_backup = wip_root
+            .join("imgs")
+            .join(format!("{REPLACEMENT_IMG}.eagle_backup_2"));
+        fs::create_dir_all(live_staging.parent().unwrap()).unwrap();
+        fs::create_dir_all(wip_staging.parent().unwrap()).unwrap();
+        write_img_archive(
+            &live_staging,
+            &[("live.col".to_string(), test_col_bytes(b"live replacement"))],
+        )
+        .unwrap();
+        write_img_archive(
+            &wip_staging,
+            &[("wip.col".to_string(), test_col_bytes(b"wip replacement"))],
+        )
+        .unwrap();
+        fs::write(&live_backup, b"live backup").unwrap();
+        fs::write(&wip_backup, b"wip backup").unwrap();
+
+        assert_eq!(
+            promote_wip_replacement_assets_from_roots(&root, &root).unwrap(),
+            2
+        );
+
+        let names = parse_img(&root.join("imgs/col.img"))
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            BTreeSet::from(["live.col".to_string(), "wip.col".to_string()])
+        );
+        assert!(!live_staging.exists());
+        assert!(!wip_staging.exists());
+        assert_eq!(fs::read(live_backup).unwrap(), b"live backup");
+        assert_eq!(fs::read(wip_backup).unwrap(), b"wip backup");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replacement_promotion_clears_an_empty_staging_archive() {
+        let root = temp_resource_root("empty_replacement_cleanup");
+        let staging = root.join("imgs").join(REPLACEMENT_IMG);
+        fs::create_dir_all(staging.parent().unwrap()).unwrap();
+        write_img_archive(&staging, &[]).unwrap();
+
+        assert_eq!(
+            merge_replacement_entries_into_root(&root, &root, Vec::new()).unwrap(),
+            0
+        );
+        assert!(!staging.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dedicated_dff_archive_names_accept_plain_and_numbered_variants() {
+        for asset in ["dff", "txd"] {
+            for suffix in ["", "1", "_1", "27", "_27"] {
+                let stem = format!("{asset}{suffix}");
+                assert!(is_numbered_asset_archive_stem(&stem, asset), "{stem}");
+            }
+        }
+        for stem in ["dff_", "dff_level", "my_dff", "blender_dff", "dff1_extra"] {
+            assert!(!is_numbered_asset_archive_stem(stem, "dff"), "{stem}");
+        }
+    }
+
+    #[test]
+    fn new_imports_choose_existing_numbered_dff_and_txd_archives() {
+        let root = temp_resource_root("numbered_import_archives");
+        let img_dir = root.join("imgs");
+        fs::create_dir_all(&img_dir).unwrap();
+        let dff_img = img_dir.join("dff_2.img");
+        let txd_img = img_dir.join("txd2.img");
+        write_img_archive(&dff_img, &[]).unwrap();
+        write_img_archive(&txd_img, &[]).unwrap();
+
+        let destinations = ReplacementDestinationIndex::build(&root);
+        assert_eq!(destinations.archive_path("new_model.dff").unwrap(), dff_img);
+        assert_eq!(destinations.archive_path("new_model.txd").unwrap(), txd_img);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn col_replacement_overwrites_existing_col_archive_entry() {
         let root = std::env::temp_dir().join(format!(
             "eagle_editor_col_merge_test_{}",
@@ -1319,6 +1631,7 @@ mod tests {
             upsert_img_archive_entries_owned(
                 &col_img,
                 vec![("example.col".to_string(), new_col_bytes.clone())],
+                true,
             )
             .unwrap(),
             1
@@ -2324,7 +2637,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_txd_can_create_and_append_to_dedicated_img() {
+    fn generated_txd_is_staged_for_the_dedicated_img() {
         let root = temp_resource_root("generated_txd_img");
         let first = root.join("sources").join("roads");
         fs::create_dir_all(&first).unwrap();
@@ -2332,10 +2645,12 @@ mod tests {
             .save(first.join("asphalt.png"))
             .unwrap();
 
-        let created = generate_txds_into_project_img(&root, &[first]).unwrap();
-        assert_eq!(created, root.join("imgs/txd.img"));
+        let target = generate_txds_into_project_img(&root, &root, &[first]).unwrap();
+        assert_eq!(target, root.join("imgs/txd.img"));
+        assert!(!target.exists());
+        let staged = root.join("imgs").join(REPLACEMENT_IMG);
         assert_eq!(
-            parse_img(&created)
+            parse_img(&staged)
                 .into_iter()
                 .map(|entry| entry.name)
                 .collect::<Vec<_>>(),
@@ -2343,16 +2658,27 @@ mod tests {
         );
 
         let uppercase = root.join("imgs/TXD.IMG");
-        fs::rename(&created, &uppercase).unwrap();
+        write_img_archive(
+            &uppercase,
+            &[("existing.txd".to_string(), vec![1, 2, 3, 4])],
+        )
+        .unwrap();
         let second = root.join("sources").join("windows");
         fs::create_dir_all(&second).unwrap();
         image::RgbaImage::from_pixel(4, 4, image::Rgba([40, 80, 120, 128]))
             .save(second.join("glass.png"))
             .unwrap();
 
-        let appended = generate_txds_into_project_img(&root, &[second]).unwrap();
-        assert_eq!(appended, uppercase);
-        let entries = parse_img(&appended);
+        let target = generate_txds_into_project_img(&root, &root, &[second]).unwrap();
+        assert_eq!(target, uppercase);
+        assert_eq!(
+            parse_img(&uppercase)
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            vec!["existing.txd"]
+        );
+        let entries = parse_img(&staged);
         assert_eq!(
             entries
                 .iter()
@@ -2368,6 +2694,19 @@ mod tests {
             &read_img_entry(roads),
             "asphalt"
         ));
+
+        let staged_entries = replacement_archive_entries(&root).unwrap();
+        assert_eq!(
+            merge_replacement_entries_into_root(&root, &root, staged_entries).unwrap(),
+            2
+        );
+        assert_eq!(
+            parse_img(&uppercase)
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            vec!["existing.txd", "roads.txd", "windows.txd"]
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2420,7 +2759,13 @@ mod tests {
     #[test]
     fn asset_optimization_scan_can_run_off_render_thread() {
         let root = temp_resource_root("async_asset_scan");
-        let job = TxdCleanupJob {
+        let mut generated_lod = test_raw_dff_mesh();
+        generated_lod.material_textures = vec!["lod_house_atlas".to_string()];
+        let generated_lod = Arc::new(
+            write_normalized_dff(&generated_lod, "lod_house")
+                .expect("generated LOD test DFF should serialize"),
+        );
+        let mut job = TxdCleanupJob {
             root: root.clone(),
             wip_root: wip_root_path(&root),
             gta_sa_dir: root.join("gta"),
@@ -2428,7 +2773,11 @@ mod tests {
             img_index: 0,
             dff_map: HashMap::new(),
             txd_map: HashMap::new(),
-            definitions: Vec::new(),
+            definitions: vec![TxdCleanupDefinition {
+                dff_name: "lod_house.dff".to_string(),
+                txd_name: "world_lod.txd".to_string(),
+                dff_bytes: Some(generated_lod),
+            }],
             definition_index: 0,
             used_by_txd: HashMap::new(),
             dffs_by_txd: HashMap::new(),
@@ -2447,6 +2796,13 @@ mod tests {
             status: String::new(),
             started_at: Instant::now(),
         };
+
+        assert!(!job.step_scan_dffs());
+        assert_eq!(
+            job.used_by_txd.get("world_lod.txd"),
+            Some(&HashSet::from(["lod_house_atlas".to_string()])),
+            "cleanup must retain atlas references from a generated DFF that only exists in memory"
+        );
 
         let plan = std::thread::spawn(move || job.run_to_completion())
             .join()
@@ -3383,6 +3739,17 @@ fn asset_ext(name: &str) -> Option<&'static str> {
     }
 }
 
+fn is_numbered_asset_archive_stem(stem: &str, asset: &str) -> bool {
+    let Some(suffix) = stem.strip_prefix(asset) else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return true;
+    }
+    let digits = suffix.strip_prefix('_').unwrap_or(suffix);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 struct ReplacementDestinationIndex {
     loose_by_name: HashMap<String, PathBuf>,
     archive_by_name: HashMap<String, PathBuf>,
@@ -3434,8 +3801,12 @@ impl ReplacementDestinationIndex {
                 .map(lower)
                 .unwrap_or_default();
             for ext in ["dff", "col", "txd"] {
-                let hinted = if ext == "txd" {
-                    stem.contains("txd") || stem.contains("tex")
+                let hinted = if ext == "dff" || ext == "txd" {
+                    // Level resources commonly split models across dff.img,
+                    // dff1.img, dff_1.img (and the equivalent TXD names).
+                    // Do not route imports into unrelated archives merely
+                    // because their longer name happens to contain the type.
+                    is_numbered_asset_archive_stem(&stem, ext)
                 } else {
                     stem.contains(ext)
                 };
@@ -3494,6 +3865,7 @@ impl ReplacementDestinationIndex {
 fn upsert_img_archive_entries_owned(
     archive_path: &Path,
     replacements: Vec<(String, Vec<u8>)>,
+    repair_dff_bounds: bool,
 ) -> Result<usize, String> {
     let mut entries = Vec::<(String, Vec<u8>)>::new();
     let replacement_keys = replacements
@@ -3524,9 +3896,11 @@ fn upsert_img_archive_entries_owned(
     }
 
     entries.extend(remaining.into_values());
-    for (name, bytes) in &mut entries {
-        if asset_ext(name).is_some_and(|ext| ext.eq_ignore_ascii_case("dff")) {
-            repair_dff_bounds_spheres(bytes);
+    if repair_dff_bounds {
+        for (name, bytes) in &mut entries {
+            if asset_ext(name).is_some_and(|ext| ext.eq_ignore_ascii_case("dff")) {
+                repair_dff_bounds_spheres(bytes);
+            }
         }
     }
     if let Some(parent) = archive_path.parent() {
@@ -3575,7 +3949,51 @@ fn upsert_img_archive_entries_owned(
     Ok(replacement_count)
 }
 
-fn dff_geometry_issue_summary(bytes: &[u8]) -> (bool, Vec<String>) {
+/// Writes newly imported assets straight into the level's dedicated IMG
+/// archives. Unlike the light-mapper replacement pipeline, imports are already
+/// resource assets and must survive independently of WIP snapshots.
+pub(crate) fn upsert_imported_resource_assets(
+    root: &Path,
+    replacements: &[(String, Vec<u8>)],
+) -> Result<usize, String> {
+    let destinations = ReplacementDestinationIndex::build(root);
+    let mut written = 0usize;
+    let mut archive_groups = BTreeMap::<PathBuf, Vec<(String, Vec<u8>)>>::new();
+    for (name, bytes) in replacements {
+        if let Some(path) = destinations.loose_path(name) {
+            fs::write(path, bytes).map_err(|err| format!("{}: {err}", path.display()))?;
+            written += 1;
+        } else {
+            archive_groups
+                .entry(destinations.archive_path(name)?)
+                .or_default()
+                .push((name.clone(), bytes.clone()));
+        }
+    }
+    for (archive, entries) in archive_groups {
+        // Preserve imported DFF bytes exactly; normalization belongs to an
+        // explicit repair/optimization action, not asset import.
+        written += upsert_img_archive_entries_owned(&archive, entries, false)?;
+    }
+    Ok(written)
+}
+
+/// Resolve the loose file or IMG archive that owns an imported resource asset.
+/// Call this after `upsert_imported_resource_assets` so a newly-created archive
+/// member is included in the destination index.
+pub(crate) fn imported_resource_asset_path(
+    root: &Path,
+    asset_name: &str,
+) -> Result<PathBuf, String> {
+    let destinations = ReplacementDestinationIndex::build(root);
+    destinations
+        .loose_path(asset_name)
+        .map(Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(|| destinations.archive_path(asset_name))
+}
+
+pub(crate) fn dff_geometry_issue_summary(bytes: &[u8]) -> (bool, Vec<String>) {
     fn scan_geometry_extension(
         bytes: &[u8],
         start: usize,
@@ -3856,7 +4274,7 @@ fn dff_normalized_rewrite_blockers(bytes: &[u8]) -> Vec<String> {
     blockers
 }
 
-fn dff_has_geometry_normals(bytes: &[u8]) -> bool {
+pub(crate) fn dff_has_geometry_normals(bytes: &[u8]) -> bool {
     fn scan(bytes: &[u8], start: usize, end: usize) -> bool {
         let mut o = start;
         while o + 12 <= end {
@@ -4376,6 +4794,8 @@ fn repair_dff_img_archive(
             let mut uv_pipeline_fixed = false;
             let mut uv_legacy_slots_fixed = false;
             let mut normalized_entry = false;
+            let mut bin_mesh_batches_removed = 0usize;
+            let mut lighting_flags_fixed = 0usize;
             let mut reasons = Vec::<String>::new();
             let mut bounds_fixed = 0usize;
             if repair_scope.prelighting {
@@ -4400,6 +4820,46 @@ fn repair_dff_img_archive(
                 }
             }
             if repair_scope.dff_issues {
+                match canonicalize_dff_bin_mesh_batches(&bytes) {
+                    Ok(Some((fixed, removed))) => {
+                        bytes = fixed;
+                        bin_mesh_batches_removed = removed;
+                        reasons.push(format!(
+                            "collapsed {removed} redundant BinMesh material batch(es)"
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        result.skipped += 1;
+                        result.errors.push(format!(
+                            "{}:{}: BinMesh repair failed: {err}",
+                            path.display(),
+                            entry.name
+                        ));
+                        packed.push((entry.name, original_bytes));
+                        continue;
+                    }
+                }
+                match repair_dff_normal_less_lighting_flags(&mut bytes) {
+                    Ok(fixed) => {
+                        lighting_flags_fixed = fixed;
+                        if fixed != 0 {
+                            reasons.push(format!(
+                                "cleared lighting on {fixed} normal-less geometry section(s)"
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        result.skipped += 1;
+                        result.errors.push(format!(
+                            "{}:{}: geometry lighting-flag repair failed: {err}",
+                            path.display(),
+                            entry.name
+                        ));
+                        packed.push((entry.name, original_bytes));
+                        continue;
+                    }
+                }
                 if let Some(reordered) = repair_dff_uv_anim_dictionary_order(&bytes) {
                     bytes = reordered;
                     uv_reordered = true;
@@ -4500,6 +4960,8 @@ fn repair_dff_img_archive(
                 result.uv_anim_pipeline_fixed += usize::from(uv_pipeline_fixed);
                 result.uv_anim_legacy_slots_fixed += usize::from(uv_legacy_slots_fixed);
                 result.normalized += usize::from(normalized_entry);
+                result.bin_mesh_batches_removed += bin_mesh_batches_removed;
+                result.lighting_flags_fixed += lighting_flags_fixed;
                 result.bounds_fixed += bounds_fixed;
                 result.repaired += 1;
                 changed = true;
@@ -4588,6 +5050,8 @@ fn repair_dffs_in_root_with_context(
         sanitized_texture_names: 0,
         sanitized_texture_references: 0,
         normalized: 0,
+        bin_mesh_batches_removed: 0,
+        lighting_flags_fixed: 0,
         bounds_fixed: 0,
         uv_anim_reordered: 0,
         uv_anim_pipeline_fixed: 0,
@@ -4706,6 +5170,8 @@ pub(crate) fn request_dff_repair(app: &mut AppState) {
                 sanitized_texture_names: 0,
                 sanitized_texture_references: 0,
                 normalized: 0,
+                bin_mesh_batches_removed: 0,
+                lighting_flags_fixed: 0,
                 bounds_fixed: 0,
                 uv_anim_reordered: 0,
                 uv_anim_pipeline_fixed: 0,
@@ -4803,12 +5269,14 @@ fn finish_dff_repair(app: &mut AppState, result: DffRepairResult, refreshed: usi
     invalidate_validation_cache(app);
     app.status_message = if result.errors.is_empty() {
         format!(
-            "DFF repair ({}) finished in {:.1}s: scanned {}, repaired {}, fixed missing prelighting in {} DFF(s), sanitized {} texture name(s) across {} reference(s), refreshed {} preview definition(s) (normalized {}, bounds {}, uv-anim reordered {}, uv-anim pipeline {}, uv-anim legacy slots {}).",
+            "DFF repair ({}) finished in {:.1}s: scanned {}, repaired {}, fixed missing prelighting in {} DFF(s), removed {} redundant BinMesh batch(es), corrected {} normal-less lighting flag(s), sanitized {} texture name(s) across {} reference(s), refreshed {} preview definition(s) (normalized {}, bounds {}, uv-anim reordered {}, uv-anim pipeline {}, uv-anim legacy slots {}).",
             dff_repair_scope_label(result.scope),
             result.elapsed,
             result.scanned,
             result.repaired,
             result.prelighting_fixed,
+            result.bin_mesh_batches_removed,
+            result.lighting_flags_fixed,
             result.sanitized_texture_names,
             result.sanitized_texture_references,
             refreshed,
@@ -4880,10 +5348,6 @@ pub(crate) fn merge_replacement_entries_into_root(
     target_root: &Path,
     replacements: Vec<(String, Vec<u8>)>,
 ) -> Result<usize, String> {
-    if replacements.is_empty() {
-        return Ok(0);
-    }
-
     let mut merged = 0usize;
     let mut archive_groups = BTreeMap::<PathBuf, Vec<(String, Vec<u8>)>>::new();
     let destinations = ReplacementDestinationIndex::build(target_root);
@@ -4901,7 +5365,7 @@ pub(crate) fn merge_replacement_entries_into_root(
     }
 
     for (archive, entries) in archive_groups {
-        merged += upsert_img_archive_entries_owned(&archive, entries)?;
+        merged += upsert_img_archive_entries_owned(&archive, entries, true)?;
     }
 
     let source_wip_root = wip_root_path(source_root);
@@ -4928,8 +5392,7 @@ fn promote_wip_replacement_assets_to_root(
     app: &AppState,
     target_root: &Path,
 ) -> Result<usize, String> {
-    let wip_root = wip_root_path(&app.root);
-    let replacements = replacement_archive_entries(&wip_root)?;
+    let replacements = pending_replacement_entries_for_root(&app.root)?;
     merge_replacement_entries_into_root(&app.root, target_root, replacements)
 }
 
@@ -5138,6 +5601,7 @@ struct ManualSaveWriteSnapshot {
     safe_collisions: SafeCollisions,
     shadow_casting: HashMap<String, bool>,
     water_planes: Vec<WaterPlane>,
+    cull_zones: Vec<CullZone>,
     race_loaded: bool,
     race_tracks: Vec<RaceTrack>,
     race_radar_path: String,
@@ -5281,6 +5745,7 @@ fn capture_manual_save(
         safe_collisions: app.safe_collisions.clone(),
         shadow_casting: app.shadow_casting.clone(),
         water_planes: app.water_planes.clone(),
+        cull_zones: app.cull_zones.clone(),
         race_loaded: app.race.loaded,
         race_tracks: app.race.tracks.clone(),
         race_radar_path: app.race.radar_path.clone(),
@@ -5354,7 +5819,7 @@ fn promote_wip_replacement_assets_from_roots(
     source_root: &Path,
     target_root: &Path,
 ) -> Result<usize, String> {
-    let replacements = replacement_archive_entries(&wip_root_path(source_root))?;
+    let replacements = pending_replacement_entries_for_root(source_root)?;
     merge_replacement_entries_into_root(source_root, target_root, replacements)
 }
 
@@ -5485,6 +5950,9 @@ fn write_manual_scene_documents(
         Err(err) => errors.push(err),
     }
     if let Err(err) = save_water_dat(&water_dat_path(root), &snapshot.water_planes) {
+        errors.push(err);
+    }
+    if let Err(err) = save_cull_system(root, &snapshot.cull_zones, include_resource_sidecars) {
         errors.push(err);
     }
     if include_resource_sidecars {
@@ -5741,7 +6209,7 @@ fn reconcile_manual_save_success(
     app: &mut AppState,
     reconcile: ManualSaveReconcile,
     result: &ManualSaveResult,
-) {
+) -> Option<String> {
     if let ManualSaveMode::SaveAs(target) = &result.mode {
         app.root = target.clone();
         save_recent_project(target);
@@ -5788,6 +6256,38 @@ fn reconcile_manual_save_success(
     }
     app.loaded_autosave = false;
     app.saved_snapshot = Some(reconcile.saved_content);
+
+    if matches!(result.mode, ManualSaveMode::Resource) {
+        refresh_open_editing_img_rows_after_resource_save(app).err()
+    } else {
+        None
+    }
+}
+
+fn refresh_open_editing_img_rows_after_resource_save(app: &mut AppState) -> Result<(), String> {
+    let Some(path) = app.editing.img_path.clone() else {
+        return Ok(());
+    };
+    let selected_name = app
+        .editing
+        .rows
+        .get(app.editing.selected_row)
+        .map(|row| row.entry.name.clone());
+    let rows = load_editing_img_rows(&path)?;
+    app.editing.rows = rows;
+    app.editing.selected_row = selected_name
+        .and_then(|name| {
+            app.editing
+                .rows
+                .iter()
+                .position(|row| row.entry.name.eq_ignore_ascii_case(&name))
+        })
+        .unwrap_or_else(|| {
+            app.editing
+                .selected_row
+                .min(app.editing.rows.len().saturating_sub(1))
+        });
+    Ok(())
 }
 
 pub(crate) fn poll_manual_save(app: &mut AppState) {
@@ -5803,8 +6303,10 @@ pub(crate) fn poll_manual_save(app: &mut AppState) {
             let label = result.mode.label();
             let _worker_thread = result.worker_thread;
             if result.errors.is_empty() {
-                reconcile_manual_save_success(app, job.reconcile, &result);
-                let warning_count = result.warnings.len();
+                let editing_refresh_warning =
+                    reconcile_manual_save_success(app, job.reconcile, &result);
+                let warning_count =
+                    result.warnings.len() + usize::from(editing_refresh_warning.is_some());
                 let race = if result.saved_race_tracks {
                     ", race tracks"
                 } else {
@@ -5838,6 +6340,11 @@ pub(crate) fn poll_manual_save(app: &mut AppState) {
                 }
                 let mut log = vec![app.status_message.clone()];
                 log.extend(result.warnings);
+                if let Some(warning) = editing_refresh_warning {
+                    log.push(format!(
+                        "Resource saved, but the open IMG index could not be refreshed: {warning}"
+                    ));
+                }
                 let title = if warning_count > 0 {
                     format!("{label} completed with warnings")
                 } else {
@@ -5903,11 +6410,18 @@ fn active_conflicting_save_job(app: &AppState) -> Option<&'static str> {
         Some("IMG archive organization")
     } else if app.object_bounds_fix_job.is_some() {
         Some("object bounds repair")
+    } else if app.dff_material_limit_repair_job.is_some() {
+        Some("DFF material-limit repair")
     } else if app.water_texture_conversion_job.is_some() {
         Some("texture-to-water conversion")
+    } else if app.preview_world_uv_job.is_some() {
+        Some("world-scale UV processing")
     } else if app.vehicle_browser.collision_copy_rx.is_some() {
         Some("vehicle collision copy")
-    } else if app.editing.txd_import_rx.is_some() || app.editing.txd_refresh_job.is_some() {
+    } else if app.editing.txd_import_rx.is_some()
+        || app.editing.dff_texture_replace_rx.is_some()
+        || app.editing.txd_refresh_job.is_some()
+    {
         Some("TXD texture import")
     } else if app.editing.merge_rx.is_some() || app.editing.merge_apply_job.is_some() {
         Some("Editing IMG merge")
@@ -5957,7 +6471,10 @@ fn start_manual_save(app: &mut AppState, mode: ManualSaveMode) -> bool {
         Some("LOD lighting")
     } else if app.fracture_generation_job.is_some() {
         Some("fracture generation")
-    } else if app.dff_geometry_job.is_some() {
+    } else if app.dff_geometry_job.is_some()
+        || app.dff_material_limit_repair_job.is_some()
+        || app.oversized_chunk_job.is_some()
+    {
         Some("DFF geometry operation")
     } else {
         None
@@ -5988,6 +6505,10 @@ fn start_manual_save(app: &mut AppState, mode: ManualSaveMode) -> bool {
 
 pub(crate) fn save_scene(app: &mut AppState) {
     let _ = start_manual_save(app, ManualSaveMode::Resource);
+}
+
+pub(crate) fn save_scene_before_action(app: &mut AppState) -> bool {
+    start_manual_save(app, ManualSaveMode::Resource)
 }
 
 #[allow(dead_code)]
@@ -6080,6 +6601,9 @@ fn save_scene_sync_legacy(app: &mut AppState) {
         Err(err) => errors.push(err),
     }
     if let Err(err) = save_water_dat(&water_dat_path(&app.root), &app.water_planes) {
+        errors.push(err);
+    }
+    if let Err(err) = save_cull_system(&app.root, &app.cull_zones, true) {
         errors.push(err);
     }
     let root_for_race = app.root.clone();
@@ -6261,6 +6785,9 @@ fn save_wip_scene_sync_legacy(app: &mut AppState) -> bool {
     if let Err(err) = save_water_dat(&wip_water_dat_path(&app.root), &app.water_planes) {
         errors.push(err);
     }
+    if let Err(err) = save_cull_system(&wip_root, &app.cull_zones, false) {
+        errors.push(err);
+    }
     if let Err(err) = fs::write(
         wip_root.join("README.txt"),
         "Light Mapper WIP snapshot. Normal Save promotes this state to the resource.\nGenerated replacement DFF/TXD/COL archives are stored in imgs/.\nwater.dat is stored here when water planes are edited.\n",
@@ -6333,6 +6860,7 @@ struct AutosaveSnapshot {
     safe_collisions: SafeCollisions,
     shadow_casting: HashMap<String, bool>,
     water_planes: Vec<WaterPlane>,
+    cull_zones: Vec<CullZone>,
     replacement_assets: BTreeMap<String, (String, Vec<u8>)>,
     editing_asset: Option<AutosaveEditingAsset>,
     asset_deletes: HashSet<String>,
@@ -6395,6 +6923,7 @@ fn capture_autosave_snapshot(app: &AppState) -> AutosaveSnapshot {
         safe_collisions: app.safe_collisions.clone(),
         shadow_casting: app.shadow_casting.clone(),
         water_planes: app.water_planes.clone(),
+        cull_zones: app.cull_zones.clone(),
         replacement_assets,
         editing_asset,
         asset_deletes: app.pending_asset_deletes.clone(),
@@ -6415,7 +6944,7 @@ fn serialize_autosave_editing_asset(
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or("model");
-            if !raw_mesh_is_safe_for_normalized_rewrite(&raw, frame) {
+            if !raw_mesh_is_safe_for_hierarchy_rewrite(&raw, frame) {
                 return Err(format!(
                     "Could not autosave {name}: its frame/component hierarchy cannot be preserved by the normalized writer"
                 ));
@@ -6542,6 +7071,9 @@ fn write_autosave_snapshot(mut snapshot: AutosaveSnapshot) -> AutosaveResult {
         &autosave_water_dat_path(&snapshot.root),
         &snapshot.water_planes,
     ) {
+        errors.push(err);
+    }
+    if let Err(err) = save_cull_system(&autosave_root, &snapshot.cull_zones, false) {
         errors.push(err);
     }
     let copied_replacement_assets = match pending_replacement_entries_from_parts(
@@ -6809,6 +7341,7 @@ pub(crate) fn latest_saved_scene_time(root: &Path) -> Option<SystemTime> {
         // Compatibility until the first verified Resource Save migration.
         light_list_path(root),
         water_dat_path(root),
+        cull_map_path(root),
         wip_root_path(root),
     ] {
         latest = max_time(latest, latest_modified_under(&path));
@@ -6893,6 +7426,7 @@ pub(crate) fn update_autosave(app: &mut AppState) {
         || app.editing.merge_rx.is_some()
         || app.editing.merge_apply_job.is_some()
         || app.editing.txd_import_rx.is_some()
+        || app.editing.dff_texture_replace_rx.is_some()
         || app.editing.txd_refresh_job.is_some()
         || app.dff_prelight_import_dialog.is_some()
         || app.txd_cleanup_job.is_some()
@@ -6911,6 +7445,7 @@ pub(crate) fn update_autosave(app: &mut AppState) {
         || app.lod_generation_job.is_some()
         || app.instance_lod_removal_job.is_some()
         || app.water_texture_conversion_job.is_some()
+        || app.preview_world_uv_job.is_some()
         || app.bake_job.is_some()
         || app.vehicle_browser.collision_copy_rx.is_some()
     {
@@ -6971,6 +7506,7 @@ pub(crate) fn copy_resource_shell(src_root: &Path, dst_root: &Path) -> Result<()
         "eagleSafeCollisions.json",
         "Light_List.xml",
         "water.dat",
+        CULL_CLIENT_FILE,
     ] {
         let src = src_root.join(file);
         if src.exists() {
@@ -7022,10 +7558,13 @@ fn update_save_as_meta_root(root: &Path) -> Result<(), String> {
     let mut info_lines = Vec::new();
     let mut file_lines = Vec::new();
     let mut zone_wildcard_lines = Vec::new();
+    let mut script_lines = Vec::new();
     for line in meta.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("<info") {
             info_lines.push(trimmed.to_string());
+        } else if trimmed.starts_with("<script") {
+            script_lines.push(trimmed.to_string());
         } else if trimmed.starts_with("<file")
             && (trimmed.contains("src=\"zones/*/*.map\"")
                 || trimmed.contains("src=\"zones/*/*.definition\""))
@@ -7055,6 +7594,20 @@ fn update_save_as_meta_root(root: &Path) -> Result<(), String> {
     {
         file_lines.push("<file src=\"water.dat\" type=\"client\" />".to_string());
     }
+    if root.join(CULL_MAP_FILE).is_file()
+        && !file_lines
+            .iter()
+            .any(|line| line.contains("src=\"cull.map\""))
+    {
+        file_lines.push("<file src=\"cull.map\" type=\"client\" />".to_string());
+    }
+    if root.join(CULL_CLIENT_FILE).is_file()
+        && !script_lines
+            .iter()
+            .any(|line| line.contains("src=\"eagle_cull.lua\""))
+    {
+        script_lines.push("<script src=\"eagle_cull.lua\" type=\"client\" />".to_string());
+    }
     if !zone_wildcard_lines
         .iter()
         .any(|line| line.contains("src=\"zones/*/*.definition\""))
@@ -7082,6 +7635,11 @@ fn update_save_as_meta_root(root: &Path) -> Result<(), String> {
     {
         out.push_str("    ");
         out.push_str(line);
+        out.push('\n');
+    }
+    for line in script_lines {
+        out.push_str("    ");
+        out.push_str(&line);
         out.push('\n');
     }
     out.push('\n');
@@ -7206,13 +7764,32 @@ pub(crate) fn validation_operation_conflict(app: &AppState) -> Option<&'static s
         Some("LOD generation")
     } else if app.fracture_generation_job.is_some() {
         Some("fracture generation")
-    } else if app.dff_geometry_job.is_some() {
+    } else if app.dff_geometry_job.is_some() || app.dff_material_limit_repair_job.is_some() {
         Some("DFF geometry operation")
     } else if app.instance_lod_removal_job.is_some() {
         Some("instance LOD removal")
     } else {
         None
     }
+}
+
+fn request_save_before_cleanup(app: &mut AppState, action: ConfirmAction, tool_name: &str) -> bool {
+    if !has_unsaved_changes(app) && !editing_dirty(app) {
+        return false;
+    }
+    app.confirm_dialog = Some(ConfirmDialog {
+        action,
+        title: "Save Before Cleanup".to_string(),
+        body: format!("Save pending project changes before running {tool_name}?"),
+        detail: format!(
+            "{tool_name} analyzes and may rewrite project assets. Saving first promotes generated LODs and all other staged DFF, TXD, COL, definition, and map changes so the tool uses a consistent saved baseline. After Save succeeds, {tool_name} will continue automatically."
+        ),
+        primary_label: "Save".to_string(),
+        secondary_label: None,
+        secondary_action: None,
+    });
+    app.status_message = format!("Save pending changes before running {tool_name}.");
+    true
 }
 
 pub(crate) fn request_purge_unused_assets(app: &mut AppState) {
@@ -7223,6 +7800,9 @@ pub(crate) fn request_purge_unused_assets(app: &mut AppState) {
     if let Some(conflict) = validation_operation_conflict(app) {
         app.status_message =
             format!("Wait for the background {conflict} to finish before reviewing a purge.");
+        return;
+    }
+    if request_save_before_cleanup(app, ConfirmAction::ReviewPurgeUnused, "unused-asset purge") {
         return;
     }
     ensure_validation_cache(app);
@@ -7439,6 +8019,7 @@ pub(crate) fn update_purge_unused_assets(app: &mut AppState) {
     {
         if let Some(id) = job.unused_definitions.get(job.next_definition) {
             job.removed_definitions += usize::from(app.definitions.remove(id).is_some());
+            app.readonly_definition_ids.remove(id);
             job.next_definition += 1;
             applied += 1;
             continue;
@@ -7463,6 +8044,7 @@ pub(crate) fn update_purge_unused_assets(app: &mut AppState) {
     let changed = job.removed_definitions > 0 || !job.unused_keys.is_empty();
     if changed {
         clear_history_for_external_change(app);
+        app.asset_browser.entries_cache_fingerprint = None;
     }
     if let Some(summary) = app.validation_cache.as_mut() {
         let keys = job.unused_keys.iter().cloned().collect::<HashSet<_>>();
@@ -7524,7 +8106,7 @@ pub(crate) fn request_fix_lods(app: &mut AppState) {
         action: ConfirmAction::FixLods,
         title: "Review LOD Repairs".to_string(),
         body: "Apply all automatic LOD repairs to the loaded scene?".to_string(),
-        detail: "This removes live orphan LOD placements, assigns matching uniqueID values to ambiguous repeated LOD pairs, and recalculates LOD/detail definition draw distances. The complete operation is recorded as one undo step.".to_string(),
+        detail: "This removes live orphan LOD placements, assigns matching uniqueID values to ambiguous repeated LOD pairs, matches each LOD's Building/Object type to its base element, and recalculates LOD/detail definition draw distances. The complete operation is recorded as one undo step.".to_string(),
         primary_label: "Apply LOD Repairs".to_string(),
         secondary_label: None,
         secondary_action: None,
@@ -7535,17 +8117,18 @@ pub(crate) fn fix_lods_confirmed(app: &mut AppState) {
     let before = world_history_snapshot(app);
     let assigned = fix_repeated_lod_unique_ids(app);
     let removed = remove_orphan_lods(app);
+    let typed = fix_lod_types(app);
     let (lod_distances, detail_distances) = fix_lod_distances(app);
-    if removed > 0 {
+    if removed > 0 || typed > 0 {
         invalidate_outliner_labels(app);
         rebuild_outliner_filter(app);
     }
-    if assigned > 0 || removed > 0 {
+    if assigned > 0 || removed > 0 || typed > 0 {
         rebuild_render_cells(app);
     }
     commit_world_history(app, "Fix LODs", before);
     app.status_message = format!(
-        "LOD repairs complete: removed {removed} orphan LOD(s), paired {assigned} repeated LOD(s), and updated draw distance on {lod_distances} LOD and {detail_distances} detail definition(s)."
+        "LOD repairs complete: removed {removed} orphan LOD(s), paired {assigned} repeated LOD(s), matched {typed} LOD type(s) to their base elements, and updated draw distance on {lod_distances} LOD and {detail_distances} detail definition(s)."
     );
 }
 
@@ -7737,13 +8320,34 @@ impl TxdCleanupJob {
 
     fn new(app: &AppState, deep_optimize: bool, profile: TxdOptimizationProfile) -> Self {
         let mut definitions = Vec::new();
+        let mut live_dff_bytes = HashMap::<String, Arc<Vec<u8>>>::new();
         for def in app.definitions.values() {
             let Some(txd_name) = definition_txd_name_from_attrs(def) else {
                 continue;
             };
+            let dff_name = asset_key_opt(def.attrs.get("dff"), &def.id, ".dff");
+            let dff_bytes = live_dff_bytes
+                .get(&dff_name)
+                .cloned()
+                .or_else(|| {
+                    app.editing
+                        .modified_entries
+                        .get(&dff_name)
+                        .filter(|_| !app.editing.deleted_entries.contains(&dff_name))
+                        .map(|bytes| Arc::new(bytes.clone()))
+                })
+                .or_else(|| {
+                    app.pending_replacement_assets
+                        .get(&dff_name)
+                        .map(|(_, bytes)| Arc::new(bytes.clone()))
+                });
+            if let Some(bytes) = &dff_bytes {
+                live_dff_bytes.insert(dff_name.clone(), Arc::clone(bytes));
+            }
             definitions.push(TxdCleanupDefinition {
-                dff_name: asset_key_opt(def.attrs.get("dff"), &def.id, ".dff"),
+                dff_name,
                 txd_name: asset_key(txd_name, ".txd"),
+                dff_bytes,
             });
         }
         definitions.sort_by(|a, b| {
@@ -7959,10 +8563,14 @@ impl TxdCleanupJob {
         if self.definition_index < self.definitions.len() {
             let def = &self.definitions[self.definition_index];
             self.definition_index += 1;
-            let Some(entry) = self.dff_map.get(&def.dff_name) else {
-                return false;
+            let raw = if let Some(bytes) = &def.dff_bytes {
+                parse_dff_mesh(bytes)
+            } else {
+                let Some(entry) = self.dff_map.get(&def.dff_name) else {
+                    return false;
+                };
+                parse_dff_mesh(&read_img_entry(entry))
             };
-            let raw = parse_dff_mesh(&read_img_entry(entry));
             let used = self.used_by_txd.entry(def.txd_name.clone()).or_default();
             self.dffs_by_txd
                 .entry(def.txd_name.clone())
@@ -8604,6 +9212,13 @@ pub(crate) fn update_object_bounds_fix(app: &mut AppState) {
             .expect("bounds fix result exists")
             .collision_meshes
             .len();
+    if job
+        .result
+        .as_ref()
+        .is_some_and(|result| !result.collision_meshes.is_empty())
+    {
+        clear_collision_render_cache(app);
+    }
     let collisions_refreshed = refresh_collision_mesh_batch(
         &mut app.collisions,
         &mut job
@@ -8959,6 +9574,7 @@ impl AssetOptimizationJob {
                 });
             }
             if self.scope.cols {
+                clear_collision_render_cache(app);
                 app.collisions
                     .retain(|key, _| result.geometry.referenced_cols.contains(key));
             }
@@ -10171,24 +10787,27 @@ fn apply_geometry_cleanup_filtered(
             ));
             continue;
         }
-        let Some(mut mesh) = parse_col_mesh(&source, entry) else {
-            if let Some(updated) = repair_zero_count_col_offsets(&source) {
-                let issues = validate_col_for_game_load(&col_name, &updated);
-                if !col_validation_has_errors(&issues) {
-                    staged_assets.push((col_name.clone(), updated));
-                    result.cols_repaired += 1;
-                    result
-                        .warnings
-                        .extend(issues.iter().map(|issue| issue.label(&col_name)));
-                    progress(format!(
-                        "COL {}/{} {}: canonicalized empty section offsets",
-                        col_index + 1,
-                        col_count,
-                        col_name
-                    ));
-                    continue;
-                }
+        // Bounds-only models are now editable, so canonicalize their empty
+        // section offsets before parsing instead of relying on parse failure
+        // to identify this repairable legacy layout.
+        if let Some(updated) = repair_zero_count_col_offsets(&source) {
+            let issues = validate_col_for_game_load(&col_name, &updated);
+            if !col_validation_has_errors(&issues) {
+                staged_assets.push((col_name.clone(), updated));
+                result.cols_repaired += 1;
+                result
+                    .warnings
+                    .extend(issues.iter().map(|issue| issue.label(&col_name)));
+                progress(format!(
+                    "COL {}/{} {}: canonicalized empty section offsets",
+                    col_index + 1,
+                    col_count,
+                    col_name
+                ));
+                continue;
             }
+        }
+        let Some(mut mesh) = parse_col_mesh(&source, entry) else {
             if !col_validation_has_errors(&before_issues) {
                 result
                     .warnings
@@ -10225,6 +10844,47 @@ fn apply_geometry_cleanup_filtered(
             ));
             continue;
         };
+        if mesh.vertices.is_empty()
+            && mesh.faces.is_empty()
+            && mesh.spheres.is_empty()
+            && mesh.boxes.is_empty()
+        {
+            if !col_validation_has_errors(&before_issues) {
+                result
+                    .warnings
+                    .extend(before_issues.iter().map(|issue| issue.label(&col_name)));
+                progress(format!(
+                    "COL {}/{} {}: valid; no editable collision geometry",
+                    col_index + 1,
+                    col_count,
+                    col_name
+                ));
+                continue;
+            }
+            let details = before_issues
+                .iter()
+                .filter(|issue| issue.severity == ColLoadIssueSeverity::Error)
+                .take(4)
+                .map(|issue| {
+                    if issue.model.trim().is_empty() {
+                        issue.message.clone()
+                    } else {
+                        format!("{}: {}", issue.model, issue.message)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            result.errors.push(format!(
+                "{col_name}: COL failed game-load validation: {details}"
+            ));
+            progress(format!(
+                "COL {}/{} {}: failed game-load validation",
+                col_index + 1,
+                col_count,
+                col_name
+            ));
+            continue;
+        }
         let mut dff_vertices = Vec::new();
         let mut dff_bounds = None::<Bounds>;
         for dff_name in &dff_names {
@@ -10876,6 +11536,9 @@ pub(crate) fn request_txd_cleanup(app: &mut AppState) {
             "TXD cleanup cannot start while another asset writer is running.".to_string();
         return;
     }
+    if request_save_before_cleanup(app, ConfirmAction::RequestTxdCleanup, "TXD cleanup") {
+        return;
+    }
     let job = TxdCleanupJob::new(app, false, TxdOptimizationProfile::lossless());
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -10964,6 +11627,13 @@ pub(crate) fn show_asset_optimization_profile_choice(app: &mut AppState) {
             "Select at least one Optimize Loaded Assets category first.".to_string();
         return;
     }
+    if request_save_before_cleanup(
+        app,
+        ConfirmAction::ChooseAssetOptimizationProfile,
+        "asset optimization",
+    ) {
+        return;
+    }
     if !app.asset_optimization_scope.textures {
         request_loaded_asset_optimization(app, TxdOptimizationProfile::lossless());
         return;
@@ -11014,6 +11684,13 @@ pub(crate) fn request_loaded_asset_optimization(
     {
         app.status_message =
             "Asset optimization cannot start while another asset writer is running.".to_string();
+        return;
+    }
+    if request_save_before_cleanup(
+        app,
+        ConfirmAction::StartAssetOptimization(profile),
+        "asset optimization",
+    ) {
         return;
     }
     let profile_label = txd_profile_label(profile);
@@ -11340,6 +12017,9 @@ fn save_scene_as_sync_legacy(app: &mut AppState, target: PathBuf) {
         Err(err) => errors.push(err),
     }
     if let Err(err) = save_water_dat(&water_dat_path(&target), &app.water_planes) {
+        errors.push(err);
+    }
+    if let Err(err) = save_cull_system(&target, &app.cull_zones, true) {
         errors.push(err);
     }
     let mut saved_race_tracks = false;
@@ -11714,6 +12394,7 @@ fn txd_source_folders(source_dir: &Path) -> Result<Vec<PathBuf>, String> {
 
 fn generate_txds_into_project_img(
     project_root: &Path,
+    staging_root: &Path,
     source_dirs: &[PathBuf],
 ) -> Result<PathBuf, String> {
     let mut generated = Vec::with_capacity(source_dirs.len());
@@ -11728,11 +12409,6 @@ fn generate_txds_into_project_img(
     }
     let img_path = project_txd_img_path(project_root)
         .unwrap_or_else(|| project_root.join("imgs").join("txd.img"));
-    let generated_names = generated
-        .iter()
-        .map(|(name, _)| name.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    let mut entries = Vec::<(String, Vec<u8>)>::new();
     if img_path.is_file() {
         let header = fs::read(&img_path)
             .map_err(|err| format!("Could not read {}: {err}", img_path.display()))?;
@@ -11742,17 +12418,8 @@ fn generate_txds_into_project_img(
                 img_path.display()
             ));
         }
-        for entry in parse_img(&img_path) {
-            if generated_names.contains(&entry.name.to_ascii_lowercase()) {
-                continue;
-            }
-            let mut bytes = read_img_entry(&entry);
-            bytes.truncate(replacement_entry_len(&entry.name, &bytes));
-            entries.push((entry.name, bytes));
-        }
     }
-    entries.extend(generated);
-    safe_write_img_archive(&img_path, &entries)?;
+    upsert_replacement_assets(staging_root, &generated)?;
     Ok(img_path)
 }
 
@@ -11812,6 +12479,7 @@ pub(crate) fn start_generate_txd_from_folder(
         return;
     }
     let project_root = app.root.clone();
+    let staging_root = replacement_asset_root(app);
     let destination_label = match destination {
         TxdGenerationDestination::Textures => "textures/",
         TxdGenerationDestination::Img => "TXD.img",
@@ -11819,7 +12487,7 @@ pub(crate) fn start_generate_txd_from_folder(
     let (tx, rx) = mpsc::channel();
     app.dff_picker_rx = Some(rx);
     app.status_message = format!(
-        "Scanning {} and generating TXDs into {destination_label}...",
+        "Scanning {} and generating TXDs for {destination_label}...",
         source_dir.display()
     );
     thread::spawn(move || {
@@ -11834,7 +12502,7 @@ pub(crate) fn start_generate_txd_from_folder(
                     generate_txds_into_textures(&project_root, &source_dirs)
                 }
                 TxdGenerationDestination::Img => {
-                    generate_txds_into_project_img(&project_root, &source_dirs)
+                    generate_txds_into_project_img(&project_root, &staging_root, &source_dirs)
                 }
             }?;
             Ok::<_, String>((txd_names, path))
@@ -11860,6 +12528,10 @@ pub(crate) fn start_generate_txd_from_folder(
 }
 
 fn prompt_txd_generation_destination(app: &mut AppState, source_dir: PathBuf) {
+    if project_txd_img_path(&app.root).is_some() {
+        start_generate_txd_from_folder(app, source_dir, TxdGenerationDestination::Img);
+        return;
+    }
     let folder_name = source_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -11873,9 +12545,8 @@ fn prompt_txd_generation_destination(app: &mut AppState, source_dir: PathBuf) {
         body: format!(
             "Where should TXDs generated from '{folder_name}' be stored? Folder discovery and PNG scanning run after confirmation."
         ),
-        detail:
-            "Eagle adds to the project TXD.img when present, or creates imgs/txd.img otherwise."
-                .to_string(),
+        detail: "Eagle can stage the TXDs for a new imgs/txd.img, or generate loose files in textures/. Save applies staged IMG entries."
+            .to_string(),
         primary_label: "Use TXD.img".to_string(),
         secondary_label: Some("Use textures/".to_string()),
         secondary_action: Some(ConfirmAction::GenerateTxd {
@@ -11926,11 +12597,16 @@ fn register_generated_txds(
             }
         }
         TxdGenerationDestination::Img => {
+            let staged = replacement_asset_root(app)
+                .join("imgs")
+                .join(REPLACEMENT_IMG);
             app.txd_textures.retain(|_, entries| {
-                entries.retain(|entry| entry.img_path != output);
+                entries.retain(|entry| entry.img_path != staged);
                 !entries.is_empty()
             });
-            index_txd_file(&output, &mut app.txd_textures);
+            index_txd_file(&staged, &mut app.txd_textures);
+            app.pending_txd_writes
+                .extend(txd_names.iter().map(|txd_name| asset_key(txd_name, ".txd")));
         }
     }
     let recompiled = txd_names
@@ -11971,7 +12647,10 @@ fn register_generated_txds(
             format!("Generated {count} TXDs in {}", output.display())
         }
         (TxdGenerationDestination::Img, count) => {
-            format!("Generated {count} TXD(s) in {}", output.display())
+            format!(
+                "Staged {count} TXD(s) for {}; Save to apply",
+                output.display()
+            )
         }
     };
     app.status_message = match meta_result {
@@ -12019,6 +12698,37 @@ pub(crate) fn choose_export_dff_path(default_path: PathBuf) -> Result<Option<Pat
                 Ok(result) => Ok(result),
                 Err(zenity_err) => Err(format!("{kdialog_err}; {zenity_err}")),
             }
+        }
+    }
+}
+
+pub(crate) fn choose_create_dff_path(default_path: PathBuf) -> Result<Option<PathBuf>, String> {
+    #[cfg(windows)]
+    return windows_save_file("Create New DFF", &default_path, "DFF files", &["dff"]);
+
+    let mut kdialog = Command::new("kdialog");
+    kdialog
+        .arg("--title")
+        .arg("Create New DFF")
+        .arg("--getsavefilename")
+        .arg(default_path.to_string_lossy().to_string())
+        .arg("*.dff|DFF files");
+    match run_folder_picker_command(kdialog) {
+        Ok(result) => Ok(result),
+        Err(kdialog_err) => {
+            let mut zenity = Command::new("zenity");
+            zenity
+                .arg("--file-selection")
+                .arg("--save")
+                .arg("--confirm-overwrite")
+                .arg("--title=Create New DFF")
+                .arg(format!("--filename={}", default_path.to_string_lossy()))
+                .arg("--file-filter=DFF files | *.dff");
+            run_folder_picker_command(zenity).map_err(|zenity_err| {
+                format!(
+                    "Could not open DFF creation dialog (kdialog: {kdialog_err}; zenity: {zenity_err})"
+                )
+            })
         }
     }
 }
@@ -12084,6 +12794,43 @@ pub(crate) fn choose_replace_dff_path(start_dir: PathBuf) -> Result<Option<PathB
             }
         }
     }
+}
+
+pub(crate) fn open_import_new_asset_picker(app: &mut AppState) {
+    if app.dff_picker_rx.is_some() {
+        app.status_message = "An asset file browser is already open".to_string();
+        return;
+    }
+    let start = if app.root.is_dir() {
+        app.root.clone()
+    } else {
+        PathBuf::from(BROWSE_ROOT)
+    };
+    let (tx, rx) = mpsc::channel();
+    app.dff_picker_rx = Some(rx);
+    app.status_message = "Choose the DFF to import...".to_string();
+    thread::spawn(move || {
+        let result = choose_replace_dff_path(start);
+        let _ = tx.send((DffPickerKind::ImportNewAssetDff, result));
+    });
+}
+
+pub(crate) fn open_import_asset_texture_folder_picker(app: &mut AppState) {
+    if app.dff_picker_rx.is_some() {
+        return;
+    }
+    let start = app
+        .import_asset_dialog
+        .as_ref()
+        .map(|dialog| dialog.texture_dir.clone())
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| app.root.clone());
+    let (tx, rx) = mpsc::channel();
+    app.dff_picker_rx = Some(rx);
+    thread::spawn(move || {
+        let result = choose_txd_source_folder(start);
+        let _ = tx.send((DffPickerKind::ImportNewAssetTextures, result));
+    });
 }
 
 pub(crate) fn choose_import_prelight_path(start_dir: PathBuf) -> Result<Option<PathBuf>, String> {
@@ -12266,6 +13013,47 @@ pub(crate) fn export_texture_png_to_path(
     }
 }
 
+pub(crate) fn export_texture_pngs_to_dir(
+    app: &mut AppState,
+    textures: Vec<(String, u32, u32, Vec<u8>)>,
+    dir: PathBuf,
+) {
+    if let Err(err) = fs::create_dir_all(&dir) {
+        app.status_message = format!("Could not create {}: {err}", dir.display());
+        return;
+    }
+    save_last_dff_export_dir(&dir);
+    let mut exported = 0usize;
+    let mut failed = 0usize;
+    let mut used_names = HashSet::new();
+    for (texture_name, width, height, rgba) in textures {
+        let expected = (width as usize) * (height as usize) * 4;
+        if width == 0 || height == 0 || rgba.len() < expected {
+            failed += 1;
+            continue;
+        }
+        let path = unique_export_texture_path(&dir, &texture_name, &mut used_names);
+        match image::save_buffer(
+            path,
+            &rgba[..expected],
+            width,
+            height,
+            image::ColorType::Rgba8,
+        ) {
+            Ok(()) => exported += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    app.status_message = if failed == 0 {
+        format!("Exported {exported} texture(s) to {}", dir.display())
+    } else {
+        format!(
+            "Exported {exported} texture(s) to {}; {failed} failed",
+            dir.display()
+        )
+    };
+}
+
 pub(crate) fn choose_texture_image_path(start_dir: PathBuf) -> Result<Option<PathBuf>, String> {
     #[cfg(windows)]
     return windows_pick_file("Choose Texture", &start_dir, "PNG images", &["png"]);
@@ -12294,6 +13082,105 @@ pub(crate) fn choose_texture_image_path(start_dir: PathBuf) -> Result<Option<Pat
             match run_folder_picker_command(zenity) {
                 Ok(result) => Ok(result),
                 Err(zenity_err) => Err(format!("{kdialog_err}; {zenity_err}")),
+            }
+        }
+    }
+}
+
+pub(crate) fn choose_texture_image_paths(
+    start_dir: PathBuf,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    #[cfg(windows)]
+    return Ok(rfd::FileDialog::new()
+        .set_title("Add Textures")
+        .set_directory(&start_dir)
+        .add_filter("PNG images", &["png"])
+        .pick_files());
+
+    #[cfg(not(windows))]
+    {
+        fn paths_from_command(mut command: Command) -> Result<Option<Vec<PathBuf>>, String> {
+            let output = command
+                .output()
+                .map_err(|err| format!("Could not open texture picker: {err}"))?;
+            if output.status.success() {
+                let paths = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                Ok((!paths.is_empty()).then_some(paths))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if stderr.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(stderr)
+                }
+            }
+        }
+
+        let mut kdialog = Command::new("kdialog");
+        kdialog
+            .arg("--title")
+            .arg("Add Textures")
+            .arg("--getopenfilename")
+            .arg(start_dir.to_string_lossy().to_string())
+            .arg("*.png|PNG images")
+            .arg("--multiple")
+            .arg("--separate-output");
+        match paths_from_command(kdialog) {
+            Ok(result) => Ok(result),
+            Err(kdialog_err) => {
+                let filename = if start_dir.is_dir() {
+                    format!("{}/", start_dir.to_string_lossy())
+                } else {
+                    start_dir.to_string_lossy().to_string()
+                };
+                let mut zenity = Command::new("zenity");
+                zenity
+                    .arg("--file-selection")
+                    .arg("--multiple")
+                    .arg("--separator=\n")
+                    .arg("--title=Add Textures")
+                    .arg(format!("--filename={filename}"))
+                    .arg("--file-filter=PNG images | *.png");
+                paths_from_command(zenity)
+                    .map_err(|zenity_err| format!("{kdialog_err}; {zenity_err}"))
+            }
+        }
+    }
+}
+
+pub(crate) fn choose_editing_texture_folder(start_dir: PathBuf) -> Result<Option<PathBuf>, String> {
+    #[cfg(windows)]
+    return windows_pick_folder("Import Texture Folder", &start_dir);
+
+    #[cfg(not(windows))]
+    {
+        let start = if start_dir.is_dir() {
+            start_dir.to_string_lossy().to_string()
+        } else {
+            BROWSE_ROOT.to_string()
+        };
+        let mut kdialog = Command::new("kdialog");
+        kdialog
+            .arg("--title")
+            .arg("Import Texture Folder")
+            .arg("--getexistingdirectory")
+            .arg(&start);
+        match run_folder_picker_command(kdialog) {
+            Ok(result) => Ok(result),
+            Err(kdialog_err) => {
+                let mut zenity = Command::new("zenity");
+                zenity
+                    .arg("--file-selection")
+                    .arg("--directory")
+                    .arg("--title=Import Texture Folder")
+                    .arg(format!("--filename={start}/"));
+                run_folder_picker_command(zenity)
+                    .map_err(|zenity_err| format!("{kdialog_err}; {zenity_err}"))
             }
         }
     }
@@ -12791,6 +13678,12 @@ pub(crate) fn poll_dff_picker(app: &mut AppState) {
     };
     app.dff_picker_rx = None;
     match (kind, result) {
+        (DffPickerKind::ImportNewAssetDff, Ok(Some(path))) => open_import_asset_dialog(app, path),
+        (DffPickerKind::ImportNewAssetTextures, Ok(Some(path))) => {
+            if let Some(dialog) = app.import_asset_dialog.as_mut() {
+                dialog.texture_dir = path;
+            }
+        }
         (DffPickerKind::ImportBlender, Ok(Some(path))) => start_blender_import(app, path),
         (DffPickerKind::GenerateTxdFolder, Ok(Some(path))) => {
             prompt_txd_generation_destination(app, path)
@@ -12828,8 +13721,14 @@ pub(crate) fn poll_dff_picker(app: &mut AppState) {
             },
             Ok(Some(path)),
         ) => export_texture_png_to_path(app, texture_name, width, height, rgba, path),
+        (DffPickerKind::ExportTexturePngs { textures }, Ok(Some(path))) => {
+            export_texture_pngs_to_dir(app, textures, path)
+        }
         (DffPickerKind::ExportTexturePng { .. }, Ok(None)) => {
             app.status_message = "Export texture cancelled".to_string()
+        }
+        (DffPickerKind::ExportTexturePngs { .. }, Ok(None)) => {
+            app.status_message = "Export textures cancelled".to_string()
         }
         (DffPickerKind::VehicleTextureReplace(request), Ok(Some(path))) => {
             start_vehicle_texture_replace(app, request, path)
@@ -12863,6 +13762,9 @@ pub(crate) fn poll_dff_picker(app: &mut AppState) {
         ) => replace_texture_in_archive(app, definition_id, txd_name, texture_name, path),
         (DffPickerKind::EditingOpenFile, Ok(Some(path))) => open_editing_file(app, path),
         (DffPickerKind::EditingOpenImg, Ok(Some(path))) => open_editing_img(app, path),
+        (DffPickerKind::EditingCreateDff, Ok(Some(path))) => {
+            create_empty_dff_at_path(app, path);
+        }
         (DffPickerKind::EditingPairTxd, Ok(Some(path))) => editing_pair_dff_txd(app, path),
         (DffPickerKind::EditingPairTxd, Ok(None)) => {
             app.status_message = "TXD pairing cancelled".to_string();
@@ -12874,9 +13776,6 @@ pub(crate) fn poll_dff_picker(app: &mut AppState) {
         }
         (DffPickerKind::EditingExtractEntry { entry_name }, Ok(Some(path))) => {
             editing_extract_entry_to_path(app, entry_name, path)
-        }
-        (DffPickerKind::EditingTextureAdd { entry_name }, Ok(Some(path))) => {
-            editing_import_texture_from_path(app, entry_name, None, path)
         }
         (
             DffPickerKind::EditingTextureReplace {
@@ -12904,6 +13803,25 @@ pub(crate) fn poll_dff_picker(app: &mut AppState) {
         ) => editing_import_material_texture_from_path(app, txd_name, dff_name, material, path),
         (DffPickerKind::EditingMaterialTextureImport { .. }, Ok(None)) => {
             app.status_message = "Set material texture cancelled".to_string()
+        }
+        (
+            DffPickerKind::EditingMaterialTextureReplace {
+                txd_name,
+                dff_name,
+                material,
+                texture_name,
+            },
+            Ok(Some(path)),
+        ) => editing_replace_material_texture_from_path(
+            app,
+            txd_name,
+            dff_name,
+            material,
+            texture_name,
+            path,
+        ),
+        (DffPickerKind::EditingMaterialTextureReplace { .. }, Ok(None)) => {
+            app.status_message = "Replace material texture cancelled".to_string()
         }
         (DffPickerKind::EditingGifAnimImport { txd_name }, Ok(Some(path))) => {
             editing_import_gif_anim_from_path(app, txd_name, path)
@@ -12935,6 +13853,12 @@ pub(crate) fn poll_dff_picker(app: &mut AppState) {
         (DffPickerKind::ImportBlender, Ok(None)) => {
             app.status_message = "Import Blender cancelled".to_string()
         }
+        (DffPickerKind::ImportNewAssetDff, Ok(None)) => {
+            app.status_message = "Import asset cancelled".to_string()
+        }
+        (DffPickerKind::ImportNewAssetTextures, Ok(None)) => {
+            app.status_message = "Texture folder selection cancelled".to_string()
+        }
         (DffPickerKind::GenerateTxdFolder | DffPickerKind::GenerateTxdBuild { .. }, Ok(None)) => {
             app.status_message = "Generate TXD cancelled".to_string()
         }
@@ -12950,6 +13874,9 @@ pub(crate) fn poll_dff_picker(app: &mut AppState) {
         (DffPickerKind::EditingOpenImg, Ok(None)) => {
             app.status_message = "Open IMG archive cancelled".to_string()
         }
+        (DffPickerKind::EditingCreateDff, Ok(None)) => {
+            app.status_message = "Create DFF cancelled".to_string()
+        }
         (DffPickerKind::EditingMergeImg, Ok(None)) => {
             app.status_message = "Merge IMG cancelled".to_string()
         }
@@ -12961,9 +13888,6 @@ pub(crate) fn poll_dff_picker(app: &mut AppState) {
         }
         (DffPickerKind::EditingExtractEntry { .. }, Ok(None)) => {
             app.status_message = "Extract IMG entry cancelled".to_string()
-        }
-        (DffPickerKind::EditingTextureAdd { .. }, Ok(None)) => {
-            app.status_message = "Add texture cancelled".to_string()
         }
         (DffPickerKind::EditingTextureReplace { .. }, Ok(None)) => {
             app.status_message = "Replace texture cancelled".to_string()
@@ -13308,6 +14232,16 @@ pub(crate) fn write_img_archive(path: &Path, entries: &[(String, Vec<u8>)]) -> R
     header.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (name, bytes) in entries {
         let sectors = bytes.len().div_ceil(2048).max(1);
+        // A VER2 directory stores the streaming size in 16 bits. Casting an
+        // oversized entry would wrap the count and hand back a silently
+        // truncated asset on the next read, so refuse the write instead.
+        if sectors > u16::MAX as usize {
+            return Err(format!(
+                "{name} is {:.1} MB, above the {:.0} MB limit for a single IMG entry",
+                bytes.len() as f64 / (1024.0 * 1024.0),
+                u16::MAX as f64 * 2048.0 / (1024.0 * 1024.0)
+            ));
+        }
         header.extend_from_slice(&offset_sector.to_le_bytes());
         header.extend_from_slice(&(sectors as u16).to_le_bytes());
         header.extend_from_slice(&0u16.to_le_bytes());

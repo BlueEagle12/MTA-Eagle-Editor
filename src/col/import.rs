@@ -114,6 +114,35 @@ fn read_col_surface(bytes: &[u8], o: usize) -> CollisionSurface {
     }
 }
 
+fn finite_ordered_bounds(min: Vec3, max: Vec3) -> Option<Bounds> {
+    [min.x, min.y, min.z, max.x, max.y, max.z]
+        .into_iter()
+        .all(f32::is_finite)
+        .then_some(())?;
+    (min.x <= max.x && min.y <= max.y && min.z <= max.z).then_some(Bounds { min, max })
+}
+
+fn col_model_header_bounds(bytes: &[u8], model_start: usize, magic: &[u8]) -> Option<Bounds> {
+    if model_start + 72 > bytes.len() {
+        return None;
+    }
+    let (min_offset, max_offset) = if magic == b"COLL" {
+        // COL1 TBounds: radius, center, min, max.
+        (48usize, 60usize)
+    } else {
+        // COL2/3/4 TBounds: min, max, center, radius.
+        (32usize, 44usize)
+    };
+    let read_v3 = |offset: usize| {
+        Vec3::new(
+            rdf32(bytes, model_start + offset),
+            rdf32(bytes, model_start + offset + 4),
+            rdf32(bytes, model_start + offset + 8),
+        )
+    };
+    finite_ordered_bounds(read_v3(min_offset), read_v3(max_offset))
+}
+
 pub(crate) fn collect_col_model_names(bytes: &[u8]) -> Vec<String> {
     let mut names = Vec::new();
     let mut model_start = 0usize;
@@ -214,7 +243,9 @@ pub(crate) fn parse_col_mesh_matching(
         }
         let file_size = rd32(bytes, model_start + 4) as usize;
         let model_end = (model_start + file_size + 8).min(bytes.len());
-        if model_end <= model_start + 116 {
+        // A bounds-only COL2 is exactly the 116-byte header. There is no
+        // geometry payload to require beyond it, so accept that boundary.
+        if model_end < model_start + 116 {
             break;
         }
         let name = parse_col_name(bytes, model_start);
@@ -234,11 +265,6 @@ pub(crate) fn parse_col_mesh_matching(
         let boxes_offset = rd32(bytes, header + 16);
         let vertices_offset = rd32(bytes, header + 24);
         let faces_offset = rd32(bytes, header + 28);
-        if face_count == 0 && sphere_count == 0 && box_count == 0 {
-            model_start += file_size + 8;
-            continue;
-        }
-
         let mut spheres = Vec::with_capacity(sphere_count);
         if sphere_count > 0 {
             let spheres_abs = col_abs(model_start, spheres_offset);
@@ -394,7 +420,14 @@ pub(crate) fn parse_col_mesh_matching(
                 }
             }
         }
-        let bounds = collision_mesh_bounds(&vertices, &spheres, &boxes);
+        let bounds = if vertices.is_empty() && spheres.is_empty() && boxes.is_empty() {
+            // Bounds-only models are deliberately emitted for LODs and for
+            // definitions whose collision geometry is disabled. They are
+            // valid COL models even though there is nothing to draw yet.
+            col_model_header_bounds(bytes, model_start, magic)?
+        } else {
+            collision_mesh_bounds(&vertices, &spheres, &boxes)
+        };
         return Some(CollisionMesh {
             name,
             spheres,
@@ -537,11 +570,11 @@ fn parse_col1_mesh_model(
         });
     }
 
-    if faces.is_empty() && spheres.is_empty() && boxes.is_empty() {
-        return None;
-    }
-
-    let bounds = collision_mesh_bounds(&vertices, &spheres, &boxes);
+    let bounds = if vertices.is_empty() && spheres.is_empty() && boxes.is_empty() {
+        col_model_header_bounds(bytes, model_start, b"COLL")?
+    } else {
+        collision_mesh_bounds(&vertices, &spheres, &boxes)
+    };
     Some(CollisionMesh {
         name,
         spheres,
@@ -644,5 +677,54 @@ mod col1_tests {
         let reparsed = parse_col_mesh(&written, &entry()).expect("COL2 output should parse");
         assert_eq!(reparsed.vertices.len(), 3);
         assert_eq!(reparsed.faces.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod bounds_only_tests {
+    use crate::*;
+
+    #[test]
+    fn bounds_only_col_opens_and_round_trips_without_losing_its_volume() {
+        let bounds = Bounds {
+            min: Vec3::new(-12.0, -4.0, -1.5),
+            max: Vec3::new(18.0, 9.0, 7.25),
+        };
+        let mesh = CollisionMesh {
+            name: "lod_bounds".to_string(),
+            spheres: Vec::new(),
+            boxes: Vec::new(),
+            vertices: Vec::new(),
+            faces: Vec::new(),
+            bounds,
+            shadow_vertices: Vec::new(),
+            shadow_faces: Vec::new(),
+        };
+        let template = col_regeneration_template(&[], "lod_bounds.col");
+        let bytes = write_col_mesh_from_template(&template, &mesh).unwrap();
+        let entry = ImgEntry {
+            img_path: PathBuf::from("lod_bounds.col"),
+            name: "lod_bounds.col".to_string(),
+            offset: 0,
+            size: bytes.len() as u32,
+        };
+
+        let (parsed, identity) = parse_col_mesh_with_identity(&bytes, &entry).unwrap();
+
+        assert!(parsed.vertices.is_empty());
+        assert!(parsed.faces.is_empty());
+        assert!(parsed.spheres.is_empty());
+        assert!(parsed.boxes.is_empty());
+        assert_eq!(parsed.bounds.min, bounds.min);
+        assert_eq!(parsed.bounds.max, bounds.max);
+
+        let rewritten = write_col_mesh_replacing_model(&bytes, &identity, &parsed).unwrap();
+        let reparsed = parse_col_mesh_for_identity(&rewritten, &entry, &identity).unwrap();
+        assert_eq!(reparsed.bounds.min, bounds.min);
+        assert_eq!(reparsed.bounds.max, bounds.max);
+        assert!(!col_validation_has_errors(&validate_col_for_game_load(
+            &entry.name,
+            &rewritten,
+        )));
     }
 }

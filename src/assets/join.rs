@@ -13,14 +13,68 @@ struct JoinSource {
 
 fn staged_asset_bytes(app: &AppState, name: &str, ext: &str) -> Option<Vec<u8>> {
     let key = asset_key(name, ext);
-    app.pending_replacement_assets
-        .get(&key)
-        .map(|(_, bytes)| bytes.clone())
+    app.editing.modified_entries.get(&key).cloned().or_else(|| {
+        app.pending_replacement_assets
+            .get(&key)
+            .map(|(_, bytes)| bytes.clone())
+    })
+}
+
+fn dff_raw_for_placement(app: &AppState, placement: &Placement) -> Option<RawMesh> {
+    let key = asset_key(&placement.dff, ".dff");
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref()
+        && asset_key(&dff.name, ".dff") == key
+    {
+        return Some(dff.raw.clone());
+    }
+    dff_bytes_for_placement(app, placement).map(|bytes| parse_dff_mesh(&bytes))
 }
 
 fn dff_bytes_for_placement(app: &AppState, placement: &Placement) -> Option<Vec<u8>> {
     staged_asset_bytes(app, &placement.dff, ".dff")
         .or_else(|| find_dff_entry_for_app(app, &placement.dff).map(|entry| read_img_entry(&entry)))
+}
+
+fn stage_joined_asset_in_open_source_img(
+    app: &mut AppState,
+    source_name: &str,
+    joined_name: &str,
+    bytes: &[u8],
+) {
+    let Some(img_path) = app.editing.img_path.clone() else {
+        return;
+    };
+    let source_key = asset_key(source_name, ".dff");
+    if !app
+        .editing
+        .rows
+        .iter()
+        .any(|row| lower(&row.entry.name) == source_key)
+    {
+        return;
+    }
+
+    let joined_key = asset_key(joined_name, ".dff");
+    app.editing
+        .modified_entries
+        .insert(joined_key.clone(), bytes.to_vec());
+    app.editing.added_entries.insert(joined_key.clone());
+    if !app
+        .editing
+        .rows
+        .iter()
+        .any(|row| lower(&row.entry.name) == joined_key)
+    {
+        app.editing.rows.push(EditingImgRow {
+            entry: ImgEntry {
+                img_path,
+                name: joined_name.to_string(),
+                offset: 0,
+                size: bytes.len().div_ceil(2048) as u32,
+            },
+            logical_size: replacement_entry_len(joined_name, bytes),
+        });
+    }
 }
 
 fn collect_join_sources(app: &AppState, indices: &[usize]) -> Result<Vec<JoinSource>, String> {
@@ -31,9 +85,8 @@ fn collect_join_sources(app: &AppState, indices: &[usize]) -> Result<Vec<JoinSou
             .get(idx)
             .ok_or_else(|| "A selected element no longer exists".to_string())?
             .clone();
-        let bytes = dff_bytes_for_placement(app, &placement)
+        let raw = dff_raw_for_placement(app, &placement)
             .ok_or_else(|| format!("{}: DFF could not be found", placement.dff))?;
-        let raw = parse_dff_mesh(&bytes);
         if raw.vertices.is_empty() || raw.triangles.is_empty() {
             return Err(format!("{}: DFF has no readable geometry", placement.dff));
         }
@@ -351,6 +404,57 @@ fn combine_dffs(sources: &[JoinSource], anchor: &Placement) -> Result<RawMesh, S
     }
     weld_raw_vertices(&mut out, JOIN_WELD_DISTANCE);
     Ok(out)
+}
+
+/// Merge two editor chunks that are already expressed in the same workspace.
+/// The normal join path also uses this combiner, so material remapping and
+/// vertex-aligned streams behave identically to the established Join command.
+pub(crate) fn combine_editor_dff_chunks(
+    destination_name: &str,
+    destination: RawMesh,
+    chunk_name: &str,
+    chunk: RawMesh,
+) -> Result<RawMesh, String> {
+    let identity_placement = |id: &str| Placement {
+        id: id.to_string(),
+        dff: id.to_string(),
+        zone: String::new(),
+        tag: "object".to_string(),
+        attrs: BTreeMap::new(),
+        pos: V3::default(),
+        rot: V3::default(),
+    };
+    let anchor = identity_placement(destination_name);
+    let sources = [
+        JoinSource {
+            placement: anchor.clone(),
+            raw: destination,
+            col: None,
+        },
+        JoinSource {
+            placement: identity_placement(chunk_name),
+            raw: chunk,
+            col: None,
+        },
+    ];
+    let mut combined = combine_dffs(&sources, &anchor)?;
+    // Cross-model moves deliberately become destination-owned geometry. A
+    // component per source would make the normalized writer emit the shared
+    // material table for every geometry, duplicating slots on the next parse
+    // and eventually redirecting face material indices. Flatten the authored
+    // frame identities into one destination component while retaining all
+    // vertex streams, triangles, material properties, and texture references.
+    combined.frames.clear();
+    combined.components = vec![RawMeshComponent {
+        name: destination_name.to_string(),
+        frame_index: None,
+        vertex_start: 0,
+        vertex_end: combined.vertices.len(),
+        tri_start: 0,
+        tri_end: combined.triangles.len(),
+        breakable: None,
+    }];
+    Ok(combined)
 }
 
 fn weld_raw_vertices(raw: &mut RawMesh, distance: f32) -> usize {
@@ -801,9 +905,11 @@ pub(crate) fn join_selected_elements(app: &mut AppState) {
     let mesh_key = mesh_key_from_dff_txd(&dff_name, txd.as_deref());
     replace_render_mesh(&mut app.meshes, mesh_key, render_mesh);
     if let Some(mesh) = &col {
-        app.collisions
-            .insert(asset_key(&col_name, ".col"), mesh.clone());
+        let collision_key = asset_key(&col_name, ".col");
+        invalidate_collision_render_cache(app, &collision_key);
+        app.collisions.insert(collision_key, mesh.clone());
     }
+    stage_joined_asset_in_open_source_img(app, &sources[0].placement.dff, &dff_name, &dff_bytes);
     app.pending_replacement_assets
         .insert(asset_key(&dff_name, ".dff"), (dff_name.clone(), dff_bytes));
     if let Some(bytes) = col_bytes {
@@ -978,5 +1084,82 @@ mod tests {
                 .iter()
                 .all(|triangle| triangle.material == 0)
         );
+    }
+
+    #[test]
+    fn editor_chunk_merge_preserves_shared_workspace_offsets() {
+        let triangle = |x: f32, texture: &str, color: V3| RawMesh {
+            vertices: vec![
+                V3 { x, ..V3::default() },
+                V3 {
+                    x: x + 1.0,
+                    ..V3::default()
+                },
+                V3 {
+                    x,
+                    y: 1.0,
+                    ..V3::default()
+                },
+            ],
+            triangles: vec![Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 0,
+            }],
+            material_textures: vec![texture.to_string()],
+            materials: vec![RawMaterial {
+                color,
+                alpha: 0.75,
+                ambient: 0.8,
+                specular: 0.3,
+                diffuse: 0.9,
+            }],
+            ..RawMesh::default()
+        };
+        let combined = combine_editor_dff_chunks(
+            "park.dff",
+            triangle(
+                0.0,
+                "grass",
+                V3 {
+                    x: 0.2,
+                    y: 0.8,
+                    z: 0.3,
+                },
+            ),
+            "path.dff",
+            triangle(
+                25.0,
+                "path",
+                V3 {
+                    x: 0.7,
+                    y: 0.6,
+                    z: 0.5,
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(combined.triangles.len(), 2);
+        assert!(combined.vertices.iter().any(|vertex| vertex.x == 25.0));
+        assert_eq!(combined.material_textures, vec!["grass", "path"]);
+        assert_eq!(combined.triangles[0].material, 0);
+        assert_eq!(combined.triangles[1].material, 1);
+
+        let bytes = write_normalized_dff(&combined, "park").unwrap();
+        let reparsed = parse_dff_mesh(&bytes);
+        assert_eq!(reparsed.material_textures, vec!["grass", "path"]);
+        assert_eq!(reparsed.materials.len(), combined.materials.len());
+        for (written, source) in reparsed.materials.iter().zip(&combined.materials) {
+            assert!((written.color.x - source.color.x).abs() <= 1.0 / 255.0);
+            assert!((written.color.y - source.color.y).abs() <= 1.0 / 255.0);
+            assert!((written.color.z - source.color.z).abs() <= 1.0 / 255.0);
+            assert!((written.alpha - source.alpha).abs() <= 1.0 / 255.0);
+            assert_eq!(written.ambient, source.ambient);
+            assert_eq!(written.specular, source.specular);
+            assert_eq!(written.diffuse, source.diffuse);
+        }
+        assert_eq!(reparsed.triangles[0].material, 0);
+        assert_eq!(reparsed.triangles[1].material, 1);
     }
 }

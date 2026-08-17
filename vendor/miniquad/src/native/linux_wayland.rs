@@ -1294,7 +1294,9 @@ where
                         let mut d = crate::native_display().try_lock().unwrap();
                         d.dropped_files = Default::default();
                         for filename in filenames.lines() {
-                            let path = std::path::PathBuf::from(filename);
+                            let Some(path) = crate::native::dropped_file_path_from_uri(filename) else {
+                                continue;
+                            };
                             if let Ok(bytes) = std::fs::read(&path) {
                                 d.dropped_files.paths.push(path);
                                 d.dropped_files.bytes.push(bytes);

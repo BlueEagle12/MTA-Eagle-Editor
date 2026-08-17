@@ -390,7 +390,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "eagle-editor"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arboard",
  "fontdue",
@@ -847,6 +847,8 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

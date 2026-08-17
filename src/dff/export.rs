@@ -851,6 +851,272 @@ pub(crate) fn rewrite_dff_bin_mesh_face_order(
     Ok((output != bytes).then_some(output))
 }
 
+/// Splits a BinMesh payload into its draw batches.
+///
+/// Returns the payload flags, one `(material, raw index bytes)` pair per batch,
+/// and any trailing bytes the batch table did not consume so callers rebuilding
+/// the payload can keep them.
+fn bin_mesh_batches(payload: &[u8]) -> Result<(u32, Vec<(u32, &[u8])>, &[u8]), String> {
+    if payload.len() < 12 {
+        return Err("DFF BinMesh is truncated".to_string());
+    }
+    let flags = rd32(payload, 0);
+    let triangle_strip = flags & 1 != 0;
+    let batch_count = rd32(payload, 4) as usize;
+    let mut batches = Vec::new();
+    let mut offset = 12usize;
+    for _ in 0..batch_count {
+        if offset + 8 > payload.len() {
+            return Err("DFF BinMesh group is truncated".to_string());
+        }
+        let index_count = rd32(payload, offset) as usize;
+        let material = rd32(payload, offset + 4);
+        offset += 8;
+        let next = index_count
+            .checked_mul(4)
+            .and_then(|size| offset.checked_add(size))
+            .filter(|next| *next <= payload.len())
+            .ok_or_else(|| "DFF BinMesh indices are invalid".to_string())?;
+        if (!triangle_strip && index_count % 3 != 0) || (triangle_strip && index_count < 3) {
+            return Err("DFF BinMesh indices are invalid".to_string());
+        }
+        batches.push((material, &payload[offset..next]));
+        offset = next;
+    }
+    Ok((flags, batches, &payload[offset..]))
+}
+
+/// Rebuilds a BinMesh payload with neighbouring same-material batches merged.
+///
+/// Returns `Some((payload, removed_batches))` when at least one batch was
+/// merged away, otherwise `None`.
+fn canonical_bin_mesh_payload(payload: &[u8]) -> Result<Option<(Vec<u8>, usize)>, String> {
+    let (flags, batches, trailing) = bin_mesh_batches(payload)?;
+    if flags & 1 != 0 {
+        // Concatenating two triangle strips welds them into a single strip and
+        // invents triangles across the seam, so strips are left untouched.
+        return Ok(None);
+    }
+    let mut merged = Vec::<(u32, Vec<u8>)>::new();
+    for (material, indices) in batches.iter().copied() {
+        match merged.last_mut() {
+            Some((known, data)) if *known == material => data.extend_from_slice(indices),
+            _ => merged.push((material, indices.to_vec())),
+        }
+    }
+    let removed = batches.len() - merged.len();
+    if removed == 0 {
+        return Ok(None);
+    }
+    let total_indices = merged.iter().map(|(_, data)| data.len() / 4).sum::<usize>();
+    let mut out = Vec::with_capacity(payload.len());
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&(merged.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(total_indices as u32).to_le_bytes());
+    for (material, indices) in merged {
+        out.extend_from_slice(&((indices.len() / 4) as u32).to_le_bytes());
+        out.extend_from_slice(&material.to_le_bytes());
+        out.extend_from_slice(&indices);
+    }
+    out.extend_from_slice(trailing);
+    Ok(Some((out, removed)))
+}
+
+/// Collapses consecutive BinMesh draw batches that already share a material.
+///
+/// Every batch is its own draw call in-game, and exporters that emit one batch
+/// per triangle multiply that cost without changing what is drawn. Merging only
+/// adjacent batches keeps the face order intact, which alpha-blended materials
+/// depend on; batches separated by a different material are left alone.
+///
+/// Returns `Some((fixed_bytes, removed_batches))` when a merge was applied.
+pub(crate) fn canonicalize_dff_bin_mesh_batches(
+    bytes: &[u8],
+) -> Result<Option<(Vec<u8>, usize)>, String> {
+    fn chunk_end(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
+        (start + 12 <= limit).then_some(())?;
+        start
+            .checked_add(12)?
+            .checked_add(rd32(bytes, start + 4) as usize)
+            .filter(|end| *end <= limit && *end <= bytes.len())
+    }
+
+    fn rewrite_range(
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+        removed: &mut usize,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        let mut chunk = start;
+        let mut changed = false;
+        while let Some(current_end) = chunk_end(bytes, chunk, end) {
+            let id = rd32(bytes, chunk);
+            let data = chunk + 12;
+            let rewritten = if id == 0x050e {
+                canonical_bin_mesh_payload(&bytes[data..current_end])?.map(|(payload, batches)| {
+                    *removed += batches;
+                    payload
+                })
+            } else if matches!(id, 0x10 | 0x0e | 0x1a | 0x0f | 0x03) {
+                rewrite_range(bytes, data, current_end, removed)?
+            } else {
+                None
+            };
+            if let Some(payload) = rewritten {
+                out.extend_from_slice(&rw_chunk_with_version(id, rd32(bytes, chunk + 8), payload));
+                changed = true;
+            } else {
+                out.extend_from_slice(&bytes[chunk..current_end]);
+            }
+            chunk = current_end;
+            if chunk == end {
+                break;
+            }
+        }
+        if chunk != end {
+            return Err("DFF has invalid RenderWare chunk boundaries".to_string());
+        }
+        Ok(changed.then_some(out))
+    }
+
+    let len = dff_chunk_len(bytes);
+    if len == 0 || len > bytes.len() {
+        return Err("DFF has no valid RenderWare chunks".to_string());
+    }
+    let mut removed = 0usize;
+    let Some(mut canonical) = rewrite_range(bytes, 0, len, &mut removed)? else {
+        return Ok(None);
+    };
+    canonical.extend_from_slice(&bytes[len..]);
+    Ok(Some((canonical, removed)))
+}
+
+/// Counts BinMesh batches that `canonicalize_dff_bin_mesh_batches` would merge
+/// away, so validation can report the problem without rewriting the file.
+pub(crate) fn dff_redundant_bin_mesh_batch_count(bytes: &[u8]) -> Result<usize, String> {
+    fn scan(bytes: &[u8], start: usize, end: usize, redundant: &mut usize) -> Result<(), String> {
+        let mut chunk = start;
+        while chunk < end {
+            let data = chunk + 12;
+            let current_end = (chunk + 12 <= end)
+                .then(|| data.checked_add(rd32(bytes, chunk + 4) as usize))
+                .flatten()
+                .filter(|current_end| *current_end <= end && *current_end <= bytes.len())
+                .ok_or_else(|| "DFF has invalid RenderWare chunk boundaries".to_string())?;
+            let id = rd32(bytes, chunk);
+            if id == 0x050e {
+                let (flags, batches, _) = bin_mesh_batches(&bytes[data..current_end])?;
+                if flags & 1 == 0 {
+                    *redundant += batches
+                        .windows(2)
+                        .filter(|pair| pair[0].0 == pair[1].0)
+                        .count();
+                }
+            } else if matches!(id, 0x10 | 0x0e | 0x1a | 0x0f | 0x03) {
+                scan(bytes, data, current_end, redundant)?;
+            }
+            chunk = current_end;
+        }
+        Ok(())
+    }
+
+    let len = dff_chunk_len(bytes);
+    if len == 0 || len > bytes.len() {
+        return Err("DFF has no valid RenderWare chunks".to_string());
+    }
+    let mut redundant = 0usize;
+    scan(bytes, 0, len, &mut redundant)?;
+    Ok(redundant)
+}
+
+/// Byte ranges of every geometry `Struct` payload (chunk 0x01 inside a 0x0f
+/// geometry) in a DFF.
+fn dff_geometry_struct_spans(bytes: &[u8]) -> Result<Vec<(usize, usize)>, String> {
+    fn scan(
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+        spans: &mut Vec<(usize, usize)>,
+    ) -> Result<(), String> {
+        let mut chunk = start;
+        while chunk < end {
+            let data = chunk + 12;
+            let current_end = (chunk + 12 <= end)
+                .then(|| data.checked_add(rd32(bytes, chunk + 4) as usize))
+                .flatten()
+                .filter(|current_end| *current_end <= end && *current_end <= bytes.len())
+                .ok_or_else(|| "DFF has invalid RenderWare chunk boundaries".to_string())?;
+            let id = rd32(bytes, chunk);
+            if id == 0x0f {
+                let mut child = data;
+                while child + 12 <= current_end {
+                    let child_data = child + 12;
+                    let child_end = child_data
+                        .checked_add(rd32(bytes, child + 4) as usize)
+                        .filter(|child_end| *child_end <= current_end)
+                        .ok_or_else(|| "DFF has invalid RenderWare chunk boundaries".to_string())?;
+                    if rd32(bytes, child) == 0x01 {
+                        spans.push((child_data, child_end));
+                    }
+                    child = child_end;
+                }
+            } else if matches!(id, 0x10 | 0x0e | 0x1a) {
+                scan(bytes, data, current_end, spans)?;
+            }
+            chunk = current_end;
+        }
+        Ok(())
+    }
+
+    let len = dff_chunk_len(bytes);
+    if len == 0 || len > bytes.len() {
+        return Err("DFF has no valid RenderWare chunks".to_string());
+    }
+    let mut spans = Vec::new();
+    scan(bytes, 0, len, &mut spans)?;
+    Ok(spans)
+}
+
+/// A geometry that requests RenderWare lighting (`rpGEOMETRYLIGHT`) without
+/// carrying the vertex normals (`rpGEOMETRYNORMALS`) that lighting reads.
+fn geometry_flags_are_normal_less_lit(flags: u32) -> bool {
+    flags & 0x20 != 0 && flags & 0x10 == 0
+}
+
+/// Counts geometry sections asking to be lit without shipping vertex normals.
+pub(crate) fn dff_normal_less_lit_geometry_count(bytes: &[u8]) -> Result<usize, String> {
+    Ok(dff_geometry_struct_spans(bytes)?
+        .into_iter()
+        .filter(|(start, end)| {
+            *end >= start + 16 && geometry_flags_are_normal_less_lit(rd32(bytes, *start))
+        })
+        .count())
+}
+
+/// Clears `rpGEOMETRYLIGHT` on geometry that has no vertex normals.
+///
+/// GTA:SA lights such a geometry from an undefined normal stream, which shows
+/// up as black or violently flickering faces. The flag lives in the geometry
+/// struct header, so this patches in place without moving any chunk boundary.
+///
+/// Returns the number of geometry sections corrected.
+pub(crate) fn repair_dff_normal_less_lighting_flags(bytes: &mut [u8]) -> Result<usize, String> {
+    let mut repaired = 0usize;
+    for (start, end) in dff_geometry_struct_spans(bytes)? {
+        if end < start + 16 {
+            continue;
+        }
+        let flags = rd32(bytes, start);
+        if !geometry_flags_are_normal_less_lit(flags) {
+            continue;
+        }
+        bytes[start..start + 4].copy_from_slice(&(flags & !0x20).to_le_bytes());
+        repaired += 1;
+    }
+    Ok(repaired)
+}
+
 /// Detects a top-level UV Animation Dictionary (chunk 0x2b) positioned after the
 /// Clump (chunk 0x10) and reorders it to appear before the clump.
 ///
@@ -2411,9 +2677,12 @@ fn write_geometry(
     let has_normals = options.include_normals && export.normals.len() == export.vertices.len();
 
     let mut geometry_struct = Vec::new();
-    let mut flags = 0x02u32 | 0x20 | 0x40;
+    let mut flags = 0x02u32 | 0x40;
     if has_normals {
-        flags |= 0x10;
+        // rpGEOMETRYLIGHT only travels with rpGEOMETRYNORMALS: asking GTA:SA to
+        // light a geometry that ships no normal stream leaves it reading
+        // undefined normals, which renders as black or flickering faces.
+        flags |= 0x10 | 0x20;
     }
     if has_uvs {
         flags |= 0x04 | ((uv_count as u32) << 16);

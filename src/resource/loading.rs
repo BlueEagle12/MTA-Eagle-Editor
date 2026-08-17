@@ -727,6 +727,7 @@ pub(crate) struct LoadJob {
     pub(crate) vertex_paint: VertexPaintSettings,
     pub(crate) lights: Vec<EditorLight>,
     pub(crate) water_planes: Vec<WaterPlane>,
+    pub(crate) cull_zones: Vec<CullZone>,
     pub(crate) timecyc: TimecycState,
     pub(crate) vehicles: Vec<VehicleAsset>,
     pub(crate) custom_vehicle_dictionaries: Vec<PathBuf>,
@@ -782,6 +783,7 @@ impl LoadJob {
         let bake_settings = load_bake_settings_preference();
         let vertex_paint = load_vertex_paint_settings_preference();
         let water_planes = load_water_dat_for_source(&root, source);
+        let cull_zones = load_cull_zones_for_source(&root, source);
         let timecyc = load_timecyc_state();
         let custom_vehicle_dictionaries = load_custom_vehicle_dictionary_preferences();
         let vehicles = load_vehicle_assets(&root, &gta_sa_dir, &[]);
@@ -832,6 +834,7 @@ impl LoadJob {
             vertex_paint,
             lights,
             water_planes,
+            cull_zones,
             timecyc,
             vehicles,
             custom_vehicle_dictionaries,
@@ -1009,6 +1012,8 @@ impl LoadJob {
         let all_lod_ids = collect_lod_ids(&placements);
         let ambient_lift = scene_ambient_lift_from_timecyc(&timecyc);
         let particle_effects = load_gta_sa_particle_effects(&gta_sa_dir);
+        let placement_2dfx_indices = build_placement_2dfx_indices(&placements, &defs, &meshes);
+        let placement_2dfx_index_placement_count = placements.len();
         // Only build the cell set the active render path will actually draw.
         // fast_vbo (default) uses world_cells; the display-list scene_cells are
         // only consulted when fast_vbo is off. Building both doubled end-of-load
@@ -1058,6 +1063,7 @@ impl LoadJob {
         );
         let gpu_lightmap = init_gpu_lightmap_pipeline();
         let selected_water_planes = initial_water_selection(&water_planes);
+        let cull_zones = self.cull_zones;
         let metadata_root = scene_metadata_root(&root, source, loaded_wip);
         let MaterialClassesLoad {
             classes: material_classes,
@@ -1081,6 +1087,8 @@ impl LoadJob {
             world_cells,
             lod_scene_cells,
             lod_world_cells,
+            placement_2dfx_indices,
+            placement_2dfx_index_placement_count,
             textures,
             txd_textures,
             texture_alias_count: texture_files.len(),
@@ -1136,7 +1144,7 @@ impl LoadJob {
             transform_space: TransformSpace::World,
             snap_enabled: false,
             show_selected_lod_local: false,
-            lod_selectable: true,
+            lod_selectable: false,
             snap_move: 32.0,
             snap_rotate: 15.0,
             active_tab,
@@ -1148,13 +1156,29 @@ impl LoadJob {
             validation_list_scroll: [0.0; 3],
             validation_list_scroll_drag: None,
             validation_list_scroll_grab_offset_y: 0.0,
+            validation_collision_material_dropdown_open: false,
+            validation_collision_material_search: String::new(),
+            validation_collision_material_scroll: 0.0,
             element_panel_collapsed: element_default_collapsed(),
             preview_selected_material: None,
+            preview_texture_advanced: false,
+            preview_world_uv_all_dffs: false,
+            preview_world_uv_scale: 1.0,
+            preview_world_uv_variation: false,
+            preview_world_uv_job: None,
+            preview_world_uv_visual: None,
             texture_match_selection_job: None,
             water_texture_conversion_job: None,
             physics_scope: PhysicsScope::default(),
             physics_root_properties,
             physics_root_dropdown_open: false,
+            native_model_dropdown_open: false,
+            native_model_dropdown_search: String::new(),
+            native_model_dropdown_scroll: 0.0,
+            txd_dropdown_open: false,
+            txd_dropdown_search: String::new(),
+            txd_dropdown_scroll: 0.0,
+            txd_dropdown_create_mode: false,
             settings_panel_collapsed: settings_default_collapsed(),
             global_transform: GlobalTransformState::default(),
             collision_edit_mode: false,
@@ -1166,7 +1190,11 @@ impl LoadJob {
             col_material_dropdown_scroll: 0.0,
             pending_col_writes: HashMap::new(),
             hovered_gizmo: None,
+            hovered_gizmo_plane: None,
             gizmo_drag: None,
+            dff_scale_input: None,
+            cull_face_drag: None,
+            cull_hovered_face: None,
             col_box_face_drag: None,
             col_box_hovered_face: None,
             inspector_edit: None,
@@ -1188,10 +1216,23 @@ impl LoadJob {
             expanded_groups,
             context_menu: None,
             load_dialog: None,
+            import_asset_dialog: None,
             preferences_dialog: None,
             load_picker_rx: None,
             dff_picker_rx: None,
+            blender_import_setup: None,
+            oversized_chunk_dialog: None,
+            oversized_chunk_job: None,
+            classify_dialog: None,
+            classify_object_max_size: DEFAULT_CLASSIFY_OBJECT_MAX_SIZE,
             blender_import_rx: None,
+            blender_import_dialog_open: false,
+            blender_import_progress: 0.0,
+            blender_import_phase: String::new(),
+            blender_import_log: Vec::new(),
+            blender_import_log_scroll: 0.0,
+            blender_import_log_follow_tail: true,
+            blender_import_finished: false,
             dff_repair_rx: None,
             dff_repair_refresh: None,
             dff_repair_scope: DffRepairScope::default(),
@@ -1209,6 +1250,7 @@ impl LoadJob {
             dff_texture_duplicate_dialog: None,
             dff_texture_view_dialog: None,
             element_id_rename_dialog: None,
+            element_replace_with_dialog: None,
             missing_texture_dialog: None,
             texture_archive_dialog: None,
             missing_col_dialog: None,
@@ -1229,6 +1271,7 @@ impl LoadJob {
             light_lod_job: None,
             fracture_generation_job: None,
             dff_geometry_job: None,
+            dff_material_limit_repair_job: None,
             collision_generation_job: None,
             shadow_mesh_generation_job: None,
             collision_cuboid_audit_job: None,
@@ -1295,6 +1338,9 @@ impl LoadJob {
             water_edge_drag: None,
             water_edge_snap_enabled: true,
             water_scroll: 0.0,
+            cull_zones,
+            selected_cull: 0,
+            cull_scroll: 0.0,
             selected_light: 0,
             light_list_scroll: 0.0,
             light_kind_dropdown_open: false,
@@ -1541,6 +1587,7 @@ pub(crate) async fn load_app_with_source(
     let bake_settings = load_bake_settings_preference();
     let vertex_paint = load_vertex_paint_settings_preference();
     let water_planes = load_water_dat_for_source(&root, source);
+    let cull_zones = load_cull_zones_for_source(&root, source);
     let custom_vehicle_dictionaries = load_custom_vehicle_dictionary_preferences();
     let vehicles = load_vehicle_assets(&root, &gta_sa_dir, &[]);
     let gpu_lightmap = init_gpu_lightmap_pipeline();
@@ -1551,6 +1598,8 @@ pub(crate) async fn load_app_with_source(
         diagnostics: material_class_diagnostics,
     } = load_material_classes(&metadata_root);
     let active_tab = launch_initial_tab(options.launch_mode);
+    let placement_2dfx_indices = build_placement_2dfx_indices(&placements, &defs, &meshes);
+    let placement_2dfx_index_placement_count = placements.len();
     let mut app = AppState {
         options,
         root: root.clone(),
@@ -1567,6 +1616,8 @@ pub(crate) async fn load_app_with_source(
         world_cells,
         lod_scene_cells,
         lod_world_cells,
+        placement_2dfx_indices,
+        placement_2dfx_index_placement_count,
         textures,
         txd_textures,
         texture_alias_count: texture_files.len(),
@@ -1622,7 +1673,7 @@ pub(crate) async fn load_app_with_source(
         transform_space: TransformSpace::World,
         snap_enabled: false,
         show_selected_lod_local: false,
-        lod_selectable: true,
+        lod_selectable: false,
         snap_move: 32.0,
         snap_rotate: 15.0,
         active_tab,
@@ -1634,13 +1685,29 @@ pub(crate) async fn load_app_with_source(
         validation_list_scroll: [0.0; 3],
         validation_list_scroll_drag: None,
         validation_list_scroll_grab_offset_y: 0.0,
+        validation_collision_material_dropdown_open: false,
+        validation_collision_material_search: String::new(),
+        validation_collision_material_scroll: 0.0,
         element_panel_collapsed: element_default_collapsed(),
         preview_selected_material: None,
+        preview_texture_advanced: false,
+        preview_world_uv_all_dffs: false,
+        preview_world_uv_scale: 1.0,
+        preview_world_uv_variation: false,
+        preview_world_uv_job: None,
+        preview_world_uv_visual: None,
         texture_match_selection_job: None,
         water_texture_conversion_job: None,
         physics_scope: PhysicsScope::default(),
         physics_root_properties,
         physics_root_dropdown_open: false,
+        native_model_dropdown_open: false,
+        native_model_dropdown_search: String::new(),
+        native_model_dropdown_scroll: 0.0,
+        txd_dropdown_open: false,
+        txd_dropdown_search: String::new(),
+        txd_dropdown_scroll: 0.0,
+        txd_dropdown_create_mode: false,
         settings_panel_collapsed: settings_default_collapsed(),
         global_transform: GlobalTransformState::default(),
         collision_edit_mode: false,
@@ -1652,7 +1719,11 @@ pub(crate) async fn load_app_with_source(
         col_material_dropdown_scroll: 0.0,
         pending_col_writes: HashMap::new(),
         hovered_gizmo: None,
+        hovered_gizmo_plane: None,
         gizmo_drag: None,
+        dff_scale_input: None,
+        cull_face_drag: None,
+        cull_hovered_face: None,
         col_box_face_drag: None,
         col_box_hovered_face: None,
         inspector_edit: None,
@@ -1674,10 +1745,23 @@ pub(crate) async fn load_app_with_source(
         expanded_groups,
         context_menu: None,
         load_dialog: None,
+        import_asset_dialog: None,
         preferences_dialog: None,
         load_picker_rx: None,
         dff_picker_rx: None,
+        blender_import_setup: None,
+        oversized_chunk_dialog: None,
+        oversized_chunk_job: None,
+        classify_dialog: None,
+        classify_object_max_size: DEFAULT_CLASSIFY_OBJECT_MAX_SIZE,
         blender_import_rx: None,
+        blender_import_dialog_open: false,
+        blender_import_progress: 0.0,
+        blender_import_phase: String::new(),
+        blender_import_log: Vec::new(),
+        blender_import_log_scroll: 0.0,
+        blender_import_log_follow_tail: true,
+        blender_import_finished: false,
         dff_repair_rx: None,
         dff_repair_refresh: None,
         dff_repair_scope: DffRepairScope::default(),
@@ -1695,6 +1779,7 @@ pub(crate) async fn load_app_with_source(
         dff_texture_duplicate_dialog: None,
         dff_texture_view_dialog: None,
         element_id_rename_dialog: None,
+        element_replace_with_dialog: None,
         missing_texture_dialog: None,
         texture_archive_dialog: None,
         missing_col_dialog: None,
@@ -1715,6 +1800,7 @@ pub(crate) async fn load_app_with_source(
         light_lod_job: None,
         fracture_generation_job: None,
         dff_geometry_job: None,
+        dff_material_limit_repair_job: None,
         collision_generation_job: None,
         shadow_mesh_generation_job: None,
         collision_cuboid_audit_job: None,
@@ -1781,6 +1867,9 @@ pub(crate) async fn load_app_with_source(
         water_edge_drag: None,
         water_edge_snap_enabled: true,
         water_scroll: 0.0,
+        cull_zones,
+        selected_cull: 0,
+        cull_scroll: 0.0,
         selected_light: 0,
         light_list_scroll: 0.0,
         light_kind_dropdown_open: false,
@@ -1874,6 +1963,7 @@ pub(crate) async fn load_icons() -> IconSet {
                 .into_owned(),
         )
         .await,
+        scale: load_icon(asset_path("icons/scale.png").to_string_lossy().into_owned()).await,
         duplicate: load_icon(
             asset_path("icons/duplicate.png")
                 .to_string_lossy()

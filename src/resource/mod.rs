@@ -1,5 +1,7 @@
 pub(crate) mod archive_rebalance;
+pub(crate) mod classify;
 pub(crate) mod collision_safety;
+pub(crate) mod cull;
 pub(crate) mod eagle_scene;
 pub(crate) mod files;
 pub(crate) mod loading;

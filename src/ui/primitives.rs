@@ -34,7 +34,7 @@ pub(crate) fn build_font(font_bytes: &[u8], raster_px: f32) -> Option<UiFont> {
     let mut characters: Vec<char> = (32u32..=126)
         .chain(160..=255)
         .filter_map(char::from_u32)
-        .chain("–—“”•→─▾".chars())
+        .chain("–—“”•→↑─▾".chars())
         .collect();
     characters.sort_unstable();
     characters.dedup();

@@ -41,7 +41,7 @@ pub(crate) struct CollisionGenerationSettings {
     pub(crate) source_materials: Vec<Option<u8>>,
     excluded_source_materials: BTreeSet<u16>,
     max_error: f32,
-    target_face_ratio: f32,
+    target_face_floor: usize,
     primitive_relative_tolerance: f32,
     box_min_surface_coverage: f32,
     sphere_max_radial_error: f32,
@@ -51,7 +51,7 @@ pub(crate) struct CollisionGenerationSettings {
     allow_boxes: bool,
     allow_spheres: bool,
     force_shapes: bool,
-    lock_mesh_boundaries: bool,
+    preserve_mesh_boundaries: bool,
     empty_collision: bool,
 }
 
@@ -67,7 +67,7 @@ impl CollisionGenerationSettings {
                 source_materials,
                 excluded_source_materials: BTreeSet::new(),
                 max_error: 0.08,
-                target_face_ratio: 0.25,
+                target_face_floor: 4,
                 primitive_relative_tolerance: 0.015,
                 box_min_surface_coverage: 0.90,
                 sphere_max_radial_error: 0.035,
@@ -77,7 +77,7 @@ impl CollisionGenerationSettings {
                 allow_boxes: true,
                 allow_spheres: true,
                 force_shapes: false,
-                lock_mesh_boundaries: true,
+                preserve_mesh_boundaries: true,
                 empty_collision: false,
             },
             CollisionGenerationPreset::Architecture => Self {
@@ -85,7 +85,7 @@ impl CollisionGenerationSettings {
                 source_materials,
                 excluded_source_materials: BTreeSet::new(),
                 max_error: 0.04,
-                target_face_ratio: 0.42,
+                target_face_floor: 4,
                 primitive_relative_tolerance: 0.008,
                 box_min_surface_coverage: 0.96,
                 sphere_max_radial_error: 0.025,
@@ -95,7 +95,7 @@ impl CollisionGenerationSettings {
                 allow_boxes: true,
                 allow_spheres: true,
                 force_shapes: false,
-                lock_mesh_boundaries: true,
+                preserve_mesh_boundaries: true,
                 empty_collision: false,
             },
             CollisionGenerationPreset::Prop => Self {
@@ -103,7 +103,7 @@ impl CollisionGenerationSettings {
                 source_materials,
                 excluded_source_materials: BTreeSet::new(),
                 max_error: 0.12,
-                target_face_ratio: 0.18,
+                target_face_floor: 4,
                 primitive_relative_tolerance: 0.025,
                 box_min_surface_coverage: 0.84,
                 sphere_max_radial_error: 0.055,
@@ -113,7 +113,7 @@ impl CollisionGenerationSettings {
                 allow_boxes: true,
                 allow_spheres: true,
                 force_shapes: false,
-                lock_mesh_boundaries: true,
+                preserve_mesh_boundaries: true,
                 empty_collision: false,
             },
             CollisionGenerationPreset::Shapes => Self {
@@ -121,7 +121,7 @@ impl CollisionGenerationSettings {
                 source_materials,
                 excluded_source_materials: BTreeSet::new(),
                 max_error: 0.12,
-                target_face_ratio: 0.18,
+                target_face_floor: 4,
                 primitive_relative_tolerance: 0.025,
                 box_min_surface_coverage: 0.84,
                 sphere_max_radial_error: 0.055,
@@ -133,7 +133,7 @@ impl CollisionGenerationSettings {
                 allow_boxes: true,
                 allow_spheres: true,
                 force_shapes: true,
-                lock_mesh_boundaries: true,
+                preserve_mesh_boundaries: true,
                 empty_collision: false,
             },
             CollisionGenerationPreset::Surface => Self {
@@ -141,7 +141,7 @@ impl CollisionGenerationSettings {
                 source_materials,
                 excluded_source_materials: BTreeSet::new(),
                 max_error: 0.12,
-                target_face_ratio: 0.36,
+                target_face_floor: 4,
                 primitive_relative_tolerance: 0.0,
                 box_min_surface_coverage: 1.0,
                 sphere_max_radial_error: 0.0,
@@ -151,7 +151,7 @@ impl CollisionGenerationSettings {
                 allow_boxes: false,
                 allow_spheres: false,
                 force_shapes: false,
-                lock_mesh_boundaries: true,
+                preserve_mesh_boundaries: true,
                 empty_collision: false,
             },
         };
@@ -350,12 +350,19 @@ fn quantize_vertex(
     let mut quantized = [0.0f32; 3];
     for axis in 0..3 {
         let scaled = (values[axis] * COL_VERTEX_SCALE).round();
-        if !scaled.is_finite() || scaled < i16::MIN as f32 || scaled > i16::MAX as f32 {
+        // RenderWare COL vertices use signed 16-bit 1/128 coordinates. Large
+        // map chunks commonly end exactly at +256, one fixed-point unit above
+        // the positive maximum (255.9921875). Clamp that single boundary unit
+        // instead of discarding the entire collision; values farther outside
+        // the representable volume still indicate a genuinely invalid chunk.
+        let min = i16::MIN as f32;
+        let max = i16::MAX as f32;
+        if !scaled.is_finite() || scaled < min - 1.0 || scaled > max + 1.0 {
             return Err(CollisionGenerationError::VertexOutsideColRange {
                 vertex: source_index,
             });
         }
-        fixed[axis] = scaled as i16;
+        fixed[axis] = scaled.clamp(min, max) as i16;
         quantized[axis] = fixed[axis] as f32 / COL_VERTEX_SCALE;
     }
     Ok((
@@ -915,12 +922,10 @@ fn try_fit_box(
     settings: &CollisionGenerationSettings,
     material: u8,
 ) -> Option<PrimitiveFit> {
-    if !settings.allow_boxes
-        || component.faces.len() < MIN_PRIMITIVE_FACES
-        || !component_is_closed(mesh, component)
-    {
+    if !settings.allow_boxes || component.faces.len() < MIN_PRIMITIVE_FACES {
         return None;
     }
+    let closed = component_is_closed(mesh, component);
     let (min, max) = component_bounds(mesh, component);
     let extents = [max.x - min.x, max.y - min.y, max.z - min.z];
     if extents.iter().any(|extent| *extent <= COL_VERTEX_STEP) {
@@ -932,6 +937,7 @@ fn try_fit_box(
         .max(COL_VERTEX_STEP * 1.5)
         .min(settings.max_error.max(COL_VERTEX_STEP * 1.5));
     let mut plane_areas = [0.0f32; 6];
+    let mut unclassified_area = 0.0f32;
 
     for &face_index in &component.faces {
         let face = mesh.faces[face_index];
@@ -944,6 +950,7 @@ fn try_fit_box(
         if length <= NORMAL_EPSILON {
             return None;
         }
+        let area = length * 0.5;
         let normalized = [
             normal.x.abs() / length,
             normal.y.abs() / length,
@@ -954,25 +961,31 @@ fn try_fit_box(
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(&b.1))?;
         if alignment < 0.995 {
-            return None;
+            unclassified_area += area;
+            continue;
         }
         let low = [min.x, min.y, min.z][axis];
         let high = [max.x, max.y, max.z][axis];
         let coordinate = [vertices[0].x, vertices[0].y, vertices[0].z][axis];
         let plane = if (coordinate - low).abs() <= tolerance {
-            axis * 2
+            Some(axis * 2)
         } else if (coordinate - high).abs() <= tolerance {
-            axis * 2 + 1
+            Some(axis * 2 + 1)
         } else {
-            return None;
+            None
+        };
+        let Some(plane) = plane else {
+            unclassified_area += area;
+            continue;
         };
         if vertices.iter().any(|vertex| {
             let value = [vertex.x, vertex.y, vertex.z][axis];
             (value - [low, high][plane % 2]).abs() > tolerance
         }) {
-            return None;
+            unclassified_area += area;
+            continue;
         }
-        plane_areas[plane] += length * 0.5;
+        plane_areas[plane] += area;
     }
 
     let expected = [
@@ -983,13 +996,29 @@ fn try_fit_box(
         extents[0] * extents[1],
         extents[0] * extents[1],
     ];
-    for plane in 0..6 {
-        let coverage = plane_areas[plane] / expected[plane];
+    let coverage = std::array::from_fn::<_, 6, _>(|plane| plane_areas[plane] / expected[plane]);
+    for &value in &coverage {
         // The lower bound detects holes/openings; the upper bound rejects
         // overlapping or folded surfaces masquerading as a box shell.
-        if coverage < settings.box_min_surface_coverage || coverage > 1.08 {
+        if value > 1.08 {
             return None;
         }
+    }
+    let complete_shell = coverage
+        .iter()
+        .all(|value| *value >= settings.box_min_surface_coverage);
+    // Many building DFFs deliberately omit their underside. Five complete
+    // exterior planes still describe an unambiguous solid cuboid, while a
+    // missing wall/doorway must remain mesh collision. Permit a small amount
+    // of interior detail, but only when the absent plane is the bottom.
+    let open_bottom_building = !closed
+        && coverage[4] <= 0.10
+        && [0usize, 1, 2, 3, 5]
+            .into_iter()
+            .all(|plane| coverage[plane] >= settings.box_min_surface_coverage)
+        && unclassified_area <= expected.iter().sum::<f32>() * 0.02;
+    if !(closed && complete_shell && unclassified_area <= NORMAL_EPSILON || open_bottom_building) {
+        return None;
     }
     Some(PrimitiveFit {
         kind: GeneratedPrimitiveKind::Box,
@@ -1146,11 +1175,22 @@ fn source_face_to_collision(indices: [u16; 3], material: u8) -> CollisionFace {
     }
 }
 
+fn edge_counts(mesh: &SanitizedMesh, face_indices: &[usize]) -> BTreeMap<(u32, u32), usize> {
+    let mut counts = BTreeMap::new();
+    for &face_index in face_indices {
+        let [a, b, c] = mesh.faces[face_index].indices;
+        for (a, b) in [(a, b), (b, c), (c, a)] {
+            *counts.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    counts
+}
+
 fn simplify_face_group(
     mesh: &SanitizedMesh,
     face_indices: &[usize],
+    component_edge_counts: &BTreeMap<(u32, u32), usize>,
     settings: &CollisionGenerationSettings,
-    effective_ratio: f32,
 ) -> Result<Vec<u32>, CollisionGenerationError> {
     let mut indices = Vec::with_capacity(face_indices.len() * 3);
     for &face_index in face_indices {
@@ -1159,8 +1199,12 @@ fn simplify_face_group(
     if face_indices.len() < settings.min_faces_for_simplification {
         return Ok(indices);
     }
-    let target_faces = ((face_indices.len() as f32 * effective_ratio).ceil() as usize)
-        .clamp(1, face_indices.len());
+    // `max_error` is the actual quality constraint. A percentage target ties
+    // collision density to render-mesh density: subdividing an otherwise
+    // identical DFF then produces a much denser COL. Ask meshopt to simplify
+    // toward a small topology floor instead; it will stop before that target
+    // whenever another collapse would exceed the preset's world-space error.
+    let target_faces = settings.target_face_floor.clamp(1, face_indices.len());
     if target_faces >= face_indices.len() {
         return Ok(indices);
     }
@@ -1173,26 +1217,24 @@ fn simplify_face_group(
         .map_err(|error| CollisionGenerationError::Simplifier(error.to_string()))?;
     let options = SimplifyOptions::ErrorAbsolute | SimplifyOptions::Regularize;
     let mut vertex_locks = vec![false; mesh.vertices.len()];
-    if settings.lock_mesh_boundaries {
-        let mut edge_counts = BTreeMap::<(u32, u32), usize>::new();
-        for triangle in indices.chunks_exact(3) {
-            for (a, b) in [
-                (triangle[0], triangle[1]),
-                (triangle[1], triangle[2]),
-                (triangle[2], triangle[0]),
-            ] {
-                *edge_counts.entry((a.min(b), a.max(b))).or_default() += 1;
-            }
-        }
-        for ((a, b), count) in edge_counts {
-            if count != 2 {
+    if settings.preserve_mesh_boundaries {
+        let group_edge_counts = edge_counts(mesh, face_indices);
+        for ((a, b), group_count) in group_edge_counts {
+            // Preserve both the component silhouette and internal material
+            // seams. Positional simplification error cannot protect an open,
+            // planar outline: collapsing its edge inward still lies on the
+            // same plane and can report almost zero error while deleting a
+            // road, floor, or terrain footprint.
+            let is_group_boundary = group_count != 2;
+            let is_material_seam = component_edge_counts.get(&(a, b)).copied() != Some(group_count);
+            if is_group_boundary || is_material_seam {
                 vertex_locks[a as usize] = true;
                 vertex_locks[b as usize] = true;
             }
         }
     }
     let mut result_error = 0.0f32;
-    let simplified = if settings.lock_mesh_boundaries {
+    let simplified = if settings.preserve_mesh_boundaries {
         simplify_with_locks(
             &indices,
             &adapter,
@@ -1304,16 +1346,6 @@ pub(crate) fn generate_collision(
             )
         })
         .collect::<BTreeSet<_>>();
-    let total_faces = components
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !discarded_backed_flat_components.contains(index))
-        .map(|(_, component)| component.faces.len())
-        .sum::<usize>();
-    // Simplify before checking the format limits. This is important for DFFs
-    // whose render mesh is too large but whose collision result is not.
-    let limit_ratio = (u16::MAX as f32 / total_faces as f32).min(1.0);
-    let effective_ratio = settings.target_face_ratio.min(limit_ratio * 0.98);
     let mut output = CollisionMesh {
         name: name.to_string(),
         spheres: Vec::new(),
@@ -1372,6 +1404,7 @@ pub(crate) fn generate_collision(
         }
 
         let mut by_material = BTreeMap::<u16, Vec<usize>>::new();
+        let component_edge_counts = edge_counts(&sanitized, &component.faces);
         for &face_index in &component.faces {
             by_material
                 .entry(sanitized.faces[face_index].source_material)
@@ -1380,7 +1413,7 @@ pub(crate) fn generate_collision(
         }
         for (source_material, face_indices) in by_material {
             let indices =
-                simplify_face_group(&sanitized, &face_indices, settings, effective_ratio)?;
+                simplify_face_group(&sanitized, &face_indices, &component_edge_counts, settings)?;
             for triangle in indices.chunks_exact(3) {
                 let [a, b, c] = [
                     sanitized.vertices[triangle[0] as usize],
@@ -1464,6 +1497,51 @@ pub(crate) fn generate_collision(
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "local Mafia map audit fixture"]
+    fn sity6453_008_open_bottom_building_audit() {
+        let path = Path::new(
+            "/home/codyl/MTA_Server/mods/deathmatch/resources/[Maps]/Mafia2/mafia2/zones/City_Builds/dff/Sity6453_008.dff",
+        );
+        let raw = parse_dff_mesh(&fs::read(path).expect("real Mafia DFF"));
+        let settings = CollisionGenerationSettings::for_preset(
+            CollisionGenerationPreset::Auto,
+            0,
+            vec![None; raw.material_textures.len()],
+        );
+        let result = generate_collision(&raw, "Sity6453_008", &settings).unwrap();
+        let contains_box = |min: V3, max: V3| {
+            result.mesh.boxes.iter().any(|candidate| {
+                v3_length(v3_sub(candidate.min, min)) < 0.02
+                    && v3_length(v3_sub(candidate.max, max)) < 0.02
+            })
+        };
+
+        assert!(contains_box(
+            V3 {
+                x: 87.88281,
+                y: 218.35156,
+                z: -14.359375,
+            },
+            V3 {
+                x: 117.89844,
+                y: 233.35156,
+                z: 2.8203125,
+            },
+        ));
+        assert!(contains_box(
+            V3 {
+                x: 87.88281,
+                y: 193.44531,
+                z: -14.359375,
+            },
+            V3 {
+                x: 117.89844,
+                y: 208.44531,
+                z: 2.8203125,
+            },
+        ));
+    }
     fn raw_mesh(vertices: Vec<V3>, triangles: Vec<Tri>) -> RawMesh {
         RawMesh {
             vertices,
@@ -1472,6 +1550,58 @@ mod tests {
             materials: vec![RawMaterial::default()],
             ..RawMesh::default()
         }
+    }
+
+    #[test]
+    fn exact_positive_col_boundary_is_clamped_without_rejecting_the_mesh() {
+        let raw = raw_mesh(
+            vec![
+                V3 {
+                    x: 0.0,
+                    y: 256.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 1.0,
+                    y: 255.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 255.0,
+                    z: 1.0,
+                },
+            ],
+            vec![Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 0,
+            }],
+        );
+
+        let result = generate_collision(&raw, "positive_boundary", &Default::default()).unwrap();
+
+        assert_eq!(result.mesh.faces.len(), 1);
+        assert!(
+            result
+                .mesh
+                .vertices
+                .iter()
+                .any(|vertex| vertex.y == i16::MAX as f32 / COL_VERTEX_SCALE)
+        );
+        assert_eq!(result.mesh.bounds.max.y, 256.0);
+        assert!(matches!(
+            quantize_vertex(
+                V3 {
+                    x: 256.0 + COL_VERTEX_STEP,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                0
+            ),
+            Err(CollisionGenerationError::VertexOutsideColRange { .. })
+        ));
     }
 
     fn push_quad(
@@ -1665,6 +1795,22 @@ mod tests {
     }
 
     #[test]
+    fn building_shell_without_underside_becomes_native_box() {
+        let mut raw = cube_mesh(false);
+        raw.triangles.retain(|triangle| {
+            [triangle.a, triangle.b, triangle.c]
+                .into_iter()
+                .any(|index| raw.vertices[index as usize].z > -1.0)
+        });
+        let result = generate_collision(&raw, "open_bottom_building", &Default::default()).unwrap();
+
+        assert_eq!(result.mesh.boxes.len(), 1);
+        assert!(result.mesh.faces.is_empty());
+        assert_eq!(result.mesh.boxes[0].min.z, -1.0);
+        assert_eq!(result.mesh.boxes[0].max.z, 1.0);
+    }
+
+    #[test]
     fn empty_collision_generation_emits_no_lod_geometry() {
         let raw = cube_mesh(true);
         let settings = CollisionGenerationSettings::for_preset(
@@ -1854,16 +2000,38 @@ mod tests {
         );
         assert_eq!(result.face_provenance.len(), result.mesh.faces.len());
 
-        // Every vertex on the open perimeter is locked. This is the same
-        // protection used for doorway, tunnel, and terrain boundaries.
+        // Every source perimeter point remains locked. On a planar surface the
+        // simplifier's positional error alone cannot detect an outline that
+        // shrinks inward, so preserving the complete boundary is required for
+        // a safe collision footprint.
+        let mut edge_counts = BTreeMap::<(u16, u16), usize>::new();
+        for face in &result.mesh.faces {
+            for (a, b) in [(face.a, face.b), (face.b, face.c), (face.c, face.a)] {
+                *edge_counts.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let output_boundary_vertices = edge_counts
+            .into_iter()
+            .filter(|(_, count)| *count == 1)
+            .flat_map(|((a, b), _)| [a, b])
+            .collect::<BTreeSet<_>>();
         for y in 0..SIDE {
             for x in 0..SIDE {
                 if x != 0 && x != SIDE - 1 && y != 0 && y != SIDE - 1 {
                     continue;
                 }
-                let index = y * SIDE + x;
-                let expected = quantize_vertex(raw.vertices[index], index).unwrap().0;
-                assert!(result.mesh.vertices.contains(&expected));
+                let source_index = y * SIDE + x;
+                let expected = quantize_vertex(raw.vertices[source_index], source_index)
+                    .unwrap()
+                    .0;
+                let output_index = result
+                    .mesh
+                    .vertices
+                    .iter()
+                    .position(|vertex| *vertex == expected)
+                    .expect("source perimeter vertex must survive simplification")
+                    as u16;
+                assert!(output_boundary_vertices.contains(&output_index));
             }
         }
     }
@@ -1923,6 +2091,67 @@ mod tests {
             .map(|(face, provenance)| (face.material, provenance.source_material_slot))
             .collect();
         assert_eq!(resolved, vec![(4, 0), (9, 1)]);
+    }
+
+    #[test]
+    fn dense_material_seam_stays_watertight_while_surfaces_simplify() {
+        const SIDE: usize = 17;
+        const SPLIT_X: usize = 8;
+        let vertices = (0..SIDE)
+            .flat_map(|y| {
+                (0..SIDE).map(move |x| V3 {
+                    x: x as f32 * 0.25,
+                    y: y as f32 * 0.25,
+                    z: 0.0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut triangles = Vec::new();
+        for y in 0..SIDE - 1 {
+            for x in 0..SIDE - 1 {
+                let a = (y * SIDE + x) as u32;
+                let b = a + 1;
+                let d = ((y + 1) * SIDE + x) as u32;
+                let c = d + 1;
+                let material = usize::from(x >= SPLIT_X) as u16;
+                triangles.push(Tri { a, b, c, material });
+                triangles.push(Tri {
+                    a,
+                    b: c,
+                    c: d,
+                    material,
+                });
+            }
+        }
+        let source_faces = triangles.len();
+        let mut raw = raw_mesh(vertices, triangles);
+        raw.material_textures.push("other".to_string());
+        raw.materials.push(RawMaterial::default());
+        let settings = CollisionGenerationSettings::for_preset(
+            CollisionGenerationPreset::Surface,
+            0,
+            vec![Some(4), Some(9)],
+        );
+
+        let result = generate_collision(&raw, "material_seam", &settings).unwrap();
+
+        assert!(result.mesh.faces.len() < source_faces / 2);
+        for y in 0..SIDE {
+            let source_index = y * SIDE + SPLIT_X;
+            let seam_vertex = quantize_vertex(raw.vertices[source_index], source_index)
+                .unwrap()
+                .0;
+            assert!(result.mesh.vertices.contains(&seam_vertex));
+        }
+        assert_eq!(
+            result
+                .mesh
+                .faces
+                .iter()
+                .map(|face| face.material)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([4, 9])
+        );
     }
 
     #[test]

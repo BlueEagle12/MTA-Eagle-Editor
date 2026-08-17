@@ -263,6 +263,57 @@ pub(crate) fn draw_outline_wire(mesh: &RenderMesh, color: [f32; 4], width: f32, 
     }
 }
 
+fn bounds_outline_corners(bounds: Bounds, padding: f32) -> [Vec3; 8] {
+    let padding = Vec3::splat(padding.max(0.0));
+    let min = bounds.min - padding;
+    let max = bounds.max + padding;
+    [
+        vec3(min.x, min.y, min.z),
+        vec3(max.x, min.y, min.z),
+        vec3(max.x, max.y, min.z),
+        vec3(min.x, max.y, min.z),
+        vec3(min.x, min.y, max.z),
+        vec3(max.x, min.y, max.z),
+        vec3(max.x, max.y, max.z),
+        vec3(min.x, max.y, max.z),
+    ]
+}
+
+fn draw_bounds_outline(bounds: Bounds, color: [f32; 4], width: f32, padding: f32) {
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    if color[3] <= 0.001 || width <= 0.001 {
+        return;
+    }
+    let corners = bounds_outline_corners(bounds, padding);
+    unsafe {
+        gl::Enable(gl::DEPTH_TEST);
+        gl::DepthFunc(gl::LEQUAL);
+        gl::DepthMask(gl::FALSE);
+        gl::LineWidth(width);
+        gl::Color4f(color[0], color[1], color[2], color[3]);
+        gl::Begin(gl::LINES);
+        for (a, b) in EDGES {
+            for point in [corners[a], corners[b]] {
+                gl::Vertex3f(point.x, point.y, point.z);
+            }
+        }
+        gl::End();
+    }
+}
+
 pub(crate) fn draw_element_outline(app: &AppState, index: usize, selected: bool) {
     if index >= app.placements.len()
         || app
@@ -309,7 +360,53 @@ pub(crate) fn draw_element_outline(app: &AppState, index: usize, selected: bool)
         gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
         gl::PushMatrix();
         gl::MultMatrixf(model.to_cols_array().as_ptr());
-        draw_outline_wire(mesh, wire, width, offset * 0.08);
+        if app.active_tab == AppTab::Collisions {
+            // Collision geometry already supplies the detailed surface. A
+            // second CPU walk over every visual-mesh triangle just to outline
+            // the selection is disproportionately expensive on large maps.
+            draw_bounds_outline(mesh.bounds, wire, width, offset * 0.08);
+        } else {
+            draw_outline_wire(mesh, wire, width, offset * 0.08);
+        }
+        gl::PopMatrix();
+        gl::PopAttrib();
+    }
+}
+
+fn draw_lod_batch_preview_outline(app: &AppState, index: usize) {
+    if index >= app.placements.len()
+        || app
+            .element_states
+            .get(index)
+            .is_some_and(|state| state.deleted || state.hidden)
+    {
+        return;
+    }
+    let placement = &app.placements[index];
+    let Some(mesh) = element_mesh(app, placement) else {
+        return;
+    };
+    let model = placement_matrix(placement);
+    let offset = outline_offset_for_mesh(mesh);
+    unsafe {
+        gl::PushAttrib(
+            gl::ENABLE_BIT
+                | gl::POLYGON_BIT
+                | gl::LINE_BIT
+                | gl::CURRENT_BIT
+                | gl::DEPTH_BUFFER_BIT,
+        );
+        gl::Disable(gl::TEXTURE_2D);
+        gl::Disable(gl::LIGHTING);
+        gl::Disable(gl::ALPHA_TEST);
+        gl::Disable(gl::CULL_FACE);
+        gl::Enable(gl::BLEND);
+        gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+        gl::PushMatrix();
+        gl::MultMatrixf(model.to_cols_array().as_ptr());
+        // Scene-wide previews can cover thousands of dense models. Bounds
+        // mark every candidate clearly without walking every source triangle.
+        draw_bounds_outline(mesh.bounds, [0.20, 0.62, 1.0, 0.86], 1.5, offset * 0.08);
         gl::PopMatrix();
         gl::PopAttrib();
     }
@@ -317,6 +414,16 @@ pub(crate) fn draw_element_outline(app: &AppState, index: usize, selected: bool)
 
 pub(crate) fn draw_editor_outlines(app: &AppState) {
     draw_preview_selected_material(app);
+    if let Some(dialog) = app.lod_batch_dialog.as_ref()
+        && dialog.mode != LodBatchMode::GenerateSelection
+        && let Some(minimum_size) = lod_batch_minimum_size(dialog)
+    {
+        for candidate in &dialog.candidates {
+            if lod_batch_candidate_included(candidate, minimum_size, dialog.mode) {
+                draw_lod_batch_preview_outline(app, candidate.placement_index);
+            }
+        }
+    }
     if let Some(hovered) = app.hovered {
         if !app.selected_elements.contains(&hovered) {
             draw_element_outline(app, hovered, false);
@@ -328,6 +435,70 @@ pub(crate) fn draw_editor_outlines(app: &AppState) {
     draw_center_of_mass_marker(app);
     draw_scene_lights(app);
     draw_transform_gizmo(app);
+    draw_asset_browser_drag_preview(app);
+}
+
+pub(crate) fn draw_asset_browser_drag_preview(app: &AppState) {
+    let Some(drag) = app.asset_browser.drag.as_ref() else {
+        return;
+    };
+    let Some(position) = drag.position else {
+        return;
+    };
+    let Some(definition) = app.definitions.get(&drag.entry_id) else {
+        return;
+    };
+    let dff = definition
+        .attrs
+        .get("dff")
+        .cloned()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| drag.entry_id.clone());
+    let mut placement = Placement {
+        id: drag.entry_id.clone(),
+        dff,
+        zone: definition.zone.clone(),
+        tag: "object".to_string(),
+        attrs: BTreeMap::new(),
+        pos: position,
+        rot: V3::default(),
+    };
+    placement
+        .attrs
+        .insert("alpha".to_string(), "112".to_string());
+    let Some(mesh) = app
+        .meshes
+        .get(&placement_mesh_key(&placement, &app.definitions))
+    else {
+        return;
+    };
+    let ambient_lift = scene_ambient_lift_from_timecyc(&app.timecyc);
+    let double_sided = placement_disable_backface_culling(&placement, &app.definitions);
+    draw_placement_render_mesh(&placement, mesh, double_sided, ambient_lift);
+    unsafe {
+        gl::PushAttrib(
+            gl::ENABLE_BIT
+                | gl::POLYGON_BIT
+                | gl::LINE_BIT
+                | gl::CURRENT_BIT
+                | gl::DEPTH_BUFFER_BIT,
+        );
+        gl::Disable(gl::TEXTURE_2D);
+        gl::Disable(gl::LIGHTING);
+        gl::Disable(gl::ALPHA_TEST);
+        gl::Enable(gl::BLEND);
+        gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+        gl::PushMatrix();
+        gl::MultMatrixf(placement_matrix(&placement).to_cols_array().as_ptr());
+        draw_outline_wire(
+            mesh,
+            [0.30, 0.84, 1.0, 0.92],
+            1.8,
+            outline_offset_for_mesh(mesh) * 0.08,
+        );
+        gl::PopMatrix();
+        gl::PopAttrib();
+    }
 }
 
 fn parse_center_of_mass_component(attrs: &BTreeMap<String, String>, key: &str) -> Option<f32> {
@@ -427,6 +598,11 @@ fn draw_center_of_mass_marker(app: &AppState) {
 }
 
 pub(crate) fn draw_scene_lights(app: &AppState) {
+    // Expanding definition-backed lights walks the whole scene. These handles
+    // are only interactive and useful in the dedicated Lights workspace.
+    if app.active_tab != AppTab::Lights {
+        return;
+    }
     unsafe {
         gl::PushAttrib(
             gl::ENABLE_BIT | gl::LINE_BIT | gl::POINT_BIT | gl::CURRENT_BIT | gl::DEPTH_BUFFER_BIT,
@@ -440,7 +616,7 @@ pub(crate) fn draw_scene_lights(app: &AppState) {
         for (idx, _, light) in expanded_scene_lights(app) {
             let pos = vec3(light.position.x, light.position.y, light.position.z);
             let light_color = light_effective_color(&light);
-            let selected = app.active_tab == AppTab::Lights && idx == app.selected_light;
+            let selected = idx == app.selected_light;
             gl::PointSize(if selected { 14.0 } else { 8.0 });
             gl::Color4f(
                 light_color.x,
@@ -624,6 +800,44 @@ fn draw_gizmo_center_ring(origin: Vec3, camera_pos: Vec3, length: f32, scale: f3
     }
 }
 
+fn draw_scale_plane(app: &AppState, origin: Vec3, length: f32, plane: GizmoPlane) {
+    let (first, second) = gizmo_plane_axes(plane);
+    let a = selected_axis_vector(app, first);
+    let b = selected_axis_vector(app, second);
+    let low = length * 0.18;
+    let high = length * 0.38;
+    let hovered = app.hovered_gizmo_plane == Some(plane);
+    let first_color = axis_color(first);
+    let second_color = axis_color(second);
+    let color = [
+        (first_color[0] + second_color[0]) * 0.5,
+        (first_color[1] + second_color[1]) * 0.5,
+        (first_color[2] + second_color[2]) * 0.5,
+        if hovered { 0.72 } else { 0.38 },
+    ];
+    let points = [
+        origin + a * low + b * low,
+        origin + a * high + b * low,
+        origin + a * high + b * high,
+        origin + a * low + b * high,
+    ];
+    unsafe {
+        gl::Color4f(color[0], color[1], color[2], color[3]);
+        gl::Begin(gl::QUADS);
+        for point in points {
+            gl::Vertex3f(point.x, point.y, point.z);
+        }
+        gl::End();
+        gl::LineWidth(if hovered { 3.0 } else { 1.5 });
+        gl::Color4f(color[0], color[1], color[2], 0.95);
+        gl::Begin(gl::LINE_LOOP);
+        for point in points {
+            gl::Vertex3f(point.x, point.y, point.z);
+        }
+        gl::End();
+    }
+}
+
 pub(crate) fn draw_transform_gizmo(app: &AppState) {
     if app.transform_mode == TransformMode::Select {
         return;
@@ -645,7 +859,7 @@ pub(crate) fn draw_transform_gizmo(app: &AppState) {
         draw_gizmo_center_ring(origin, app.camera.pos, length, gizmo_scale(app));
         match app.transform_mode {
             TransformMode::Select => {}
-            TransformMode::Move => {
+            TransformMode::Move | TransformMode::Scale => {
                 for axis in [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
                     draw_axis_line(
                         origin,
@@ -654,6 +868,11 @@ pub(crate) fn draw_transform_gizmo(app: &AppState) {
                         axis_color(axis),
                         app.hovered_gizmo == Some(axis),
                     );
+                }
+                if app.transform_mode == TransformMode::Scale {
+                    for plane in [GizmoPlane::XY, GizmoPlane::XZ, GizmoPlane::YZ] {
+                        draw_scale_plane(app, origin, length, plane);
+                    }
                 }
             }
             TransformMode::Rotate => {
@@ -682,3 +901,37 @@ pub(crate) fn draw_transform_gizmo(app: &AppState) {
 // also renders as garbage here. Instead we give every glyph its OWN small
 // texture and draw it with `draw_texture_ex` and NO source rect -- byte for
 // byte the same code path as the toolbar icons, which render correctly.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounds_outline_corners_expand_all_axes() {
+        let corners = bounds_outline_corners(
+            Bounds {
+                min: vec3(-1.0, -2.0, -3.0),
+                max: vec3(4.0, 5.0, 6.0),
+            },
+            0.5,
+        );
+
+        assert_eq!(corners[0], vec3(-1.5, -2.5, -3.5));
+        assert_eq!(corners[2], vec3(4.5, 5.5, -3.5));
+        assert_eq!(corners[5], vec3(4.5, -2.5, 6.5));
+        assert_eq!(corners[7], vec3(-1.5, 5.5, 6.5));
+    }
+
+    #[test]
+    fn bounds_outline_corners_clamp_negative_padding() {
+        let bounds = Bounds {
+            min: vec3(-1.0, -2.0, -3.0),
+            max: vec3(4.0, 5.0, 6.0),
+        };
+
+        assert_eq!(
+            bounds_outline_corners(bounds, -10.0),
+            bounds_outline_corners(bounds, 0.0)
+        );
+    }
+}

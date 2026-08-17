@@ -481,6 +481,7 @@ fn apply_runtime_name_repairs_to_app(
         app.meshes.insert(format!("{new_dff}|{new_txd}"), mesh);
     }
 
+    clear_collision_render_cache(app);
     let old_collisions = std::mem::take(&mut app.collisions);
     for (key, collision) in old_collisions {
         let new_key = renamed_definition_asset(&key, repairs).unwrap_or(key);
@@ -939,6 +940,109 @@ pub(crate) fn request_img_archive_rebalance(app: &mut AppState) {
     });
 }
 
+fn saved_project_img_duplicates(root: &Path) -> Result<Vec<String>, String> {
+    let mut paths = Vec::new();
+    collect_img_files_from_dir(&root.join("imgs"), &mut paths);
+    paths.retain(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| !name.eq_ignore_ascii_case(REPLACEMENT_IMG))
+    });
+    paths.sort();
+    let mut first = HashMap::<String, (String, PathBuf)>::new();
+    let mut duplicates = Vec::new();
+    for path in paths {
+        let entries = parse_img(&path);
+        let valid_ver2 = fs::read(&path)
+            .map(|bytes| bytes.starts_with(b"VER2"))
+            .unwrap_or(false);
+        if !valid_ver2 {
+            return Err(format!(
+                "{} is not a supported VER2 IMG archive",
+                path.display()
+            ));
+        }
+        for entry in entries {
+            let key = lower(&entry.name);
+            if let Some((first_name, first_path)) = first.get(&key) {
+                duplicates.push(format!(
+                    "{} in {} duplicates {} in {}",
+                    entry.name,
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("IMG"),
+                    first_name,
+                    first_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("IMG"),
+                ));
+            } else {
+                first.insert(key, (entry.name, path.clone()));
+            }
+        }
+    }
+    Ok(duplicates)
+}
+
+pub(crate) fn request_img_duplicate_fix(app: &mut AppState) {
+    if app.img_archive_rebalance_job.is_some() {
+        app.status_message = "IMG archive repair is already running.".to_string();
+        return;
+    }
+    if let Some(conflict) = validation_operation_conflict(app) {
+        app.status_message =
+            format!("Wait for the background {conflict} to finish before fixing duplicates.");
+        return;
+    }
+    if editing_dirty(app) {
+        app.status_message =
+            "Save or discard the current Editing changes before fixing duplicate IMG entries."
+                .to_string();
+        return;
+    }
+    if has_unsaved_changes(app) {
+        app.status_message =
+            "Save project changes before fixing duplicate IMG entries.".to_string();
+        return;
+    }
+    let duplicates = match saved_project_img_duplicates(&app.root) {
+        Ok(duplicates) => duplicates,
+        Err(error) => {
+            app.status_message = format!("Could not scan IMG duplicates: {error}");
+            return;
+        }
+    };
+    if duplicates.is_empty() {
+        app.status_message = "No duplicate IMG entry names were found.".to_string();
+        return;
+    }
+    let mut listed = duplicates.iter().take(8).cloned().collect::<Vec<_>>();
+    if duplicates.len() > listed.len() {
+        listed.push(format!("and {} more", duplicates.len() - listed.len()));
+    }
+    app.confirm_dialog = Some(ConfirmDialog {
+        action: ConfirmAction::RebalanceImgArchives,
+        title: "Fix Duplicate IMG Entries".to_string(),
+        body: format!(
+            "Found {} duplicate IMG entr{}. Fix them now?",
+            duplicates.len(),
+            if duplicates.len() == 1 { "y" } else { "ies" },
+        ),
+        detail: format!(
+            "The verified repair keeps the newest copy across archives and the first copy when a name repeats inside one archive. It creates a recovery backup, repairs incompatible IMG names, and reorganizes entries into type-specific archives.\n{}",
+            listed.join("; ")
+        ),
+        primary_label: "Fix Duplicates".to_string(),
+        secondary_label: None,
+        secondary_action: None,
+    });
+    app.status_message = format!(
+        "Found {} duplicate IMG entries; confirmation required.",
+        duplicates.len()
+    );
+}
+
 pub(crate) fn start_img_archive_rebalance(app: &mut AppState) {
     if app.img_archive_rebalance_job.is_some() {
         return;
@@ -1066,6 +1170,34 @@ mod tests {
             name: name.to_string(),
             bytes: vec![1; sectors * IMG_ARCHIVE_SECTOR_BYTES as usize],
         }
+    }
+
+    #[test]
+    fn duplicate_scan_finds_repeated_names_within_and_across_archives() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("eagle_img_duplicate_scan_{nonce}"));
+        let imgs = root.join("imgs");
+        fs::create_dir_all(&imgs).unwrap();
+        write_img_archive(
+            &imgs.join("a.img"),
+            &[
+                ("shared.dff".to_string(), vec![1]),
+                ("inside.dff".to_string(), vec![2]),
+                ("INSIDE.DFF".to_string(), vec![3]),
+            ],
+        )
+        .unwrap();
+        write_img_archive(&imgs.join("b.img"), &[("SHARED.DFF".to_string(), vec![4])]).unwrap();
+
+        let duplicates = saved_project_img_duplicates(&root).unwrap();
+
+        assert_eq!(duplicates.len(), 2);
+        assert!(duplicates.iter().any(|item| item.contains("INSIDE.DFF")));
+        assert!(duplicates.iter().any(|item| item.contains("SHARED.DFF")));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

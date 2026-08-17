@@ -266,6 +266,7 @@ fn set_editing_selection_mode(app: &mut AppState, mode: EditingSelectMode) -> bo
                     set_input_dff_face_selection(dff, selected);
                 }
             }
+            sync_active_open_dff_model(dff);
         }
         Some(EditingAsset::Col(col)) => {
             let mode_was_active = col.select_mode == mode;
@@ -496,7 +497,8 @@ fn editing_mesh_shortcuts_blocked_by_text_input(app: &AppState) -> bool {
     matches!(
         app.editing.asset.as_ref(),
         Some(EditingAsset::Dff(dff))
-            if dff.texture_picker_open
+            if dff.uv_editor.open
+                || dff.texture_picker_open
                 || dff.collision_material_picker_open
                 || dff.uv_anim_picker_open
                 || dff.dff_2dfx_type_picker_open
@@ -519,6 +521,18 @@ fn handle_editing_mesh_selection_shortcuts(
         || editing_mesh_shortcuts_blocked_by_text_input(app)
     {
         return false;
+    }
+    if alt_down && !ctrl_down && !shift_down && is_key_pressed(KeyCode::D) {
+        if app.editing.linked_selection_job.is_some() {
+            app.status_message =
+                "Wait for linked-island selection to finish before duplicating".to_string();
+            return true;
+        }
+        let before = editing_history_snapshot(app);
+        if editing_duplicate_selected_mesh(app) {
+            commit_editing_history(app, "Duplicate Mesh Selection", before);
+        }
+        return true;
     }
     let mode = if !ctrl_down && !shift_down && !alt_down && is_key_pressed(KeyCode::Key1) {
         Some(EditingSelectMode::Vertex)
@@ -914,6 +928,33 @@ pub(crate) fn inspector_field_rect(app: &AppState, field: InspectorField) -> Rec
             150.0,
             30.0,
         ),
+        InspectorField::CullPosX => {
+            Rect::new(x, TOP_H + 510.0 - app.properties_scroll, 150.0, 30.0)
+        }
+        InspectorField::CullPosY => Rect::new(
+            x + 168.0,
+            TOP_H + 510.0 - app.properties_scroll,
+            150.0,
+            30.0,
+        ),
+        InspectorField::CullPosZ => {
+            Rect::new(x, TOP_H + 576.0 - app.properties_scroll, 150.0, 30.0)
+        }
+        InspectorField::CullSizeX => Rect::new(
+            x + 168.0,
+            TOP_H + 576.0 - app.properties_scroll,
+            150.0,
+            30.0,
+        ),
+        InspectorField::CullSizeY => {
+            Rect::new(x, TOP_H + 642.0 - app.properties_scroll, 150.0, 30.0)
+        }
+        InspectorField::CullSizeZ => Rect::new(
+            x + 168.0,
+            TOP_H + 642.0 - app.properties_scroll,
+            150.0,
+            30.0,
+        ),
     }
 }
 
@@ -1105,6 +1146,16 @@ pub(crate) fn inspector_fields(app: &AppState) -> Vec<InspectorField> {
             InspectorField::WaterType,
         ];
     }
+    if app.active_tab == AppTab::Cull {
+        return vec![
+            InspectorField::CullPosX,
+            InspectorField::CullPosY,
+            InspectorField::CullPosZ,
+            InspectorField::CullSizeX,
+            InspectorField::CullSizeY,
+            InspectorField::CullSizeZ,
+        ];
+    }
     if app.properties_tab == PropertiesTab::Settings {
         return vec![
             InspectorField::SnapMove,
@@ -1167,7 +1218,7 @@ pub(crate) fn clicked_inspector_field(app: &AppState, mouse: Vec2) -> Option<Ins
     }
     if matches!(
         app.active_tab,
-        AppTab::Collisions | AppTab::Lights | AppTab::Bake | AppTab::Water
+        AppTab::Collisions | AppTab::Lights | AppTab::Bake | AppTab::Water | AppTab::Cull
     ) && !inspector_panel_content_rect().contains(mouse)
     {
         return None;
@@ -1225,6 +1276,17 @@ pub(crate) fn inspector_field_value(app: &AppState, field: InspectorField) -> St
             return format!("{:.3}", app.global_transform.rotation.z);
         }
         _ => {}
+    }
+    if let Some(zone) = selected_cull_zone(app) {
+        match field {
+            InspectorField::CullPosX => return format!("{:.3}", zone.center.x),
+            InspectorField::CullPosY => return format!("{:.3}", zone.center.y),
+            InspectorField::CullPosZ => return format!("{:.3}", zone.center.z),
+            InspectorField::CullSizeX => return format!("{:.3}", zone.size.x),
+            InspectorField::CullSizeY => return format!("{:.3}", zone.size.y),
+            InspectorField::CullSizeZ => return format!("{:.3}", zone.size.z),
+            _ => {}
+        }
     }
     if matches!(
         field,
@@ -1557,6 +1619,7 @@ pub(crate) fn inspector_field_value(app: &AppState, field: InspectorField) -> St
 fn inspector_history_snapshot(app: &AppState) -> ScopedHistorySnapshot {
     match app.active_tab {
         AppTab::Water => ScopedHistorySnapshot::Water(water_history_snapshot(app)),
+        AppTab::Cull => ScopedHistorySnapshot::Cull(cull_history_snapshot(app)),
         AppTab::Lights => ScopedHistorySnapshot::Lights(light_history_snapshot(app)),
         AppTab::Race => ScopedHistorySnapshot::Race(race_history_snapshot(app)),
         AppTab::Collisions => ScopedHistorySnapshot::Collision(collision_history_snapshot(app)),
@@ -1726,6 +1789,278 @@ fn handle_col_material_dropdown_click(app: &mut AppState, mouse: Vec2) -> bool {
     false
 }
 
+pub(crate) fn assign_selected_definition_txd(app: &mut AppState, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let before = world_history_snapshot(app);
+    let ids = ensure_selected_definition_overrides(app);
+    if ids.is_empty() {
+        app.status_message = "Select an element before choosing a TXD".to_string();
+        return false;
+    }
+    let mut changed = 0usize;
+    for id in ids {
+        let Some(definition) = app.definitions.get_mut(&id) else {
+            continue;
+        };
+        let old = definition.attrs.get("txd").map(String::as_str);
+        if !old.is_some_and(|old| old.eq_ignore_ascii_case(value)) {
+            definition
+                .attrs
+                .insert("txd".to_string(), value.to_string());
+            mark_definition_override_attr(definition, "txd");
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        commit_world_history(app, "Assign TXD", before);
+        invalidate_validation_cache(app);
+        app.status_message = format!("Assigned TXD {value} to {changed} definition(s)");
+    }
+    true
+}
+
+fn close_txd_dropdown(app: &mut AppState) {
+    app.txd_dropdown_open = false;
+    app.txd_dropdown_search.clear();
+    app.txd_dropdown_scroll = 0.0;
+    app.txd_dropdown_create_mode = false;
+}
+
+fn close_native_model_dropdown(app: &mut AppState) {
+    app.native_model_dropdown_open = false;
+    app.native_model_dropdown_search.clear();
+    app.native_model_dropdown_scroll = 0.0;
+}
+
+fn apply_native_model_dropdown_value(app: &mut AppState, value: String) {
+    let before = ScopedHistorySnapshot::World(world_history_snapshot(app));
+    app.inspector_edit = Some(InspectorEdit {
+        field: InspectorField::DefinitionNativeModel,
+        cursor: value.len(),
+        buffer: value,
+        selection_anchor: None,
+        before,
+    });
+    apply_inspector_edit(app);
+}
+
+fn handle_native_model_dropdown_input(app: &mut AppState, mouse: Vec2) -> bool {
+    let active_context = app.active_tab == AppTab::Preview
+        && app.properties_tab == PropertiesTab::Element
+        && selected_placement(app).is_some();
+    if !active_context {
+        close_native_model_dropdown(app);
+        return false;
+    }
+
+    let field = inspector_field_rect(app, InspectorField::DefinitionNativeModel);
+    if !app.native_model_dropdown_open {
+        if is_mouse_button_pressed(MouseButton::Left) && field.contains(mouse) {
+            if app.inspector_edit.is_some() {
+                apply_inspector_edit(app);
+            }
+            close_txd_dropdown(app);
+            app.native_model_dropdown_open = true;
+            app.native_model_dropdown_search.clear();
+            app.native_model_dropdown_scroll = 0.0;
+            drain_text_input();
+            return true;
+        }
+        return false;
+    }
+
+    if is_key_pressed(KeyCode::Escape) {
+        close_native_model_dropdown(app);
+        return true;
+    }
+    if is_key_pressed(KeyCode::Backspace) {
+        app.native_model_dropdown_search.pop();
+        app.native_model_dropdown_scroll = 0.0;
+    }
+    while let Some(ch) = get_char_pressed() {
+        if !ch.is_control() && app.native_model_dropdown_search.len() < 64 {
+            app.native_model_dropdown_search.push(ch);
+            app.native_model_dropdown_scroll = 0.0;
+        }
+    }
+
+    let specs = filtered_native_model_specs(app);
+    let visible = specs.len().min(NATIVE_MODEL_DROPDOWN_VISIBLE);
+    let max_start = specs.len().saturating_sub(visible);
+    if is_key_pressed(KeyCode::Down) {
+        app.native_model_dropdown_scroll =
+            (app.native_model_dropdown_scroll + 1.0).min(max_start as f32);
+    }
+    if is_key_pressed(KeyCode::Up) {
+        app.native_model_dropdown_scroll = (app.native_model_dropdown_scroll - 1.0).max(0.0);
+    }
+    let first = native_model_dropdown_option_rect(app, 0);
+    let custom = native_model_dropdown_custom_rect(app);
+    let popup = Rect::new(
+        first.x - 4.0,
+        first.y - 4.0,
+        first.w + 8.0,
+        custom.y + custom.h - first.y + 8.0,
+    );
+    let wheel = mouse_wheel().1;
+    if wheel.abs() > 0.0 && popup.contains(mouse) {
+        app.native_model_dropdown_scroll =
+            (app.native_model_dropdown_scroll - wheel * 2.0).clamp(0.0, max_start as f32);
+        return true;
+    }
+
+    if is_key_pressed(KeyCode::Enter) {
+        let value = specs
+            .get(app.native_model_dropdown_scroll.floor().max(0.0) as usize)
+            .map(|spec| spec.model_id.to_string())
+            .unwrap_or_else(|| app.native_model_dropdown_search.trim().to_string());
+        apply_native_model_dropdown_value(app, value);
+        close_native_model_dropdown(app);
+        return true;
+    }
+
+    if !is_mouse_button_pressed(MouseButton::Left) {
+        return true;
+    }
+    let start = (app.native_model_dropdown_scroll.floor().max(0.0) as usize).min(max_start);
+    for row in 0..visible {
+        if native_model_dropdown_option_rect(app, row).contains(mouse) {
+            if let Some(spec) = specs.get(start + row) {
+                apply_native_model_dropdown_value(app, spec.model_id.to_string());
+            }
+            close_native_model_dropdown(app);
+            return true;
+        }
+    }
+    if custom.contains(mouse) {
+        let value = app.native_model_dropdown_search.trim().to_string();
+        apply_native_model_dropdown_value(app, value);
+        close_native_model_dropdown(app);
+        return true;
+    }
+    if field.contains(mouse) {
+        return true;
+    }
+    close_native_model_dropdown(app);
+    true
+}
+
+fn handle_txd_dropdown_input(app: &mut AppState, mouse: Vec2) -> bool {
+    let active_context = app.active_tab == AppTab::Preview
+        && app.properties_tab == PropertiesTab::Element
+        && selected_placement(app).is_some();
+    if !active_context {
+        close_txd_dropdown(app);
+        return false;
+    }
+
+    let field = inspector_field_rect(app, InspectorField::DefinitionTxd);
+    if !app.txd_dropdown_open {
+        if is_mouse_button_pressed(MouseButton::Left) && field.contains(mouse) {
+            if app.inspector_edit.is_some() {
+                apply_inspector_edit(app);
+            }
+            close_native_model_dropdown(app);
+            app.txd_dropdown_open = true;
+            app.txd_dropdown_search.clear();
+            app.txd_dropdown_scroll = 0.0;
+            app.txd_dropdown_create_mode = false;
+            return true;
+        }
+        return false;
+    }
+
+    if is_key_pressed(KeyCode::Escape) {
+        close_txd_dropdown(app);
+        return true;
+    }
+    if is_key_pressed(KeyCode::Backspace) {
+        app.txd_dropdown_search.pop();
+        app.txd_dropdown_scroll = 0.0;
+    }
+    while let Some(ch) = get_char_pressed() {
+        if !ch.is_control() && app.txd_dropdown_search.len() < 64 {
+            app.txd_dropdown_search.push(ch);
+            app.txd_dropdown_scroll = 0.0;
+        }
+    }
+
+    let names = filtered_scene_txd_names(app);
+    let visible = names.len().min(TXD_DROPDOWN_VISIBLE);
+    let max_start = names.len().saturating_sub(visible);
+    if is_key_pressed(KeyCode::Down) {
+        app.txd_dropdown_scroll = (app.txd_dropdown_scroll + 1.0).min(max_start as f32);
+    }
+    if is_key_pressed(KeyCode::Up) {
+        app.txd_dropdown_scroll = (app.txd_dropdown_scroll - 1.0).max(0.0);
+    }
+    let first = txd_dropdown_option_rect(app, 0);
+    let create = txd_dropdown_create_rect(app);
+    let popup = Rect::new(
+        first.x - 4.0,
+        first.y - 4.0,
+        first.w + 8.0,
+        create.y + create.h - first.y + 8.0,
+    );
+    let wheel = mouse_wheel().1;
+    if wheel.abs() > 0.0 && popup.contains(mouse) {
+        app.txd_dropdown_scroll =
+            (app.txd_dropdown_scroll - wheel * 2.0).clamp(0.0, max_start as f32);
+        return true;
+    }
+
+    if is_key_pressed(KeyCode::Enter) {
+        if app.txd_dropdown_create_mode {
+            let name = app.txd_dropdown_search.clone();
+            if create_empty_txd_for_selected(app, &name) {
+                close_txd_dropdown(app);
+            }
+        } else if let Some(name) = names
+            .get(app.txd_dropdown_scroll.floor().max(0.0) as usize)
+            .cloned()
+        {
+            assign_selected_definition_txd(app, &name);
+            close_txd_dropdown(app);
+        }
+        return true;
+    }
+
+    if !is_mouse_button_pressed(MouseButton::Left) {
+        return true;
+    }
+    let start = (app.txd_dropdown_scroll.floor().max(0.0) as usize).min(max_start);
+    for row in 0..visible {
+        if txd_dropdown_option_rect(app, row).contains(mouse) {
+            if let Some(name) = names.get(start + row) {
+                assign_selected_definition_txd(app, name);
+            }
+            close_txd_dropdown(app);
+            return true;
+        }
+    }
+    if create.contains(mouse) {
+        if app.txd_dropdown_create_mode {
+            let name = app.txd_dropdown_search.clone();
+            if create_empty_txd_for_selected(app, &name) {
+                close_txd_dropdown(app);
+            }
+        } else {
+            app.txd_dropdown_create_mode = true;
+            app.txd_dropdown_search.clear();
+            app.txd_dropdown_scroll = 0.0;
+        }
+        return true;
+    }
+    if field.contains(mouse) {
+        return true;
+    }
+    close_txd_dropdown(app);
+    true
+}
+
 pub(crate) fn selected_definition_ids(app: &AppState) -> Vec<String> {
     let mut ids = Vec::new();
     let mut seen = BTreeSet::new();
@@ -1856,24 +2191,81 @@ fn apply_physics_root_attrs(
             .count()
 }
 
-fn set_selected_physics_root(app: &mut AppState, model_id: Option<u16>) {
+fn physics_conversion_indices(app: &AppState) -> Vec<usize> {
+    match app.physics_scope {
+        PhysicsScope::PerObject => selected_live_indices(app)
+            .into_iter()
+            .filter(|index| {
+                app.placements
+                    .get(*index)
+                    .is_some_and(|placement| placement.tag.eq_ignore_ascii_case("building"))
+            })
+            .collect(),
+        PhysicsScope::Global => {
+            let ids: BTreeSet<_> = selected_definition_ids(app).into_iter().collect();
+            app.placements
+                .iter()
+                .enumerate()
+                .filter(|(index, placement)| {
+                    is_live_element(app, *index)
+                        && ids.contains(&placement.id)
+                        && !placement.tag.eq_ignore_ascii_case("object")
+                })
+                .map(|(index, _)| index)
+                .collect()
+        }
+    }
+}
+
+fn convert_physics_elements_to_objects(app: &mut AppState, indices: &[usize]) -> usize {
+    let mut converted = 0usize;
+    for index in indices.iter().copied() {
+        let Some(placement) = app.placements.get_mut(index) else {
+            continue;
+        };
+        if !placement.tag.eq_ignore_ascii_case("object") {
+            placement.tag = "object".to_string();
+            converted += 1;
+        }
+    }
+    if converted > 0 {
+        invalidate_outliner_labels(app);
+        invalidate_validation_cache(app);
+        rebuild_outliner_filter(app);
+        rebuild_render_cells(app);
+    }
+    converted
+}
+
+fn physics_conversion_detail(app: &AppState, count: usize) -> String {
+    match app.physics_scope {
+        PhysicsScope::PerObject => format!(
+            "{count} selected building instance(s) will be permanently retagged as object elements."
+        ),
+        PhysicsScope::Global => format!(
+            "Global physics applies by model: all {count} non-object instance(s) using the selected definition(s) will be retagged as object elements."
+        ),
+    }
+}
+
+fn set_selected_physics_root_with_before(
+    app: &mut AppState,
+    model_id: Option<u16>,
+    before: WorldHistorySnapshot,
+) {
     if app.physics_scope == PhysicsScope::PerObject && model_id.is_some() {
         app.status_message =
             "Physical roots are model-wide in MTA. Switch Physics Scope to Global; per-object mass and center-of-mass overrides remain supported."
                 .to_string();
         return;
     }
-    let before = world_history_snapshot(app);
     let properties = model_id.and_then(|model_id| {
         app.physics_root_properties
             .get(&model_id)
             .cloned()
             .or_else(|| physics_root_spec(model_id).map(|spec| spec.fallback.clone()))
     });
-    let breakable_root = properties
-        .as_ref()
-        .is_some_and(PhysicsRootProperties::is_breakable);
-    let mut changed = match app.physics_scope {
+    let changed = match app.physics_scope {
         PhysicsScope::Global => {
             let ids = ensure_selected_definition_overrides(app);
             if ids.is_empty() {
@@ -1920,20 +2312,8 @@ fn set_selected_physics_root(app: &mut AppState, model_id: Option<u16>) {
             changed
         }
     };
-    if breakable_root && app.physics_scope == PhysicsScope::Global {
-        let definition_ids: BTreeSet<_> = selected_definition_ids(app).into_iter().collect();
-        for placement in &mut app.placements {
-            if definition_ids.contains(&placement.id)
-                && !placement.tag.eq_ignore_ascii_case("object")
-            {
-                placement.tag = "object".to_string();
-                changed += 1;
-            }
-        }
-    }
-    if changed > 0 {
-        commit_world_history(app, "Set Physics Root", before);
-    }
+    let _ = changed;
+    commit_world_history(app, "Set Physics Root", before);
     app.status_message = match model_id {
         Some(model_id) => format!(
             "{} physics root: {}",
@@ -1945,6 +2325,36 @@ fn set_selected_physics_root(app: &mut AppState, model_id: Option<u16>) {
         }
         None => "Global physics root cleared; manual values kept".to_string(),
     };
+}
+
+fn request_set_selected_physics_root(app: &mut AppState, model_id: Option<u16>) {
+    let before = world_history_snapshot(app);
+    if app.physics_scope == PhysicsScope::PerObject && model_id.is_some() {
+        set_selected_physics_root_with_before(app, model_id, before);
+        return;
+    }
+    let conversion_indices = model_id.map_or_else(Vec::new, |_| physics_conversion_indices(app));
+    if let Some(model_id) = model_id
+        && !conversion_indices.is_empty()
+    {
+        app.confirm_dialog = Some(ConfirmDialog {
+            action: ConfirmAction::SetPhysicsRoot {
+                model_id,
+                conversion_indices: conversion_indices.clone(),
+                before,
+            },
+            title: "Convert Elements for Physics?".to_string(),
+            body: "MTA physics requires object elements. Apply physics and convert the affected elements?"
+                .to_string(),
+            detail: physics_conversion_detail(app, conversion_indices.len()),
+            primary_label: "Convert & Apply".to_string(),
+            secondary_label: None,
+            secondary_action: None,
+        });
+        app.status_message = "Confirm element conversion before applying physics".to_string();
+        return;
+    }
+    set_selected_physics_root_with_before(app, model_id, before);
 }
 
 fn handle_physics_root_dropdown_click(app: &mut AppState, mouse: Vec2) -> bool {
@@ -1961,7 +2371,7 @@ fn handle_physics_root_dropdown_click(app: &mut AppState, mouse: Vec2) -> bool {
                 let model_id = row
                     .checked_sub(1)
                     .map(|index| PHYSICS_ROOT_SPECS[index].model_id);
-                set_selected_physics_root(app, model_id);
+                request_set_selected_physics_root(app, model_id);
                 app.physics_root_dropdown_open = false;
                 return true;
             }
@@ -2130,6 +2540,114 @@ fn select_same_id_as_active(app: &mut AppState) {
     commit_world_history(app, "Select Same ID", before);
 }
 
+pub(crate) fn element_replace_target_ids(app: &AppState, query: &str) -> Vec<String> {
+    let needle = query.trim().to_ascii_lowercase();
+    let mut ids = BTreeSet::new();
+    ids.extend(app.definitions.keys().cloned());
+    ids.extend(app.placements.iter().map(|placement| placement.id.clone()));
+    ids.into_iter()
+        .filter(|id| needle.is_empty() || id.to_ascii_lowercase().contains(&needle))
+        .collect()
+}
+
+fn open_element_replace_with_dialog(app: &mut AppState) {
+    let source_indices = selected_live_indices(app);
+    if source_indices.is_empty() {
+        app.status_message = "Select one or more live elements first".to_string();
+        return;
+    }
+    app.element_replace_with_dialog = Some(ElementReplaceWithDialog {
+        source_indices,
+        search: String::new(),
+        cursor: 0,
+        selection_anchor: None,
+        scroll: 0.0,
+        selected_target: None,
+        picking_scene: false,
+    });
+}
+
+fn replace_elements_with_id(app: &mut AppState, target: &str, source_indices: &[usize]) {
+    let Some(target_id) = element_replace_target_ids(app, "")
+        .into_iter()
+        .find(|id| id.eq_ignore_ascii_case(target))
+    else {
+        app.status_message = format!("Model ID {target} was not found");
+        return;
+    };
+    let target_dff = app
+        .placements
+        .iter()
+        .find(|placement| placement.id.eq_ignore_ascii_case(&target_id))
+        .map(|placement| placement.dff.clone())
+        .or_else(|| {
+            app.definitions.get(&target_id).map(|definition| {
+                dff_override_stem(
+                    &definition.id,
+                    definition.attrs.get("dff").map(String::as_str),
+                )
+                .unwrap_or_else(|| definition.id.clone())
+            })
+        })
+        .unwrap_or_else(|| target_id.clone());
+    let before = ScopedHistorySnapshot::World(world_history_snapshot(app));
+    let mut old_ids = BTreeSet::new();
+    let mut changed = 0usize;
+    for index in source_indices.iter().copied() {
+        let Some(placement) = app.placements.get_mut(index) else {
+            continue;
+        };
+        if placement.id.eq_ignore_ascii_case(&target_id) {
+            continue;
+        }
+        old_ids.insert(placement.id.clone());
+        placement.id = target_id.clone();
+        placement.dff = target_dff.clone();
+        sync_placement_attrs(placement);
+        changed += 1;
+    }
+    if changed == 0 {
+        app.status_message = format!("Selected elements already use {target_id}");
+        return;
+    }
+
+    let mut retired_ids = Vec::new();
+    for old_id in old_ids {
+        let still_used = app
+            .placements
+            .iter()
+            .any(|placement| placement.id.eq_ignore_ascii_case(&old_id));
+        if !still_used && !app.readonly_definition_ids.contains(&old_id) {
+            app.definitions.remove(&old_id);
+            retired_ids.push(old_id);
+        }
+    }
+    for placement in &mut app.placements {
+        if placement.attrs.get("lodParent").is_some_and(|parent| {
+            retired_ids
+                .iter()
+                .any(|old_id| parent.eq_ignore_ascii_case(old_id))
+        }) {
+            placement
+                .attrs
+                .insert("lodParent".to_string(), target_id.clone());
+        }
+    }
+    invalidate_outliner_labels(app);
+    invalidate_validation_cache(app);
+    rebuild_outliner_filter(app);
+    rebuild_render_cells(app);
+    commit_scoped_history(app, "Replace Elements With Model", before);
+    app.status_message = if retired_ids.is_empty() {
+        format!("Replaced {changed} element(s) with {target_id}")
+    } else {
+        format!(
+            "Replaced {changed} element(s) with {target_id}; combined {} unused definition(s)",
+            retired_ids.len()
+        )
+    };
+}
+
 pub(crate) fn apply_inspector_edit(app: &mut AppState) {
     let Some(edit) = app.inspector_edit.take() else {
         return;
@@ -2138,7 +2656,7 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
     let mut rebuild = false;
     if selected_definitions_include_readonly(app)
         && definition_field_is_readonly(edit.field)
-        && (!inspector_field_is_physics(edit.field) || app.physics_scope == PhysicsScope::Global)
+        && !inspector_field_is_physics(edit.field)
     {
         prompt_definition_override_edit(app, edit.field, value, edit.before);
         return;
@@ -2321,6 +2839,53 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
                 }
                 fmt_f32(parsed, 6)
             };
+
+            let conversion_indices = if normalized.is_empty() {
+                Vec::new()
+            } else {
+                physics_conversion_indices(app)
+            };
+            if !conversion_indices.is_empty() {
+                let writable_definition_ids = if app.physics_scope == PhysicsScope::Global
+                    && selected_definitions_include_readonly(app)
+                {
+                    selected_definition_ids(app)
+                        .into_iter()
+                        .filter(|id| app.readonly_definition_ids.contains(id))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let detail = physics_conversion_detail(app, conversion_indices.len());
+                app.confirm_dialog = Some(ConfirmDialog {
+                    action: ConfirmAction::ApplyPhysicsEdit {
+                        edit: InspectorEdit {
+                            buffer: normalized,
+                            cursor: 0,
+                            selection_anchor: None,
+                            ..edit
+                        },
+                        conversion_indices,
+                        writable_definition_ids,
+                    },
+                    title: "Convert Elements for Physics?".to_string(),
+                    body: "MTA physics requires object elements. Apply physics and convert the affected elements?"
+                        .to_string(),
+                    detail,
+                    primary_label: "Convert & Apply".to_string(),
+                    secondary_label: None,
+                    secondary_action: None,
+                });
+                app.status_message =
+                    "Confirm element conversion before applying physics".to_string();
+                return;
+            }
+            if app.physics_scope == PhysicsScope::Global
+                && selected_definitions_include_readonly(app)
+            {
+                prompt_definition_override_edit(app, edit.field, normalized, edit.before);
+                return;
+            }
 
             match app.physics_scope {
                 PhysicsScope::Global => {
@@ -2751,6 +3316,7 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
                 }
                 _ => unreachable!(),
             };
+            invalidate_collision_render_cache(app, &key);
             app.pending_col_writes.insert((path, offset), parsed);
             app.status_message = if edit.field == InspectorField::CollisionFaceMaterial {
                 format!(
@@ -3119,6 +3685,31 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
                 plane.kind = kind;
                 app.status_message = format!("Edited water plane {}", app.selected_water + 1);
                 commit_scoped_history(app, "Edit water plane", edit.before);
+            }
+            return;
+        }
+        InspectorField::CullPosX
+        | InspectorField::CullPosY
+        | InspectorField::CullPosZ
+        | InspectorField::CullSizeX
+        | InspectorField::CullSizeY
+        | InspectorField::CullSizeZ => {
+            let Some(parsed) = parse_finite_f32(&value) else {
+                app.status_message = "Cull zone values must be finite numbers".to_string();
+                return;
+            };
+            let selected = app.selected_cull;
+            if let Some(zone) = app.cull_zones.get_mut(selected) {
+                match edit.field {
+                    InspectorField::CullPosX => zone.center.x = parsed,
+                    InspectorField::CullPosY => zone.center.y = parsed,
+                    InspectorField::CullPosZ => zone.center.z = parsed,
+                    InspectorField::CullSizeX => zone.size.x = parsed.abs().max(0.1),
+                    InspectorField::CullSizeY => zone.size.y = parsed.abs().max(0.1),
+                    InspectorField::CullSizeZ => zone.size.z = parsed.abs().max(0.1),
+                    _ => {}
+                }
+                app.status_message = format!("Edited water cull zone {}", selected + 1);
             }
             return;
         }
@@ -4166,6 +4757,58 @@ pub(crate) fn save_log_dialog_rect() -> Rect {
     )
 }
 
+pub(crate) fn blender_import_dialog_rect() -> Rect {
+    let w = 880.0_f32.min(screen_width() - 64.0);
+    let h = 560.0_f32.min(screen_height() - 64.0);
+    Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - h) * 0.5,
+        w,
+        h,
+    )
+}
+
+pub(crate) fn blender_import_setup_dialog_rect() -> Rect {
+    let w = 700.0_f32.min(screen_width() - 64.0);
+    let h = 400.0_f32.min(screen_height() - 64.0);
+    Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - h) * 0.5,
+        w,
+        h,
+    )
+}
+
+pub(crate) fn blender_import_setup_chunk_rect() -> Rect {
+    let rect = blender_import_setup_dialog_rect();
+    Rect::new(rect.x + rect.w - 184.0, rect.y + 125.0, 160.0, 32.0)
+}
+
+pub(crate) fn blender_import_setup_toggle_rect(row: usize) -> Rect {
+    let rect = blender_import_setup_dialog_rect();
+    Rect::new(
+        rect.x + 24.0,
+        rect.y + 182.0 + row as f32 * 52.0,
+        rect.w - 48.0,
+        38.0,
+    )
+}
+
+pub(crate) fn blender_import_setup_start_rect() -> Rect {
+    let rect = blender_import_setup_dialog_rect();
+    Rect::new(rect.x + rect.w - 230.0, rect.y + rect.h - 50.0, 120.0, 32.0)
+}
+
+pub(crate) fn blender_import_setup_cancel_rect() -> Rect {
+    let rect = blender_import_setup_dialog_rect();
+    Rect::new(rect.x + rect.w - 98.0, rect.y + rect.h - 50.0, 74.0, 32.0)
+}
+
+pub(crate) fn blender_import_close_rect() -> Rect {
+    let rect = blender_import_dialog_rect();
+    Rect::new(rect.x + rect.w - 92.0, rect.y + rect.h - 48.0, 68.0, 30.0)
+}
+
 pub(crate) fn save_log_close_rect() -> Rect {
     let rect = save_log_dialog_rect();
     Rect::new(rect.x + rect.w - 92.0, rect.y + rect.h - 48.0, 68.0, 30.0)
@@ -4300,6 +4943,46 @@ pub(crate) fn element_id_rename_dialog_rect() -> Rect {
     )
 }
 
+pub(crate) fn element_replace_with_dialog_rect() -> Rect {
+    let w = 700.0_f32.min(screen_width() - 80.0);
+    Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - 500.0) * 0.5,
+        w,
+        500.0,
+    )
+}
+
+pub(crate) fn element_replace_with_search_rect() -> Rect {
+    let rect = element_replace_with_dialog_rect();
+    Rect::new(rect.x + 24.0, rect.y + 88.0, rect.w - 48.0, 36.0)
+}
+
+pub(crate) fn element_replace_with_row_rect(row: usize) -> Rect {
+    let rect = element_replace_with_dialog_rect();
+    Rect::new(
+        rect.x + 24.0,
+        rect.y + 138.0 + row as f32 * 32.0,
+        rect.w - 48.0,
+        30.0,
+    )
+}
+
+pub(crate) fn element_replace_with_pick_rect() -> Rect {
+    let rect = element_replace_with_dialog_rect();
+    Rect::new(rect.x + 24.0, rect.y + rect.h - 52.0, 150.0, 32.0)
+}
+
+pub(crate) fn element_replace_with_apply_rect() -> Rect {
+    let rect = element_replace_with_dialog_rect();
+    Rect::new(rect.x + rect.w - 210.0, rect.y + rect.h - 52.0, 100.0, 32.0)
+}
+
+pub(crate) fn element_replace_with_cancel_rect() -> Rect {
+    let rect = element_replace_with_dialog_rect();
+    Rect::new(rect.x + rect.w - 98.0, rect.y + rect.h - 52.0, 74.0, 32.0)
+}
+
 pub(crate) fn missing_texture_dialog_rect() -> Rect {
     let w = 720.0_f32.min(screen_width() - 80.0);
     Rect::new(
@@ -4420,7 +5103,17 @@ pub(crate) fn lod_batch_minimum_size_rect() -> Rect {
 
 pub(crate) fn lod_batch_list_rect() -> Rect {
     let rect = lod_batch_dialog_rect();
-    Rect::new(rect.x + 24.0, rect.y + 142.0, rect.w - 48.0, rect.h - 212.0)
+    Rect::new(rect.x + 24.0, rect.y + 176.0, rect.w - 48.0, rect.h - 246.0)
+}
+
+pub(crate) fn lod_batch_missing_only_rect() -> Rect {
+    let rect = lod_batch_dialog_rect();
+    Rect::new(rect.x + 166.0, rect.y + 122.0, 132.0, 30.0)
+}
+
+pub(crate) fn lod_batch_regenerate_all_rect() -> Rect {
+    let rect = lod_batch_dialog_rect();
+    Rect::new(rect.x + 306.0, rect.y + 122.0, 142.0, 30.0)
 }
 
 pub(crate) fn lod_batch_continue_rect() -> Rect {
@@ -4545,7 +5238,7 @@ pub(crate) fn save_preferences_dialog(app: &mut AppState, dialog: PreferencesDia
     }
     let draw_distance_percent = clamp_draw_distance_percent(dialog.draw_distance_percent);
     app.options.draw_distance_percent = draw_distance_percent;
-    app.options.draw_radius = DEFAULT_DRAW * draw_distance_percent as f32 / 100.0;
+    app.options.draw_radius = draw_radius_for_percent(draw_distance_percent);
     save_draw_distance_percent_preference(draw_distance_percent);
 
     app.status_message = if msaa_changed {
@@ -4661,6 +5354,83 @@ pub(crate) fn update_load_dialog_input(app: &mut AppState, mouse: Vec2) -> bool 
                     &ch.to_string(),
                 );
             }
+        }
+    }
+    true
+}
+
+pub(crate) fn update_import_asset_dialog_input(app: &mut AppState, mouse: Vec2) -> bool {
+    if app.import_asset_dialog.is_none() {
+        return false;
+    }
+    let layout = import_asset_dialog_layout();
+    if is_mouse_button_pressed(MouseButton::Left) {
+        if layout.browse.contains(mouse) {
+            open_import_asset_texture_folder_picker(app);
+            return true;
+        }
+        if layout.cancel.contains(mouse) || !layout.rect.contains(mouse) {
+            cancel_import_asset_dialog(app);
+            return true;
+        }
+        if layout.import.contains(mouse) {
+            if let Some(dialog) = app.import_asset_dialog.take() {
+                if let Err(err) = import_new_asset(
+                    app,
+                    &dialog.dff_path,
+                    Some(&dialog.texture_dir),
+                    &dialog.id,
+                    None,
+                ) {
+                    app.status_message = format!("Import failed: {err}");
+                    app.import_asset_dialog = Some(dialog);
+                }
+            }
+            return true;
+        }
+    }
+    if is_key_pressed(KeyCode::Escape) {
+        cancel_import_asset_dialog(app);
+        return true;
+    }
+    if is_key_pressed(KeyCode::Enter) {
+        if let Some(dialog) = app.import_asset_dialog.take() {
+            if let Err(err) = import_new_asset(
+                app,
+                &dialog.dff_path,
+                Some(&dialog.texture_dir),
+                &dialog.id,
+                None,
+            ) {
+                app.status_message = format!("Import failed: {err}");
+                app.import_asset_dialog = Some(dialog);
+            }
+        }
+        return true;
+    }
+    let Some(dialog) = app.import_asset_dialog.as_mut() else {
+        return true;
+    };
+    dialog.cursor = clamp_char_boundary(&dialog.id, dialog.cursor);
+    if is_key_pressed(KeyCode::Left) {
+        dialog.cursor = prev_char_boundary(&dialog.id, dialog.cursor);
+    }
+    if is_key_pressed(KeyCode::Right) {
+        dialog.cursor = next_char_boundary(&dialog.id, dialog.cursor);
+    }
+    if is_key_pressed(KeyCode::Backspace) && dialog.cursor > 0 {
+        let previous = prev_char_boundary(&dialog.id, dialog.cursor);
+        dialog.id.replace_range(previous..dialog.cursor, "");
+        dialog.cursor = previous;
+    }
+    if is_key_pressed(KeyCode::Delete) && dialog.cursor < dialog.id.len() {
+        let next = next_char_boundary(&dialog.id, dialog.cursor);
+        dialog.id.replace_range(dialog.cursor..next, "");
+    }
+    while let Some(ch) = get_char_pressed() {
+        if !ch.is_control() && dialog.id.len() < 96 {
+            dialog.id.insert(dialog.cursor, ch);
+            dialog.cursor += ch.len_utf8();
         }
     }
     true
@@ -5043,6 +5813,351 @@ pub(crate) fn update_save_log_input(app: &mut AppState, mouse: Vec2) -> bool {
     false
 }
 
+pub(crate) fn update_blender_import_dialog_input(app: &mut AppState, mouse: Vec2) -> bool {
+    if !app.blender_import_dialog_open {
+        return false;
+    }
+    let rect = blender_import_dialog_rect();
+    let list = Rect::new(rect.x + 24.0, rect.y + 142.0, rect.w - 48.0, rect.h - 206.0);
+    let rows = blender_import_display_rows(app, list.w).len();
+    let visible_rows = (list.h / 20.0).max(1.0) as usize;
+    let max_scroll = rows.saturating_sub(visible_rows) as f32;
+    if app.blender_import_log_follow_tail {
+        app.blender_import_log_scroll = max_scroll;
+    } else {
+        app.blender_import_log_scroll = app.blender_import_log_scroll.clamp(0.0, max_scroll);
+    }
+
+    let (_, wheel_y) = safe_mouse_wheel();
+    if list.contains(mouse) && wheel_y.abs() > 0.01 {
+        app.blender_import_log_scroll =
+            (app.blender_import_log_scroll - wheel_y * 3.0).clamp(0.0, max_scroll);
+        app.blender_import_log_follow_tail = app.blender_import_log_scroll >= max_scroll - 0.5;
+        return true;
+    }
+    if is_key_pressed(KeyCode::End) {
+        app.blender_import_log_scroll = max_scroll;
+        app.blender_import_log_follow_tail = true;
+        return true;
+    }
+    if is_key_pressed(KeyCode::Home) {
+        app.blender_import_log_scroll = 0.0;
+        app.blender_import_log_follow_tail = false;
+        return true;
+    }
+    if app.blender_import_finished
+        && (is_key_pressed(KeyCode::Escape)
+            || (is_mouse_button_pressed(MouseButton::Left)
+                && blender_import_close_rect().contains(mouse)))
+    {
+        app.blender_import_dialog_open = false;
+        return true;
+    }
+    true
+}
+
+pub(crate) fn update_blender_import_setup_input(app: &mut AppState, mouse: Vec2) -> bool {
+    if app.blender_import_setup.is_none() {
+        return false;
+    }
+    if is_key_pressed(KeyCode::Escape) {
+        app.blender_import_setup = None;
+        app.status_message = "Blender import cancelled".to_string();
+        return true;
+    }
+    if is_key_pressed(KeyCode::Enter) {
+        confirm_blender_import_setup(app);
+        return true;
+    }
+    if is_mouse_button_pressed(MouseButton::Left) {
+        if blender_import_setup_start_rect().contains(mouse) {
+            confirm_blender_import_setup(app);
+            return true;
+        }
+        if blender_import_setup_cancel_rect().contains(mouse) {
+            app.blender_import_setup = None;
+            app.status_message = "Blender import cancelled".to_string();
+            return true;
+        }
+        if blender_import_setup_toggle_rect(0).contains(mouse) {
+            if let Some(setup) = app.blender_import_setup.as_mut() {
+                setup.options.chunk_meshes = !setup.options.chunk_meshes;
+            }
+            return true;
+        }
+        if blender_import_setup_toggle_rect(1).contains(mouse) {
+            if let Some(setup) = app.blender_import_setup.as_mut() {
+                setup.options.center_origins = !setup.options.center_origins;
+            }
+            return true;
+        }
+        if blender_import_setup_chunk_rect().contains(mouse)
+            && let Some(setup) = app.blender_import_setup.as_mut()
+        {
+            setup.chunk_size_cursor = setup.chunk_size.len();
+            setup.chunk_size_selection_anchor = None;
+            setup.error = None;
+        }
+    }
+
+    let Some(setup) = app.blender_import_setup.as_mut() else {
+        return true;
+    };
+    if is_key_pressed(KeyCode::Backspace) {
+        if !delete_text_selection(
+            &mut setup.chunk_size,
+            &mut setup.chunk_size_cursor,
+            &mut setup.chunk_size_selection_anchor,
+        ) && setup.chunk_size_cursor > 0
+        {
+            let previous = prev_char_boundary(&setup.chunk_size, setup.chunk_size_cursor);
+            setup
+                .chunk_size
+                .replace_range(previous..setup.chunk_size_cursor, "");
+            setup.chunk_size_cursor = previous;
+        }
+        setup.error = None;
+    }
+    if is_key_pressed(KeyCode::Left) {
+        setup.chunk_size_cursor = prev_char_boundary(&setup.chunk_size, setup.chunk_size_cursor);
+        setup.chunk_size_selection_anchor = None;
+    }
+    if is_key_pressed(KeyCode::Right) {
+        setup.chunk_size_cursor = next_char_boundary(&setup.chunk_size, setup.chunk_size_cursor);
+        setup.chunk_size_selection_anchor = None;
+    }
+    while let Some(ch) = get_char_pressed() {
+        if (ch.is_ascii_digit() || ch == '.') && setup.chunk_size.len() < 12 {
+            insert_text_at_cursor(
+                &mut setup.chunk_size,
+                &mut setup.chunk_size_cursor,
+                &mut setup.chunk_size_selection_anchor,
+                &ch.to_string(),
+            );
+            setup.error = None;
+        }
+    }
+    true
+}
+
+pub(crate) fn update_classify_dialog_input(app: &mut AppState, mouse: Vec2) -> bool {
+    if app.classify_dialog.is_none() {
+        return false;
+    }
+    if is_key_pressed(KeyCode::Escape) {
+        app.classify_dialog = None;
+        app.status_message = "Element classification cancelled".to_string();
+        return true;
+    }
+    if is_key_pressed(KeyCode::Enter) {
+        if !app
+            .classify_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.scanning)
+        {
+            refresh_classify_candidates(app);
+        }
+        return true;
+    }
+    let list = classify_list_rect();
+    let wheel = safe_mouse_wheel().1;
+    if list.contains(mouse) && wheel.abs() > f32::EPSILON {
+        if let Some(dialog) = app.classify_dialog.as_mut() {
+            let max_scroll = (dialog.candidates.len() as f32 * 58.0 + 12.0 - list.h).max(0.0);
+            dialog.scroll = (dialog.scroll - wheel * 44.0).clamp(0.0, max_scroll);
+        }
+        return true;
+    }
+    if is_mouse_button_pressed(MouseButton::Left) {
+        if classify_review_rect().contains(mouse) {
+            if !app
+                .classify_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.scanning)
+            {
+                refresh_classify_candidates(app);
+            }
+            return true;
+        }
+        if classify_apply_rect().contains(mouse) {
+            apply_classify_candidates(app);
+            return true;
+        }
+        if classify_cancel_rect().contains(mouse) {
+            app.classify_dialog = None;
+            app.status_message = "Element classification cancelled".to_string();
+            return true;
+        }
+        if list.contains(mouse) {
+            let candidate_index = app.classify_dialog.as_ref().and_then(|dialog| {
+                dialog
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .find(|(index, _)| classify_candidate_rect(app, *index).contains(mouse))
+                    .map(|(index, _)| index)
+            });
+            if let Some(index) = candidate_index
+                && let Some(candidate) = app
+                    .classify_dialog
+                    .as_mut()
+                    .and_then(|dialog| dialog.candidates.get_mut(index))
+                && candidate.blocked_reason.is_none()
+            {
+                candidate.selected = !candidate.selected;
+            }
+            return true;
+        }
+        if classify_size_rect().contains(mouse)
+            && let Some(dialog) = app.classify_dialog.as_mut()
+        {
+            dialog.size_cursor = dialog.size.len();
+            dialog.size_selection_anchor = Some(0);
+            dialog.error = None;
+        }
+    }
+    let Some(dialog) = app.classify_dialog.as_mut() else {
+        return true;
+    };
+    if is_key_pressed(KeyCode::Backspace) {
+        if !delete_text_selection(
+            &mut dialog.size,
+            &mut dialog.size_cursor,
+            &mut dialog.size_selection_anchor,
+        ) && dialog.size_cursor > 0
+        {
+            let previous = prev_char_boundary(&dialog.size, dialog.size_cursor);
+            dialog.size.replace_range(previous..dialog.size_cursor, "");
+            dialog.size_cursor = previous;
+        }
+        dialog.error = None;
+    }
+    if is_key_pressed(KeyCode::Left) {
+        dialog.size_cursor = prev_char_boundary(&dialog.size, dialog.size_cursor);
+        dialog.size_selection_anchor = None;
+    }
+    if is_key_pressed(KeyCode::Right) {
+        dialog.size_cursor = next_char_boundary(&dialog.size, dialog.size_cursor);
+        dialog.size_selection_anchor = None;
+    }
+    while let Some(ch) = get_char_pressed() {
+        if (ch.is_ascii_digit() || ch == '.') && dialog.size.len() < 12 {
+            insert_text_at_cursor(
+                &mut dialog.size,
+                &mut dialog.size_cursor,
+                &mut dialog.size_selection_anchor,
+                &ch.to_string(),
+            );
+            dialog.error = None;
+        }
+    }
+    true
+}
+
+pub(crate) fn update_oversized_chunk_dialog_input(app: &mut AppState, mouse: Vec2) -> bool {
+    if app.oversized_chunk_dialog.is_none() {
+        return false;
+    }
+    if is_key_pressed(KeyCode::Escape) {
+        app.oversized_chunk_dialog = None;
+        app.status_message = "Oversized-element review cancelled".to_string();
+        return true;
+    }
+    if is_key_pressed(KeyCode::Enter) {
+        refresh_oversized_chunk_candidates(app);
+        return true;
+    }
+    let list = oversized_chunk_list_rect();
+    let wheel = safe_mouse_wheel().1;
+    if list.contains(mouse) && wheel.abs() > f32::EPSILON {
+        if let Some(dialog) = app.oversized_chunk_dialog.as_mut() {
+            let max_scroll = (dialog.candidates.len() as f32 * 58.0 + 12.0 - list.h).max(0.0);
+            dialog.scroll = (dialog.scroll - wheel * 44.0).clamp(0.0, max_scroll);
+        }
+        return true;
+    }
+    if is_mouse_button_pressed(MouseButton::Left) {
+        if oversized_chunk_rescan_rect().contains(mouse) {
+            refresh_oversized_chunk_candidates(app);
+            return true;
+        }
+        if oversized_chunk_apply_rect().contains(mouse) {
+            start_oversized_chunking(app);
+            return true;
+        }
+        if oversized_chunk_cancel_rect().contains(mouse) {
+            app.oversized_chunk_dialog = None;
+            app.status_message = "Oversized-element review cancelled".to_string();
+            return true;
+        }
+        if list.contains(mouse) {
+            let candidate_index = app.oversized_chunk_dialog.as_ref().and_then(|dialog| {
+                dialog
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .find(|(index, _)| oversized_chunk_candidate_rect(app, *index).contains(mouse))
+                    .map(|(index, _)| index)
+            });
+            if let Some(index) = candidate_index
+                && let Some(candidate) = app
+                    .oversized_chunk_dialog
+                    .as_mut()
+                    .and_then(|dialog| dialog.candidates.get_mut(index))
+                && candidate.blocked_reason.is_none()
+            {
+                candidate.selected = !candidate.selected;
+            }
+            return true;
+        }
+        if oversized_chunk_size_rect().contains(mouse)
+            && let Some(dialog) = app.oversized_chunk_dialog.as_mut()
+        {
+            dialog.chunk_size_cursor = dialog.chunk_size.len();
+            dialog.chunk_size_selection_anchor = Some(0);
+            dialog.error = None;
+        }
+    }
+    let Some(dialog) = app.oversized_chunk_dialog.as_mut() else {
+        return true;
+    };
+    if is_key_pressed(KeyCode::Backspace) {
+        if !delete_text_selection(
+            &mut dialog.chunk_size,
+            &mut dialog.chunk_size_cursor,
+            &mut dialog.chunk_size_selection_anchor,
+        ) && dialog.chunk_size_cursor > 0
+        {
+            let previous = prev_char_boundary(&dialog.chunk_size, dialog.chunk_size_cursor);
+            dialog
+                .chunk_size
+                .replace_range(previous..dialog.chunk_size_cursor, "");
+            dialog.chunk_size_cursor = previous;
+        }
+        dialog.error = None;
+    }
+    if is_key_pressed(KeyCode::Left) {
+        dialog.chunk_size_cursor = prev_char_boundary(&dialog.chunk_size, dialog.chunk_size_cursor);
+        dialog.chunk_size_selection_anchor = None;
+    }
+    if is_key_pressed(KeyCode::Right) {
+        dialog.chunk_size_cursor = next_char_boundary(&dialog.chunk_size, dialog.chunk_size_cursor);
+        dialog.chunk_size_selection_anchor = None;
+    }
+    while let Some(ch) = get_char_pressed() {
+        if (ch.is_ascii_digit() || ch == '.') && dialog.chunk_size.len() < 12 {
+            insert_text_at_cursor(
+                &mut dialog.chunk_size,
+                &mut dialog.chunk_size_cursor,
+                &mut dialog.chunk_size_selection_anchor,
+                &ch.to_string(),
+            );
+            dialog.error = None;
+        }
+    }
+    true
+}
+
 pub(crate) fn update_dff_replace_choice_dialog_input(app: &mut AppState, mouse: Vec2) -> bool {
     if app.dff_replace_choice_dialog.is_none() {
         return false;
@@ -5113,6 +6228,142 @@ pub(crate) fn update_element_id_rename_dialog_input(app: &mut AppState, mouse: V
     if let Some(mode) = choice {
         apply_element_id_rename(app, mode);
         return true;
+    }
+    true
+}
+
+pub(crate) fn update_element_replace_with_dialog_input(
+    app: &mut AppState,
+    viewport: Rect,
+    mouse: Vec2,
+) -> bool {
+    let Some(dialog) = app.element_replace_with_dialog.as_ref() else {
+        return false;
+    };
+    if dialog.picking_scene {
+        if is_key_pressed(KeyCode::Escape) || is_mouse_button_pressed(MouseButton::Right) {
+            if let Some(dialog) = app.element_replace_with_dialog.as_mut() {
+                dialog.picking_scene = false;
+            }
+            app.status_message = "Returned to Replace with search".to_string();
+        } else if viewport.contains(mouse) && is_mouse_button_pressed(MouseButton::Left) {
+            if let Some(index) = pick_scene_element(app, viewport, mouse) {
+                let target = app.placements[index].id.clone();
+                let sources = app
+                    .element_replace_with_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.source_indices.clone())
+                    .unwrap_or_default();
+                app.element_replace_with_dialog = None;
+                replace_elements_with_id(app, &target, &sources);
+            } else {
+                app.status_message =
+                    "No scene element under the pointer; click a model or press Esc".to_string();
+            }
+        }
+        return true;
+    }
+
+    if is_key_pressed(KeyCode::Escape) {
+        app.element_replace_with_dialog = None;
+        return true;
+    }
+    let search_before = app
+        .element_replace_with_dialog
+        .as_ref()
+        .map(|dialog| dialog.search.clone())
+        .unwrap_or_default();
+    if let Some(dialog) = app.element_replace_with_dialog.as_mut() {
+        while let Some(ch) = get_char_pressed() {
+            if !ch.is_control() {
+                insert_text_at_cursor(
+                    &mut dialog.search,
+                    &mut dialog.cursor,
+                    &mut dialog.selection_anchor,
+                    &ch.to_string(),
+                );
+            }
+        }
+        if is_key_pressed(KeyCode::Backspace)
+            && !delete_text_selection(
+                &mut dialog.search,
+                &mut dialog.cursor,
+                &mut dialog.selection_anchor,
+            )
+            && dialog.cursor > 0
+        {
+            let previous = prev_char_boundary(&dialog.search, dialog.cursor);
+            dialog.search.replace_range(previous..dialog.cursor, "");
+            dialog.cursor = previous;
+        }
+        if dialog.search != search_before {
+            dialog.scroll = 0.0;
+            dialog.selected_target = None;
+        }
+    }
+    let query = app
+        .element_replace_with_dialog
+        .as_ref()
+        .map(|dialog| dialog.search.as_str())
+        .unwrap_or_default();
+    let options = element_replace_target_ids(app, query);
+    let max_scroll = options.len().saturating_sub(8) as f32;
+    let wheel = mouse_wheel().1;
+    if wheel.abs() > 0.0 {
+        if let Some(dialog) = app.element_replace_with_dialog.as_mut() {
+            dialog.scroll = (dialog.scroll - wheel * 3.0).clamp(0.0, max_scroll);
+        }
+    }
+    if is_mouse_button_pressed(MouseButton::Left) {
+        if element_replace_with_pick_rect().contains(mouse) {
+            if let Some(dialog) = app.element_replace_with_dialog.as_mut() {
+                dialog.picking_scene = true;
+            }
+            app.status_message =
+                "Click the replacement element in the scene; Esc returns".to_string();
+            return true;
+        }
+        if element_replace_with_cancel_rect().contains(mouse) {
+            app.element_replace_with_dialog = None;
+            return true;
+        }
+        let start = app
+            .element_replace_with_dialog
+            .as_ref()
+            .map(|dialog| dialog.scroll.floor() as usize)
+            .unwrap_or(0);
+        for row in 0..8 {
+            if element_replace_with_row_rect(row).contains(mouse) {
+                if let Some(target) = options.get(start + row).cloned() {
+                    if let Some(dialog) = app.element_replace_with_dialog.as_mut() {
+                        dialog.selected_target = Some(target);
+                    }
+                }
+                return true;
+            }
+        }
+        if element_replace_with_apply_rect().contains(mouse) {
+            let selection = app.element_replace_with_dialog.as_ref().and_then(|dialog| {
+                dialog.selected_target.clone().or_else(|| {
+                    options
+                        .iter()
+                        .find(|id| id.eq_ignore_ascii_case(dialog.search.trim()))
+                        .cloned()
+                })
+            });
+            if let Some(target) = selection {
+                let sources = app
+                    .element_replace_with_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.source_indices.clone())
+                    .unwrap_or_default();
+                app.element_replace_with_dialog = None;
+                replace_elements_with_id(app, &target, &sources);
+            } else {
+                app.status_message = "Choose a replacement model ID first".to_string();
+            }
+            return true;
+        }
     }
     true
 }
@@ -5375,6 +6626,33 @@ pub(crate) fn update_lod_batch_dialog_input(app: &mut AppState, mouse: Vec2) -> 
             }
             return true;
         }
+        if lod_batch_missing_only_rect().contains(mouse)
+            && app
+                .lod_batch_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.mode != LodBatchMode::GenerateSelection)
+        {
+            if let Some(dialog) = app.lod_batch_dialog.as_mut() {
+                dialog.mode = LodBatchMode::GenerateSceneMissing;
+            }
+            app.status_message =
+                "Generate LODs will include only scene elements currently missing an LOD."
+                    .to_string();
+            return true;
+        }
+        if lod_batch_regenerate_all_rect().contains(mouse)
+            && app
+                .lod_batch_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.mode != LodBatchMode::GenerateSelection)
+        {
+            if let Some(dialog) = app.lod_batch_dialog.as_mut() {
+                dialog.mode = LodBatchMode::RegenerateScene;
+            }
+            app.status_message =
+                "Generate LODs will replace existing LODs and generate missing ones.".to_string();
+            return true;
+        }
         if lod_batch_continue_rect().contains(mouse) {
             continue_lod_batch_dialog(app);
             return true;
@@ -5475,6 +6753,9 @@ pub(crate) fn run_confirm_action(app: &mut AppState, action: ConfirmAction) {
         ConfirmAction::OpenEditingImgEntry(entry) => {
             open_img_entry_in_editing_unchecked(app, entry)
         }
+        ConfirmAction::OpenSceneDffsInEditing { models, camera } => {
+            open_scene_dffs_in_editing_unchecked(app, models, camera)
+        }
         ConfirmAction::OpenEditingStagedAsset(name) => {
             let _ = open_staged_asset_in_editing_unchecked(app, &name);
         }
@@ -5482,6 +6763,9 @@ pub(crate) fn run_confirm_action(app: &mut AppState, action: ConfirmAction) {
             plan,
             overwrite_matching,
         } => start_editing_img_merge_apply(app, plan, overwrite_matching),
+        ConfirmAction::SaveEditingImgWithDuplicateCleanup => {
+            editing_save_img_after_duplicate_confirmation(app)
+        }
         ConfirmAction::OpenSelectedVehicleCollision => {
             open_selected_vehicle_collision_editor_unchecked(app)
         }
@@ -5528,12 +6812,18 @@ pub(crate) fn run_confirm_action(app: &mut AppState, action: ConfirmAction) {
         ConfirmAction::StartInstanceLodRemoval(target_id) => {
             start_instance_lod_removal(app, target_id)
         }
+        ConfirmAction::ReviewPurgeUnused => request_purge_unused_assets(app),
         ConfirmAction::PurgeUnused => start_purge_unused_assets(app),
         ConfirmAction::RebalanceImgArchives => start_img_archive_rebalance(app),
         ConfirmAction::FixLods => fix_lods_confirmed(app),
         ConfirmAction::RegenerateLods(indices) => regenerate_selected_element_lods(app, indices),
+        ConfirmAction::ClearAllLods => clear_all_lods(app),
         ConfirmAction::TxdCleanup(plan) => {
             start_loaded_asset_optimization(app, plan);
+        }
+        ConfirmAction::RequestTxdCleanup => request_txd_cleanup(app),
+        ConfirmAction::ChooseAssetOptimizationProfile => {
+            show_asset_optimization_profile_choice(app)
         }
         ConfirmAction::StartAssetOptimization(profile) => {
             request_loaded_asset_optimization(app, profile);
@@ -5577,6 +6867,31 @@ pub(crate) fn run_confirm_action(app: &mut AppState, action: ConfirmAction) {
             target_enabled,
             before,
         } => apply_definition_override_flag(app, ids, flag, target_enabled, before),
+        ConfirmAction::MarkTextureElementsDoubleSided {
+            indices,
+            texture_name,
+        } => mark_texture_elements_double_sided(app, indices, &texture_name),
+        ConfirmAction::ApplyPhysicsEdit {
+            edit,
+            conversion_indices,
+            writable_definition_ids,
+        } => {
+            convert_physics_elements_to_objects(app, &conversion_indices);
+            for id in writable_definition_ids {
+                let zone = selected_zone_for_definition(app, &id);
+                make_definition_override_writable(app, &id, zone);
+            }
+            app.inspector_edit = Some(edit);
+            apply_inspector_edit(app);
+        }
+        ConfirmAction::SetPhysicsRoot {
+            model_id,
+            conversion_indices,
+            before,
+        } => {
+            convert_physics_elements_to_objects(app, &conversion_indices);
+            set_selected_physics_root_with_before(app, Some(model_id), before);
+        }
     }
 }
 
@@ -5606,6 +6921,12 @@ pub(crate) fn update_confirm_dialog_input(app: &mut AppState, mouse: Vec2) -> bo
             if let Some(mut dialog) = app.confirm_dialog.take() {
                 if dialog.primary_label == "Save WIP" {
                     if save_wip_scene(app) {
+                        app.pending_after_manual_save = Some(dialog.action);
+                    } else {
+                        app.confirm_dialog = Some(dialog);
+                    }
+                } else if dialog.primary_label == "Save" {
+                    if save_scene_before_action(app) {
                         app.pending_after_manual_save = Some(dialog.action);
                     } else {
                         app.confirm_dialog = Some(dialog);
@@ -6002,6 +7323,40 @@ pub(crate) fn update_dff_texture_view_dialog_input(app: &mut AppState, mouse: Ve
         return false;
     };
     let layout = dff_texture_view_dialog_layout(dialog);
+    if is_mouse_button_pressed(MouseButton::Left) && layout.export.contains(mouse) {
+        let export = dialog.rgba.as_ref().map(|rgba| {
+            (
+                dialog.texture_name.clone(),
+                dialog.width as u32,
+                dialog.height as u32,
+                rgba.clone(),
+            )
+        });
+        if let Some((texture_name, width, height, rgba)) = export {
+            if app.dff_picker_rx.is_some() {
+                app.status_message = "File browser is already open".to_string();
+            } else {
+                let default_path =
+                    load_last_dff_export_dir().join(format!("{}.png", lower(&texture_name)));
+                let (tx, rx) = mpsc::channel();
+                app.dff_picker_rx = Some(rx);
+                app.status_message =
+                    format!("Opening texture export browser for {texture_name}...");
+                thread::spawn(move || {
+                    let _ = tx.send((
+                        DffPickerKind::ExportTexturePng {
+                            texture_name,
+                            width,
+                            height,
+                            rgba,
+                        },
+                        choose_export_png_path(default_path),
+                    ));
+                });
+            }
+        }
+        return true;
+    }
     if is_key_pressed(KeyCode::Escape)
         || is_key_pressed(KeyCode::Enter)
         || (is_mouse_button_pressed(MouseButton::Left)
@@ -6201,10 +7556,7 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
                     }
                     if is_mouse_button_pressed(MouseButton::Left) {
                         app.preview_selected_material = Some((app.selected, entry.material_index));
-                        if (preview_texture_thumbnail_rect(*rect).contains(mouse)
-                            || preview_texture_view_rect(*rect).contains(mouse))
-                            && entry.texture_id != 0
-                        {
+                        if entry.texture_id != 0 {
                             let placement_index = app.selected;
                             open_preview_texture_view_dialog(
                                 app,
@@ -6237,6 +7589,121 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
                     }
                     return true;
                 }
+            }
+            if layout
+                .texture_export_all
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    open_preview_texture_export_all_picker(app);
+                }
+                return true;
+            }
+            if layout
+                .texture_advanced
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    app.preview_texture_advanced = !app.preview_texture_advanced;
+                    let max_scroll = element_panel_max_scroll(&element_panel_layout(app));
+                    app.properties_scroll = app.properties_scroll.min(max_scroll);
+                }
+                return true;
+            }
+            if layout
+                .texture_variation
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    app.preview_world_uv_variation = !app.preview_world_uv_variation;
+                    refresh_preview_world_scale_uv_visual(app);
+                    app.status_message = if app.preview_world_uv_variation {
+                        "Multi-scale world UV variation enabled; seams remain matched".to_string()
+                    } else {
+                        "World UV variation disabled".to_string()
+                    };
+                }
+                return true;
+            }
+            if layout
+                .texture_uv_scale_minus
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    app.preview_world_uv_scale =
+                        (app.preview_world_uv_scale * 0.5).clamp(0.001, 1024.0);
+                    refresh_preview_world_scale_uv_visual(app);
+                    app.status_message = format!(
+                        "World UV scale set to {}x",
+                        fmt_f32(app.preview_world_uv_scale, 3)
+                    );
+                }
+                return true;
+            }
+            if layout
+                .texture_scope_object
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    app.preview_world_uv_all_dffs = false;
+                    app.status_message = "World-scale UV scope: object only".to_string();
+                }
+                return true;
+            }
+            if layout
+                .texture_scope_world
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    app.preview_world_uv_all_dffs = true;
+                    app.status_message =
+                        "World-scale UV scope: all DFFs using this texture".to_string();
+                }
+                return true;
+            }
+            if layout
+                .texture_uv_scale_value
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    app.preview_world_uv_scale = 1.0;
+                    refresh_preview_world_scale_uv_visual(app);
+                    app.status_message = "World UV scale reset to 1x".to_string();
+                }
+                return true;
+            }
+            if layout
+                .texture_uv_scale_plus
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    app.preview_world_uv_scale =
+                        (app.preview_world_uv_scale * 2.0).clamp(0.001, 1024.0);
+                    refresh_preview_world_scale_uv_visual(app);
+                    app.status_message = format!(
+                        "World UV scale set to {}x",
+                        fmt_f32(app.preview_world_uv_scale, 3)
+                    );
+                }
+                return true;
+            }
+            if layout
+                .texture_world_preview
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    toggle_preview_world_scale_uv_visual(app);
+                }
+                return true;
+            }
+            if layout
+                .texture_world_unwrap
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    apply_preview_world_scale_uv(app);
+                }
+                return true;
             }
         }
         for scope in [PhysicsScope::Global, PhysicsScope::PerObject] {
@@ -6491,6 +7958,15 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
             }
             return true;
         }
+        if element_replace_with_rect(app).contains(mouse) {
+            if is_mouse_button_pressed(MouseButton::Left) {
+                if app.inspector_edit.is_some() {
+                    apply_inspector_edit(app);
+                }
+                open_element_replace_with_dialog(app);
+            }
+            return true;
+        }
         if element_open_col_editor_rect(app).contains(mouse) {
             if is_mouse_button_pressed(MouseButton::Left) {
                 if dff_actions_enabled {
@@ -6673,7 +8149,7 @@ pub(crate) fn move_selected(app: &mut AppState, delta: Vec3) {
     if indices.is_empty() {
         return;
     }
-    let before = world_history_snapshot(app);
+    let before = placement_transform_history_snapshot(app, indices.iter().copied());
     for idx in indices {
         if let Some(placement) = app.placements.get_mut(idx) {
             placement.pos.x += delta.x;
@@ -6682,8 +8158,8 @@ pub(crate) fn move_selected(app: &mut AppState, delta: Vec3) {
             sync_placement_attrs(placement);
         }
     }
-    rebuild_render_cells(app);
-    commit_world_history(app, "Nudge", before);
+    rebuild_render_cells_for_placement_transforms(app, &before);
+    commit_placement_transform_history(app, "Nudge", before);
 }
 
 pub(crate) fn move_selected_light(app: &mut AppState, delta: Vec3) {
@@ -6708,7 +8184,7 @@ pub(crate) fn move_selected_light(app: &mut AppState, delta: Vec3) {
 
 fn transform_interaction_viewport(app: &AppState, viewport: Rect) -> Rect {
     if app.active_tab == AppTab::Editing {
-        editing_center_rect()
+        editing_preview_rect(app)
     } else {
         viewport
     }
@@ -6750,6 +8226,11 @@ pub(crate) fn apply_gizmo_drag(app: &mut AppState, viewport: Rect, mouse: Vec2) 
                         }
                     }
                 }
+                GizmoTarget::CullZone => {
+                    if let Some(zone) = app.cull_zones.get_mut(app.selected_cull) {
+                        zone.center = from_mq(to_mq(drag.start_pos) + delta);
+                    }
+                }
                 GizmoTarget::Light => {
                     let inverse = app
                         .lights
@@ -6787,6 +8268,15 @@ pub(crate) fn apply_gizmo_drag(app: &mut AppState, viewport: Rect, mouse: Vec2) 
                     if let Err(err) = set_selected_editing_dff_vertex_position(app, target) {
                         app.status_message = err;
                     }
+                }
+                GizmoTarget::DffPivot => {
+                    set_editing_dff_freeform_pivot(
+                        app,
+                        DffFreeformPivot {
+                            position: from_mq(to_mq(drag.start_pos) + delta),
+                            rotation: drag.start_rot,
+                        },
+                    );
                 }
                 GizmoTarget::DffBooleanBox => {
                     let target = from_mq(to_mq(drag.start_pos) + delta);
@@ -6908,19 +8398,244 @@ pub(crate) fn apply_gizmo_drag(app: &mut AppState, viewport: Rect, mouse: Vec2) 
                     }
                 }
                 GizmoTarget::CollisionVertex
+                | GizmoTarget::CullZone
                 | GizmoTarget::DffVertex
                 | GizmoTarget::DffBooleanBox
-                | GizmoTarget::Dff2dEffect
                 | GizmoTarget::RacePoint => {}
+                GizmoTarget::DffPivot => {
+                    let start = dff_pivot_rotation_matrix(drag.start_rot);
+                    let incremental =
+                        Mat4::from_axis_angle(axis_vector(drag.axis), degrees.to_radians());
+                    // The rings are drawn in pivot-local space, so apply the
+                    // delta in that exact same basis to keep visuals and math
+                    // locked together throughout the drag.
+                    let rotation = start * incremental;
+                    set_editing_dff_freeform_pivot(
+                        app,
+                        DffFreeformPivot {
+                            position: drag.start_pos,
+                            rotation: matrix_rotation_degrees(rotation),
+                        },
+                    );
+                }
+                GizmoTarget::Dff2dEffect => {
+                    let mut rotation = drag.start_rot;
+                    match drag.axis {
+                        GizmoAxis::X => rotation.x += degrees,
+                        GizmoAxis::Y => rotation.y += degrees,
+                        GizmoAxis::Z => rotation.z += degrees,
+                    }
+                    if let Err(err) = set_selected_editing_dff_2dfx_rotation(app, rotation) {
+                        app.status_message = err;
+                    }
+                }
+            }
+        }
+        TransformMode::Scale => {
+            if drag.target != GizmoTarget::DffVertex {
+                return;
+            }
+            let length = gizmo_visual_length(app, to_mq(drag.start_pos)).max(0.001);
+            let factor = if let Some(plane) = drag.scale_plane {
+                let (first, second) = gizmo_plane_axes(plane);
+                let direction =
+                    selected_axis_vector(app, first) + selected_axis_vector(app, second);
+                let screen_direction = world_to_screen(
+                    app,
+                    viewport,
+                    to_mq(drag.start_pos) + direction * length * 0.28,
+                )
+                .and_then(|end| {
+                    world_to_screen(app, viewport, to_mq(drag.start_pos))
+                        .map(|start| (end - start).normalize_or_zero())
+                })
+                .unwrap_or(Vec2::new(1.0, -1.0).normalize());
+                ((mouse - drag.start_mouse).dot(screen_direction) / 90.0)
+                    .exp()
+                    .clamp(0.001, 1000.0)
+            } else {
+                (amount / length).exp().clamp(0.001, 1000.0)
+            };
+            let mut factors = Vec3::ONE;
+            if let Some(plane) = drag.scale_plane {
+                let (first, second) = gizmo_plane_axes(plane);
+                for axis in [first, second] {
+                    match axis {
+                        GizmoAxis::X => factors.x = factor,
+                        GizmoAxis::Y => factors.y = factor,
+                        GizmoAxis::Z => factors.z = factor,
+                    }
+                }
+            } else {
+                match drag.axis {
+                    GizmoAxis::X => factors.x = factor,
+                    GizmoAxis::Y => factors.y = factor,
+                    GizmoAxis::Z => factors.z = factor,
+                }
+            }
+            let start_vertices = drag.dff_start_vertices.clone();
+            let pivot = drag.start_pos;
+            if let Err(err) =
+                scale_selected_editing_dff_vertices_from(app, &start_vertices, pivot, factors)
+            {
+                app.status_message = err;
             }
         }
     }
+}
+
+fn begin_dff_scale_input(app: &mut AppState) -> bool {
+    if app.active_tab != AppTab::Editing {
+        return false;
+    }
+    let start_vertices = selected_editing_dff_vertices(app);
+    let Some(pivot) = selected_editing_dff_vertex_position(app).map(from_mq) else {
+        app.status_message = "Select DFF vertices, edges, or faces before scaling".to_string();
+        return true;
+    };
+    if start_vertices.is_empty() {
+        app.status_message = "Select DFF vertices, edges, or faces before scaling".to_string();
+        return true;
+    }
+    drain_text_input();
+    app.transform_mode = TransformMode::Scale;
+    app.dff_scale_input = Some(DffScaleInput {
+        axis: None,
+        numeric_input: String::new(),
+        pivot,
+        start_vertices,
+        before: editing_history_snapshot(app),
+    });
+    app.status_message =
+        "Scale: type a factor, or X/Y/Z then a factor; Enter confirms, Esc cancels".to_string();
+    true
+}
+
+fn update_dff_scale_input(app: &mut AppState) -> bool {
+    let Some(mut input) = app.dff_scale_input.take() else {
+        return false;
+    };
+    if is_key_pressed(KeyCode::Escape) {
+        let _ = scale_selected_editing_dff_vertices_from(
+            app,
+            &input.start_vertices,
+            input.pivot,
+            Vec3::ONE,
+        );
+        app.status_message = "Cancelled DFF scaling".to_string();
+        return true;
+    }
+    for (key, axis) in [
+        (KeyCode::X, GizmoAxis::X),
+        (KeyCode::Y, GizmoAxis::Y),
+        (KeyCode::Z, GizmoAxis::Z),
+    ] {
+        if is_key_pressed(key) {
+            input.axis = Some(axis);
+        }
+    }
+    while let Some(ch) = get_char_pressed() {
+        let decimal = ch == '.' && !input.numeric_input.contains('.');
+        let sign = (ch == '-' || ch == '+') && input.numeric_input.is_empty();
+        if ch.is_ascii_digit() || decimal || sign {
+            input.numeric_input.push(ch);
+        }
+    }
+    if is_key_pressed(KeyCode::Backspace) {
+        input.numeric_input.pop();
+    }
+    let factor = input
+        .numeric_input
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite());
+    if let Some(factor) = factor {
+        let mut factors = Vec3::splat(factor);
+        if let Some(axis) = input.axis {
+            factors = Vec3::ONE;
+            match axis {
+                GizmoAxis::X => factors.x = factor,
+                GizmoAxis::Y => factors.y = factor,
+                GizmoAxis::Z => factors.z = factor,
+            }
+        }
+        if let Err(err) = scale_selected_editing_dff_vertices_from(
+            app,
+            &input.start_vertices,
+            input.pivot,
+            factors,
+        ) {
+            app.status_message = err;
+        } else {
+            let axis = input.axis.map_or("XYZ", |axis| match axis {
+                GizmoAxis::X => "X",
+                GizmoAxis::Y => "Y",
+                GizmoAxis::Z => "Z",
+            });
+            app.status_message = format!("Scale {axis}: {factor}; Enter confirms, Esc cancels");
+        }
+    }
+    if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
+        if factor.is_some() {
+            commit_editing_history(app, "Scale DFF Mesh Selection", input.before);
+        } else {
+            let _ = scale_selected_editing_dff_vertices_from(
+                app,
+                &input.start_vertices,
+                input.pivot,
+                Vec3::ONE,
+            );
+            app.status_message = "Scale cancelled: enter a valid number first".to_string();
+        }
+        return true;
+    }
+    app.dff_scale_input = Some(input);
+    true
 }
 
 pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     poll_dff_picker(app);
     update_race_minimap(app);
     let mouse: Vec2 = mouse_position().into();
+    // Asset drags must retain pointer ownership after leaving the browser;
+    // otherwise viewport handlers can consume the release before placement.
+    if app.asset_browser.drag.is_some() && update_asset_browser_drag(app, mouse) {
+        return;
+    }
+    // Context menus float above every panel. Handle them before the asset
+    // browser so a menu opened over a card receives its own click, and any
+    // click away dismisses it immediately.
+    if app.context_menu.is_some() {
+        set_ui_interaction_suppressed(true);
+        if is_key_pressed(KeyCode::Escape) {
+            app.context_menu = None;
+            return;
+        }
+        if is_mouse_button_pressed(MouseButton::Left) {
+            if let Some(action) = context_action_at(app, mouse) {
+                run_context_action(app, action);
+            }
+            app.context_menu = None;
+            return;
+        }
+        if is_mouse_button_pressed(MouseButton::Right) {
+            app.context_menu = None;
+            return;
+        }
+        return;
+    }
+    if update_classify_dialog_input(app, mouse) {
+        return;
+    }
+    if update_oversized_chunk_dialog_input(app, mouse) {
+        return;
+    }
+    if update_blender_import_setup_input(app, mouse) {
+        return;
+    }
+    if update_blender_import_dialog_input(app, mouse) {
+        return;
+    }
     if app.camera.looking {
         // Freecam owns pointer input until the right button is released. Do
         // not let the cursor's virtual position hover or activate editor UI.
@@ -6928,6 +8643,9 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         // tuned without interrupting camera movement.
         let wheel = safe_mouse_wheel().1;
         if wheel.abs() > f32::EPSILON {
+            if app.active_tab == AppTab::Editing && handle_dff_uv_editor_wheel(app, mouse, wheel) {
+                return;
+            }
             let active_tab = app.active_tab;
             let speed =
                 camera_speed_after_wheel(camera_speed_for_tab(app, active_tab), wheel, active_tab);
@@ -6935,6 +8653,7 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         }
         app.hovered = None;
         app.hovered_gizmo = None;
+        app.cull_hovered_face = None;
         app.hovered_col_face = None;
         app.hovered_col_vertex = None;
         app.col_box_hovered_face = None;
@@ -6994,6 +8713,9 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     if update_missing_col_dialog_input(app, mouse) {
         return;
     }
+    if update_import_asset_dialog_input(app, mouse) {
+        return;
+    }
     if update_load_dialog_input(app, mouse) {
         return;
     }
@@ -7004,6 +8726,9 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         return;
     }
     if update_dff_replace_choice_dialog_input(app, mouse) {
+        return;
+    }
+    if update_element_replace_with_dialog_input(app, viewport, mouse) {
         return;
     }
     if update_element_id_rename_dialog_input(app, mouse) {
@@ -7027,7 +8752,6 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     if handle_viewport_render_mode_click(app, viewport, mouse) {
         return;
     }
-    update_dropped_light_files(app);
     if handle_race_2d(app, mouse) {
         return;
     }
@@ -7090,10 +8814,19 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     if handle_col_material_dropdown_click(app, mouse) {
         return;
     }
+    if handle_native_model_dropdown_input(app, mouse) {
+        return;
+    }
+    if handle_txd_dropdown_input(app, mouse) {
+        return;
+    }
     if app.active_tab == AppTab::Preview
         && app.properties_tab == PropertiesTab::Element
         && handle_physics_root_dropdown_click(app, mouse)
     {
+        return;
+    }
+    if update_dff_scale_input(app) {
         return;
     }
     if update_inspector_text_input(app, mouse) {
@@ -7102,11 +8835,25 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     if app.active_tab == AppTab::Editing && update_dff_uv_anim_picker_text_input(app) {
         return;
     }
+    if app.active_tab == AppTab::Editing {
+        capture_dff_uv_numeric_transform_input(app);
+    }
     drain_text_input();
     if app.water_edge_drag.is_some() {
         update_water_edge_drag(app, viewport, mouse);
         if is_mouse_button_released(MouseButton::Left) {
             finish_water_edge_drag(app);
+        }
+        return;
+    }
+    if app.cull_face_drag.is_some() {
+        let transform_viewport = transform_interaction_viewport(app, viewport);
+        apply_cull_face_drag(app, transform_viewport, mouse);
+        if is_mouse_button_released(MouseButton::Left)
+            && let Some(drag) = app.cull_face_drag.take()
+        {
+            commit_cull_history(app, "Resize Cull Zone Face", drag.before);
+            app.status_message = "Resized water cull zone".to_string();
         }
         return;
     }
@@ -7119,8 +8866,18 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
             };
             match drag.target {
                 GizmoTarget::Element => {
-                    rebuild_render_cells(app);
+                    if let ScopedHistorySnapshot::PlacementTransforms(before) = &drag.before {
+                        rebuild_render_cells_for_placement_transforms(app, before);
+                    } else {
+                        // Alt-drag duplicates placements and is therefore a
+                        // structural edit rather than an in-place transform.
+                        rebuild_render_cells(app);
+                    }
                     commit_scoped_history(app, drag.label, drag.before);
+                }
+                GizmoTarget::CullZone => {
+                    commit_scoped_history(app, drag.label.clone(), drag.before);
+                    app.status_message = drag.label;
                 }
                 GizmoTarget::Light => {
                     mark_lights_changed(app);
@@ -7156,6 +8913,9 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                     commit_scoped_history(app, drag.label.clone(), drag.before);
                     app.status_message = drag.label;
                 }
+                GizmoTarget::DffPivot => {
+                    app.status_message = drag.label;
+                }
                 GizmoTarget::RacePoint => {
                     commit_scoped_history(app, drag.label.clone(), drag.before);
                     app.status_message = drag.label;
@@ -7176,6 +8936,18 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         return;
     }
     let (_, wheel) = safe_mouse_wheel();
+    // The UV workspace owns wheel input over its canvas. Route this before the
+    // generic editing viewport handler so scrolling zooms UVs without also
+    // changing the 3D camera speed underneath the editor.
+    if app.active_tab == AppTab::Editing && handle_dff_uv_editor_wheel(app, mouse, wheel) {
+        return;
+    }
+    if app.active_tab == AppTab::Editing && update_editing_txd_preview_input(app, mouse, wheel) {
+        return;
+    }
+    if handle_validation_collision_material_dropdown_input(app, mouse, wheel) {
+        return;
+    }
     if handle_validation_scroll(app, mouse, wheel) {
         return;
     }
@@ -7418,6 +9190,10 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         update_water_hover(app, mouse);
         return;
     }
+    if wheel.abs() > 0.0 && app.active_tab == AppTab::Cull && cull_list_rect(app).contains(mouse) {
+        scroll_cull_list(app, wheel);
+        return;
+    }
     if wheel.abs() > 0.0 && app.active_tab == AppTab::Lights && light_list_rect(app).contains(mouse)
     {
         scroll_light_list(app, wheel);
@@ -7486,7 +9262,13 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
 
     app.hovered = None;
     app.hovered_gizmo = None;
+    app.cull_hovered_face = None;
     app.col_box_hovered_face = None;
+    if app.active_tab == AppTab::Cull && viewport.contains(mouse) {
+        if let Some(pick) = pick_selected_cull_face(app, viewport, mouse) {
+            app.cull_hovered_face = Some((pick.axis, pick.side_is_max));
+        }
+    }
     if app.active_tab == AppTab::Editing && matches!(app.editing.asset, Some(EditingAsset::Col(_)))
     {
         let face_viewport = transform_interaction_viewport(app, viewport);
@@ -7502,6 +9284,9 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     let ctrl_down = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
     let shift_down = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
     let alt_down = is_key_down(KeyCode::LeftAlt) || is_key_down(KeyCode::RightAlt);
+    if alt_down && !ctrl_down && is_key_pressed(KeyCode::S) && begin_dff_scale_input(app) {
+        return;
+    }
     if app.active_tab == AppTab::Collisions && app.collision_edit_mode && viewport.contains(mouse) {
         if let Some((face, vertex)) =
             nearest_selected_collision_tab_screen_vertex(app, viewport, mouse)
@@ -7577,24 +9362,6 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         );
         return;
     }
-    if app.context_menu.is_some() {
-        if is_key_pressed(KeyCode::Escape) {
-            app.context_menu = None;
-            return;
-        }
-        if is_mouse_button_pressed(MouseButton::Left) {
-            if let Some(action) = context_action_at(app, mouse) {
-                run_context_action(app, action);
-            }
-            app.context_menu = None;
-            return;
-        }
-        if is_mouse_button_pressed(MouseButton::Right) {
-            app.context_menu = None;
-            return;
-        }
-        return;
-    }
     if handle_editing_mesh_selection_shortcuts(app, ctrl_down, shift_down, alt_down) {
         return;
     }
@@ -7620,7 +9387,15 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         redo(app);
         return;
     }
-    if !ctrl_down && app.active_tab == AppTab::Editing && is_key_pressed(KeyCode::M) {
+    let uv_editor_open = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.uv_editor.open
+    );
+    if !ctrl_down
+        && app.active_tab == AppTab::Editing
+        && !uv_editor_open
+        && is_key_pressed(KeyCode::M)
+    {
         open_dff_merge_choice_dialog(app);
         return;
     }
@@ -7688,6 +9463,12 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         }
         return;
     }
+    // The overflow navigation menu is drawn over the viewport. Give it first
+    // refusal while open so viewport-owned tools (notably vertex painting in
+    // the Bake tab) cannot consume clicks intended for its Water/Race rows.
+    if app.navigation_menu_open && handle_tab_click(app, mouse) {
+        return;
+    }
     if handle_lights_click(app, mouse) {
         return;
     }
@@ -7713,6 +9494,9 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         return;
     }
     if handle_water_click(app, mouse) {
+        return;
+    }
+    if handle_cull_click(app, mouse) {
         return;
     }
     if handle_race_overlay_toggle(app, mouse) {
@@ -7754,6 +9538,14 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
             return;
         }
         if viewport.contains(mouse) && is_mouse_button_pressed(MouseButton::Right) {
+            return;
+        }
+    }
+    if app.active_tab == AppTab::Cull {
+        if start_cull_face_drag(app, viewport, mouse) {
+            return;
+        }
+        if handle_cull_viewport_click(app, viewport, mouse) {
             return;
         }
     }
@@ -7850,7 +9642,12 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         && app.transform_mode != TransformMode::Select
         && app.active_tab != AppTab::Bake
     {
-        app.hovered_gizmo = gizmo_axis_at(app, transform_viewport, mouse);
+        app.hovered_gizmo_plane = gizmo_scale_plane_at(app, transform_viewport, mouse);
+        app.hovered_gizmo = if app.hovered_gizmo_plane.is_none() {
+            gizmo_axis_at(app, transform_viewport, mouse)
+        } else {
+            None
+        };
     }
 
     if !suppress_hover_pick
@@ -7859,17 +9656,15 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
         && app.active_tab != AppTab::Bake
         && is_mouse_button_pressed(MouseButton::Left)
     {
-        if let Some(axis) = app.hovered_gizmo {
+        let hovered_plane = app.hovered_gizmo_plane;
+        if let Some(axis) = app
+            .hovered_gizmo
+            .or_else(|| hovered_plane.map(|plane| gizmo_plane_axes(plane).0))
+        {
             let alt_down = is_key_down(KeyCode::LeftAlt) || is_key_down(KeyCode::RightAlt);
-            if alt_down
-                && app.active_tab == AppTab::Collisions
-                && app.collision_edit_mode
-                && app.selected_col_face.is_some()
-            {
-                app.status_message = "COL vertex duplicate is not supported".to_string();
-                return;
-            }
-            let before = if alt_down && app.active_tab != AppTab::Lights {
+            let before = if app.active_tab == AppTab::Cull {
+                ScopedHistorySnapshot::Cull(cull_history_snapshot(app))
+            } else if alt_down && app.active_tab != AppTab::Lights {
                 match app.active_tab {
                     AppTab::Editing => {
                         ScopedHistorySnapshot::WorldEditing(world_editing_history_snapshot(app))
@@ -7889,12 +9684,15 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                         ScopedHistorySnapshot::Editing(editing_history_snapshot(app))
                     }
                     AppTab::Race => ScopedHistorySnapshot::Race(race_history_snapshot(app)),
-                    _ => ScopedHistorySnapshot::World(world_history_snapshot(app)),
+                    _ => ScopedHistorySnapshot::PlacementTransforms(
+                        placement_transform_history_snapshot(app, selected_live_indices(app)),
+                    ),
                 }
             };
             let mut label = match app.transform_mode {
                 TransformMode::Move => "Move",
                 TransformMode::Rotate => "Rotate",
+                TransformMode::Scale => "Scale",
                 TransformMode::Select => "Transform",
             }
             .to_string();
@@ -7926,6 +9724,8 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                         start_rot: from_mq(start_direction),
                         element_start_positions: Vec::new(),
                         element_start_rots: Vec::new(),
+                        scale_plane: None,
+                        dff_start_vertices: Vec::new(),
                         before,
                         label: drag_label,
                     });
@@ -7945,6 +9745,8 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                         start_rot: V3::default(),
                         element_start_positions: Vec::new(),
                         element_start_rots: Vec::new(),
+                        scale_plane: None,
+                        dff_start_vertices: Vec::new(),
                         before,
                         label: "Move COL Vertex".to_string(),
                     });
@@ -7963,8 +9765,8 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                         _ => None,
                     })
                     .is_some();
-                if primitive_selected && alt_down {
-                    editing_duplicate_selected_col_primitive(app);
+                if alt_down && !editing_duplicate_selected_mesh(app) {
+                    return;
                 }
                 if let Some(origin) = selected_origin(app) {
                     let target = if primitive_selected {
@@ -8018,6 +9820,8 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                         "Rotate Editing COL Box"
                     } else if target == GizmoTarget::CollisionPrimitive {
                         "Move Editing COL Primitive"
+                    } else if alt_down {
+                        "Alt Duplicate COL Mesh Selection"
                     } else {
                         "Move Editing COL Vertex"
                     };
@@ -8029,6 +9833,8 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                         start_rot: primitive_rotation,
                         element_start_positions: Vec::new(),
                         element_start_rots: Vec::new(),
+                        scale_plane: None,
+                        dff_start_vertices: Vec::new(),
                         before,
                         label: label.to_string(),
                     });
@@ -8037,35 +9843,35 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
             }
             if app.active_tab == AppTab::Editing {
                 if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() {
-                    if let Some(origin) = selected_editing_dff_2dfx_position(app) {
+                    // Freeform pivot editing owns the transform gimbal until it
+                    // is applied or cancelled, regardless of mesh selection.
+                    if let Some(pivot) = dff.freeform_pivot {
+                        if app.dff_geometry_job.is_some() {
+                            return;
+                        }
                         app.gizmo_drag = Some(GizmoDrag {
-                            target: GizmoTarget::Dff2dEffect,
+                            target: GizmoTarget::DffPivot,
                             axis,
                             start_mouse: mouse,
-                            start_pos: from_mq(origin),
-                            start_rot: V3::default(),
+                            start_pos: pivot.position,
+                            start_rot: pivot.rotation,
                             element_start_positions: Vec::new(),
                             element_start_rots: Vec::new(),
+                            scale_plane: None,
+                            dff_start_vertices: Vec::new(),
                             before,
-                            label: "Moved DFF 2DFX".to_string(),
+                            label: if app.transform_mode == TransformMode::Rotate {
+                                "Rotated freeform DFF pivot".to_string()
+                            } else {
+                                "Moved freeform DFF pivot".to_string()
+                            },
                         });
                         return;
                     }
-                    if let Some(origin) = selected_editing_dff_vertex_position(app) {
-                        app.gizmo_drag = Some(GizmoDrag {
-                            target: GizmoTarget::DffVertex,
-                            axis,
-                            start_mouse: mouse,
-                            start_pos: from_mq(origin),
-                            start_rot: V3::default(),
-                            element_start_positions: Vec::new(),
-                            element_start_rots: Vec::new(),
-                            before,
-                            label: "Moved DFF Vertex".to_string(),
-                        });
-                        return;
-                    }
-                    if dff.boolean_box.is_some() {
+                    // An active cutter owns the DFF transform gizmo. Prioritise
+                    // it over mesh and 2DFX selections so restored selection
+                    // state cannot make the cutter appear immovable.
+                    if dff.boolean_box.is_some() && app.transform_mode != TransformMode::Scale {
                         if let Some(origin) = selected_editing_dff_boolean_box_position(app) {
                             app.gizmo_drag = Some(GizmoDrag {
                                 target: GizmoTarget::DffBooleanBox,
@@ -8075,11 +9881,68 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                                 start_rot: V3::default(),
                                 element_start_positions: Vec::new(),
                                 element_start_rots: Vec::new(),
+                                scale_plane: None,
+                                dff_start_vertices: Vec::new(),
                                 before,
                                 label: "Moved DFF Boolean Cutter".to_string(),
                             });
                             return;
                         }
+                    }
+                    if app.transform_mode != TransformMode::Scale
+                        && let Some(origin) = selected_editing_dff_2dfx_position(app)
+                    {
+                        let rotation = selected_editing_dff_2dfx_rotation(app);
+                        if app.transform_mode == TransformMode::Rotate && rotation.is_none() {
+                            return;
+                        }
+                        let rotating = app.transform_mode == TransformMode::Rotate;
+                        app.gizmo_drag = Some(GizmoDrag {
+                            target: GizmoTarget::Dff2dEffect,
+                            axis,
+                            start_mouse: mouse,
+                            start_pos: from_mq(origin),
+                            start_rot: rotation.unwrap_or_default(),
+                            element_start_positions: Vec::new(),
+                            element_start_rots: Vec::new(),
+                            scale_plane: None,
+                            dff_start_vertices: Vec::new(),
+                            before,
+                            label: if rotating {
+                                "Rotated DFF Road Sign".to_string()
+                            } else {
+                                "Moved DFF 2DFX".to_string()
+                            },
+                        });
+                        return;
+                    }
+                    if selected_editing_dff_vertex_position(app).is_some() {
+                        if alt_down && !editing_duplicate_selected_mesh(app) {
+                            return;
+                        }
+                        let Some(origin) = selected_editing_dff_vertex_position(app) else {
+                            return;
+                        };
+                        app.gizmo_drag = Some(GizmoDrag {
+                            target: GizmoTarget::DffVertex,
+                            axis,
+                            start_mouse: mouse,
+                            start_pos: from_mq(origin),
+                            start_rot: V3::default(),
+                            element_start_positions: Vec::new(),
+                            element_start_rots: Vec::new(),
+                            scale_plane: hovered_plane,
+                            dff_start_vertices: selected_editing_dff_vertices(app),
+                            before,
+                            label: if app.transform_mode == TransformMode::Scale {
+                                "Scaled DFF Mesh Selection".to_string()
+                            } else if alt_down {
+                                "Alt Duplicate DFF Mesh Selection".to_string()
+                            } else {
+                                "Moved DFF Vertex".to_string()
+                            },
+                        });
+                        return;
                     }
                 }
             }
@@ -8093,8 +9956,28 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                         start_rot: V3::default(),
                         element_start_positions: Vec::new(),
                         element_start_rots: Vec::new(),
+                        scale_plane: None,
+                        dff_start_vertices: Vec::new(),
                         before,
                         label: "Move Race Point".to_string(),
+                    });
+                    return;
+                }
+            }
+            if app.active_tab == AppTab::Cull {
+                if let Some(zone) = selected_cull_zone(app) {
+                    app.gizmo_drag = Some(GizmoDrag {
+                        target: GizmoTarget::CullZone,
+                        axis,
+                        start_mouse: mouse,
+                        start_pos: zone.center,
+                        start_rot: V3::default(),
+                        element_start_positions: Vec::new(),
+                        element_start_rots: Vec::new(),
+                        scale_plane: None,
+                        dff_start_vertices: Vec::new(),
+                        before,
+                        label: "Move water cull zone".to_string(),
                     });
                     return;
                 }
@@ -8143,6 +10026,8 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                     start_rot: V3::default(),
                     element_start_positions,
                     element_start_rots,
+                    scale_plane: None,
+                    dff_start_vertices: Vec::new(),
                     before,
                     label,
                 });
@@ -8197,7 +10082,11 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                         if is_mouse_button_pressed(MouseButton::Left)
                             && (app.active_tab != AppTab::Lights || alt_down)
                         {
-                            select_element_with_mode(app, idx, shift_down);
+                            if shift_down {
+                                select_outliner_range(app, idx);
+                            } else {
+                                select_element(app, idx);
+                            }
                         }
                         if is_mouse_button_pressed(MouseButton::Right) {
                             snap_to(app, idx);
@@ -8271,6 +10160,8 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
             delete_selected_light(app);
         } else if app.active_tab == AppTab::Water {
             delete_water_plane(app);
+        } else if app.active_tab == AppTab::Cull {
+            delete_cull_zone(app);
         } else if app.active_tab == AppTab::Editing {
             match app.editing.asset.as_ref() {
                 Some(EditingAsset::Dff(dff)) if dff.select_mode == EditingSelectMode::Vertex => {
@@ -8339,6 +10230,8 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                 duplicate_selected_light(app);
             } else if app.active_tab == AppTab::Water {
                 duplicate_water_plane(app);
+            } else if app.active_tab == AppTab::Cull {
+                duplicate_cull_zone(app);
             } else if app.active_tab == AppTab::Editing
                 && matches!(app.editing.asset, Some(EditingAsset::Col(_)))
             {
@@ -8383,6 +10276,8 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
             move_selected_light(app, delta);
         } else if app.active_tab == AppTab::Water {
             move_selected_water(app, delta);
+        } else if app.active_tab == AppTab::Cull {
+            move_selected_cull(app, delta);
         } else {
             move_selected(app, delta);
         }
@@ -8475,6 +10370,58 @@ fn toggle_camera_mode(app: &mut AppState) {
     app.status_message = format!("Camera mode: {}", camera_mode_label(app.camera_mode));
 }
 
+/// Whether an editor text control currently owns keyboard input.
+///
+/// Macroquad exposes typed characters separately from key-down state, so
+/// draining `get_char_pressed` is not enough to keep a held W/A/S/D/Q/E from
+/// reaching the camera later in the same frame. Keep the focus test in one
+/// place so every custom edit box follows the same rule.
+pub(crate) fn editor_text_input_active(app: &AppState) -> bool {
+    let world_outliner_active = app.active_tab != AppTab::Editing
+        && app.active_tab != AppTab::Race
+        && left_sidebar_visible()
+        && app.outliner_search_active;
+    let asset_search_active = app.active_tab != AppTab::Editing
+        && app.active_tab != AppTab::Vehicles
+        && app.asset_browser.expanded
+        && app.asset_browser.search_active;
+    let vehicle_text_active = app.active_tab == AppTab::Vehicles
+        && (app.vehicle_browser.search_active
+            || app.vehicle_browser.build_dialog.is_some()
+            || app.vehicle_browser.collision_copy_dialog.is_some());
+    let editing_text_active = app.active_tab == AppTab::Editing
+        && (app.editing.search_active
+            || match app.editing.asset.as_ref() {
+                Some(EditingAsset::Txd(txd)) => txd.search_active || txd.material_picker_open,
+                Some(EditingAsset::Dff(dff)) => {
+                    dff.collision_material_picker_open
+                        || dff.uv_anim_picker_open
+                        || dff.dff_2dfx_type_picker_open
+                        || dff.dff_2dfx_corona_preset_picker_open
+                        || dff.dff_2dfx_payload_editor_open
+                }
+                _ => false,
+            });
+
+    app.inspector_edit.is_some()
+        || (app.active_tab != AppTab::Editing && app.group_rename.is_some())
+        || (app.active_tab == AppTab::Race && app.race_name_edit.is_some())
+        || world_outliner_active
+        || asset_search_active
+        || vehicle_text_active
+        || editing_text_active
+        || app.native_model_dropdown_open
+        || app.txd_dropdown_open
+        || app.load_dialog.is_some()
+        || app.preferences_dialog.is_some()
+        || app.save_as_dialog.is_some()
+        || app.blender_import_setup.is_some()
+        || app.oversized_chunk_dialog.is_some()
+        || app.classify_dialog.is_some()
+        || app.lod_batch_dialog.is_some()
+        || app.dff_texture_duplicate_dialog.is_some()
+}
+
 pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
     let viewport = if app.active_tab == AppTab::Vehicles {
         vehicle_preview_viewport_rect(app)
@@ -8483,7 +10430,7 @@ pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
     };
     if app.context_menu.is_some() {
         app.camera.looking = false;
-        set_ui_interaction_suppressed(false);
+        set_ui_interaction_suppressed(true);
         set_cursor_grab(false);
         show_mouse(true);
         return;
@@ -8494,7 +10441,13 @@ pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
     let mut stopped_looking = false;
     let mouse: Vec2 = mouse_position().into();
     let in_view = viewport.contains(mouse);
-    if is_mouse_button_pressed(MouseButton::Right) && in_view {
+    let uv_editor_open = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if app.active_tab == AppTab::Editing && dff.uv_editor.open
+    );
+    let right_click_owns_viewport =
+        in_view && (!uv_editor_open || editing_preview_rect(app).contains(mouse));
+    if is_mouse_button_pressed(MouseButton::Right) && right_click_owns_viewport {
         app.camera.looking = true;
         app.camera.last_mouse = mouse;
         set_cursor_grab(true);
@@ -8508,7 +10461,10 @@ pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
     }
     set_ui_interaction_suppressed(app.camera.looking);
     // Hold middle mouse to pan the camera across the scene (grab-style drag).
-    let mid_pan = !app.camera.looking && is_mouse_button_down(MouseButton::Middle) && in_view;
+    let mid_pan = !app.camera.looking
+        && is_mouse_button_down(MouseButton::Middle)
+        && in_view
+        && !dff_uv_editor_owns_middle_mouse(app, mouse);
     if app.camera.looking {
         let delta = mouse - app.camera.last_mouse;
         app.camera.last_mouse = mouse;
@@ -8549,33 +10505,45 @@ pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
 
     let dt = get_frame_time();
     let active_camera_speed = camera_speed_for_tab(app, app.active_tab);
-    let speed = if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
-        active_camera_speed * 3.5
-    } else {
-        active_camera_speed
-    } * camera_translation_scale(app.active_tab);
+    let shift_down = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+    let alt_down = is_key_down(KeyCode::LeftAlt) || is_key_down(KeyCode::RightAlt);
+    let speed = active_camera_speed
+        * camera_translation_modifier(shift_down, alt_down)
+        * camera_translation_scale(app.active_tab);
     let step = speed * dt;
     let (forward, right) = camera_vectors(&app.camera);
     let mut movement = Vec3::ZERO;
-    if is_key_down(KeyCode::W) {
-        movement += forward * step;
-    }
-    if is_key_down(KeyCode::S) {
-        movement -= forward * step;
-    }
-    if is_key_down(KeyCode::D) {
-        movement += right * step;
-    }
-    if is_key_down(KeyCode::A) {
-        movement -= right * step;
-    }
-    if is_key_down(KeyCode::Q) {
-        movement.z -= step;
+    // Keep keyboard focus stable while freecam captures/hides the pointer.
+    // Either mouse button can focus the model preview; clicking the UV panel
+    // hands WASDEQ back to the UV workspace.
+    let camera_translation_focused = app.dff_scale_input.is_none()
+        && app.editing.asset.as_ref().is_none_or(|asset| match asset {
+            EditingAsset::Dff(dff) if app.active_tab == AppTab::Editing && dff.uv_editor.open => {
+                dff.uv_editor.viewport_keyboard_focus
+            }
+            _ => true,
+        });
+    if camera_translation_focused {
+        if is_key_down(KeyCode::W) {
+            movement += forward * step;
+        }
+        if is_key_down(KeyCode::S) {
+            movement -= forward * step;
+        }
+        if is_key_down(KeyCode::D) {
+            movement += right * step;
+        }
+        if is_key_down(KeyCode::A) {
+            movement -= right * step;
+        }
+        if is_key_down(KeyCode::Q) {
+            movement.z -= step;
+        }
     }
     let ctrl_down = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
     let editing_extrude_pressed =
         app.active_tab == AppTab::Editing && ctrl_down && is_key_pressed(KeyCode::E);
-    if is_key_down(KeyCode::E) && !editing_extrude_pressed {
+    if camera_translation_focused && is_key_down(KeyCode::E) && !editing_extrude_pressed {
         movement.z += step;
     }
     if movement.length_squared() > 0.0 {
@@ -8606,6 +10574,12 @@ fn camera_translation_scale(active_tab: AppTab) -> f32 {
     }
 }
 
+fn camera_translation_modifier(shift_down: bool, alt_down: bool) -> f32 {
+    let shift_multiplier = if shift_down { 3.5 } else { 1.0 };
+    let alt_multiplier = if alt_down { 0.5 } else { 1.0 };
+    shift_multiplier * alt_multiplier
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8614,6 +10588,14 @@ mod tests {
     fn vehicle_freecam_translation_runs_at_half_speed() {
         assert_eq!(camera_translation_scale(AppTab::Vehicles), 0.5);
         assert_eq!(camera_translation_scale(AppTab::Editing), 1.0);
+    }
+
+    #[test]
+    fn alt_halves_freecam_translation_speed() {
+        assert_eq!(camera_translation_modifier(false, false), 1.0);
+        assert_eq!(camera_translation_modifier(false, true), 0.5);
+        assert_eq!(camera_translation_modifier(true, false), 3.5);
+        assert_eq!(camera_translation_modifier(true, true), 1.75);
     }
 
     #[test]

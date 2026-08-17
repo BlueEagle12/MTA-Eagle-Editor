@@ -1,6 +1,6 @@
 [package]
 name = "eagle-editor"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.85"
 description = "Native 3D world and asset editor for Multi Theft Auto: San Andreas"
@@ -12,7 +12,7 @@ categories = ["graphics", "game-development"]
 
 [dependencies]
 macroquad = "0.4.15"
-image = { version = "0.25.8", default-features = false, features = ["png", "gif"] }
+image = { version = "0.25.8", default-features = false, features = ["png", "gif", "jpeg", "bmp", "tga"] }
 regex = "1.12.2"
 walkdir = "2.5.0"
 fontdue = "0.9"
@@ -27,6 +27,10 @@ rfd = "0.15.4"
 [build-dependencies]
 gl_generator = "0.14.0"
 image = { version = "0.25.8", default-features = false, features = ["png"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
 
 [patch.crates-io]
 # Miniquad 0.4.10 requests a forward-compatible core profile on Windows,

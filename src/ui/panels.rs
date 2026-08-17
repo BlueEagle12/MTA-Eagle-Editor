@@ -1,7 +1,21 @@
 use super::super::*;
 
 pub(crate) fn current_rss_mb() -> f32 {
+    static RSS_SAMPLE: OnceLock<Mutex<Option<(Instant, f32)>>> = OnceLock::new();
+
+    let now = Instant::now();
+    let mut sample = RSS_SAMPLE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((sampled_at, value)) = *sample
+        && now.duration_since(sampled_at) < Duration::from_secs(1)
+    {
+        return value;
+    }
+
     let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        *sample = Some((now, 0.0));
         return 0.0;
     };
     for line in status.lines() {
@@ -11,9 +25,12 @@ pub(crate) fn current_rss_mb() -> f32 {
                 .next()
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(0.0);
-            return kb / 1024.0;
+            let value = kb / 1024.0;
+            *sample = Some((now, value));
+            return value;
         }
     }
+    *sample = Some((now, 0.0));
     0.0
 }
 
@@ -475,6 +492,14 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     icon_button(
         &app.ui_font,
         toolbar_button_rect(3),
+        &app.icons.scale,
+        app.transform_mode == TransformMode::Scale,
+        app.active_tab == AppTab::Editing && !selected_editing_dff_vertices(app).is_empty(),
+        "Scale (Alt+S)",
+    );
+    icon_button(
+        &app.ui_font,
+        toolbar_button_rect(4),
         &app.icons.duplicate,
         false,
         has_selection && !selected_deleted,
@@ -482,7 +507,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     );
     icon_button(
         &app.ui_font,
-        toolbar_button_rect(4),
+        toolbar_button_rect(5),
         &app.icons.delete,
         false,
         has_selection,
@@ -494,7 +519,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     );
     icon_button(
         &app.ui_font,
-        toolbar_button_rect(5),
+        toolbar_button_rect(6),
         &app.icons.undo,
         false,
         !app.undo_stack.is_empty(),
@@ -502,13 +527,13 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     );
     icon_button(
         &app.ui_font,
-        toolbar_button_rect(6),
+        toolbar_button_rect(7),
         &app.icons.redo,
         false,
         !app.redo_stack.is_empty(),
         "Redo",
     );
-    for slot in [2_usize, 4, 6] {
+    for slot in [3_usize, 5, 7] {
         let rect = toolbar_button_rect(slot);
         draw_line(
             rect.x + rect.w + 3.0,
@@ -519,7 +544,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
             ui_border(),
         );
     }
-    draw_line(318.0, TOP_H - 34.0, 318.0, TOP_H - 8.0, 1.0, ui_border());
+    draw_line(362.0, TOP_H - 34.0, 362.0, TOP_H - 8.0, 1.0, ui_border());
     text_button(&app.ui_font, snap_mode_rect(), "Snap", app.snap_enabled);
     if snap_mode_rect().contains(mouse_position().into()) {
         draw_text_tooltip(
@@ -555,7 +580,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     }
     text_button(&app.ui_font, generate_txd_button_rect(), "Build TXD", false);
     if SHOW_BLENDER_IMPORT {
-        if app.blender_import_rx.is_some() {
+        if app.blender_import_rx.is_some() || app.blender_import_setup.is_some() {
             text_button_busy(&app.ui_font, import_blender_button_rect(), "Import Blender");
         } else {
             text_button(
@@ -572,7 +597,13 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
         "Preferences",
         app.preferences_dialog.is_some(),
     );
-    let hint_x = preferences_button_rect().x + preferences_button_rect().w + 12.0;
+    text_button(
+        &app.ui_font,
+        import_asset_button_rect(),
+        "Import new asset",
+        app.import_asset_dialog.is_some(),
+    );
+    let hint_x = import_asset_button_rect().x + import_asset_button_rect().w + 12.0;
     let hint_w = (sw - hint_x - 12.0).max(0.0);
     if hint_w > 160.0 {
         ui_text(
@@ -1074,6 +1105,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
         AppTab::Lights => draw_lights_panel(app),
         AppTab::Bake => draw_bake_panel(app),
         AppTab::Water => draw_water_panel(app),
+        AppTab::Cull => draw_cull_panel(app),
         AppTab::Race => draw_race_panel(app),
         AppTab::Simulate => draw_simulate_panel(app),
     }
@@ -1152,6 +1184,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     }
     draw_context_menu(app);
     if app.last_log.elapsed().as_secs_f32() >= 1.0 {
+        let viewport_diagnostics = viewport_render_diagnostics();
         eprintln!(
             "frame: fps={} rss={:.0}MB placements={} parts={} vertices={} msaa={} radius={} part_budget={} vertex_budget={} textures={}",
             app.fps_display,
@@ -1165,6 +1198,27 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
             budget_label(app.options.vertex_budget),
             app.options.textures
         );
+        eprintln!(
+            "viewport: total={:.2}ms cull={:.2}ms sort={:.2}ms submit={:.2}ms cells={}/{} submitted={} blend_segments={} draw_calls={} state_changes={}",
+            viewport_diagnostics.frame_ms,
+            viewport_diagnostics.cull_ms,
+            viewport_diagnostics.sort_ms,
+            viewport_diagnostics.submit_ms,
+            viewport_diagnostics.visible_cells,
+            viewport_diagnostics.candidate_cells,
+            viewport_diagnostics.submitted_cells,
+            viewport_diagnostics.blend_segments,
+            viewport_diagnostics.draw_calls,
+            viewport_diagnostics.state_changes,
+        );
+        eprintln!(
+            "residency: cells={} gpu={:.1}MB uploads={} evictions={} misses={}",
+            viewport_diagnostics.resident_cells,
+            viewport_diagnostics.resident_bytes as f64 / (1024.0 * 1024.0),
+            viewport_diagnostics.residency_uploads,
+            viewport_diagnostics.residency_evictions,
+            viewport_diagnostics.residency_misses,
+        );
         app.last_log = Instant::now();
     }
 }
@@ -1173,7 +1227,10 @@ pub(crate) fn viewport_render_mode_available(app: &AppState) -> bool {
     app.active_tab == AppTab::Preview
         || (app.active_tab == AppTab::Editing
             && !editing_material_picker_is_open(app)
-            && matches!(app.editing.asset, Some(EditingAsset::Dff(_))))
+            && matches!(
+                app.editing.asset,
+                Some(EditingAsset::Dff(ref dff)) if !dff.uv_editor.open
+            ))
 }
 
 pub(crate) fn viewport_render_mode_rects(app: &AppState, viewport: Rect) -> [Rect; 3] {

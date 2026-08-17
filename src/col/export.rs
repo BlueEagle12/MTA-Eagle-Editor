@@ -379,7 +379,11 @@ pub(crate) fn write_col_mesh_from_template(
     template: &[u8],
     mesh: &CollisionMesh,
 ) -> Result<Vec<u8>, String> {
-    write_col_mesh_from_template_with_bounds(template, mesh, None)
+    let bounds_only = mesh.vertices.is_empty()
+        && mesh.faces.is_empty()
+        && mesh.spheres.is_empty()
+        && mesh.boxes.is_empty();
+    write_col_mesh_from_template_with_bounds(template, mesh, bounds_only.then_some(mesh.bounds))
 }
 
 /// Replace exactly one model in a packed COL entry.

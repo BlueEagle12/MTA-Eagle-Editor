@@ -169,6 +169,9 @@ pub(crate) fn properties_scroll_max(app: &AppState) -> f32 {
     if app.active_tab == AppTab::Water {
         return water_panel_scroll_max();
     }
+    if app.active_tab == AppTab::Cull {
+        return cull_panel_scroll_max();
+    }
     if app.active_tab != AppTab::Preview {
         return 0.0;
     }
@@ -472,10 +475,6 @@ pub(crate) fn preview_texture_thumbnail_rect(row: Rect) -> Rect {
     Rect::new(row.x + 4.0, row.y + 4.0, 44.0, 44.0)
 }
 
-pub(crate) fn preview_texture_view_rect(row: Rect) -> Rect {
-    Rect::new(row.x + row.w - 54.0, row.y + 13.0, 48.0, 26.0)
-}
-
 pub(crate) fn open_preview_texture_view_dialog(
     app: &mut AppState,
     placement_index: usize,
@@ -492,23 +491,115 @@ pub(crate) fn open_preview_texture_view_dialog(
         );
         return false;
     }
-    let width = entry.texture_width.max(1);
-    let height = entry.texture_height.max(1);
+    let fallback_width = entry.texture_width.max(1);
+    let fallback_height = entry.texture_height.max(1);
     let txd_name = app
         .placements
         .get(placement_index)
         .and_then(|placement| definition_txd_name(&app.definitions, &placement.id))
         .map(|name| asset_key(name, ".txd"))
         .unwrap_or_else(|| "Resolved texture pool".to_string());
+    let decoded = decode_preview_material_texture(app, &entry, &txd_name);
+    let (texture, rgba, width, height) = decoded
+        .map(|(decoded_width, decoded_height, rgba)| {
+            let texture = Texture2D::from_rgba8(decoded_width, decoded_height, &rgba);
+            texture.set_filter(FilterMode::Nearest);
+            (Some(texture), Some(rgba), decoded_width, decoded_height)
+        })
+        .unwrap_or((None, None, fallback_width, fallback_height));
+    let raw_texture = if rgba.is_some() { 0 } else { entry.texture_id };
     app.dff_texture_view_dialog = Some(DffTextureViewDialog {
         texture_name: entry.texture_name,
         txd_name,
         width,
         height,
-        texture: None,
-        raw_texture: entry.texture_id,
+        texture,
+        raw_texture,
+        rgba,
     });
     true
+}
+
+fn decode_preview_material_texture(
+    app: &AppState,
+    entry: &PreviewMaterialEntry,
+    txd_name: &str,
+) -> Option<(u16, u16, Vec<u8>)> {
+    let decoded = app
+        .txd_textures
+        .get(&lower(&entry.texture_name))
+        .and_then(|textures| {
+            entry
+                .fingerprint
+                .and_then(|fingerprint| {
+                    textures
+                        .iter()
+                        .find(|texture| texture.content_fingerprint == fingerprint)
+                })
+                .or_else(|| {
+                    textures
+                        .iter()
+                        .find(|texture| texture.txd_name.eq_ignore_ascii_case(txd_name))
+                })
+                .or_else(|| textures.first())
+        })
+        .and_then(decode_txd_texture)
+        .and_then(|(width, height, rgba)| {
+            Some((
+                u16::try_from(width).ok()?,
+                u16::try_from(height).ok()?,
+                rgba,
+            ))
+        });
+    decoded.or_else(|| {
+        let path = app.texture_files.get(&lower(&entry.texture_name))?;
+        let image = image::open(path).ok()?.to_rgba8();
+        let (width, height) = image.dimensions();
+        Some((
+            u16::try_from(width).ok()?,
+            u16::try_from(height).ok()?,
+            image.into_raw(),
+        ))
+    })
+}
+
+pub(crate) fn open_preview_texture_export_all_picker(app: &mut AppState) {
+    if app.dff_picker_rx.is_some() {
+        app.status_message = "File browser is already open".to_string();
+        return;
+    }
+    let placement_index = app.selected;
+    let txd_name = app
+        .placements
+        .get(placement_index)
+        .and_then(|placement| definition_txd_name(&app.definitions, &placement.id))
+        .map(|name| asset_key(name, ".txd"))
+        .unwrap_or_else(|| "Resolved texture pool".to_string());
+    let mut seen = HashSet::new();
+    let textures = preview_material_entries(app, placement_index)
+        .into_iter()
+        .filter(|entry| seen.insert(lower(&entry.texture_name)))
+        .filter_map(|entry| {
+            let name = entry.texture_name.clone();
+            decode_preview_material_texture(app, &entry, &txd_name)
+                .map(|(width, height, rgba)| (name, width as u32, height as u32, rgba))
+        })
+        .collect::<Vec<_>>();
+    if textures.is_empty() {
+        app.status_message = "No resolved textures are available to export".to_string();
+        return;
+    }
+    drain_text_input();
+    let start_dir = load_last_dff_export_dir();
+    let (tx, rx) = mpsc::channel();
+    app.dff_picker_rx = Some(rx);
+    app.status_message = "Choose a folder for the exported textures...".to_string();
+    thread::spawn(move || {
+        let _ = tx.send((
+            DffPickerKind::ExportTexturePngs { textures },
+            choose_editing_export_textures_dir(start_dir),
+        ));
+    });
 }
 
 pub(crate) fn preview_material_entry(
@@ -536,6 +627,7 @@ pub(crate) struct ElementPanelLayout {
     pub(crate) light_lod: Option<Rect>,
     pub(crate) unique_id: Option<Rect>,
     pub(crate) select_same_id: Option<Rect>,
+    pub(crate) replace_with: Option<Rect>,
     pub(crate) copy_position: Option<Rect>,
     pub(crate) copy_rotation: Option<Rect>,
     pub(crate) pos: Option<[Rect; 3]>,
@@ -576,6 +668,16 @@ pub(crate) struct ElementPanelLayout {
     pub(crate) physics_buoyancy: Option<Rect>,
     pub(crate) physics_center_of_mass: Option<[Rect; 3]>,
     pub(crate) physics_clear: Option<Rect>,
+    pub(crate) texture_export_all: Option<Rect>,
+    pub(crate) texture_advanced: Option<Rect>,
+    pub(crate) texture_scope_object: Option<Rect>,
+    pub(crate) texture_scope_world: Option<Rect>,
+    pub(crate) texture_variation: Option<Rect>,
+    pub(crate) texture_uv_scale_minus: Option<Rect>,
+    pub(crate) texture_uv_scale_value: Option<Rect>,
+    pub(crate) texture_uv_scale_plus: Option<Rect>,
+    pub(crate) texture_world_preview: Option<Rect>,
+    pub(crate) texture_world_unwrap: Option<Rect>,
     pub(crate) texture_rows: Option<Vec<Rect>>,
 }
 
@@ -623,6 +725,7 @@ pub(crate) fn element_panel_layout(app: &AppState) -> ElementPanelLayout {
         light_lod: None,
         unique_id: None,
         select_same_id: None,
+        replace_with: None,
         copy_position: None,
         copy_rotation: None,
         pos: None,
@@ -663,6 +766,16 @@ pub(crate) fn element_panel_layout(app: &AppState) -> ElementPanelLayout {
         physics_buoyancy: None,
         physics_center_of_mass: None,
         physics_clear: None,
+        texture_export_all: None,
+        texture_advanced: None,
+        texture_scope_object: None,
+        texture_scope_world: None,
+        texture_variation: None,
+        texture_uv_scale_minus: None,
+        texture_uv_scale_value: None,
+        texture_uv_scale_plus: None,
+        texture_world_preview: None,
+        texture_world_unwrap: None,
         texture_rows: None,
     };
 
@@ -703,6 +816,8 @@ pub(crate) fn element_panel_layout(app: &AppState) -> ElementPanelLayout {
         layout.remove_instance_lods = Some(elem_full(x0, y, DFF_BTN_H));
         y += DFF_BTN_H + ELEM_ROW_GAP;
         layout.select_same_id = Some(elem_full(x0, y, DFF_BTN_H));
+        y += DFF_BTN_H + ELEM_ROW_GAP;
+        layout.replace_with = Some(elem_full(x0, y, DFF_BTN_H));
         y += DFF_BTN_H + ELEM_ROW_GAP;
         layout.assign_lod = Some(elem_full(x0, y, DFF_BTN_H));
         y += DFF_BTN_H + ELEM_ROW_GAP;
@@ -865,6 +980,27 @@ pub(crate) fn element_panel_layout(app: &AppState) -> ElementPanelLayout {
         if entries.is_empty() {
             y += 28.0;
         } else {
+            layout.texture_export_all = Some(elem_full(x0, y, DFF_BTN_H));
+            y += DFF_BTN_H + ELEM_ROW_GAP;
+            layout.texture_advanced = Some(elem_full(x0, y, DFF_BTN_H));
+            y += DFF_BTN_H + ELEM_ROW_GAP;
+            if app.preview_texture_advanced {
+                layout.texture_scope_object = Some(elem_half(x0, y, 0, DFF_BTN_H));
+                layout.texture_scope_world = Some(elem_half(x0, y, 1, DFF_BTN_H));
+                y += DFF_BTN_H + ELEM_ROW_GAP;
+                layout.texture_variation = Some(elem_full(x0, y, DFF_BTN_H));
+                y += DFF_BTN_H + ELEM_ROW_GAP;
+                let third = (elem_full_w() - 18.0) / 4.0;
+                layout.texture_uv_scale_minus = Some(Rect::new(x0, y, third, DFF_BTN_H));
+                layout.texture_uv_scale_value =
+                    Some(Rect::new(x0 + third + 6.0, y, third * 2.0, DFF_BTN_H));
+                layout.texture_uv_scale_plus =
+                    Some(Rect::new(x0 + third * 3.0 + 12.0, y, third, DFF_BTN_H));
+                y += DFF_BTN_H + ELEM_ROW_GAP;
+                layout.texture_world_preview = Some(elem_half(x0, y, 0, DFF_BTN_H));
+                layout.texture_world_unwrap = Some(elem_half(x0, y, 1, DFF_BTN_H));
+                y += DFF_BTN_H + 4.0;
+            }
             let mut rows = Vec::with_capacity(entries.len());
             for _ in entries {
                 rows.push(elem_full(x0, y, PREVIEW_TEXTURE_ROW_H - 4.0));
@@ -1071,6 +1207,10 @@ pub(crate) fn element_assign_lod_rect(app: &AppState) -> Rect {
 
 pub(crate) fn element_select_same_id_rect(app: &AppState) -> Rect {
     element_layout_rect(app, |layout| layout.select_same_id)
+}
+
+pub(crate) fn element_replace_with_rect(app: &AppState) -> Rect {
+    element_layout_rect(app, |layout| layout.replace_with)
 }
 
 pub(crate) fn element_lod_parent_select_rect(app: &AppState) -> Rect {
@@ -1494,6 +1634,70 @@ pub(crate) fn placement_override_flag_label(flag: &str) -> &str {
     }
 }
 
+pub(crate) fn definition_flag_tooltip(flag: &str) -> &'static str {
+    match flag {
+        "is_road" => "Marks this model as road geometry.",
+        "draw_last" => {
+            "Draws this model after normal world geometry; useful for surfaces that must appear on top."
+        }
+        "additive" => {
+            "Uses additive blending, adding this model's colors to the background. Common for lights and glows."
+        }
+        "no_zbuffer_write" => {
+            "Does not write this model to the depth buffer, so it will not hide geometry drawn later."
+        }
+        "dont_receive_shadows" => "Prevents dynamic shadows from being cast onto this model.",
+        "is_glass_type_1" => "Uses GTA:SA glass rendering preset 1 for this model.",
+        "is_glass_type_2" => {
+            "Uses GTA:SA glass rendering preset 2, an alternate glass transparency/reflection style."
+        }
+        "is_garage_door" => "Marks this model for the game's special garage-door handling.",
+        "is_damagable" => {
+            "Marks this model as damageable, allowing its damaged state where the game supports one."
+        }
+        "is_tree" => {
+            "Marks this model as tree vegetation for the game's vegetation rendering behavior."
+        }
+        "is_palm" => {
+            "Marks this model as palm vegetation for the game's palm-specific rendering behavior."
+        }
+        "does_not_collide_with_flyer" => {
+            "Prevents this model from colliding with aircraft and other flying vehicles."
+        }
+        "is_tag" => "Marks this model as a graffiti tag for the game's tag-specific behavior.",
+        "disable_backface_culling" => {
+            "Draws both sides of polygons instead of hiding faces viewed from behind."
+        }
+        "is_breakable_statue" => {
+            "Enables GTA:SA's special breakable-statue behavior for this model."
+        }
+        "disable_collisions" => {
+            "Disables collision for every placement that uses this model definition."
+        }
+        _ => "Model-definition rendering or behavior flag.",
+    }
+}
+
+pub(crate) fn placement_override_flag_tooltip(flag: &str) -> &'static str {
+    match flag {
+        "double_sided" => {
+            "Draws both sides of polygons for this placement, overriding the model's normal backface culling."
+        }
+        "disable_collisions" => "Disables collision for this placement only.",
+        "breakable" => "Forces this placement to be breakable.",
+        "unbreakable" => "Forces this placement to be unbreakable.",
+        "frozen" => "Keeps this placement fixed in place instead of allowing physics to move it.",
+        "no_stream" => "Keeps this placement loaded instead of distance-streaming it in and out.",
+        _ => "Placement-level override for this object.",
+    }
+}
+
+fn draw_property_tooltip(font: &Font, rect: Rect, description: &str) {
+    if !scrollbar_hover_suppressed() && rect.contains(mouse_position().into()) {
+        draw_text_tooltip(font, rect, description);
+    }
+}
+
 pub(crate) fn placement_override_flag_enabled(placement: &Placement, flag: &str) -> bool {
     match flag {
         "double_sided" => placement_override_bool(
@@ -1810,6 +2014,385 @@ pub(crate) fn draw_input_box(app: &AppState, field: InspectorField, label: &str)
     if has_copy_button {
         draw_field_copy_button(app, copy_rect);
     }
+}
+
+pub(crate) const TXD_DROPDOWN_VISIBLE: usize = 6;
+pub(crate) const NATIVE_MODEL_DROPDOWN_VISIBLE: usize = 6;
+
+pub(crate) fn filtered_native_model_specs(app: &AppState) -> Vec<&'static PhysicsRootSpec> {
+    let query = app.native_model_dropdown_search.trim().to_ascii_lowercase();
+    PHYSICS_ROOT_SPECS
+        .iter()
+        .filter(|spec| {
+            query.is_empty()
+                || spec.label.to_ascii_lowercase().contains(&query)
+                || spec.object_name.to_ascii_lowercase().contains(&query)
+                || spec.model_id.to_string().contains(&query)
+        })
+        .collect()
+}
+
+pub(crate) fn native_model_dropdown_option_rect(app: &AppState, row: usize) -> Rect {
+    let field = inspector_field_rect(app, InspectorField::DefinitionNativeModel);
+    Rect::new(
+        field.x,
+        field.y + field.h + 4.0 + row as f32 * 28.0,
+        field.w,
+        26.0,
+    )
+}
+
+pub(crate) fn native_model_dropdown_custom_rect(app: &AppState) -> Rect {
+    let visible = filtered_native_model_specs(app)
+        .len()
+        .min(NATIVE_MODEL_DROPDOWN_VISIBLE);
+    native_model_dropdown_option_rect(app, visible)
+}
+
+pub(crate) fn draw_native_model_dropdown(app: &AppState) {
+    let rect = inspector_field_rect(app, InspectorField::DefinitionNativeModel);
+    let copy_rect = inspector_copy_button_rect(
+        app,
+        InspectorCopyAction::Field(InspectorField::DefinitionNativeModel),
+    );
+    let hovered = rect.contains(mouse_position().into());
+    let readonly = selected_definition_is_readonly(app);
+    ui_text_size(
+        &app.ui_font,
+        "Native Behavior Model",
+        rect.x,
+        rect.y - 7.0,
+        14,
+        ui_dim(),
+    );
+    draw_rrect_bordered(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        7.0,
+        1.0,
+        if readonly {
+            Color::new(0.026, 0.034, 0.046, 1.0)
+        } else {
+            ui_input_bg()
+        },
+        if app.native_model_dropdown_open || hovered {
+            ui_accent()
+        } else {
+            ui_border()
+        },
+    );
+    let value = if app.native_model_dropdown_open {
+        if app.native_model_dropdown_search.is_empty() {
+            "Search or enter a custom ID...".to_string()
+        } else {
+            app.native_model_dropdown_search.clone()
+        }
+    } else {
+        let model = inspector_field_value(app, InspectorField::DefinitionNativeModel);
+        model
+            .parse::<u16>()
+            .ok()
+            .and_then(physics_root_spec)
+            .map(|spec| format!("{} ({})", spec.label, spec.model_id))
+            .unwrap_or(model)
+    };
+    ui_text(
+        &app.ui_font,
+        &ellipsize_width(&value, 16, rect.w - 58.0),
+        rect.x + 10.0,
+        rect.y + 20.0,
+        if app.native_model_dropdown_open && app.native_model_dropdown_search.is_empty() {
+            ui_muted()
+        } else if readonly {
+            ui_muted()
+        } else {
+            WHITE
+        },
+    );
+    ui_text(
+        &app.ui_font,
+        if app.native_model_dropdown_open {
+            "^"
+        } else {
+            "v"
+        },
+        copy_rect.x - 16.0,
+        rect.y + 20.0,
+        ui_dim(),
+    );
+    draw_field_copy_button(app, copy_rect);
+}
+
+pub(crate) fn draw_native_model_dropdown_popup(app: &AppState) {
+    if !app.native_model_dropdown_open {
+        return;
+    }
+    let specs = filtered_native_model_specs(app);
+    let visible = specs.len().min(NATIVE_MODEL_DROPDOWN_VISIBLE);
+    let max_start = specs.len().saturating_sub(visible);
+    let start = (app.native_model_dropdown_scroll.floor().max(0.0) as usize).min(max_start);
+    let custom = native_model_dropdown_custom_rect(app);
+    let first = native_model_dropdown_option_rect(app, 0);
+    let pad = 4.0;
+    draw_rrect_bordered(
+        first.x - pad,
+        first.y - pad,
+        first.w + pad * 2.0,
+        custom.y + custom.h - first.y + pad * 2.0,
+        7.0,
+        1.0,
+        Color::new(0.04, 0.047, 0.058, 1.0),
+        ui_accent(),
+    );
+    let current = inspector_field_value(app, InspectorField::DefinitionNativeModel);
+    for row in 0..visible {
+        let option = native_model_dropdown_option_rect(app, row);
+        let spec = specs[start + row];
+        let selected = current == spec.model_id.to_string();
+        draw_rrect_bordered(
+            option.x,
+            option.y,
+            option.w,
+            option.h,
+            5.0,
+            1.0,
+            if selected {
+                ui_surface_active()
+            } else if option.contains(mouse_position().into()) {
+                ui_surface_hover()
+            } else {
+                ui_input_bg()
+            },
+            ui_border(),
+        );
+        let label = format!("{} — {}", spec.label, spec.model_id);
+        ui_text(
+            &app.ui_font,
+            &ellipsize_width(&label, 16, option.w - 20.0),
+            option.x + 10.0,
+            option.y + 18.0,
+            if selected { ui_accent() } else { WHITE },
+        );
+    }
+    draw_rrect_bordered(
+        custom.x,
+        custom.y,
+        custom.w,
+        custom.h,
+        5.0,
+        1.0,
+        if custom.contains(mouse_position().into()) {
+            ui_surface_hover()
+        } else {
+            ui_input_bg()
+        },
+        ui_border(),
+    );
+    let query = app.native_model_dropdown_search.trim();
+    let custom_label = if query.is_empty() {
+        "Clear native behavior model".to_string()
+    } else {
+        format!("Use custom ID ‘{}’", ellipsize(query, 24))
+    };
+    ui_text(
+        &app.ui_font,
+        &custom_label,
+        custom.x + 10.0,
+        custom.y + 18.0,
+        ui_accent(),
+    );
+}
+
+pub(crate) fn scene_txd_names(app: &AppState) -> Vec<String> {
+    let mut names = BTreeMap::<String, String>::new();
+    for definition in app.definitions.values() {
+        let Some(value) = definition_txd_name_from_attrs(definition) else {
+            continue;
+        };
+        let stem = Path::new(value.trim())
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(value.trim())
+            .trim();
+        if !stem.is_empty() {
+            names
+                .entry(stem.to_ascii_lowercase())
+                .or_insert_with(|| stem.to_string());
+        }
+    }
+    names.into_values().collect()
+}
+
+pub(crate) fn filtered_scene_txd_names(app: &AppState) -> Vec<String> {
+    let query = app.txd_dropdown_search.trim().to_ascii_lowercase();
+    scene_txd_names(app)
+        .into_iter()
+        .filter(|name| query.is_empty() || name.to_ascii_lowercase().contains(&query))
+        .collect()
+}
+
+pub(crate) fn txd_dropdown_option_rect(app: &AppState, row: usize) -> Rect {
+    let field = inspector_field_rect(app, InspectorField::DefinitionTxd);
+    Rect::new(
+        field.x,
+        field.y + field.h + 4.0 + row as f32 * 28.0,
+        field.w,
+        26.0,
+    )
+}
+
+pub(crate) fn txd_dropdown_create_rect(app: &AppState) -> Rect {
+    let visible = filtered_scene_txd_names(app)
+        .len()
+        .min(TXD_DROPDOWN_VISIBLE);
+    txd_dropdown_option_rect(app, visible)
+}
+
+pub(crate) fn draw_txd_dropdown(app: &AppState) {
+    let rect = inspector_field_rect(app, InspectorField::DefinitionTxd);
+    let hovered = rect.contains(mouse_position().into());
+    let readonly = selected_definition_is_readonly(app);
+    ui_text_size(&app.ui_font, "TXD", rect.x, rect.y - 7.0, 14, ui_dim());
+    draw_rrect_bordered(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        7.0,
+        1.0,
+        if readonly {
+            Color::new(0.026, 0.034, 0.046, 1.0)
+        } else {
+            ui_input_bg()
+        },
+        if app.txd_dropdown_open || hovered {
+            ui_accent()
+        } else {
+            ui_border()
+        },
+    );
+    let value = if app.txd_dropdown_open {
+        if app.txd_dropdown_search.is_empty() {
+            if app.txd_dropdown_create_mode {
+                "Name the new TXD...".to_string()
+            } else {
+                "Search TXDs...".to_string()
+            }
+        } else {
+            app.txd_dropdown_search.clone()
+        }
+    } else {
+        inspector_field_value(app, InspectorField::DefinitionTxd)
+    };
+    ui_text(
+        &app.ui_font,
+        &ellipsize_width(&value, 16, rect.w - 66.0),
+        rect.x + 10.0,
+        rect.y + 20.0,
+        if app.txd_dropdown_open && app.txd_dropdown_search.is_empty() {
+            ui_muted()
+        } else {
+            WHITE
+        },
+    );
+    ui_text(
+        &app.ui_font,
+        if app.txd_dropdown_open { "^" } else { "v" },
+        rect.x + rect.w - 48.0,
+        rect.y + 20.0,
+        ui_dim(),
+    );
+    draw_field_copy_button(
+        app,
+        inspector_copy_button_rect(
+            app,
+            InspectorCopyAction::Field(InspectorField::DefinitionTxd),
+        ),
+    );
+}
+
+pub(crate) fn draw_txd_dropdown_popup(app: &AppState) {
+    if !app.txd_dropdown_open {
+        return;
+    }
+    let names = filtered_scene_txd_names(app);
+    let visible = names.len().min(TXD_DROPDOWN_VISIBLE);
+    let max_start = names.len().saturating_sub(visible);
+    let start = (app.txd_dropdown_scroll.floor().max(0.0) as usize).min(max_start);
+    let create = txd_dropdown_create_rect(app);
+    let first = txd_dropdown_option_rect(app, 0);
+    let pad = 4.0;
+    draw_rrect_bordered(
+        first.x - pad,
+        first.y - pad,
+        first.w + pad * 2.0,
+        create.y + create.h - first.y + pad * 2.0,
+        7.0,
+        1.0,
+        Color::new(0.04, 0.047, 0.058, 1.0),
+        ui_accent(),
+    );
+    for row in 0..visible {
+        let option = txd_dropdown_option_rect(app, row);
+        let name = &names[start + row];
+        let selected =
+            inspector_field_value(app, InspectorField::DefinitionTxd).eq_ignore_ascii_case(name);
+        draw_rrect_bordered(
+            option.x,
+            option.y,
+            option.w,
+            option.h,
+            5.0,
+            1.0,
+            if selected {
+                ui_surface_active()
+            } else if option.contains(mouse_position().into()) {
+                ui_surface_hover()
+            } else {
+                ui_input_bg()
+            },
+            ui_border(),
+        );
+        ui_text(
+            &app.ui_font,
+            &ellipsize_width(name, 16, option.w - 20.0),
+            option.x + 10.0,
+            option.y + 18.0,
+            if selected { ui_accent() } else { WHITE },
+        );
+    }
+    draw_rrect_bordered(
+        create.x,
+        create.y,
+        create.w,
+        create.h,
+        5.0,
+        1.0,
+        if create.contains(mouse_position().into()) {
+            ui_surface_hover()
+        } else {
+            ui_input_bg()
+        },
+        ui_border(),
+    );
+    let create_label = if app.txd_dropdown_create_mode {
+        if app.txd_dropdown_search.trim().is_empty() {
+            "Enter a name, then press Enter".to_string()
+        } else {
+            format!("Create ‘{}’", ellipsize(app.txd_dropdown_search.trim(), 24))
+        }
+    } else {
+        "+ Create new TXD...".to_string()
+    };
+    ui_text(
+        &app.ui_font,
+        &create_label,
+        create.x + 10.0,
+        create.y + 18.0,
+        ui_accent(),
+    );
 }
 
 pub(crate) fn draw_lod_parent_box(app: &AppState) {
@@ -2709,6 +3292,101 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
         );
     }
     let texture_entries = preview_material_entries(app, app.selected);
+    if let Some(export_all) = layout.texture_export_all {
+        text_button(&app.ui_font, export_all, "Export all", false);
+    }
+    if let Some(advanced) = layout.texture_advanced {
+        text_button(
+            &app.ui_font,
+            advanced,
+            if app.preview_texture_advanced {
+                "Advanced options: On"
+            } else {
+                "Advanced options"
+            },
+            app.preview_texture_advanced,
+        );
+    }
+    if let (Some(minus), Some(value), Some(plus)) = (
+        layout.texture_uv_scale_minus,
+        layout.texture_uv_scale_value,
+        layout.texture_uv_scale_plus,
+    ) {
+        text_button(&app.ui_font, minus, "Half", false);
+        text_button(
+            &app.ui_font,
+            value,
+            &format!("UV scale  {}x", fmt_f32(app.preview_world_uv_scale, 3)),
+            false,
+        );
+        text_button(&app.ui_font, plus, "Double", false);
+    }
+    if let (Some(object), Some(world)) = (layout.texture_scope_object, layout.texture_scope_world) {
+        text_button(
+            &app.ui_font,
+            object,
+            "Object only",
+            !app.preview_world_uv_all_dffs,
+        );
+        text_button(&app.ui_font, world, "World", app.preview_world_uv_all_dffs);
+    }
+    if let Some(variation) = layout.texture_variation {
+        text_button(
+            &app.ui_font,
+            variation,
+            if app.preview_world_uv_variation {
+                "Variation: On"
+            } else {
+                "Variation: Off"
+            },
+            app.preview_world_uv_variation,
+        );
+        if variation.contains(mouse_position().into()) {
+            draw_text_tooltip(
+                &app.ui_font,
+                variation,
+                "Add multi-scale world-space distortion to break up visible tiling on grass and terrain. Shared world positions remain identical, preserving texture seams.",
+            );
+        }
+    }
+    if let Some(preview) = layout.texture_world_preview {
+        text_button(
+            &app.ui_font,
+            preview,
+            if app.preview_world_uv_visual.is_some() {
+                "Clear preview"
+            } else {
+                "Preview"
+            },
+            app.preview_world_uv_visual.is_some(),
+        );
+    }
+    if let Some(unwrap) = layout.texture_world_unwrap {
+        let has_selected_material = app
+            .preview_selected_material
+            .is_some_and(|(placement, _)| placement == app.selected);
+        text_button(
+            &app.ui_font,
+            unwrap,
+            if has_selected_material {
+                "Apply"
+            } else {
+                "Select material"
+            },
+            false,
+        );
+        if unwrap.contains(mouse_position().into()) {
+            draw_text_tooltip(
+                &app.ui_font,
+                unwrap,
+                if app.preview_world_uv_all_dffs {
+                    "Box-project every editable world DFF material using this texture. The UV scale controls texture repeats per world unit."
+                } else {
+                    "Box-project the selected material in world units. The UV scale controls texture repeats per world unit; all instances sharing this DFF are updated."
+                },
+            );
+        }
+    }
     if let Some(rows) = layout.texture_rows.as_ref() {
         let mouse: Vec2 = mouse_position().into();
         let mut thumbnails = Vec::new();
@@ -2776,7 +3454,7 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
             };
             ui_text(
                 &app.ui_font,
-                &ellipsize_width(texture_label, 16, rect.w - 126.0),
+                &ellipsize_width(texture_label, 16, rect.w - 68.0),
                 rect.x + 57.0,
                 rect.y + 21.0,
                 if selected { ui_accent() } else { WHITE },
@@ -2793,20 +3471,12 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
             };
             ui_text_size(
                 &app.ui_font,
-                &ellipsize_width(&detail, 14, rect.w - 126.0),
+                &ellipsize_width(&detail, 14, rect.w - 68.0),
                 rect.x + 57.0,
                 rect.y + 42.0,
                 14,
                 if entry.missing { RED } else { ui_muted() },
             );
-            if entry.texture_id != 0 {
-                text_button(
-                    &app.ui_font,
-                    preview_texture_view_rect(*rect),
-                    "View",
-                    false,
-                );
-            }
         }
         draw_raw_texture_quads(&thumbnails);
     } else if !app.element_panel_collapsed[8] && texture_entries.is_empty() {
@@ -2935,6 +3605,21 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
         "Select Same ID",
         false,
     );
+    if has_live_element {
+        text_button(
+            &app.ui_font,
+            element_replace_with_rect(app),
+            "Replace with...",
+            false,
+        );
+    } else {
+        text_button_disabled(
+            &app.ui_font,
+            element_replace_with_rect(app),
+            "Replace with...",
+            "Select one or more live elements first.",
+        );
+    }
     if selected_live_indices_in_selection_order(app).len() >= 2 {
         text_button(
             &app.ui_font,
@@ -2993,12 +3678,8 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
         );
     }
     draw_input_box(app, InspectorField::DefinitionDff, "DFF override");
-    draw_input_box(
-        app,
-        InspectorField::DefinitionNativeModel,
-        "Native Behavior Model",
-    );
-    draw_input_box(app, InspectorField::DefinitionTxd, "TXD");
+    draw_native_model_dropdown(app);
+    draw_txd_dropdown(app);
     let open_txd_enabled = selected_definition_id_and_txd(app).is_some();
     let find_missing_textures_enabled = selected_definition_has_missing_textures(app);
     if has_live_element {
@@ -3170,12 +3851,35 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
     }
     draw_input_box(app, InspectorField::DefinitionTimeIn, "Time In");
     draw_input_box(app, InspectorField::DefinitionTimeOut, "Time Out");
+    let time_in_rect = inspector_field_rect(app, InspectorField::DefinitionTimeIn);
+    let time_out_rect = inspector_field_rect(app, InspectorField::DefinitionTimeOut);
+    draw_property_tooltip(
+        &app.ui_font,
+        Rect::new(
+            time_in_rect.x,
+            time_in_rect.y - ELEM_LABEL_GAP,
+            time_in_rect.w,
+            time_in_rect.h + ELEM_LABEL_GAP,
+        ),
+        "Whole hour (0-24) when this model starts appearing. Pair with Time Out; the window may cross midnight.",
+    );
+    draw_property_tooltip(
+        &app.ui_font,
+        Rect::new(
+            time_out_rect.x,
+            time_out_rect.y - ELEM_LABEL_GAP,
+            time_out_rect.w,
+            time_out_rect.h + ELEM_LABEL_GAP,
+        ),
+        "Whole hour (0-24) when this model stops appearing. Pair with Time In; the window may cross midnight.",
+    );
     let selected_definition_ids = selected_definition_ids(app);
     if !selected_definition_ids.is_empty() {
         for (slot, flag) in EAGLE_DEFINITION_FLAGS.iter().enumerate() {
+            let rect = definition_flag_rect(app, slot);
             draw_checkbox(
                 &app.ui_font,
-                definition_flag_rect(app, slot),
+                rect,
                 flag,
                 selected_definition_ids.iter().all(|id| {
                     app.definitions
@@ -3183,14 +3887,16 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
                         .is_some_and(|def| definition_flag_enabled(def, flag))
                 }),
             );
+            draw_property_tooltip(&app.ui_font, rect, definition_flag_tooltip(flag));
         }
     }
     let selected = selected_live_indices(app);
     if !selected.is_empty() {
         for (slot, flag) in EAGLE_PLACEMENT_OVERRIDE_FLAGS.iter().enumerate() {
+            let rect = placement_override_flag_rect(app, slot);
             draw_checkbox(
                 &app.ui_font,
-                placement_override_flag_rect(app, slot),
+                rect,
                 placement_override_flag_label(flag),
                 selected.iter().all(|idx| {
                     app.placements
@@ -3198,6 +3904,7 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
                         .is_some_and(|p| placement_override_flag_enabled(p, flag))
                 }),
             );
+            draw_property_tooltip(&app.ui_font, rect, placement_override_flag_tooltip(flag));
         }
     }
     let max_scroll = element_panel_max_scroll(&layout);
@@ -3220,6 +3927,8 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
         }
     }
     draw_physics_root_dropdown_popup(app);
+    draw_native_model_dropdown_popup(app);
+    draw_txd_dropdown_popup(app);
 }
 
 pub(crate) fn draw_properties_settings(app: &AppState, _x: f32, _y: f32) {
@@ -4073,6 +4782,24 @@ mod placement_override_tests {
                 .collect(),
             pos: V3::default(),
             rot: V3::default(),
+        }
+    }
+
+    #[test]
+    fn every_game_world_flag_has_specific_help_text() {
+        for flag in EAGLE_DEFINITION_FLAGS {
+            assert_ne!(
+                definition_flag_tooltip(flag),
+                "Model-definition rendering or behavior flag.",
+                "missing definition tooltip for {flag}"
+            );
+        }
+        for flag in EAGLE_PLACEMENT_OVERRIDE_FLAGS {
+            assert_ne!(
+                placement_override_flag_tooltip(flag),
+                "Placement-level override for this object.",
+                "missing placement tooltip for {flag}"
+            );
         }
     }
 

@@ -432,10 +432,50 @@ fn parse_geometry_extension_2dfx(b: &[u8], start: usize, end: usize, mesh: &mut 
     }
 }
 
+#[derive(Default)]
+struct GeometryMaterials {
+    names: Vec<String>,
+    materials: Vec<RawMaterial>,
+    animations: Vec<DffMaterialAnim>,
+}
+
+/// Fold one geometry's material list into the model-wide table and return the
+/// base every triangle in that geometry rebases onto.
+///
+/// A RenderWare geometry owns its own material list, so a clump whose atomics
+/// share materials repeats them. Appending unconditionally meant each rewrite
+/// multiplied the table by the atomic count and moved the material index that
+/// identifies a texture, which made per-material tools (the world-scale UV
+/// unwrap in particular) act on the wrong faces the second time they ran.
+/// Reusing an identical run keeps the table canonical and the indices stable
+/// across any number of write/read cycles.
+fn merge_geometry_materials(mesh: &mut RawMesh, geometry: GeometryMaterials) -> u32 {
+    let count = geometry.names.len();
+    let aligned = mesh.materials.len() == mesh.material_textures.len()
+        && mesh.material_animations.len() == mesh.material_textures.len()
+        && geometry.materials.len() == count
+        && geometry.animations.len() == count;
+    if count > 0 && aligned && mesh.material_textures.len() >= count {
+        for base in 0..=(mesh.material_textures.len() - count) {
+            if mesh.material_textures[base..base + count] == geometry.names[..]
+                && mesh.materials[base..base + count] == geometry.materials[..]
+                && mesh.material_animations[base..base + count] == geometry.animations[..]
+            {
+                return base as u32;
+            }
+        }
+    }
+    let base = mesh.material_textures.len() as u32;
+    mesh.material_textures.extend(geometry.names);
+    mesh.materials.extend(geometry.materials);
+    mesh.material_animations.extend(geometry.animations);
+    base
+}
+
 fn parse_geometry_chunk(b: &[u8], start: usize, end: usize, mesh: &mut RawMesh) -> bool {
     let mut o = start;
     let vertex_base = mesh.vertices.len() as u32;
-    let material_base = mesh.material_textures.len() as u32;
+    let mut geometry_materials = GeometryMaterials::default();
     let mut parsed_geometry: Option<(
         usize,
         Vec<Vec<V2>>,
@@ -462,9 +502,9 @@ fn parse_geometry_chunk(b: &[u8], start: usize, end: usize, mesh: &mut RawMesh) 
                 b,
                 cs,
                 ce,
-                &mut mesh.material_textures,
-                &mut mesh.materials,
-                &mut mesh.material_animations,
+                &mut geometry_materials.names,
+                &mut geometry_materials.materials,
+                &mut geometry_materials.animations,
             );
         }
         if id == 0x03 {
@@ -633,6 +673,7 @@ fn parse_geometry_chunk(b: &[u8], start: usize, end: usize, mesh: &mut RawMesh) 
         if let Some(breakable) = breakable.as_mut() {
             map_breakable_source_faces(breakable, &local_verts, &local_tris, tri_start);
         }
+        let material_base = merge_geometry_materials(mesh, geometry_materials);
         for tri in &mut local_tris {
             tri.a = tri.a.saturating_add(vertex_base);
             tri.b = tri.b.saturating_add(vertex_base);
@@ -721,6 +762,79 @@ fn scan_dff_chunks(b: &[u8], start: usize, end: usize, mesh: &mut RawMesh) {
     }
 }
 
+fn geometry_material_count(b: &[u8], start: usize, end: usize) -> Result<usize, String> {
+    let mut o = start;
+    while o + 12 <= end {
+        let id = rd32(b, o);
+        let size = rd32(b, o + 4) as usize;
+        let cs = o + 12;
+        let ce = cs
+            .checked_add(size)
+            .filter(|ce| *ce <= end && *ce <= b.len())
+            .ok_or_else(|| "DFF contains a truncated RenderWare chunk".to_string())?;
+        if id == 0x08 {
+            let mut material_chunk = cs;
+            while material_chunk + 12 <= ce {
+                let child_id = rd32(b, material_chunk);
+                let child_size = rd32(b, material_chunk + 4) as usize;
+                let child_start = material_chunk + 12;
+                let child_end = child_start
+                    .checked_add(child_size)
+                    .filter(|child_end| *child_end <= ce)
+                    .ok_or_else(|| "DFF contains a truncated material list".to_string())?;
+                if child_id == 0x01 {
+                    if child_size < 4 {
+                        return Err("DFF material-list struct is truncated".to_string());
+                    }
+                    return Ok(rd32(b, child_start) as usize);
+                }
+                material_chunk = child_end;
+            }
+        }
+        o = ce;
+    }
+    Ok(0)
+}
+
+fn scan_dff_material_counts(
+    b: &[u8],
+    start: usize,
+    end: usize,
+    maximum: &mut usize,
+) -> Result<(), String> {
+    let mut o = start;
+    while o + 12 <= end {
+        let id = rd32(b, o);
+        let size = rd32(b, o + 4) as usize;
+        let cs = o + 12;
+        let ce = cs
+            .checked_add(size)
+            .filter(|ce| *ce <= end && *ce <= b.len())
+            .ok_or_else(|| "DFF contains a truncated RenderWare chunk".to_string())?;
+        if id == 0x0f {
+            *maximum = (*maximum).max(geometry_material_count(b, cs, ce)?);
+        } else if matches!(id, 0x10 | 0x1a) {
+            // Only Clump and Geometry List are containers on the path to a
+            // Geometry. Extension/plugin payloads are arbitrary binary data,
+            // not necessarily nested RenderWare chunks. Recursing into them
+            // made valid DragonFF files look truncated and silently excluded
+            // them from the material-limit scan.
+            scan_dff_material_counts(b, cs, ce, maximum)?;
+        }
+        o = ce;
+    }
+    Ok(())
+}
+
+pub(crate) fn max_dff_geometry_material_count(bytes: &[u8]) -> Result<usize, String> {
+    if bytes.len() < 12 {
+        return Err("DFF is too short to contain a RenderWare chunk".to_string());
+    }
+    let mut maximum = 0;
+    scan_dff_material_counts(bytes, 0, bytes.len(), &mut maximum)?;
+    Ok(maximum)
+}
+
 #[derive(Clone, Copy)]
 struct DffFrameTransform {
     right: V3,
@@ -730,6 +844,27 @@ struct DffFrameTransform {
 }
 
 impl DffFrameTransform {
+    fn identity() -> Self {
+        Self {
+            right: V3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            up: V3 {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            at: V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+            pos: V3::default(),
+        }
+    }
+
     fn transform_point(self, point: V3) -> V3 {
         V3 {
             x: self.right.x * point.x + self.up.x * point.y + self.at.x * point.z + self.pos.x,
@@ -896,7 +1031,14 @@ fn scan_dff_structure(
     }
 }
 
-fn world_frame_transform(
+/// Resolve a frame into the model entity's coordinate space.
+///
+/// GTA installs the entity matrix on the clump's root frame when it creates a
+/// world object, replacing the root matrix stored in the DFF. Child matrices
+/// remain relative to that root and must still be accumulated. Including an
+/// authored root translation here made Eagle move static geometry away from
+/// its placement pivot even though GTA renders it at the pivot.
+fn entity_frame_transform(
     frames: &[DffFrameInfo],
     frame_idx: usize,
     visiting: &mut Vec<bool>,
@@ -914,11 +1056,11 @@ fn world_frame_transform(
     visiting[frame_idx] = true;
     let local = frames[frame_idx].local;
     let world = if frames[frame_idx].parent >= 0 {
-        world_frame_transform(frames, frames[frame_idx].parent as usize, visiting, cached)
+        entity_frame_transform(frames, frames[frame_idx].parent as usize, visiting, cached)
             .map(|parent| parent.then(local))
             .unwrap_or(local)
     } else {
-        local
+        DffFrameTransform::identity()
     };
     visiting[frame_idx] = false;
     cached[frame_idx] = Some(world);
@@ -936,7 +1078,7 @@ fn assign_component_names_and_transforms(bytes: &[u8], mesh: &mut RawMesh) {
     let mut cached = vec![None; frames.len()];
     mesh.frames = (0..frames.len())
         .filter_map(|frame_idx| {
-            let transform = world_frame_transform(&frames, frame_idx, &mut visiting, &mut cached)?;
+            let transform = entity_frame_transform(&frames, frame_idx, &mut visiting, &mut cached)?;
             Some(RawMeshFrame {
                 name: frames[frame_idx].name.clone(),
                 parent: frames[frame_idx].parent,
@@ -963,7 +1105,7 @@ fn assign_component_names_and_transforms(bytes: &[u8], mesh: &mut RawMesh) {
                 component.frame_index = Some(frame_idx);
             }
             if let Some(transform) =
-                world_frame_transform(&frames, frame_idx, &mut visiting, &mut cached)
+                entity_frame_transform(&frames, frame_idx, &mut visiting, &mut cached)
             {
                 for vertex in component.vertex_start..component.vertex_end.min(mesh.vertices.len())
                 {
@@ -1356,6 +1498,44 @@ mod tests {
         }
     }
 
+    fn dff_with_material_count(count: usize) -> Vec<u8> {
+        let mut material_list_struct = (count as u32).to_le_bytes().to_vec();
+        for _ in 0..count {
+            material_list_struct.extend_from_slice(&(-1i32).to_le_bytes());
+        }
+        let material_list = chunk(0x08, chunk(0x01, material_list_struct));
+        chunk(0x10, chunk(0x0f, material_list))
+    }
+
+    #[test]
+    fn reads_maximum_material_count_per_dff_geometry() {
+        assert_eq!(
+            max_dff_geometry_material_count(&dff_with_material_count(152)).unwrap(),
+            152
+        );
+        assert_eq!(
+            max_dff_geometry_material_count(&dff_with_material_count(153)).unwrap(),
+            153
+        );
+    }
+
+    #[test]
+    fn material_count_ignores_non_chunk_plugin_payloads() {
+        let mut clump = chunk(0x03, vec![0xff; 31]);
+        clump.extend_from_slice(&chunk(
+            0x1a,
+            chunk(
+                0x0f,
+                chunk(0x08, chunk(0x01, 153u32.to_le_bytes().to_vec())),
+            ),
+        ));
+
+        assert_eq!(
+            max_dff_geometry_material_count(&chunk(0x10, clump)),
+            Ok(153)
+        );
+    }
+
     #[test]
     fn material_surface_properties_are_parsed_for_game_preview() {
         let mut data = vec![0u8; 16];
@@ -1589,14 +1769,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_dff_mesh_applies_atomic_frame_dummy_offsets() {
+    fn parse_dff_mesh_ignores_entity_root_but_applies_atomic_child_offset() {
+        let ignored_root_pos = V3 {
+            x: 20.0,
+            y: 30.0,
+            z: 40.0,
+        };
         let wheel_pos = V3 {
             x: 2.0,
             y: 3.0,
             z: 4.0,
         };
         let mut frame_struct = 2u32.to_le_bytes().to_vec();
-        frame_struct.extend_from_slice(&identity_frame(-1, V3::default()));
+        frame_struct.extend_from_slice(&identity_frame(-1, ignored_root_pos));
         frame_struct.extend_from_slice(&identity_frame(0, wheel_pos));
         let frame_list = chunk(
             0x0e,
@@ -1656,6 +1841,74 @@ mod tests {
                 && (vertex.y - wheel_pos.y).abs() < 0.001
                 && (vertex.z - wheel_pos.z).abs() < 0.001
         }));
+        assert_eq!(
+            raw.frames.first().map(|frame| frame.pos),
+            Some(V3::default())
+        );
+        assert_eq!(raw.frames.get(1).map(|frame| frame.pos), Some(wheel_pos));
+    }
+
+    #[test]
+    fn parse_dff_mesh_ignores_root_offset_for_static_atomic() {
+        let ignored_root_pos = V3 {
+            x: -0.0583408,
+            y: -0.00422143,
+            z: -1.2912693,
+        };
+        let mut frame_struct = 1u32.to_le_bytes().to_vec();
+        frame_struct.extend_from_slice(&identity_frame(-1, ignored_root_pos));
+        let frame_list = chunk(
+            0x0e,
+            [
+                chunk(0x01, frame_struct),
+                frame_name_extension("box493_c2q_0"),
+            ]
+            .concat(),
+        );
+        let geometry_list = chunk(
+            0x1a,
+            [
+                chunk(0x01, 1u32.to_le_bytes().to_vec()),
+                simple_triangle_geometry(),
+            ]
+            .concat(),
+        );
+        let atomic = chunk(
+            0x14,
+            chunk(
+                0x01,
+                [
+                    0u32.to_le_bytes(),
+                    0u32.to_le_bytes(),
+                    5u32.to_le_bytes(),
+                    0u32.to_le_bytes(),
+                ]
+                .concat(),
+            ),
+        );
+        let clump = chunk(
+            0x10,
+            [
+                chunk(
+                    0x01,
+                    [1u32.to_le_bytes(), 1u32.to_le_bytes(), 0u32.to_le_bytes()].concat(),
+                ),
+                frame_list,
+                geometry_list,
+                atomic,
+            ]
+            .concat(),
+        );
+
+        let raw = parse_dff_mesh(&clump);
+
+        assert!(raw.vertices.iter().any(|vertex| {
+            vertex.x.abs() < 0.001 && vertex.y.abs() < 0.001 && vertex.z.abs() < 0.001
+        }));
+        assert_eq!(
+            raw.frames.first().map(|frame| frame.pos),
+            Some(V3::default())
+        );
     }
 }
 

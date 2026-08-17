@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+id = "eagle_mta_toolkit"
+version = "3.0.0"
+name = "Eagle MTA Map Authoring"
+tagline = "Author MTA map metadata for Eagle Editor's native builder"
+maintainer = "Blue Eagle Team"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["GPL-3.0-only"]
+tags = ["Object", "Scene"]
+
+[addon]
+module = "eagle_mta_toolkit"
+
+[build]
+type = "module"

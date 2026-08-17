@@ -860,6 +860,7 @@ declare_atoms!(
     xsel_data: "XSEL_DATA",
     incr: "INCR",
     // drag_n_drop related
+    text_uri_list: "text/uri-list",
     xdnd_action_copy: "XdndActionCopy",
     xdnd_aware: "XdndAware",
     xdnd_drop: "XdndDrop",

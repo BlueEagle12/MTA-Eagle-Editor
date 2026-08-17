@@ -2,12 +2,20 @@ use super::super::*;
 
 const EDIT_ROW_H: f32 = 30.0;
 const EDIT_VERTEX_PICK_RADIUS: f32 = 7.0;
+// DFF mesh points and one-pixel wireframe lines are difficult targets on a
+// large viewport (and especially on high-DPI displays). Keep the visual
+// markers compact, but give pointer picking a more forgiving screen target.
+const DFF_VERTEX_PICK_RADIUS: f32 = 12.0;
+const EDIT_EDGE_PICK_RADIUS: f32 = 10.0;
 const COLLISION_TAB_VERTEX_PICK_RADIUS: f32 = 7.0;
 const VERTEX_OCCLUSION_TOLERANCE: f32 = 6.0;
 const MERGE_BY_DISTANCE_DEFAULT: f32 = 0.0001;
 /// The browser and asset inspector together otherwise leave too little room
 /// for meaningful mesh work on common laptop displays.
 const EDITING_ARCHIVE_MIN_SCREEN_W: f32 = 1200.0;
+/// Scene cameras farther than this from an element's world bounds are not
+/// useful starting points for detail work in the standalone DFF editor.
+const DFF_SCENE_CAMERA_TRANSFER_MAX_DISTANCE: f32 = 750.0;
 
 pub(crate) fn editing_archive_visible() -> bool {
     screen_width() >= EDITING_ARCHIVE_MIN_SCREEN_W
@@ -52,6 +60,94 @@ pub(crate) fn editing_center_rect() -> Rect {
     )
 }
 
+const DFF_UV_SPLITTER_H: f32 = 8.0;
+const DFF_UV_MIN_PANEL_H: f32 = 250.0;
+const DFF_UV_MIN_PREVIEW_H: f32 = 120.0;
+
+fn dff_uv_editor_panel_rect(editor: &DffUvEditorState) -> Rect {
+    let center = editing_center_rect();
+    let max_height =
+        (center.h - DFF_UV_MIN_PREVIEW_H - DFF_UV_SPLITTER_H).max(DFF_UV_MIN_PANEL_H.min(center.h));
+    let min_height = DFF_UV_MIN_PANEL_H.min(max_height);
+    let height = (center.h * editor.split_fraction).clamp(min_height, max_height);
+    Rect::new(center.x, center.y + center.h - height, center.w, height)
+}
+
+fn dff_uv_editor_splitter_rect(editor: &DffUvEditorState) -> Rect {
+    let panel = dff_uv_editor_panel_rect(editor);
+    Rect::new(
+        panel.x,
+        panel.y - DFF_UV_SPLITTER_H,
+        panel.w,
+        DFF_UV_SPLITTER_H,
+    )
+}
+
+/// The live model keeps the portion of the viewport above the resizable UV split.
+pub(crate) fn editing_preview_rect(app: &AppState) -> Rect {
+    let center = editing_center_rect();
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        return center;
+    };
+    if !dff.uv_editor.open {
+        return center;
+    }
+    let splitter = dff_uv_editor_splitter_rect(&dff.uv_editor);
+    Rect::new(
+        center.x,
+        center.y,
+        center.w,
+        (splitter.y - center.y).max(1.0),
+    )
+}
+
+fn editing_dff_models_rect(dff: &EditingDffState) -> Rect {
+    let center = editing_preview_rect_for_models();
+    let rows = dff.open_models.len().min(7) as f32;
+    Rect::new(
+        center.x + 12.0,
+        center.y + 60.0,
+        440.0_f32.min(center.w - 24.0),
+        48.0 + rows * 38.0,
+    )
+}
+
+fn editing_preview_rect_for_models() -> Rect {
+    editing_center_rect()
+}
+
+fn editing_dff_model_row_rect(dff: &EditingDffState, index: usize) -> Rect {
+    let list = editing_dff_models_rect(dff);
+    Rect::new(
+        list.x + 8.0,
+        list.y + 42.0 + index as f32 * 38.0,
+        list.w - 16.0,
+        32.0,
+    )
+}
+
+fn editing_dff_model_move_rect(dff: &EditingDffState, index: usize) -> Rect {
+    let row = editing_dff_model_row_rect(dff, index);
+    Rect::new(row.x + row.w - 98.0, row.y + 3.0, 94.0, row.h - 6.0)
+}
+
+fn editing_dff_multi_select_rect(dff: &EditingDffState) -> Rect {
+    let list = editing_dff_models_rect(dff);
+    Rect::new(list.x + list.w - 116.0, list.y + 8.0, 104.0, 27.0)
+}
+
+pub(crate) fn editing_dff_hovered_open_model(app: &AppState) -> Option<usize> {
+    let EditingAsset::Dff(dff) = app.editing.asset.as_ref()? else {
+        return None;
+    };
+    if dff.open_models.len() <= 1 {
+        return None;
+    }
+    let mouse: Vec2 = mouse_position().into();
+    (0..dff.open_models.len().min(7))
+        .find(|index| editing_dff_model_row_rect(dff, *index).contains(mouse))
+}
+
 pub(crate) fn editing_archive_picker_rect() -> Rect {
     let panel = editing_panel_rect();
     Rect::new(panel.x + 92.0, panel.y + 4.0, 200.0, 28.0)
@@ -84,6 +180,11 @@ pub(crate) fn editing_img_choose_rect() -> Rect {
 pub(crate) fn editing_img_open_archive_rect() -> Rect {
     let asset = editing_img_choose_rect();
     Rect::new(asset.x + asset.w + 8.0, asset.y, 156.0, asset.h)
+}
+
+pub(crate) fn editing_create_dff_rect() -> Rect {
+    let archive = editing_img_open_archive_rect();
+    Rect::new(archive.x + archive.w + 8.0, archive.y, 126.0, archive.h)
 }
 
 pub(crate) fn editing_img_save_rect() -> Rect {
@@ -153,31 +254,42 @@ pub(crate) fn editing_extract_entry_rect() -> Rect {
 
 pub(crate) fn editing_txd_add_rect() -> Rect {
     let right = editing_asset_rect();
-    let w = (right.w - 46.0) / 4.0;
+    let w = (right.w - 52.0) / 5.0;
     Rect::new(right.x + 14.0, right.y + right.h - 38.0, w, 28.0)
+}
+
+pub(crate) fn editing_txd_import_folder_rect() -> Rect {
+    let right = editing_asset_rect();
+    let w = (right.w - 52.0) / 5.0;
+    Rect::new(right.x + 20.0 + w, right.y + right.h - 38.0, w, 28.0)
 }
 
 pub(crate) fn editing_txd_replace_rect() -> Rect {
     let right = editing_asset_rect();
-    let w = (right.w - 46.0) / 4.0;
-    Rect::new(right.x + 20.0 + w, right.y + right.h - 38.0, w, 28.0)
+    let w = (right.w - 52.0) / 5.0;
+    Rect::new(right.x + 26.0 + w * 2.0, right.y + right.h - 38.0, w, 28.0)
 }
 
 pub(crate) fn editing_txd_rename_rect() -> Rect {
     let right = editing_asset_rect();
-    let w = (right.w - 46.0) / 4.0;
-    Rect::new(right.x + 26.0 + w * 2.0, right.y + right.h - 38.0, w, 28.0)
+    let w = (right.w - 52.0) / 5.0;
+    Rect::new(right.x + 32.0 + w * 3.0, right.y + right.h - 38.0, w, 28.0)
 }
 
 pub(crate) fn editing_txd_export_all_rect() -> Rect {
     let right = editing_asset_rect();
-    let w = (right.w - 46.0) / 4.0;
-    Rect::new(right.x + 32.0 + w * 3.0, right.y + right.h - 38.0, w, 28.0)
+    let w = (right.w - 52.0) / 5.0;
+    Rect::new(right.x + 38.0 + w * 4.0, right.y + right.h - 38.0, w, 28.0)
 }
 
 pub(crate) fn editing_txd_search_rect() -> Rect {
     let right = editing_asset_rect();
-    Rect::new(right.x + 14.0, right.y + 74.0, right.w - 28.0, 28.0)
+    Rect::new(right.x + 14.0, right.y + 74.0, right.w - 154.0, 28.0)
+}
+
+pub(crate) fn editing_txd_category_rect() -> Rect {
+    let right = editing_asset_rect();
+    Rect::new(right.x + right.w - 132.0, right.y + 74.0, 118.0, 28.0)
 }
 
 pub(crate) fn editing_txd_list_rect() -> Rect {
@@ -187,6 +299,16 @@ pub(crate) fn editing_txd_list_rect() -> Rect {
         right.y + 110.0,
         right.w - 28.0,
         (right.h - 158.0).max(32.0),
+    )
+}
+
+pub(crate) fn editing_txd_preview_rect() -> Rect {
+    let center = editing_center_rect();
+    Rect::new(
+        center.x + 22.0,
+        center.y + 52.0,
+        center.w - 44.0,
+        center.h - 110.0,
     )
 }
 
@@ -454,6 +576,16 @@ pub(crate) const DFF_2DFX_ROW_H: f32 = 28.0;
 pub(crate) const DFF_LIGHT_ROW_H: f32 = 32.0;
 pub(crate) const DFF_MAT_VISIBLE_MAX: usize = 7;
 pub(crate) const DFF_2DFX_VISIBLE_MAX: usize = 8;
+const DFF_MESH_CATEGORY_COUNT: usize = 6;
+const DFF_MESH_CATEGORY_H: f32 = 22.0;
+const DFF_MESH_CATEGORY_TITLES: [&str; DFF_MESH_CATEGORY_COUNT] = [
+    "Import & Texture",
+    "Faces",
+    "Vertices",
+    "Normals & Shading",
+    "Materials",
+    "Object & Pivot",
+];
 
 pub(crate) struct DffPanelLayout {
     pub(crate) content: Rect,
@@ -476,6 +608,7 @@ pub(crate) struct DffPanelLayout {
     pub(crate) simulate_fractures: Option<Rect>,
     pub(crate) material_list: Option<Rect>,
     pub(crate) material_visible: usize,
+    pub(crate) select_material_faces: Option<Rect>,
     pub(crate) view_texture: Option<Rect>,
     pub(crate) rename_texture: Option<Rect>,
     pub(crate) duplicate_texture: Option<Rect>,
@@ -492,10 +625,12 @@ pub(crate) struct DffPanelLayout {
     pub(crate) collision_material: Option<Rect>,
     pub(crate) shadow_casting_toggle: Option<Rect>,
     pub(crate) shadow_casting_scope: Option<Rect>,
+    pub(crate) emitter_target: Option<Rect>,
     pub(crate) emitter_toggle: Option<Rect>,
     pub(crate) emitter_source: Option<Rect>,
     pub(crate) emitter_scope: Option<Rect>,
     pub(crate) emitter_cast_mode: Option<Rect>,
+    pub(crate) emitter_casts_shadow: Option<Rect>,
     pub(crate) emitter_max_grouping_size: Option<Rect>,
     pub(crate) emitter_point_up_strength: Option<Rect>,
     pub(crate) emitter_point_down_strength: Option<Rect>,
@@ -511,13 +646,26 @@ pub(crate) struct DffPanelLayout {
     pub(crate) tex_browse: Option<Rect>,
     pub(crate) anim_assign: Option<Rect>,
     pub(crate) anim_clear: Option<Rect>,
+    pub(crate) anim_continuous: Option<Rect>,
+    pub(crate) anim_speed: Option<[Rect; 2]>,
     pub(crate) anim_motion: Option<[Rect; 4]>,
     pub(crate) uv_nudge: Option<[Rect; 4]>,
     pub(crate) uv_scale: Option<[Rect; 2]>,
     pub(crate) uv_rotate: Option<[Rect; 2]>,
+    pub(crate) uv_blend_neighbors: Option<Rect>,
+    pub(crate) uv_editor_open: Option<Rect>,
     pub(crate) uv_unwrap_face: Option<Rect>,
     pub(crate) uv_unwrap_material: Option<Rect>,
+    pub(crate) uv_face_aligned_unwrap: Option<Rect>,
+    pub(crate) uv_box_unwrap_face: Option<Rect>,
+    pub(crate) uv_box_unwrap_material: Option<Rect>,
+    pub(crate) uv_cliff_unwrap_face: Option<Rect>,
+    pub(crate) uv_cliff_unwrap_material: Option<Rect>,
+    pub(crate) mesh_category_headers: [Option<Rect>; DFF_MESH_CATEGORY_COUNT],
     pub(crate) mesh_import_set: Option<Rect>,
+    pub(crate) add_vertex: Option<Rect>,
+    pub(crate) add_plane: Option<Rect>,
+    pub(crate) add_cube: Option<Rect>,
     pub(crate) make_face: Option<Rect>,
     pub(crate) delete_face: Option<Rect>,
     pub(crate) delete_vertex: Option<Rect>,
@@ -526,12 +674,24 @@ pub(crate) struct DffPanelLayout {
     pub(crate) merge_selected: Option<Rect>,
     pub(crate) merge_distance: Option<Rect>,
     pub(crate) subdivide: Option<Rect>,
+    pub(crate) knife: Option<Rect>,
     pub(crate) duplicate_faces: Option<Rect>,
+    pub(crate) shade_flat: Option<Rect>,
+    pub(crate) shade_smooth: Option<Rect>,
+    pub(crate) mark_edges_sharp: Option<Rect>,
+    pub(crate) area_weighted_normals: Option<Rect>,
+    pub(crate) flip_selected_faces: Option<Rect>,
+    pub(crate) show_normals: Option<Rect>,
     pub(crate) duplicate_material: Option<Rect>,
     pub(crate) separate_faces: Option<Rect>,
+    pub(crate) split_material_limits: Option<Rect>,
     pub(crate) pivot_to_selection: Option<Rect>,
     pub(crate) pivot_to_bounds: Option<Rect>,
+    pub(crate) freeform_pivot: Option<Rect>,
+    pub(crate) freeform_pivot_apply: Option<Rect>,
+    pub(crate) freeform_pivot_cancel: Option<Rect>,
     pub(crate) cutter_add: Option<Rect>,
+    pub(crate) cutter_apply: Option<Rect>,
     pub(crate) cutter_clear: Option<Rect>,
     pub(crate) cutter_resize: Option<[Rect; 6]>,
     pub(crate) generate_lod: Option<Rect>,
@@ -609,6 +769,7 @@ pub(crate) fn dff_panel_layout(
         simulate_fractures: None,
         material_list: None,
         material_visible: 0,
+        select_material_faces: None,
         view_texture: None,
         rename_texture: None,
         duplicate_texture: None,
@@ -625,10 +786,12 @@ pub(crate) fn dff_panel_layout(
         collision_material: None,
         shadow_casting_toggle: None,
         shadow_casting_scope: None,
+        emitter_target: None,
         emitter_toggle: None,
         emitter_source: None,
         emitter_scope: None,
         emitter_cast_mode: None,
+        emitter_casts_shadow: None,
         emitter_max_grouping_size: None,
         emitter_point_up_strength: None,
         emitter_point_down_strength: None,
@@ -644,13 +807,26 @@ pub(crate) fn dff_panel_layout(
         tex_browse: None,
         anim_assign: None,
         anim_clear: None,
+        anim_continuous: None,
+        anim_speed: None,
         anim_motion: None,
         uv_nudge: None,
         uv_scale: None,
         uv_rotate: None,
+        uv_blend_neighbors: None,
+        uv_editor_open: None,
         uv_unwrap_face: None,
         uv_unwrap_material: None,
+        uv_face_aligned_unwrap: None,
+        uv_box_unwrap_face: None,
+        uv_box_unwrap_material: None,
+        uv_cliff_unwrap_face: None,
+        uv_cliff_unwrap_material: None,
+        mesh_category_headers: [None; DFF_MESH_CATEGORY_COUNT],
         mesh_import_set: None,
+        add_vertex: None,
+        add_plane: None,
+        add_cube: None,
         make_face: None,
         delete_face: None,
         delete_vertex: None,
@@ -659,12 +835,24 @@ pub(crate) fn dff_panel_layout(
         merge_selected: None,
         merge_distance: None,
         subdivide: None,
+        knife: None,
         duplicate_faces: None,
+        shade_flat: None,
+        shade_smooth: None,
+        mark_edges_sharp: None,
+        area_weighted_normals: None,
+        flip_selected_faces: None,
+        show_normals: None,
         duplicate_material: None,
         separate_faces: None,
+        split_material_limits: None,
         pivot_to_selection: None,
         pivot_to_bounds: None,
+        freeform_pivot: None,
+        freeform_pivot_apply: None,
+        freeform_pivot_cancel: None,
         cutter_add: None,
+        cutter_apply: None,
         cutter_clear: None,
         cutter_resize: None,
         generate_lod: None,
@@ -768,6 +956,8 @@ pub(crate) fn dff_panel_layout(
                 layout.material_list =
                     Some(Rect::new(x0, y, fullw, visible as f32 * DFF_MAT_ROW_H));
                 y += visible as f32 * DFF_MAT_ROW_H + 6.0;
+                layout.select_material_faces = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + DFF_ROW_GAP;
                 layout.view_texture = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                 layout.rename_texture = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
                 y += DFF_BTN_H + DFF_ROW_GAP;
@@ -823,8 +1013,12 @@ pub(crate) fn dff_panel_layout(
                 y += DFF_BTN_H + DFF_ROW_GAP;
                 layout.shadow_casting_toggle = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
                 y += DFF_BTN_H + DFF_ROW_GAP;
-                if !selected_dff_faces_are_emitter_target(dff) {
+                if !dff_has_selected_faces(dff) {
                     layout.shadow_casting_scope = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                    y += DFF_BTN_H + DFF_ROW_GAP;
+                }
+                if dff_has_selected_faces(dff) {
+                    layout.emitter_target = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
                     y += DFF_BTN_H + DFF_ROW_GAP;
                 }
                 layout.emitter_toggle = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
@@ -849,6 +1043,9 @@ pub(crate) fn dff_panel_layout(
                             *slot = Some(Rect::new(x0, y, fullw, DFF_FIELD_H));
                             y += DFF_FIELD_H + DFF_ROW_GAP;
                         }
+                    } else {
+                        layout.emitter_casts_shadow = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                        y += DFF_BTN_H + DFF_ROW_GAP;
                     }
                     layout.emitter_day = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                     layout.emitter_night = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
@@ -884,6 +1081,13 @@ pub(crate) fn dff_panel_layout(
                 layout.anim_assign = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                 layout.anim_clear = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
                 y += DFF_BTN_H + 6.0;
+                layout.anim_continuous = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                layout.anim_speed = Some([
+                    Rect::new(x0, y, halfw, DFF_SMALL_BTN_H),
+                    Rect::new(x2, y, halfw, DFF_SMALL_BTN_H),
+                ]);
+                y += DFF_SMALL_BTN_H + 6.0;
                 let bw = ((fullw - 18.0) / 4.0).min(64.0);
                 let mut motion = [zero; 4];
                 for (i, slot) in motion.iter_mut().enumerate() {
@@ -893,6 +1097,8 @@ pub(crate) fn dff_panel_layout(
                 y += DFF_SMALL_BTN_H + gap;
             }
             DffSection::UvTools => {
+                layout.uv_editor_open = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
                 let bw = ((fullw - 18.0) / 4.0).min(64.0);
                 let mut nudge = [zero; 4];
                 for (i, slot) in nudge.iter_mut().enumerate() {
@@ -910,33 +1116,85 @@ pub(crate) fn dff_panel_layout(
                     Rect::new(x2, y, halfw, DFF_BTN_H),
                 ]);
                 y += DFF_BTN_H + 6.0;
+                layout.uv_blend_neighbors = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
                 layout.uv_unwrap_face = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                 layout.uv_unwrap_material = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                layout.uv_face_aligned_unwrap = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                layout.uv_box_unwrap_face = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                layout.uv_box_unwrap_material = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                layout.uv_cliff_unwrap_face = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                layout.uv_cliff_unwrap_material = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
                 y += DFF_BTN_H + gap;
             }
             DffSection::Mesh => {
+                let category = |layout: &mut DffPanelLayout, index: usize, y: &mut f32| {
+                    layout.mesh_category_headers[index] =
+                        Some(Rect::new(x0, *y, fullw, DFF_MESH_CATEGORY_H));
+                    *y += DFF_MESH_CATEGORY_H + 4.0;
+                };
+
+                category(&mut layout, 0, &mut y);
                 layout.mesh_import_set = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                y += DFF_BTN_H + 6.0;
+                y += DFF_BTN_H + 9.0;
+
+                category(&mut layout, 1, &mut y);
                 layout.make_face = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                 layout.delete_face = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
                 y += DFF_BTN_H + 6.0;
-                layout.delete_vertex = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
-                layout.delete_material_faces = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
-                y += DFF_BTN_H + 6.0;
                 layout.extrude_selection = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                layout.subdivide = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                layout.knife = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                y += DFF_BTN_H + 9.0;
+                layout.duplicate_faces = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + 9.0;
+
+                category(&mut layout, 2, &mut y);
+                layout.add_vertex = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                layout.add_plane = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                layout.add_cube = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                layout.delete_vertex = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
                 y += DFF_BTN_H + 6.0;
                 layout.merge_selected = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                 layout.merge_distance = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                y += DFF_BTN_H + 9.0;
+
+                category(&mut layout, 3, &mut y);
+                layout.shade_flat = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                layout.shade_smooth = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
                 y += DFF_BTN_H + 6.0;
-                layout.subdivide = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
-                layout.duplicate_faces = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                layout.mark_edges_sharp = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                layout.area_weighted_normals = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
                 y += DFF_BTN_H + 6.0;
-                layout.duplicate_material = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
-                y += DFF_BTN_H + 6.0;
+                layout.flip_selected_faces = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                layout.show_normals = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                y += DFF_BTN_H + 9.0;
+
+                category(&mut layout, 4, &mut y);
+                layout.duplicate_material = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                layout.delete_material_faces = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                y += DFF_BTN_H + 9.0;
+
+                category(&mut layout, 5, &mut y);
                 layout.separate_faces = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                layout.split_material_limits = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
                 y += DFF_BTN_H + 6.0;
                 layout.pivot_to_selection = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                 layout.pivot_to_bounds = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                if dff.freeform_pivot.is_some() {
+                    layout.freeform_pivot_apply = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                    layout.freeform_pivot_cancel = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                } else {
+                    layout.freeform_pivot = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                }
                 y += DFF_BTN_H + gap;
             }
             DffSection::Cutter => {
@@ -949,7 +1207,9 @@ pub(crate) fn dff_panel_layout(
                     *slot = Rect::new(x0 + i as f32 * (bw + 6.0), y, bw, DFF_SMALL_BTN_H);
                 }
                 layout.cutter_resize = Some(resize);
-                y += DFF_SMALL_BTN_H + gap;
+                y += DFF_SMALL_BTN_H + 6.0;
+                layout.cutter_apply = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + gap;
             }
             DffSection::Lod => {
                 layout.generate_lod = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
@@ -1040,7 +1300,7 @@ pub(crate) fn editing_dff_2dfx_payload_text_rect() -> Rect {
         popup.x + 12.0,
         popup.y + 132.0,
         popup.w - 24.0,
-        popup.h - 178.0,
+        popup.h - 204.0,
     )
 }
 
@@ -1135,15 +1395,25 @@ pub(crate) fn editing_dff_texture_picker_close_rect() -> Rect {
     Rect::new(popup.x + popup.w - 84.0, popup.y + 8.0, 76.0, 26.0)
 }
 
+pub(crate) fn editing_dff_texture_picker_search_rect() -> Rect {
+    let popup = editing_dff_texture_picker_rect();
+    Rect::new(popup.x + 8.0, popup.y + 44.0, popup.w - 142.0, 28.0)
+}
+
+pub(crate) fn editing_dff_texture_picker_category_rect() -> Rect {
+    let popup = editing_dff_texture_picker_rect();
+    Rect::new(popup.x + popup.w - 126.0, popup.y + 44.0, 118.0, 28.0)
+}
+
 pub(crate) const DFF_TEXTURE_PICKER_ROW_H: f32 = 30.0;
 
 pub(crate) fn editing_dff_texture_picker_list_rect() -> Rect {
     let popup = editing_dff_texture_picker_rect();
     Rect::new(
         popup.x + 8.0,
-        popup.y + 44.0,
+        popup.y + 80.0,
         popup.w - 16.0,
-        popup.h - 52.0,
+        popup.h - 88.0,
     )
 }
 
@@ -1196,6 +1466,7 @@ pub(crate) struct ColPanelLayout {
     pub(crate) primitive_visible: usize,
     pub(crate) add_sphere: Option<Rect>,
     pub(crate) add_box: Option<Rect>,
+    pub(crate) fit_box_to_object: Option<Rect>,
     pub(crate) add_capsule: Option<Rect>,
     pub(crate) duplicate_primitive: Option<Rect>,
     pub(crate) box_pick_toggle: Option<Rect>,
@@ -1391,6 +1662,15 @@ fn col_regular_topology_has_editable_primitives(col: &EditingColState) -> bool {
 }
 
 fn refresh_editing_col_bounds(col: &mut EditingColState) {
+    let has_regular_geometry = !col.mesh.vertices.is_empty()
+        || !col.mesh.faces.is_empty()
+        || !col.mesh.spheres.is_empty()
+        || !col.mesh.boxes.is_empty();
+    if !col.editing_shadow && !has_regular_geometry {
+        // A bounds-only COL has no geometry from which to recompute bounds.
+        // Retain the broad-phase volume parsed from its model header.
+        return;
+    }
     col.mesh.bounds = if col.editing_shadow {
         bounds_from_vertices(&col.mesh.vertices)
     } else {
@@ -1424,6 +1704,7 @@ pub(crate) fn col_panel_layout(col: &EditingColState) -> ColPanelLayout {
         primitive_visible: 0,
         add_sphere: None,
         add_box: None,
+        fit_box_to_object: None,
         add_capsule: None,
         duplicate_primitive: None,
         box_pick_toggle: None,
@@ -1480,6 +1761,8 @@ pub(crate) fn col_panel_layout(col: &EditingColState) -> ColPanelLayout {
                 layout.add_box = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
                 y += DFF_BTN_H + 6.0;
                 layout.add_capsule = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                layout.fit_box_to_object = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
                 y += DFF_BTN_H + 6.0;
                 layout.duplicate_primitive = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
                 if col
@@ -1662,8 +1945,12 @@ fn editing_entry_type(name: &str) -> &'static str {
 pub(crate) fn editing_dirty(app: &AppState) -> bool {
     !app.editing.modified_entries.is_empty()
         || !app.editing.deleted_entries.is_empty()
-        || matches!(app.editing.asset.as_ref(), Some(EditingAsset::Dff(dff)) if dff.dirty)
+        || matches!(app.editing.asset.as_ref(), Some(EditingAsset::Dff(dff)) if editing_dff_dirty(dff))
         || matches!(app.editing.asset.as_ref(), Some(EditingAsset::Col(col)) if col.dirty)
+}
+
+fn editing_dff_dirty(dff: &EditingDffState) -> bool {
+    dff.dirty || dff.open_models.iter().any(|model| model.dirty)
 }
 
 fn editing_filtered_indices(app: &AppState) -> Vec<usize> {
@@ -1682,12 +1969,81 @@ fn editing_filtered_indices(app: &AppState) -> Vec<usize> {
         .collect()
 }
 
-fn editing_txd_filtered_indices(txd: &EditingTxdState) -> Vec<usize> {
+const TEXTURE_CATEGORY_PRESETS: [&str; 10] = [
+    "Nature",
+    "Ground",
+    "Road",
+    "Architecture",
+    "Vegetation",
+    "Water",
+    "Vehicle",
+    "Effects",
+    "UI",
+    "Other",
+];
+
+fn texture_matches_category(
+    classes: &TextureMaterialClasses,
+    txd_name: &str,
+    texture_name: &str,
+    filter: &str,
+) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let category = classes.texture_category(txd_name, texture_name);
+    if filter == "__uncategorized" {
+        category.is_none()
+    } else {
+        category.is_some_and(|category| category.eq_ignore_ascii_case(filter))
+    }
+}
+
+fn texture_category_filter_label(filter: &str) -> &str {
+    match filter {
+        "" => "All categories",
+        "__uncategorized" => "Uncategorized",
+        value => value,
+    }
+}
+
+fn next_texture_category_filter(current: &str, classes: &TextureMaterialClasses) -> String {
+    let mut choices = vec![String::new(), "__uncategorized".to_string()];
+    for preset in TEXTURE_CATEGORY_PRESETS {
+        if !choices
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(preset))
+        {
+            choices.push(preset.to_string());
+        }
+    }
+    for category in classes.texture_category_names() {
+        if !choices
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(&category))
+        {
+            choices.push(category);
+        }
+    }
+    let current_index = choices
+        .iter()
+        .position(|value| value.eq_ignore_ascii_case(current))
+        .unwrap_or(0);
+    choices[(current_index + 1) % choices.len()].clone()
+}
+
+fn editing_txd_filtered_indices(
+    txd: &EditingTxdState,
+    classes: &TextureMaterialClasses,
+) -> Vec<usize> {
     let query = lower(txd.search.trim());
     txd.textures
         .iter()
         .enumerate()
-        .filter(|(_, texture)| query.is_empty() || lower(&texture.name).contains(&query))
+        .filter(|(_, texture)| {
+            (query.is_empty() || lower(&texture.name).contains(&query))
+                && texture_matches_category(classes, &txd.name, &texture.name, &txd.category_filter)
+        })
         .map(|(index, _)| index)
         .collect()
 }
@@ -1710,7 +2066,7 @@ pub(crate) fn scroll_editing_txd_list(app: &mut AppState, mouse: Vec2, wheel_y: 
     let Some(EditingAsset::Txd(txd)) = app.editing.asset.as_mut() else {
         return false;
     };
-    let filtered_len = editing_txd_filtered_indices(txd).len();
+    let filtered_len = editing_txd_filtered_indices(txd, &app.material_classes).len();
     txd.scroll =
         editing_txd_scroll_value(txd.scroll, filtered_len, editing_txd_list_rect().h, wheel_y);
     true
@@ -1751,7 +2107,29 @@ fn editing_entry_bytes(app: &AppState, row: &EditingImgRow) -> Result<Vec<u8>, S
     if let Some(bytes) = app.editing.modified_entries.get(&key) {
         return Ok(bytes.clone());
     }
-    checked_editing_entry_bytes(row, read_img_entry(&row.entry))
+    current_editing_entry_bytes(row)
+}
+
+fn current_editing_entry_bytes(row: &EditingImgRow) -> Result<Vec<u8>, String> {
+    // IMG rewrites can relocate every payload while the Editing tab still has
+    // rows containing the old offsets. Resolve the entry again immediately
+    // before reading it so a cached row never reads unrelated sector data.
+    let current = parse_img(&row.entry.img_path)
+        .into_iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(&row.entry.name))
+        .ok_or_else(|| {
+            format!(
+                "IMG archive {} no longer contains {}",
+                row.entry.img_path.display(),
+                row.entry.name
+            )
+        })?;
+    let bytes = read_img_entry(&current);
+    let current_row = EditingImgRow {
+        logical_size: replacement_entry_len(&current.name, &bytes),
+        entry: current,
+    };
+    checked_editing_entry_bytes(&current_row, bytes)
 }
 
 fn txd_entries_from_bytes(name: &str, bytes: &[u8]) -> Vec<TextureArchiveEntry> {
@@ -1893,7 +2271,7 @@ fn build_editing_dff_preview(
     txd_context: Option<&str>,
 ) -> Option<RenderMesh> {
     let ambient_lift = scene_ambient_lift_from_timecyc(&app.timecyc);
-    let mut mesh = compile_render_mesh(
+    compile_render_mesh(
         raw.clone(),
         txd_context,
         None,
@@ -1904,39 +2282,7 @@ fn build_editing_dff_preview(
         &mut app.textured_parts,
         app.options.textures,
         ambient_lift,
-    )?;
-    // The world renderer intentionally neutralizes tint on many textured
-    // materials. Editing preview must instead show the authored material RGBA,
-    // including fully transparent values, so changes are visible before save.
-    for part in &mut mesh.parts {
-        let material = raw
-            .materials
-            .get(part.material_index)
-            .copied()
-            .unwrap_or_else(default_dff_material);
-        part.alpha = material.alpha.clamp(0.0, 1.0);
-        part.material_color = material.color;
-        part.material_ambient = material.ambient;
-        let diffuse = material.diffuse.clamp(0.0, 4.0);
-        if part.alpha < 0.98 {
-            part.transparency = TransparencyMode::Blend;
-        }
-        for vertex in &mut part.cpu_vertices {
-            vertex.day_color = V3 {
-                x: vertex.base_day_color.x * material.color.x * diffuse,
-                y: vertex.base_day_color.y * material.color.y * diffuse,
-                z: vertex.base_day_color.z * material.color.z * diffuse,
-            };
-            vertex.night_color = V3 {
-                x: vertex.base_night_color.x * material.color.x * diffuse,
-                y: vertex.base_night_color.y * material.color.y * diffuse,
-                z: vertex.base_night_color.z * material.color.z * diffuse,
-            };
-            vertex.color = vertex.day_color;
-        }
-        rebuild_render_part_list_with_lift(part, ambient_lift);
-    }
-    Some(mesh)
+    )
 }
 
 fn build_editing_dff_overlay_from_entry(
@@ -2001,18 +2347,1972 @@ fn pick_selected_row_as_col_dff_overlay(app: &mut AppState) {
 }
 
 pub(crate) fn refresh_editing_dff_preview(app: &mut AppState) {
-    let Some((raw, txd_context)) = app.editing.asset.as_ref().and_then(|asset| match asset {
-        EditingAsset::Dff(dff) => Some((dff.raw.clone(), dff.txd_context.clone())),
-        _ => None,
-    }) else {
+    // Mesh/material/UV tools edit the active top-level DFF state first. Copy
+    // that state into its workspace model before taking the preview snapshot;
+    // otherwise a one- or multi-model workspace rebuilds the active preview
+    // from the previous model.raw and appears unchanged until it is reopened.
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        sync_active_open_dff_model(dff);
+    }
+    let Some((raw, txd_context, active_model, open_models)) =
+        app.editing.asset.as_ref().and_then(|asset| match asset {
+            EditingAsset::Dff(dff) => Some((
+                dff.raw.clone(),
+                dff.txd_context.clone(),
+                dff.active_open_model,
+                dff.open_models
+                    .iter()
+                    .map(|model| (model.raw.clone(), model.txd_context.clone()))
+                    .collect::<Vec<_>>(),
+            )),
+            _ => None,
+        })
+    else {
         return;
     };
     let thumbnails = editing_dff_material_thumbnails(app, &raw, txd_context.as_deref());
-    let preview_mesh = build_editing_dff_preview(app, &raw, txd_context.as_deref());
+    let mut model_previews = open_models
+        .iter()
+        .map(|(raw, txd)| build_editing_dff_preview(app, raw, txd.as_deref()))
+        .collect::<Vec<_>>();
+    let preview_mesh = if model_previews.is_empty() {
+        build_editing_dff_preview(app, &raw, txd_context.as_deref())
+    } else {
+        model_previews.get(active_model).cloned().flatten()
+    };
     if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
         dff.preview_mesh = preview_mesh;
         dff.material_thumbnails = thumbnails;
+        for (model, preview) in dff.open_models.iter_mut().zip(model_previews.drain(..)) {
+            model.preview_mesh = preview;
+        }
+        if dff.uv_editor.open {
+            dff.uv_editor.texture_aspect = dff_uv_texture_aspect(dff);
+        }
     }
+}
+
+fn transform_editor_raw_mesh(raw: &mut RawMesh, transform: Mat4) {
+    let normal_transform = transform.inverse().transpose();
+    for vertex in &mut raw.vertices {
+        *vertex = from_mq(transform.transform_point3(to_mq(*vertex)));
+    }
+    for normal in &mut raw.normals {
+        *normal = from_mq(
+            normal_transform
+                .transform_vector3(to_mq(*normal))
+                .normalize_or_zero(),
+        );
+    }
+    for effect in &mut raw.effects_2dfx {
+        effect.position = from_mq(transform.transform_point3(to_mq(effect.position)));
+    }
+    for breakable in raw
+        .components
+        .iter_mut()
+        .filter_map(|component| component.breakable.as_mut())
+    {
+        for vertex in &mut breakable.vertices {
+            vertex.position = from_mq(transform.transform_point3(to_mq(vertex.position)));
+        }
+    }
+}
+
+fn activate_open_dff_model(app: &mut AppState, index: usize) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if index >= dff.open_models.len() || index == dff.active_open_model {
+        return false;
+    }
+    if let Some(current) = dff.open_models.get_mut(dff.active_open_model) {
+        current.raw = dff.raw.clone();
+        current.preview_mesh = dff.preview_mesh.clone();
+        current.txd_context = dff.txd_context.clone();
+        current.txd_source_label = dff.txd_source_label.clone();
+        current.dirty |= dff.dirty;
+        current.selected_face = dff.selected_face;
+        current.selected_faces = dff.selected_faces.clone();
+        current.selected_edges = dff.selected_edges.clone();
+        current.selected_vertex = dff.selected_vertex;
+        current.selected_vertices = dff.selected_vertices.clone();
+    }
+    let next = dff.open_models[index].clone();
+    dff.active_open_model = index;
+    dff.name = next.name;
+    dff.raw = next.raw;
+    dff.preview_mesh = next.preview_mesh;
+    dff.txd_context = next.txd_context;
+    dff.txd_source_label = next.txd_source_label;
+    dff.dirty = next.dirty;
+    dff.selected_face = next.selected_face;
+    dff.selected_faces = next.selected_faces;
+    dff.selected_edges = next.selected_edges;
+    dff.selected_vertex = next.selected_vertex;
+    dff.selected_vertices = next.selected_vertices;
+    dff.selected_2dfx = None;
+    dff.hovered_face = None;
+    dff.hovered_vertex = None;
+    dff.hovered_edge = None;
+    dff.uv_editor.selected.clear();
+    dff.uv_editor.hovered = None;
+    dff.selected_material = 0;
+    app.status_message = format!("Editing {} in the multi-model workspace", dff.name);
+    true
+}
+
+pub(crate) fn sync_active_open_dff_model(dff: &mut EditingDffState) {
+    let Some(model) = dff.open_models.get_mut(dff.active_open_model) else {
+        return;
+    };
+    model.raw = dff.raw.clone();
+    model.preview_mesh = dff.preview_mesh.clone();
+    model.txd_context = dff.txd_context.clone();
+    model.txd_source_label = dff.txd_source_label.clone();
+    model.dirty |= dff.dirty;
+    model.selected_face = dff.selected_face;
+    model.selected_faces = dff.selected_faces.clone();
+    model.selected_edges = dff.selected_edges.clone();
+    model.selected_vertex = dff.selected_vertex;
+    model.selected_vertices = dff.selected_vertices.clone();
+}
+
+fn move_selected_dff_chunk_to_model(app: &mut AppState, target: usize) -> bool {
+    let before = world_editing_history_snapshot(app);
+    let result = (|| -> Result<(String, String, usize, bool), String> {
+        let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+            return Err("Open a DFF workspace first".to_string());
+        };
+        let source = dff.active_open_model;
+        if target >= dff.open_models.len() || target == source {
+            return Err("Choose another open model as the destination".to_string());
+        }
+        let selected = dff_selected_face_set(dff);
+        if selected.is_empty() {
+            return Err("Select one or more faces from the chunk to move".to_string());
+        }
+        if dff
+            .raw
+            .components
+            .iter()
+            .any(|component| component.breakable.is_some())
+            || dff.open_models[target]
+                .raw
+                .components
+                .iter()
+                .any(|component| component.breakable.is_some())
+        {
+            return Err("Move Chunk cannot rewrite breakable component data yet".to_string());
+        }
+        let moves_entire_model = selected.len() == dff.raw.triangles.len();
+        let (remaining, chunk) = if moves_entire_model {
+            (None, dff.raw.clone())
+        } else {
+            let (remaining, chunk) = split_raw_mesh_faces(&dff.raw, &selected)?;
+            (Some(remaining), chunk)
+        };
+        let source_name = dff.name.clone();
+        let target_name = dff.open_models[target].name.clone();
+        let destination = dff.open_models[target].raw.clone();
+        let combined = combine_editor_dff_chunks(&target_name, destination, &source_name, chunk)?;
+        if let Some(model) = dff.open_models.get_mut(target) {
+            model.raw = combined;
+            model.dirty = true;
+            model.preview_mesh = None;
+        }
+        if let Some(remaining) = remaining {
+            dff.raw = remaining;
+            dff.dirty = true;
+            if let Some(model) = dff.open_models.get_mut(source) {
+                model.raw = dff.raw.clone();
+                model.dirty = true;
+            }
+        } else {
+            let placement_index = dff.open_models[source].placement_index;
+            if let Some(state) = app.element_states.get_mut(placement_index) {
+                state.deleted = true;
+            }
+            dff.open_models.remove(source);
+            let target = if target > source { target - 1 } else { target };
+            let next = dff.open_models[target].clone();
+            dff.active_open_model = target;
+            dff.name = next.name;
+            dff.raw = next.raw;
+            dff.preview_mesh = next.preview_mesh;
+            dff.txd_context = next.txd_context;
+            dff.txd_source_label = next.txd_source_label;
+            dff.dirty = true;
+            app.selected = next.placement_index;
+            app.selected_elements.clear();
+            app.selected_elements.insert(next.placement_index);
+            app.selected_element_order = vec![next.placement_index];
+        }
+        dff.selected_face = None;
+        dff.selected_faces.clear();
+        dff.selected_edges.clear();
+        dff.selected_vertex = None;
+        dff.selected_vertices.clear();
+        Ok((source_name, target_name, selected.len(), moves_entire_model))
+    })();
+    match result {
+        Ok((source, target_name, count, moved_entire_model)) => {
+            refresh_editing_dff_preview(app);
+            if moved_entire_model {
+                rebuild_render_cells(app);
+                invalidate_validation_cache(app);
+            }
+            commit_scoped_history(
+                app,
+                "Move DFF Chunk Between Models",
+                ScopedHistorySnapshot::WorldEditing(before),
+            );
+            app.status_message = if moved_entire_model {
+                format!(
+                    "Moved all {count} faces from {source} to {target_name} and removed the source placement"
+                )
+            } else {
+                format!(
+                    "Moved {count} face{} from {source} to {target_name}",
+                    if count == 1 { "" } else { "s" }
+                )
+            };
+            true
+        }
+        Err(error) => {
+            app.status_message = error;
+            false
+        }
+    }
+}
+
+fn dff_uv_editor_view_rect(editor: &DffUvEditorState) -> Rect {
+    let center = dff_uv_editor_panel_rect(editor);
+    Rect::new(
+        center.x + 12.0,
+        center.y + 52.0,
+        center.w - 24.0,
+        (center.h - 92.0).max(80.0),
+    )
+}
+
+/// True while the UV canvas owns a middle-mouse interaction. Camera input is
+/// updated before panel input each frame, so it also needs this read-only hit
+/// test to avoid panning the 3D viewport underneath the UV editor.
+pub(crate) fn dff_uv_editor_owns_middle_mouse(app: &AppState, mouse: Vec2) -> bool {
+    matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff))
+            if dff.uv_editor.open
+                && (dff.uv_editor.panning || dff_uv_editor_view_rect(&dff.uv_editor).contains(mouse))
+    )
+}
+
+fn dff_uv_editor_toolbar_rect(editor: &DffUvEditorState, index: usize) -> Rect {
+    let center = dff_uv_editor_panel_rect(editor);
+    let widths = [72.0, 96.0, 82.0, 86.0, 88.0, 98.0];
+    let gap = 5.0;
+    let x = center.x + 12.0 + widths[..index].iter().map(|width| width + gap).sum::<f32>();
+    Rect::new(x, center.y + 11.0, widths[index], 30.0)
+}
+
+fn dff_uv_editor_menu_rect(button: Rect, item_count: usize) -> Rect {
+    Rect::new(
+        button.x,
+        button.y + button.h + 3.0,
+        190.0,
+        item_count as f32 * 29.0 + 8.0,
+    )
+}
+
+fn dff_uv_editor_menu_item_rect(menu: Rect, index: usize) -> Rect {
+    Rect::new(
+        menu.x + 4.0,
+        menu.y + 4.0 + index as f32 * 29.0,
+        menu.w - 8.0,
+        27.0,
+    )
+}
+
+fn dff_uv_editor_base_size(view: Rect, texture_aspect: f32) -> Vec2 {
+    let aspect = if texture_aspect.is_finite() {
+        texture_aspect.clamp(0.01, 100.0)
+    } else {
+        1.0
+    };
+    if aspect >= 1.0 {
+        let width = view.w.min(view.h * aspect).max(1.0);
+        vec2(width, width / aspect)
+    } else {
+        let height = view.h.min(view.w / aspect).max(1.0);
+        vec2(height * aspect, height)
+    }
+}
+
+fn dff_uv_editor_transform(view: Rect, editor: &DffUvEditorState) -> (Vec2, Vec2) {
+    // Pixel-aligned bounds keep the texture and UV overlay on the same raster
+    // coordinates. Fractional centered bounds made the wireframe look subtly
+    // offset from texels, especially with nearest-filtered small textures.
+    let raw_size = dff_uv_editor_base_size(view, editor.texture_aspect) * editor.zoom;
+    let size = vec2(raw_size.x.round().max(1.0), raw_size.y.round().max(1.0));
+    let origin = (view.center() + editor.pan - size * 0.5).round();
+    (origin, size)
+}
+
+fn dff_uv_to_screen(view: Rect, editor: &DffUvEditorState, uv: V2) -> Vec2 {
+    let (origin, size) = dff_uv_editor_transform(view, editor);
+    origin + vec2(uv.u * size.x, uv.v * size.y)
+}
+
+fn dff_uv_from_screen(view: Rect, editor: &DffUvEditorState, point: Vec2) -> V2 {
+    let (origin, size) = dff_uv_editor_transform(view, editor);
+    V2 {
+        u: (point.x - origin.x) / size.x,
+        v: (point.y - origin.y) / size.y,
+    }
+}
+
+fn zoom_dff_uv_editor(editor: &mut DffUvEditorState, view: Rect, focus: Vec2, factor: f32) {
+    let focus_uv = dff_uv_from_screen(view, editor, focus);
+    editor.zoom = (editor.zoom * factor).clamp(0.1, 64.0);
+    let shifted_focus = dff_uv_to_screen(view, editor, focus_uv);
+    editor.pan += focus - shifted_focus;
+}
+
+pub(crate) fn handle_dff_uv_editor_wheel(app: &mut AppState, mouse: Vec2, wheel_y: f32) -> bool {
+    if wheel_y.abs() <= f32::EPSILON {
+        return false;
+    }
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if !dff.uv_editor.open {
+        return false;
+    }
+    let view = dff_uv_editor_view_rect(&dff.uv_editor);
+    if !view.contains(mouse) {
+        return false;
+    }
+    let focus = vec2(
+        mouse.x.clamp(view.x, view.x + view.w),
+        mouse.y.clamp(view.y, view.y + view.h),
+    );
+    zoom_dff_uv_editor(&mut dff.uv_editor, view, focus, 1.15_f32.powf(wheel_y));
+    true
+}
+
+fn dff_uv_visible_texture_tiles(view: Rect, editor: &DffUvEditorState) -> (i32, i32, i32, i32) {
+    if !editor.repeat_texture {
+        return (0, 0, 0, 0);
+    }
+    let min = dff_uv_from_screen(view, editor, vec2(view.x, view.y));
+    let max = dff_uv_from_screen(view, editor, vec2(view.x + view.w, view.y + view.h));
+    let min_u = min.u.floor() as i32;
+    let min_v = min.v.floor() as i32;
+    let max_u = ((max.u.ceil() as i32) - 1).max(min_u).min(min_u + 63);
+    let max_v = ((max.v.ceil() as i32) - 1).max(min_v).min(min_v + 63);
+    (min_u, max_u, min_v, max_v)
+}
+
+fn dff_uv_selected_face_indices(dff: &EditingDffState) -> BTreeSet<usize> {
+    dff.selected_faces
+        .iter()
+        .copied()
+        .filter(|face| {
+            dff.raw
+                .triangles
+                .get(*face)
+                .is_some_and(|triangle| triangle.material as usize == dff.selected_material)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn dff_uv_material_vertices(raw: &RawMesh, material: usize) -> BTreeSet<usize> {
+    raw.triangles
+        .iter()
+        .filter(|triangle| triangle.material as usize == material)
+        .flat_map(|triangle| {
+            [
+                triangle.a as usize,
+                triangle.b as usize,
+                triangle.c as usize,
+            ]
+        })
+        .filter(|index| *index < raw.vertices.len())
+        .collect()
+}
+
+fn dff_uv_selected_face_vertices(dff: &EditingDffState) -> BTreeSet<usize> {
+    dff_uv_face_vertices(&dff.raw, &dff_uv_selected_face_indices(dff))
+}
+
+fn dff_uv_face_vertices(raw: &RawMesh, faces: &BTreeSet<usize>) -> BTreeSet<usize> {
+    faces
+        .into_iter()
+        .filter_map(|face| raw.triangles.get(*face))
+        .flat_map(|triangle| {
+            [
+                triangle.a as usize,
+                triangle.b as usize,
+                triangle.c as usize,
+            ]
+        })
+        .filter(|index| *index < raw.vertices.len())
+        .collect()
+}
+
+fn dff_uv_texture_aspect(dff: &EditingDffState) -> f32 {
+    dff.material_thumbnails
+        .get(dff.selected_material)
+        .and_then(Option::as_ref)
+        .map(Texture2D::size)
+        .filter(|size| size.x > 0.0 && size.y > 0.0)
+        .map(|size| size.x / size.y)
+        .unwrap_or(1.0)
+}
+
+fn sync_dff_uv_editor_material(dff: &mut EditingDffState) {
+    if !dff.uv_editor.open {
+        return;
+    }
+    dff.uv_editor.selected = dff_uv_selected_face_vertices(dff);
+    dff.uv_editor.hovered = None;
+    dff.uv_editor.texture_aspect = dff_uv_texture_aspect(dff);
+}
+
+fn dff_uv_linked_vertices_in_faces(
+    raw: &RawMesh,
+    visible_faces: &BTreeSet<usize>,
+    seeds: &BTreeSet<usize>,
+) -> BTreeSet<usize> {
+    let triangles = raw
+        .triangles
+        .iter()
+        .enumerate()
+        .filter(|(face, _)| visible_faces.contains(face))
+        .map(|(_, triangle)| triangle)
+        .map(|triangle| {
+            [
+                triangle.a as usize,
+                triangle.b as usize,
+                triangle.c as usize,
+            ]
+        })
+        .filter(|indices| indices.iter().all(|index| *index < raw.vertices.len()))
+        .collect::<Vec<_>>();
+    let mut linked = seeds
+        .iter()
+        .copied()
+        .filter(|index| *index < raw.vertices.len())
+        .collect::<BTreeSet<_>>();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for indices in &triangles {
+            if indices.iter().any(|index| linked.contains(index)) {
+                for index in indices {
+                    changed |= linked.insert(*index);
+                }
+            }
+        }
+    }
+    linked
+}
+
+fn dff_uv_linked_vertices(dff: &EditingDffState, seeds: &BTreeSet<usize>) -> BTreeSet<usize> {
+    dff_uv_linked_vertices_in_faces(&dff.raw, &dff_uv_selected_face_indices(dff), seeds)
+}
+
+fn fit_dff_uv_editor_view(dff: &mut EditingDffState, view: Rect) {
+    let visible = dff_uv_selected_face_vertices(dff);
+    let scope = if dff.uv_editor.selected.is_empty() {
+        &visible
+    } else {
+        &dff.uv_editor.selected
+    };
+    let points = scope
+        .iter()
+        .filter_map(|index| dff.raw.uvs.get(*index).copied())
+        .filter(|uv| uv.u.is_finite() && uv.v.is_finite())
+        .collect::<Vec<_>>();
+    if points.is_empty() {
+        dff.uv_editor.zoom = 1.0;
+        dff.uv_editor.pan = Vec2::ZERO;
+        return;
+    }
+    let min_u = points.iter().map(|uv| uv.u).fold(f32::INFINITY, f32::min);
+    let max_u = points
+        .iter()
+        .map(|uv| uv.u)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_v = points.iter().map(|uv| uv.v).fold(f32::INFINITY, f32::min);
+    let max_v = points
+        .iter()
+        .map(|uv| uv.v)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let base = dff_uv_editor_base_size(view, dff.uv_editor.texture_aspect);
+    let extent_u = (max_u - min_u).abs().max(0.05);
+    let extent_v = (max_v - min_v).abs().max(0.05);
+    let padding = 36.0;
+    dff.uv_editor.zoom = (((view.w - padding * 2.0).max(20.0) / (extent_u * base.x))
+        .min((view.h - padding * 2.0).max(20.0) / (extent_v * base.y)))
+    .clamp(0.1, 64.0);
+    let size = base * dff.uv_editor.zoom;
+    let center_uv = vec2((min_u + max_u) * 0.5, (min_v + max_v) * 0.5);
+    dff.uv_editor.pan = size * 0.5 - center_uv * size;
+}
+
+fn open_dff_uv_editor(app: &mut AppState) {
+    let before = editing_history_snapshot(app);
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return;
+    };
+    let generated_uvs = dff.raw.uvs.len() != dff.raw.vertices.len();
+    ensure_raw_uvs(&mut dff.raw);
+    if generated_uvs {
+        dff.dirty = true;
+    }
+    dff.uv_editor.open = true;
+    dff.uv_editor.viewport_keyboard_focus = false;
+    sync_dff_uv_editor_material(dff);
+    dff.uv_editor.transform = None;
+    dff.uv_editor.menu = None;
+    dff.uv_editor.box_start = None;
+    dff.uv_editor.zoom = 1.0;
+    dff.uv_editor.pan = Vec2::ZERO;
+    app.status_message =
+        "UV Editor: drag the divider to resize · click empty space to deselect · Home fit"
+            .to_string();
+    if generated_uvs {
+        commit_editing_history(app, "Create DFF UV coordinates", before);
+        refresh_editing_dff_preview(app);
+    }
+}
+
+fn begin_dff_uv_edit(dff: &mut EditingDffState) {
+    if dff.uv_editor.before_uvs.is_none() {
+        dff.uv_editor.before_uvs = Some(dff.raw.uvs.clone());
+        dff.uv_editor.before_dirty = dff.dirty;
+    }
+}
+
+fn finish_dff_uv_edit(app: &mut AppState, label: &str) {
+    let before_values = match app.editing.asset.as_mut() {
+        Some(EditingAsset::Dff(dff)) => {
+            dff.uv_editor.transform = None;
+            dff.uv_editor
+                .before_uvs
+                .take()
+                .map(|uvs| (uvs, dff.uv_editor.before_dirty))
+        }
+        _ => None,
+    };
+    let Some((before_uvs, before_dirty)) = before_values else {
+        return;
+    };
+    let mut before = editing_history_snapshot(app);
+    if let Some(EditingAsset::Dff(dff)) = before.asset.as_mut() {
+        dff.raw.uvs = before_uvs;
+        dff.dirty = before_dirty;
+        dff.uv_editor.transform = None;
+        dff.uv_editor.box_start = None;
+    }
+    commit_editing_history(app, label, before);
+    refresh_editing_dff_preview(app);
+}
+
+fn cancel_dff_uv_edit(app: &mut AppState) {
+    let restored = match app.editing.asset.as_mut() {
+        Some(EditingAsset::Dff(dff)) => dff.uv_editor.before_uvs.take().map(|uvs| {
+            dff.raw.uvs = uvs;
+            dff.dirty = dff.uv_editor.before_dirty;
+            dff.uv_editor.transform = None;
+            true
+        }),
+        _ => None,
+    }
+    .unwrap_or(false);
+    if restored {
+        refresh_editing_dff_preview(app);
+        app.status_message = "Cancelled UV transform".to_string();
+    }
+}
+
+fn start_dff_uv_transform_on_axis(
+    dff: &mut EditingDffState,
+    mode: DffUvTransformMode,
+    axis: DffUvAxis,
+    mouse: Vec2,
+) {
+    if dff.uv_editor.selected.is_empty() {
+        return;
+    }
+    begin_dff_uv_edit(dff);
+    let start_uvs = dff
+        .uv_editor
+        .selected
+        .iter()
+        .filter_map(|index| {
+            dff.raw
+                .uvs
+                .get(*index)
+                .copied()
+                .filter(|uv| uv.u.is_finite() && uv.v.is_finite())
+                .map(|uv| (*index, uv))
+        })
+        .collect();
+    dff.uv_editor.transform = Some(DffUvTransform {
+        mode,
+        axis,
+        start_mouse: mouse,
+        start_uvs,
+        numeric_input: String::new(),
+    });
+}
+
+fn dff_uv_scale_multiplier(input: &str) -> Option<f32> {
+    input.parse::<f32>().ok().filter(|value| value.is_finite())
+}
+
+fn append_dff_uv_numeric_char(input: &mut String, ch: char) -> bool {
+    let decimal = ch == '.' && !input.contains('.');
+    let sign = (ch == '-' || ch == '+') && input.is_empty();
+    if ch.is_ascii_digit() || decimal || sign {
+        input.push(ch);
+        true
+    } else {
+        false
+    }
+}
+
+/// Text input is normally drained by the main editor before pointer/shortcut
+/// handling. Capture scale factors first so sequences such as `S 2`, `S X 2`,
+/// and `S Y 0.5` reach the active UV transform.
+pub(crate) fn capture_dff_uv_numeric_transform_input(app: &mut AppState) {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return;
+    };
+    let Some(transform) = dff.uv_editor.transform.as_mut() else {
+        return;
+    };
+    if transform.mode != DffUvTransformMode::Scale {
+        return;
+    }
+    while let Some(ch) = get_char_pressed() {
+        append_dff_uv_numeric_char(&mut transform.numeric_input, ch);
+    }
+}
+
+fn dff_uv_split_shortcut_available(transform_active: bool) -> bool {
+    !transform_active
+}
+
+fn scale_dff_uv_from_center(start: V2, center: V2, factor: f32, axis: DffUvAxis) -> V2 {
+    V2 {
+        u: if axis == DffUvAxis::V {
+            start.u
+        } else {
+            center.u + (start.u - center.u) * factor
+        },
+        v: if axis == DffUvAxis::U {
+            start.v
+        } else {
+            center.v + (start.v - center.v) * factor
+        },
+    }
+}
+
+fn start_dff_uv_transform(dff: &mut EditingDffState, mode: DffUvTransformMode, mouse: Vec2) {
+    start_dff_uv_transform_on_axis(dff, mode, DffUvAxis::Free, mouse);
+}
+
+fn dff_uv_selection_center_screen(dff: &EditingDffState, view: Rect) -> Option<Vec2> {
+    let (sum, count) = dff
+        .uv_editor
+        .selected
+        .iter()
+        .filter_map(|index| dff.raw.uvs.get(*index))
+        .filter(|uv| uv.u.is_finite() && uv.v.is_finite())
+        .fold((Vec2::ZERO, 0usize), |(sum, count), uv| {
+            (sum + vec2(uv.u, uv.v), count + 1)
+        });
+    (count > 0).then(|| {
+        let center = sum / count as f32;
+        dff_uv_to_screen(
+            view,
+            &dff.uv_editor,
+            V2 {
+                u: center.x,
+                v: center.y,
+            },
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DffUvGizmoHit {
+    MoveFree,
+    MoveU,
+    MoveV,
+    Rotate,
+}
+
+fn dff_uv_gizmo_hit(center: Vec2, mouse: Vec2) -> Option<DffUvGizmoHit> {
+    if (mouse - center).abs().max_element() <= 8.0 {
+        return Some(DffUvGizmoHit::MoveFree);
+    }
+    let u_end = center + vec2(64.0, 0.0);
+    if dff_uv_point_segment_distance(mouse, center + vec2(9.0, 0.0), u_end) <= 6.0 {
+        return Some(DffUvGizmoHit::MoveU);
+    }
+    let v_end = center + vec2(0.0, 64.0);
+    if dff_uv_point_segment_distance(mouse, center + vec2(0.0, 9.0), v_end) <= 6.0 {
+        return Some(DffUvGizmoHit::MoveV);
+    }
+    let radius = mouse.distance(center);
+    ((radius - 42.0).abs() <= 5.0).then_some(DffUvGizmoHit::Rotate)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DffUvAlignEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl DffUvAlignEdge {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
+}
+
+fn snap_raw_uv_selection_to_material_edge(
+    raw: &mut RawMesh,
+    selected: &BTreeSet<usize>,
+    edge: DffUvAlignEdge,
+) -> usize {
+    let coordinate = match edge {
+        DffUvAlignEdge::Left | DffUvAlignEdge::Top => 0.0,
+        DffUvAlignEdge::Right | DffUvAlignEdge::Bottom => 1.0,
+    };
+    let mut changed = 0;
+    for index in selected {
+        let Some(uv) = raw.uvs.get_mut(*index) else {
+            continue;
+        };
+        match edge {
+            DffUvAlignEdge::Left | DffUvAlignEdge::Right => uv.u = coordinate,
+            DffUvAlignEdge::Top | DffUvAlignEdge::Bottom => uv.v = coordinate,
+        }
+        changed += 1;
+    }
+    changed
+}
+
+fn align_dff_uv_selection(app: &mut AppState, edge: DffUvAlignEdge) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff.uv_editor.selected.is_empty() {
+        app.status_message = "Select UV points to snap to the material boundary".to_string();
+        return false;
+    }
+    begin_dff_uv_edit(dff);
+    let changed =
+        snap_raw_uv_selection_to_material_edge(&mut dff.raw, &dff.uv_editor.selected, edge);
+    if changed == 0 {
+        dff.uv_editor.before_uvs = None;
+        app.status_message = "Selected UV points do not have valid coordinates".to_string();
+        return false;
+    }
+    dff.dirty = true;
+    let label = format!("Snap UVs to material {}", edge.label());
+    finish_dff_uv_edit(app, &label);
+    app.status_message = format!(
+        "Snapped {changed} UV point(s) to the material {} edge",
+        edge.label()
+    );
+    true
+}
+
+fn merge_raw_uv_selection(raw: &mut RawMesh, selected: &BTreeSet<usize>) -> usize {
+    let points = selected
+        .iter()
+        .filter_map(|index| raw.uvs.get(*index).copied())
+        .filter(|uv| uv.u.is_finite() && uv.v.is_finite())
+        .collect::<Vec<_>>();
+    if points.len() < 2 {
+        return 0;
+    }
+    let count = points.len() as f32;
+    let average = V2 {
+        u: points.iter().map(|uv| uv.u).sum::<f32>() / count,
+        v: points.iter().map(|uv| uv.v).sum::<f32>() / count,
+    };
+    let mut changed = 0;
+    for index in selected {
+        if let Some(uv) = raw.uvs.get_mut(*index) {
+            *uv = average;
+            changed += 1;
+        }
+    }
+    changed
+}
+
+fn merge_dff_uv_selection(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff.uv_editor.selected.len() < 2 {
+        app.status_message = "Select at least two UV points to merge".to_string();
+        return false;
+    }
+    begin_dff_uv_edit(dff);
+    let changed = merge_raw_uv_selection(&mut dff.raw, &dff.uv_editor.selected);
+    if changed < 2 {
+        dff.uv_editor.before_uvs = None;
+        app.status_message = "Selected UV points do not have valid coordinates".to_string();
+        return false;
+    }
+    dff.dirty = true;
+    finish_dff_uv_edit(app, "Merge UVs");
+    app.status_message = format!("Merged {changed} UV points at their average position");
+    true
+}
+
+/// Smooth selected UV points against the points connected to them by a
+/// triangle edge. Only the faces exposed in the UV workspace participate, so
+/// a repair cannot accidentally borrow coordinates from another material or
+/// from faces outside the current face selection.
+fn blend_raw_uv_selection_with_neighbors(
+    raw: &mut RawMesh,
+    visible_faces: &BTreeSet<usize>,
+    selected: &BTreeSet<usize>,
+) -> usize {
+    let source_uvs = raw.uvs.clone();
+    let mut neighbors = selected
+        .iter()
+        .copied()
+        .filter(|index| *index < source_uvs.len())
+        .map(|index| (index, BTreeSet::<usize>::new()))
+        .collect::<BTreeMap<_, _>>();
+
+    for face in visible_faces {
+        let Some(triangle) = raw.triangles.get(*face) else {
+            continue;
+        };
+        let indices = [
+            triangle.a as usize,
+            triangle.b as usize,
+            triangle.c as usize,
+        ];
+        for index in indices {
+            let Some(adjacent) = neighbors.get_mut(&index) else {
+                continue;
+            };
+            adjacent.extend(
+                indices
+                    .iter()
+                    .copied()
+                    .filter(|neighbor| *neighbor != index && *neighbor < source_uvs.len()),
+            );
+        }
+    }
+
+    let blended = neighbors
+        .into_iter()
+        .filter_map(|(index, neighbors)| {
+            let points = neighbors
+                .into_iter()
+                .filter_map(|neighbor| source_uvs.get(neighbor).copied())
+                .filter(|uv| uv.u.is_finite() && uv.v.is_finite())
+                .collect::<Vec<_>>();
+            if points.is_empty() {
+                return None;
+            }
+            let count = points.len() as f32;
+            Some((
+                index,
+                V2 {
+                    u: points.iter().map(|uv| uv.u).sum::<f32>() / count,
+                    v: points.iter().map(|uv| uv.v).sum::<f32>() / count,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    for (index, uv) in &blended {
+        raw.uvs[*index] = *uv;
+    }
+    blended.len()
+}
+
+fn blend_dff_uv_selection_with_neighbors(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff.uv_editor.selected.is_empty() {
+        app.status_message = "Select UV points to blend with their neighbors".to_string();
+        return false;
+    }
+    let visible_faces = dff_uv_selected_face_indices(dff);
+    begin_dff_uv_edit(dff);
+    let changed = blend_raw_uv_selection_with_neighbors(
+        &mut dff.raw,
+        &visible_faces,
+        &dff.uv_editor.selected,
+    );
+    if changed == 0 {
+        dff.uv_editor.before_uvs = None;
+        app.status_message = "Selected UV points have no connected UV neighbors".to_string();
+        return false;
+    }
+    dff.dirty = true;
+    finish_dff_uv_edit(app, "Blend UVs with neighbors");
+    app.status_message = format!("Blended {changed} UV point(s) with their connected neighbors");
+    true
+}
+
+fn blend_raw_uv_faces_with_neighbors(
+    raw: &mut RawMesh,
+    faces: &BTreeSet<usize>,
+) -> (usize, usize, BTreeSet<usize>) {
+    let selected = dff_uv_face_vertices(raw, faces);
+    let old_vertex_count = raw.vertices.len();
+    let selected = split_raw_uv_selection(raw, faces, &selected);
+    let split_count = raw.vertices.len() - old_vertex_count;
+    let changed = blend_raw_uv_selection_with_neighbors(raw, faces, &selected);
+    (changed, split_count, selected)
+}
+
+/// Main DFF UV Tools variant. RenderWare shares geometry and UV indices, so
+/// detach any selected-face corners that are also used outside the selection
+/// before changing them. This keeps every neighboring face's UVs untouched.
+pub(crate) fn editing_blend_selected_dff_uvs_with_neighbors(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let faces = dff_selected_face_set(dff);
+    if faces.is_empty() {
+        app.status_message = "Select a DFF face before blending its UVs".to_string();
+        return false;
+    }
+    let before_raw = dff.raw.clone();
+    ensure_raw_uvs(&mut dff.raw);
+    let (changed, split_count, selected) = blend_raw_uv_faces_with_neighbors(&mut dff.raw, &faces);
+    if changed == 0 {
+        dff.raw = before_raw;
+        app.status_message = "Selected DFF face has no blendable UV corners".to_string();
+        return false;
+    }
+    dff.selected_vertices = selected;
+    dff.selected_vertex = dff.selected_vertices.iter().next_back().copied();
+    dff.dirty = true;
+    app.status_message = if split_count == 0 {
+        format!("Blended {changed} UV corner(s) on the selected face(s)")
+    } else {
+        format!(
+            "Blended {changed} UV corner(s) on the selected face(s); detached {split_count} shared corner(s)"
+        )
+    };
+    refresh_editing_dff_preview(app);
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DffUvQuickTransform {
+    Rotate90,
+    MirrorX,
+    MirrorY,
+}
+
+impl DffUvQuickTransform {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rotate90 => "Rotate UVs 90 degrees",
+            Self::MirrorX => "Mirror UVs on X",
+            Self::MirrorY => "Mirror UVs on Y",
+        }
+    }
+}
+
+fn quick_transform_raw_uv_selection(
+    raw: &mut RawMesh,
+    selected: &BTreeSet<usize>,
+    operation: DffUvQuickTransform,
+) -> usize {
+    let points = selected
+        .iter()
+        .filter_map(|index| raw.uvs.get(*index).copied())
+        .filter(|uv| uv.u.is_finite() && uv.v.is_finite())
+        .collect::<Vec<_>>();
+    if points.is_empty() {
+        return 0;
+    }
+    let count = points.len() as f32;
+    let center = V2 {
+        u: points.iter().map(|uv| uv.u).sum::<f32>() / count,
+        v: points.iter().map(|uv| uv.v).sum::<f32>() / count,
+    };
+    let mut changed = 0;
+    for index in selected {
+        let Some(uv) = raw.uvs.get_mut(*index) else {
+            continue;
+        };
+        let du = uv.u - center.u;
+        let dv = uv.v - center.v;
+        match operation {
+            // V increases downward in the UV canvas, so this appears as a
+            // clockwise quarter-turn to the user.
+            DffUvQuickTransform::Rotate90 => {
+                uv.u = center.u - dv;
+                uv.v = center.v + du;
+            }
+            DffUvQuickTransform::MirrorX => uv.u = center.u - du,
+            DffUvQuickTransform::MirrorY => uv.v = center.v - dv,
+        }
+        changed += 1;
+    }
+    changed
+}
+
+fn quick_transform_dff_uv_selection(app: &mut AppState, operation: DffUvQuickTransform) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff.uv_editor.selected.is_empty() {
+        app.status_message = "Select UV points to transform".to_string();
+        return false;
+    }
+    begin_dff_uv_edit(dff);
+    let changed =
+        quick_transform_raw_uv_selection(&mut dff.raw, &dff.uv_editor.selected, operation);
+    if changed == 0 {
+        dff.uv_editor.before_uvs = None;
+        app.status_message = "Selected UV points do not have valid coordinates".to_string();
+        return false;
+    }
+    dff.dirty = true;
+    finish_dff_uv_edit(app, operation.label());
+    app.status_message = format!("{} ({changed} points)", operation.label());
+    true
+}
+
+/// Detach selected UVs on the currently exposed faces from faces outside that
+/// selection. RenderWare indexes geometry and UVs together, so a UV seam is an
+/// exact duplicate of the mesh vertex with only the selected face corners
+/// redirected to the copy.
+fn split_raw_uv_selection(
+    raw: &mut RawMesh,
+    faces: &BTreeSet<usize>,
+    selected: &BTreeSet<usize>,
+) -> BTreeSet<usize> {
+    let shared = selected
+        .iter()
+        .copied()
+        .filter(|vertex| {
+            let used_inside = raw.triangles.iter().enumerate().any(|(face, triangle)| {
+                faces.contains(&face)
+                    && [triangle.a, triangle.b, triangle.c].contains(&(*vertex as u32))
+            });
+            let used_outside = raw.triangles.iter().enumerate().any(|(face, triangle)| {
+                !faces.contains(&face)
+                    && [triangle.a, triangle.b, triangle.c].contains(&(*vertex as u32))
+            });
+            used_inside && used_outside
+        })
+        .collect::<Vec<_>>();
+    let remap = shared
+        .into_iter()
+        .map(|old| (old, raw_append_vertex_copy(raw, old)))
+        .collect::<BTreeMap<_, _>>();
+    for face in faces {
+        let Some(triangle) = raw.triangles.get_mut(*face) else {
+            continue;
+        };
+        for corner in [&mut triangle.a, &mut triangle.b, &mut triangle.c] {
+            if let Some(new) = remap.get(&(*corner as usize)) {
+                *corner = *new as u32;
+            }
+        }
+    }
+    selected
+        .iter()
+        .map(|vertex| remap.get(vertex).copied().unwrap_or(*vertex))
+        .collect()
+}
+
+fn split_dff_uv_selection(app: &mut AppState) -> bool {
+    let before = editing_history_snapshot(app);
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff.uv_editor.selected.is_empty() {
+        app.status_message = "Select UV points to split".to_string();
+        return false;
+    }
+    let faces = dff_uv_selected_face_indices(dff);
+    let old_vertex_count = dff.raw.vertices.len();
+    dff.uv_editor.selected = split_raw_uv_selection(&mut dff.raw, &faces, &dff.uv_editor.selected);
+    let split_count = dff.raw.vertices.len() - old_vertex_count;
+    if split_count == 0 {
+        app.status_message =
+            "Selected UV points are already separate from surrounding faces".to_string();
+        return false;
+    }
+    dff.uv_editor.hovered = None;
+    dff.dirty = true;
+    commit_editing_history(app, "Split UVs", before);
+    refresh_editing_dff_preview(app);
+    app.status_message = format!("Split {split_count} UV point(s) from surrounding faces");
+    true
+}
+
+fn dff_uv_point_segment_distance(point: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let ab = b - a;
+    let denominator = ab.length_squared();
+    if denominator <= f32::EPSILON {
+        return point.distance(a);
+    }
+    let t = ((point - a).dot(ab) / denominator).clamp(0.0, 1.0);
+    point.distance(a + ab * t)
+}
+
+fn dff_uv_point_in_triangle(point: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
+    let sign =
+        |p: Vec2, v1: Vec2, v2: Vec2| (p.x - v2.x) * (v1.y - v2.y) - (v1.x - v2.x) * (p.y - v2.y);
+    let d1 = sign(point, a, b);
+    let d2 = sign(point, b, c);
+    let d3 = sign(point, c, a);
+    let has_negative = d1 < -0.001 || d2 < -0.001 || d3 < -0.001;
+    let has_positive = d1 > 0.001 || d2 > 0.001 || d3 > 0.001;
+    !has_negative || !has_positive
+}
+
+fn dff_uv_component_at(dff: &EditingDffState, view: Rect, mouse: Vec2) -> Option<BTreeSet<usize>> {
+    let mut closest_edge = None::<(f32, [usize; 2])>;
+    let mut containing_face = None::<[usize; 3]>;
+    for face in dff_uv_selected_face_indices(dff) {
+        let Some(triangle) = dff.raw.triangles.get(face) else {
+            continue;
+        };
+        let indices = [
+            triangle.a as usize,
+            triangle.b as usize,
+            triangle.c as usize,
+        ];
+        let Some(points) = indices
+            .map(|index| dff.raw.uvs.get(index).copied())
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if points
+            .iter()
+            .any(|uv| !uv.u.is_finite() || !uv.v.is_finite())
+        {
+            continue;
+        }
+        let screen = [
+            dff_uv_to_screen(view, &dff.uv_editor, points[0]),
+            dff_uv_to_screen(view, &dff.uv_editor, points[1]),
+            dff_uv_to_screen(view, &dff.uv_editor, points[2]),
+        ];
+        for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+            let distance = dff_uv_point_segment_distance(mouse, screen[a], screen[b]);
+            if distance <= 7.0 && closest_edge.is_none_or(|(closest, _)| distance < closest) {
+                closest_edge = Some((distance, [indices[a], indices[b]]));
+            }
+        }
+        if containing_face.is_none()
+            && dff_uv_point_in_triangle(mouse, screen[0], screen[1], screen[2])
+        {
+            containing_face = Some(indices);
+        }
+    }
+    closest_edge
+        .map(|(_, indices)| indices.into_iter().collect())
+        .or_else(|| containing_face.map(|indices| indices.into_iter().collect()))
+}
+
+fn nudge_dff_uv_selection(app: &mut AppState, du: f32, dv: f32) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff.uv_editor.selected.is_empty() {
+        app.status_message = "Select UV points before nudging".to_string();
+        return false;
+    }
+    begin_dff_uv_edit(dff);
+    let mut changed = 0usize;
+    for index in &dff.uv_editor.selected {
+        if let Some(uv) = dff.raw.uvs.get_mut(*index) {
+            uv.u += du;
+            uv.v += dv;
+            changed += 1;
+        }
+    }
+    dff.dirty = true;
+    finish_dff_uv_edit(app, "Nudge UVs");
+    app.status_message = format!("Nudged {changed} UV point(s)");
+    true
+}
+
+fn handle_dff_uv_editor(app: &mut AppState, mouse: Vec2) -> bool {
+    let is_open = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.uv_editor.open
+    );
+    if !is_open {
+        return false;
+    }
+    let (panel, splitter, view) = match app.editing.asset.as_ref() {
+        Some(EditingAsset::Dff(dff)) => (
+            dff_uv_editor_panel_rect(&dff.uv_editor),
+            dff_uv_editor_splitter_rect(&dff.uv_editor),
+            dff_uv_editor_view_rect(&dff.uv_editor),
+        ),
+        _ => return false,
+    };
+    let center = editing_center_rect();
+    let preview = editing_preview_rect(app);
+    let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+    let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+    let alt = is_key_down(KeyCode::LeftAlt) || is_key_down(KeyCode::RightAlt);
+
+    if is_mouse_button_pressed(MouseButton::Left)
+        || is_mouse_button_pressed(MouseButton::Right)
+        || is_mouse_button_pressed(MouseButton::Middle)
+    {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            if preview.contains(mouse) {
+                dff.uv_editor.viewport_keyboard_focus = true;
+            } else if panel.contains(mouse) || splitter.contains(mouse) {
+                dff.uv_editor.viewport_keyboard_focus = false;
+            }
+        }
+    }
+
+    let resizing = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.uv_editor.resizing_split
+    );
+    if is_mouse_button_pressed(MouseButton::Left) && splitter.contains(mouse) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.uv_editor.resizing_split = true;
+            dff.uv_editor.menu = None;
+        }
+        return true;
+    }
+    if resizing {
+        if is_mouse_button_down(MouseButton::Left) {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.uv_editor.split_fraction =
+                    ((center.y + center.h - mouse.y) / center.h.max(1.0)).clamp(0.0, 1.0);
+            }
+        }
+        if is_mouse_button_released(MouseButton::Left) {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.uv_editor.resizing_split = false;
+            }
+        }
+        return true;
+    }
+
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        let visible = dff_uv_selected_face_vertices(dff);
+        dff.uv_editor
+            .selected
+            .retain(|vertex| visible.contains(vertex));
+        if dff
+            .uv_editor
+            .hovered
+            .is_some_and(|vertex| !visible.contains(&vertex))
+        {
+            dff.uv_editor.hovered = None;
+        }
+    }
+
+    let editor = match app.editing.asset.as_ref() {
+        Some(EditingAsset::Dff(dff)) => &dff.uv_editor,
+        _ => return false,
+    };
+    let close = dff_uv_editor_toolbar_rect(editor, 0);
+    let menu_buttons = [
+        (DffUvMenu::Select, dff_uv_editor_toolbar_rect(editor, 1)),
+        (DffUvMenu::View, dff_uv_editor_toolbar_rect(editor, 2)),
+        (DffUvMenu::Snap, dff_uv_editor_toolbar_rect(editor, 3)),
+        (DffUvMenu::Align, dff_uv_editor_toolbar_rect(editor, 4)),
+        (DffUvMenu::Display, dff_uv_editor_toolbar_rect(editor, 5)),
+    ];
+
+    if is_mouse_button_pressed(MouseButton::Left) {
+        if close.contains(mouse) {
+            cancel_dff_uv_edit(app);
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.uv_editor.open = false;
+            }
+            return true;
+        }
+        if let Some((menu, _)) = menu_buttons.iter().find(|(_, rect)| rect.contains(mouse)) {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.uv_editor.menu = (dff.uv_editor.menu != Some(*menu)).then_some(*menu);
+            }
+            return true;
+        }
+
+        let open_menu = app.editing.asset.as_ref().and_then(|asset| match asset {
+            EditingAsset::Dff(dff) => dff.uv_editor.menu,
+            _ => None,
+        });
+        if let Some(menu) = open_menu {
+            let button = menu_buttons
+                .iter()
+                .find(|(candidate, _)| *candidate == menu)
+                .map(|(_, rect)| *rect)
+                .unwrap();
+            let item_count = match menu {
+                DffUvMenu::Select => 3,
+                DffUvMenu::View => 3,
+                DffUvMenu::Snap => 4,
+                DffUvMenu::Align => 8,
+                DffUvMenu::Display => 3,
+            };
+            let popup = dff_uv_editor_menu_rect(button, item_count);
+            let item = (0..item_count)
+                .find(|index| dff_uv_editor_menu_item_rect(popup, *index).contains(mouse));
+            if let Some(item) = item {
+                match (menu, item) {
+                    (DffUvMenu::Select, 0) => {
+                        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                            dff.uv_editor.selected = dff_uv_selected_face_vertices(dff);
+                        }
+                    }
+                    (DffUvMenu::Select, 1) => {
+                        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                            dff.uv_editor.selected.clear();
+                        }
+                    }
+                    (DffUvMenu::Select, 2) => {
+                        split_dff_uv_selection(app);
+                    }
+                    (DffUvMenu::View, 0) => {
+                        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                            fit_dff_uv_editor_view(dff, view);
+                        }
+                    }
+                    (DffUvMenu::View, 1 | 2) => {
+                        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                            zoom_dff_uv_editor(
+                                &mut dff.uv_editor,
+                                view,
+                                view.center(),
+                                if item == 1 { 1.25 } else { 0.8 },
+                            );
+                        }
+                    }
+                    (DffUvMenu::Snap, 0) => {
+                        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                            dff.uv_editor.snap_grid = !dff.uv_editor.snap_grid;
+                        }
+                    }
+                    (DffUvMenu::Snap, 1) => {
+                        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                            dff.uv_editor.snap_vertices = !dff.uv_editor.snap_vertices;
+                        }
+                    }
+                    (DffUvMenu::Snap, 2 | 3) => {
+                        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                            dff.uv_editor.grid_step = if item == 2 {
+                                (dff.uv_editor.grid_step * 0.5).max(1.0 / 1024.0)
+                            } else {
+                                (dff.uv_editor.grid_step * 2.0).min(1.0)
+                            };
+                            app.status_message =
+                                format!("UV snap increment: {:.5}", dff.uv_editor.grid_step);
+                        }
+                    }
+                    (DffUvMenu::Align, 0) => {
+                        align_dff_uv_selection(app, DffUvAlignEdge::Left);
+                    }
+                    (DffUvMenu::Align, 1) => {
+                        align_dff_uv_selection(app, DffUvAlignEdge::Right);
+                    }
+                    (DffUvMenu::Align, 2) => {
+                        align_dff_uv_selection(app, DffUvAlignEdge::Top);
+                    }
+                    (DffUvMenu::Align, 3) => {
+                        align_dff_uv_selection(app, DffUvAlignEdge::Bottom);
+                    }
+                    (DffUvMenu::Align, 4) => {
+                        quick_transform_dff_uv_selection(app, DffUvQuickTransform::Rotate90);
+                    }
+                    (DffUvMenu::Align, 5) => {
+                        quick_transform_dff_uv_selection(app, DffUvQuickTransform::MirrorX);
+                    }
+                    (DffUvMenu::Align, 6) => {
+                        quick_transform_dff_uv_selection(app, DffUvQuickTransform::MirrorY);
+                    }
+                    (DffUvMenu::Align, 7) => {
+                        blend_dff_uv_selection_with_neighbors(app);
+                    }
+                    (DffUvMenu::Display, 0) => {
+                        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                            dff.uv_editor.repeat_texture = !dff.uv_editor.repeat_texture;
+                        }
+                    }
+                    (DffUvMenu::Display, 1) => {
+                        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                            dff.uv_editor.show_material_outlines =
+                                !dff.uv_editor.show_material_outlines;
+                        }
+                    }
+                    (DffUvMenu::Display, 2) => {
+                        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                            dff.uv_editor.show_material_selection_outlines =
+                                !dff.uv_editor.show_material_selection_outlines;
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                    dff.uv_editor.menu = None;
+                }
+                return true;
+            }
+            if popup.contains(mouse) {
+                return true;
+            }
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.uv_editor.menu = None;
+            }
+        }
+    }
+
+    if is_key_pressed(KeyCode::Escape) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+            && dff.uv_editor.menu.take().is_some()
+        {
+            return true;
+        }
+        let transforming = matches!(
+            app.editing.asset.as_ref(),
+            Some(EditingAsset::Dff(dff)) if dff.uv_editor.transform.is_some()
+        );
+        if transforming {
+            cancel_dff_uv_edit(app);
+        } else if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.uv_editor.open = false;
+        }
+        return true;
+    }
+    if !ctrl && !alt && is_key_pressed(KeyCode::A) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            if shift {
+                dff.uv_editor.selected.clear();
+            } else {
+                dff.uv_editor.selected = dff_uv_selected_face_vertices(dff);
+            }
+        }
+        return true;
+    }
+    if alt && is_key_pressed(KeyCode::A) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.uv_editor.selected.clear();
+        }
+        return true;
+    }
+    if shift && is_key_pressed(KeyCode::Tab) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.uv_editor.snap_grid = !dff.uv_editor.snap_grid;
+            app.status_message = if dff.uv_editor.snap_grid {
+                "UV grid snapping enabled"
+            } else {
+                "UV grid snapping disabled"
+            }
+            .to_string();
+        }
+        return true;
+    }
+    if is_key_pressed(KeyCode::LeftBracket) || is_key_pressed(KeyCode::RightBracket) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            if is_key_pressed(KeyCode::LeftBracket) {
+                dff.uv_editor.grid_step = (dff.uv_editor.grid_step * 0.5).max(1.0 / 1024.0);
+            } else {
+                dff.uv_editor.grid_step = (dff.uv_editor.grid_step * 2.0).min(1.0);
+            }
+            app.status_message = format!("UV snap increment: {:.5}", dff.uv_editor.grid_step);
+        }
+        return true;
+    }
+    if is_key_pressed(KeyCode::Home) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            fit_dff_uv_editor_view(dff, view);
+        }
+        return true;
+    }
+    if !ctrl && !alt && is_key_pressed(KeyCode::L) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            let mut seeds = BTreeSet::new();
+            if let Some(hovered) = dff.uv_editor.hovered {
+                seeds.insert(hovered);
+            } else {
+                seeds = dff.uv_editor.selected.clone();
+            }
+            let linked = dff_uv_linked_vertices(dff, &seeds);
+            if linked.is_empty() {
+                app.status_message =
+                    "Hover or select a UV point before selecting an island".to_string();
+            } else if shift {
+                dff.uv_editor.selected = dff
+                    .uv_editor
+                    .selected
+                    .difference(&linked)
+                    .copied()
+                    .collect();
+                app.status_message = format!("Deselected {} linked UV point(s)", linked.len());
+            } else {
+                dff.uv_editor.selected.extend(linked.iter().copied());
+                app.status_message = format!("Selected {} linked UV point(s)", linked.len());
+            }
+        }
+        return true;
+    }
+    if !ctrl && !alt && is_key_pressed(KeyCode::M) {
+        merge_dff_uv_selection(app);
+        return true;
+    }
+    let transform_active = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.uv_editor.transform.is_some()
+    );
+    if !ctrl
+        && !alt
+        && dff_uv_split_shortcut_available(transform_active)
+        && is_key_pressed(KeyCode::Y)
+    {
+        split_dff_uv_selection(app);
+        return true;
+    }
+    let arrow_delta = if is_key_pressed(KeyCode::Left) {
+        Some((-1.0, 0.0))
+    } else if is_key_pressed(KeyCode::Right) {
+        Some((1.0, 0.0))
+    } else if is_key_pressed(KeyCode::Up) {
+        Some((0.0, -1.0))
+    } else if is_key_pressed(KeyCode::Down) {
+        Some((0.0, 1.0))
+    } else {
+        None
+    };
+    if let Some((u_direction, v_direction)) = arrow_delta {
+        let step = match app.editing.asset.as_ref() {
+            Some(EditingAsset::Dff(dff)) if dff.uv_editor.snap_grid => dff.uv_editor.grid_step,
+            _ => 0.01,
+        } * if shift { 10.0 } else { 1.0 };
+        nudge_dff_uv_selection(app, u_direction * step, v_direction * step);
+        return true;
+    }
+    if !ctrl && !alt && is_key_pressed(KeyCode::B) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.uv_editor.box_start = Some(mouse);
+        }
+        app.status_message = "UV box select: drag, then release left mouse".to_string();
+        return true;
+    }
+
+    if transform_active {
+        if is_mouse_button_pressed(MouseButton::Right) {
+            cancel_dff_uv_edit(app);
+            return true;
+        }
+        if is_key_pressed(KeyCode::X) {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+                && let Some(transform) = dff.uv_editor.transform.as_mut()
+            {
+                transform.axis = DffUvAxis::U;
+                app.status_message = "UV transform constrained to X".to_string();
+            }
+        }
+        if is_key_pressed(KeyCode::Y) {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+                && let Some(transform) = dff.uv_editor.transform.as_mut()
+            {
+                transform.axis = DffUvAxis::V;
+                app.status_message = "UV transform constrained to Y".to_string();
+            }
+        }
+        let scale_transform_active = matches!(
+            app.editing.asset.as_ref(),
+            Some(EditingAsset::Dff(dff))
+                if dff.uv_editor.transform.as_ref().is_some_and(|transform| {
+                    transform.mode == DffUvTransformMode::Scale
+                })
+        );
+        if scale_transform_active {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+                && let Some(transform) = dff.uv_editor.transform.as_mut()
+            {
+                while let Some(ch) = get_char_pressed() {
+                    append_dff_uv_numeric_char(&mut transform.numeric_input, ch);
+                }
+                if is_key_pressed(KeyCode::Backspace) {
+                    transform.numeric_input.pop();
+                }
+                if !transform.numeric_input.is_empty() {
+                    let axis = match transform.axis {
+                        DffUvAxis::Free => "XY",
+                        DffUvAxis::U => "X",
+                        DffUvAxis::V => "Y",
+                    };
+                    app.status_message = format!(
+                        "Scale {axis}: {}× · Enter to confirm",
+                        transform.numeric_input
+                    );
+                }
+            }
+        }
+
+        let mut preview_changed = false;
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+            && let Some(transform) = dff.uv_editor.transform.clone()
+        {
+            let (_, view_scale) = dff_uv_editor_transform(view, &dff.uv_editor);
+            let delta = (mouse - transform.start_mouse) / view_scale;
+            let center_uv = if transform.start_uvs.is_empty() {
+                V2::default()
+            } else {
+                let count = transform.start_uvs.len() as f32;
+                V2 {
+                    u: transform.start_uvs.iter().map(|(_, uv)| uv.u).sum::<f32>() / count,
+                    v: transform.start_uvs.iter().map(|(_, uv)| uv.v).sum::<f32>() / count,
+                }
+            };
+            let center_screen = dff_uv_to_screen(view, &dff.uv_editor, center_uv);
+            let start_vector = transform.start_mouse - center_screen;
+            let current_vector = mouse - center_screen;
+            let mouse_scale_factor = if start_vector.length() > 2.0 {
+                (current_vector.length() / start_vector.length()).max(0.001)
+            } else {
+                (1.0 + delta.x + delta.y).max(0.001)
+            };
+            let scale_factor = if transform.numeric_input.is_empty() {
+                mouse_scale_factor
+            } else {
+                dff_uv_scale_multiplier(&transform.numeric_input).unwrap_or(1.0)
+            };
+            let mut rotation_angle =
+                current_vector.y.atan2(current_vector.x) - start_vector.y.atan2(start_vector.x);
+            if ctrl {
+                let increment = 15.0_f32.to_radians();
+                rotation_angle = (rotation_angle / increment).round() * increment;
+            }
+            for (index, start) in &transform.start_uvs {
+                let Some(uv) = dff.raw.uvs.get_mut(*index) else {
+                    continue;
+                };
+                match transform.mode {
+                    DffUvTransformMode::Grab => {
+                        uv.u = start.u
+                            + if transform.axis == DffUvAxis::V {
+                                0.0
+                            } else {
+                                delta.x
+                            };
+                        uv.v = start.v
+                            + if transform.axis == DffUvAxis::U {
+                                0.0
+                            } else {
+                                delta.y
+                            };
+                    }
+                    DffUvTransformMode::Scale => {
+                        *uv = scale_dff_uv_from_center(
+                            *start,
+                            center_uv,
+                            scale_factor,
+                            transform.axis,
+                        );
+                    }
+                    DffUvTransformMode::Rotate => {
+                        let (sin, cos) = rotation_angle.sin_cos();
+                        let du = start.u - center_uv.u;
+                        let dv = start.v - center_uv.v;
+                        uv.u = center_uv.u + du * cos - dv * sin;
+                        uv.v = center_uv.v + du * sin + dv * cos;
+                    }
+                }
+                if dff.uv_editor.snap_grid {
+                    let step = dff.uv_editor.grid_step.max(0.001);
+                    if transform.axis != DffUvAxis::V {
+                        uv.u = (uv.u / step).round() * step;
+                    }
+                    if transform.axis != DffUvAxis::U {
+                        uv.v = (uv.v / step).round() * step;
+                    }
+                }
+            }
+            if dff.uv_editor.snap_vertices && transform.mode == DffUvTransformMode::Grab {
+                let visible_vertices = dff_uv_selected_face_vertices(dff);
+                let candidates = visible_vertices
+                    .difference(&dff.uv_editor.selected)
+                    .filter_map(|index| dff.raw.uvs.get(*index).copied())
+                    .collect::<Vec<_>>();
+                for (index, _) in &transform.start_uvs {
+                    let Some(current) = dff.raw.uvs.get(*index).copied() else {
+                        continue;
+                    };
+                    if let Some(target) = candidates.iter().copied().min_by(|a, b| {
+                        let da = (a.u - current.u).powi(2) + (a.v - current.v).powi(2);
+                        let db = (b.u - current.u).powi(2) + (b.v - current.v).powi(2);
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    }) && vec2(
+                        (target.u - current.u) * view_scale.x,
+                        (target.v - current.v) * view_scale.y,
+                    )
+                    .length()
+                        <= 10.0
+                        && let Some(uv) = dff.raw.uvs.get_mut(*index)
+                    {
+                        *uv = target;
+                    }
+                }
+            }
+            dff.dirty = true;
+            preview_changed = true;
+        }
+        if preview_changed {
+            refresh_editing_dff_preview(app);
+        }
+        if is_key_pressed(KeyCode::Enter) || is_mouse_button_pressed(MouseButton::Left) {
+            finish_dff_uv_edit(app, "Transform UVs");
+            return true;
+        }
+        if is_mouse_button_released(MouseButton::Left) {
+            let label = match app.editing.asset.as_ref() {
+                Some(EditingAsset::Dff(dff)) => match dff
+                    .uv_editor
+                    .transform
+                    .as_ref()
+                    .map(|transform| transform.mode)
+                {
+                    Some(DffUvTransformMode::Rotate) => "Rotate UVs",
+                    Some(DffUvTransformMode::Scale) => "Scale UVs",
+                    _ => "Move UVs",
+                },
+                _ => "Transform UVs",
+            };
+            finish_dff_uv_edit(app, label);
+            return true;
+        }
+        // An active transform owns keyboard input even if the cursor leaves
+        // the UV panel, so numeric keys cannot fall through to global modes.
+        return true;
+    }
+
+    if !ctrl && !alt && is_key_pressed(KeyCode::G) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            start_dff_uv_transform(dff, DffUvTransformMode::Grab, mouse);
+        }
+        return true;
+    }
+    if !ctrl && !alt && is_key_pressed(KeyCode::S) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            start_dff_uv_transform(dff, DffUvTransformMode::Scale, mouse);
+        }
+        return true;
+    }
+    if !ctrl && !alt && is_key_pressed(KeyCode::R) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            start_dff_uv_transform(dff, DffUvTransformMode::Rotate, mouse);
+        }
+        return true;
+    }
+
+    let (_, wheel_y) = safe_mouse_wheel();
+    if view.contains(mouse) && wheel_y.abs() > f32::EPSILON {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            zoom_dff_uv_editor(&mut dff.uv_editor, view, mouse, 1.15_f32.powf(wheel_y));
+        }
+        return true;
+    }
+
+    if view.contains(mouse) && is_mouse_button_pressed(MouseButton::Middle) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.uv_editor.panning = true;
+            dff.uv_editor.pan_last = mouse;
+        }
+        return true;
+    }
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        if dff.uv_editor.panning && is_mouse_button_down(MouseButton::Middle) {
+            dff.uv_editor.pan += mouse - dff.uv_editor.pan_last;
+            dff.uv_editor.pan_last = mouse;
+            return true;
+        }
+        if is_mouse_button_released(MouseButton::Middle) {
+            dff.uv_editor.panning = false;
+        }
+    }
+
+    let gizmo_hit = app.editing.asset.as_ref().and_then(|asset| match asset {
+        EditingAsset::Dff(dff) if view.contains(mouse) => dff_uv_selection_center_screen(dff, view)
+            .and_then(|center| dff_uv_gizmo_hit(center, mouse)),
+        _ => None,
+    });
+    if is_mouse_button_pressed(MouseButton::Left)
+        && let Some(hit) = gizmo_hit
+    {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            let (mode, axis, label) = match hit {
+                DffUvGizmoHit::MoveFree => (DffUvTransformMode::Grab, DffUvAxis::Free, "Move UVs"),
+                DffUvGizmoHit::MoveU => (DffUvTransformMode::Grab, DffUvAxis::U, "Move UVs on X"),
+                DffUvGizmoHit::MoveV => (DffUvTransformMode::Grab, DffUvAxis::V, "Move UVs on Y"),
+                DffUvGizmoHit::Rotate => {
+                    (DffUvTransformMode::Rotate, DffUvAxis::Free, "Rotate UVs")
+                }
+            };
+            start_dff_uv_transform_on_axis(dff, mode, axis, mouse);
+            app.status_message = label.to_string();
+        }
+        return true;
+    }
+
+    let hovered = app.editing.asset.as_ref().and_then(|asset| match asset {
+        EditingAsset::Dff(dff) if view.contains(mouse) => dff_uv_selected_face_vertices(dff)
+            .into_iter()
+            .filter_map(|index| {
+                let point = dff.raw.uvs.get(index).copied()?;
+                if !point.u.is_finite() || !point.v.is_finite() {
+                    return None;
+                }
+                let distance = dff_uv_to_screen(view, &dff.uv_editor, point).distance(mouse);
+                (distance <= 9.0).then_some((index, distance))
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(index, _)| index),
+        _ => None,
+    });
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        dff.uv_editor.hovered = hovered;
+    }
+    let hovered_component = if hovered.is_none() && view.contains(mouse) {
+        app.editing.asset.as_ref().and_then(|asset| match asset {
+            EditingAsset::Dff(dff) => dff_uv_component_at(dff, view, mouse),
+            _ => None,
+        })
+    } else {
+        None
+    };
+
+    if view.contains(mouse) && is_mouse_button_pressed(MouseButton::Left) {
+        if let Some(index) = hovered {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                let hovered_point = dff.raw.uvs.get(index).copied();
+                let stacked = hovered_point
+                    .map(|point| dff_uv_to_screen(view, &dff.uv_editor, point))
+                    .map(|screen_point| {
+                        dff_uv_selected_face_vertices(dff)
+                            .into_iter()
+                            .filter(|candidate| {
+                                dff.raw.uvs.get(*candidate).is_some_and(|uv| {
+                                    dff_uv_to_screen(view, &dff.uv_editor, *uv)
+                                        .distance(screen_point)
+                                        <= 1.5
+                                })
+                            })
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .filter(|vertices| !vertices.is_empty())
+                    .unwrap_or_else(|| BTreeSet::from([index]));
+                if shift {
+                    if stacked
+                        .iter()
+                        .all(|vertex| dff.uv_editor.selected.contains(vertex))
+                    {
+                        for vertex in stacked {
+                            dff.uv_editor.selected.remove(&vertex);
+                        }
+                    } else {
+                        dff.uv_editor.selected.extend(stacked);
+                    }
+                } else {
+                    if !stacked
+                        .iter()
+                        .all(|vertex| dff.uv_editor.selected.contains(vertex))
+                    {
+                        dff.uv_editor.selected.clear();
+                        dff.uv_editor.selected.extend(stacked);
+                    }
+                    start_dff_uv_transform(dff, DffUvTransformMode::Grab, mouse);
+                }
+            }
+        } else if let Some(component) = hovered_component {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                if shift {
+                    if component
+                        .iter()
+                        .all(|vertex| dff.uv_editor.selected.contains(vertex))
+                    {
+                        for vertex in component {
+                            dff.uv_editor.selected.remove(&vertex);
+                        }
+                    } else {
+                        dff.uv_editor.selected.extend(component);
+                    }
+                } else {
+                    if !component
+                        .iter()
+                        .all(|vertex| dff.uv_editor.selected.contains(vertex))
+                    {
+                        dff.uv_editor.selected.clear();
+                        dff.uv_editor.selected.extend(component);
+                    }
+                    start_dff_uv_transform(dff, DffUvTransformMode::Grab, mouse);
+                }
+            }
+        } else if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.uv_editor.box_start = Some(mouse);
+            if !shift {
+                dff.uv_editor.selected.clear();
+                app.status_message = "Deselected UV selection".to_string();
+            }
+        }
+        return true;
+    }
+    let box_start = app.editing.asset.as_ref().and_then(|asset| match asset {
+        EditingAsset::Dff(dff) => dff.uv_editor.box_start,
+        _ => None,
+    });
+    if let Some(start) = box_start
+        && is_mouse_button_released(MouseButton::Left)
+    {
+        let box_rect = Rect::new(
+            start.x.min(mouse.x),
+            start.y.min(mouse.y),
+            (start.x - mouse.x).abs(),
+            (start.y - mouse.y).abs(),
+        );
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            for index in dff_uv_selected_face_vertices(dff) {
+                if let Some(uv) = dff.raw.uvs.get(index).copied()
+                    && box_rect.contains(dff_uv_to_screen(view, &dff.uv_editor, uv))
+                {
+                    dff.uv_editor.selected.insert(index);
+                }
+            }
+            dff.uv_editor.box_start = None;
+        }
+        return true;
+    }
+    panel.contains(mouse) || splitter.contains(mouse)
 }
 
 pub(crate) fn refresh_editing_img_paths(app: &mut AppState) {
@@ -2154,32 +4454,47 @@ fn draw_editing_archive_picker(app: &AppState) {
 }
 
 fn handle_editing_archive_picker(app: &mut AppState, mouse: Vec2) -> bool {
+    let left_pressed = is_mouse_button_pressed(MouseButton::Left);
+    let dismiss_pressed = left_pressed
+        || is_mouse_button_pressed(MouseButton::Right)
+        || is_mouse_button_pressed(MouseButton::Middle);
     if app.editing.archive_picker_open {
-        for row in 0..editing_archive_picker_visible_rows(app) {
-            if editing_archive_picker_option_rect(row).contains(mouse) {
-                let path = app.editing.img_paths[row].clone();
-                app.editing.selected_img_path = row;
+        // This handler runs every frame, not just on click frames. Keep the
+        // popup open while the pointer travels from the button to an option,
+        // and claim the interaction so controls underneath cannot activate.
+        if !dismiss_pressed {
+            return true;
+        }
+        if left_pressed {
+            for row in 0..editing_archive_picker_visible_rows(app) {
+                if editing_archive_picker_option_rect(row).contains(mouse) {
+                    let path = app.editing.img_paths[row].clone();
+                    app.editing.selected_img_path = row;
+                    app.editing.archive_picker_open = false;
+                    open_editing_img(app, path);
+                    return true;
+                }
+            }
+            if editing_archive_picker_browse_rect(app).is_some_and(|rect| rect.contains(mouse)) {
                 app.editing.archive_picker_open = false;
-                open_editing_img(app, path);
+                open_external_editing_img_picker(app);
                 return true;
             }
         }
-        if editing_archive_picker_browse_rect(app).is_some_and(|rect| rect.contains(mouse)) {
-            app.editing.archive_picker_open = false;
-            open_external_editing_img_picker(app);
-            return true;
-        }
+        // Any click that did not choose an option is a click-away dismissal.
+        // Consume it so the control underneath is not activated as the popup
+        // closes.
         app.editing.archive_picker_open = false;
         return true;
     }
-    if editing_archive_picker_rect().contains(mouse) {
+    if left_pressed && editing_archive_picker_rect().contains(mouse) {
         app.editing.archive_picker_open = true;
         return true;
     }
     false
 }
 
-fn load_editing_img_rows(path: &Path) -> Result<Vec<EditingImgRow>, String> {
+pub(crate) fn load_editing_img_rows(path: &Path) -> Result<Vec<EditingImgRow>, String> {
     let rows: Vec<EditingImgRow> = parse_img(path)
         .into_iter()
         .map(|entry| {
@@ -2233,7 +4548,7 @@ fn request_discard_active_editing_asset(
     target: &str,
 ) -> bool {
     let active_name = match app.editing.asset.as_ref() {
-        Some(EditingAsset::Dff(dff)) if dff.dirty => Some(dff.name.as_str()),
+        Some(EditingAsset::Dff(dff)) if editing_dff_dirty(dff) => Some(dff.name.as_str()),
         Some(EditingAsset::Col(col)) if col.dirty => Some(col.name.as_str()),
         _ => None,
     };
@@ -2254,6 +4569,19 @@ fn request_discard_active_editing_asset(
 }
 
 pub(crate) fn open_editing_img(app: &mut AppState, path: PathBuf) {
+    // Selecting the archive that is already open must be a no-op. Apart from
+    // avoiding needless disk work, this prevents an incidental repeated
+    // request (for example from the archive picker) from presenting a discard
+    // prompt for edits that belong to that same archive.
+    if app
+        .editing
+        .img_path
+        .as_deref()
+        .is_some_and(|current| same_resource_path(current, &path))
+    {
+        app.editing.archive_picker_open = false;
+        return;
+    }
     let target = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -2305,6 +4633,134 @@ pub(crate) fn open_editing_file(app: &mut AppState, path: PathBuf) {
         return;
     }
     open_editing_file_unchecked(app, path);
+}
+
+pub(crate) fn start_create_empty_dff(app: &mut AppState) {
+    if editing_dirty(app) {
+        app.status_message =
+            "Save or discard the current Editing changes before creating a DFF".to_string();
+        return;
+    }
+    if app.dff_picker_rx.is_some() {
+        app.status_message = "File browser is already open".to_string();
+        return;
+    }
+    let default_path = app.root.join("new_model.dff");
+    let (tx, rx) = mpsc::channel();
+    app.dff_picker_rx = Some(rx);
+    thread::spawn(move || {
+        let _ = tx.send((
+            DffPickerKind::EditingCreateDff,
+            choose_create_dff_path(default_path),
+        ));
+    });
+}
+
+pub(crate) fn create_empty_dff_at_path(app: &mut AppState, mut path: PathBuf) -> bool {
+    if editing_dirty(app) {
+        app.status_message =
+            "The new DFF was not created because Editing now has unsaved changes".to_string();
+        return false;
+    }
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dff"))
+    {
+        path.set_extension("dff");
+    }
+    let Some(name) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+    else {
+        app.status_message = "Choose a valid file name for the new DFF".to_string();
+        return false;
+    };
+    let mut raw = RawMesh::default();
+    ensure_dff_material_slots(&mut raw, 1);
+    let entry = ImgEntry {
+        img_path: path.clone(),
+        name: name.clone(),
+        offset: 0,
+        size: 0,
+    };
+    app.editing.img_path = None;
+    app.editing.rows = vec![EditingImgRow {
+        entry,
+        logical_size: 0,
+    }];
+    app.editing.selected_row = 0;
+    app.editing.scroll = 0.0;
+    app.editing.modified_entries.clear();
+    app.editing.deleted_entries.clear();
+    app.editing.added_entries.clear();
+    clear_editing_history(app);
+    app.editing.asset = Some(EditingAsset::Dff(EditingDffState {
+        name: name.clone(),
+        read_only: false,
+        raw,
+        preview_mesh: None,
+        txd_context: None,
+        txd_source_label: "No TXD paired".to_string(),
+        material_thumbnails: vec![None],
+        uv_editor: DffUvEditorState::default(),
+        selected_material: 0,
+        selected_breakable_group: 0,
+        fracture_preview_started_at: None,
+        selected_face: None,
+        selected_faces: BTreeSet::new(),
+        emitter_targets_faces: false,
+        selected_edges: BTreeSet::new(),
+        select_mode: EditingSelectMode::Vertex,
+        selected_vertex: None,
+        selected_vertices: BTreeSet::new(),
+        selected_2dfx: None,
+        hovered_face: None,
+        hovered_vertex: None,
+        hovered_edge: None,
+        show_normals: false,
+        boolean_box: None,
+        freeform_pivot: None,
+        dirty: true,
+        normalized_warning: false,
+        normalized_rewrite_confirmed: true,
+        material_scroll: 0.0,
+        collision_material_picker_open: false,
+        collision_material_picker_search: String::new(),
+        collision_material_picker_scroll: 0.0,
+        collision_material_picker_scope: CollisionMaterialAssignmentScope::GlobalName,
+        texture_picker_open: false,
+        texture_picker_edits_material: false,
+        texture_picker_scroll: 0.0,
+        texture_picker_search: String::new(),
+        texture_picker_category: String::new(),
+        texture_picker_entries: Vec::new(),
+        uv_anim_picker_open: false,
+        uv_anim_picker_search: String::new(),
+        uv_anim_picker_scroll: 0.0,
+        dff_2dfx_type_picker_open: false,
+        dff_2dfx_type_picker_search: String::new(),
+        dff_2dfx_type_picker_scroll: 0.0,
+        dff_2dfx_corona_preset_picker_open: false,
+        dff_2dfx_payload_editor_open: false,
+        dff_2dfx_payload_hex: String::new(),
+        dff_2dfx_payload_fields: Vec::new(),
+        dff_2dfx_payload_active_field: None,
+        dff_2dfx_payload_field_scroll: 0.0,
+        dff_2dfx_particle_picker_scroll: 0.0,
+        panel_tab: 3,
+        panel_scroll: 0.0,
+        panel_collapsed: dff_default_collapsed(),
+        open_models: Vec::new(),
+        active_open_model: 0,
+        multi_select: false,
+    }));
+    app.transform_mode = TransformMode::Select;
+    app.editing.message = format!("Created new DFF {}", path.display());
+    app.status_message =
+        "Created an empty DFF; add vertices, make faces, then Write Asset".to_string();
+    true
 }
 
 pub(crate) fn open_editing_file_unchecked(app: &mut AppState, path: PathBuf) {
@@ -2389,7 +4845,7 @@ pub(crate) fn editing_open_selected_asset(app: &mut AppState) {
     };
     let active_asset_dirty = matches!(
         app.editing.asset.as_ref(),
-        Some(EditingAsset::Dff(dff)) if dff.dirty
+        Some(EditingAsset::Dff(dff)) if editing_dff_dirty(dff)
     ) || matches!(
         app.editing.asset.as_ref(),
         Some(EditingAsset::Col(col)) if col.dirty
@@ -2438,7 +4894,12 @@ pub(crate) fn editing_open_asset_row(app: &mut AppState, row: EditingImgRow) {
             search_cursor: 0,
             search_anchor: None,
             search_active: false,
+            category_filter: String::new(),
             preview_texture: None,
+            preview_zoom: 1.0,
+            preview_pan: Vec2::ZERO,
+            preview_dragging: false,
+            preview_drag_last: Vec2::ZERO,
             material_picker_open: false,
             material_picker_search: String::new(),
             material_picker_scroll: 0.0,
@@ -2464,16 +4925,19 @@ pub(crate) fn editing_open_asset_row(app: &mut AppState, row: EditingImgRow) {
         clear_editing_history(app);
         app.editing.asset = Some(EditingAsset::Dff(EditingDffState {
             name: row.entry.name.clone(),
+            read_only: false,
             raw,
             preview_mesh,
             txd_context,
             txd_source_label,
             material_thumbnails,
+            uv_editor: DffUvEditorState::default(),
             selected_material: 0,
             selected_breakable_group: 0,
             fracture_preview_started_at: None,
             selected_face: None,
             selected_faces: BTreeSet::new(),
+            emitter_targets_faces: false,
             selected_edges: BTreeSet::new(),
             select_mode: EditingSelectMode::Vertex,
             selected_vertex: None,
@@ -2481,7 +4945,10 @@ pub(crate) fn editing_open_asset_row(app: &mut AppState, row: EditingImgRow) {
             selected_2dfx: None,
             hovered_face: None,
             hovered_vertex: None,
+            hovered_edge: None,
+            show_normals: false,
             boolean_box: None,
+            freeform_pivot: None,
             dirty: false,
             normalized_warning: true,
             normalized_rewrite_confirmed: false,
@@ -2493,6 +4960,9 @@ pub(crate) fn editing_open_asset_row(app: &mut AppState, row: EditingImgRow) {
             texture_picker_open: false,
             texture_picker_edits_material: false,
             texture_picker_scroll: 0.0,
+            texture_picker_search: String::new(),
+            texture_picker_category: String::new(),
+            texture_picker_entries: Vec::new(),
             uv_anim_picker_open: false,
             uv_anim_picker_search: String::new(),
             uv_anim_picker_scroll: 0.0,
@@ -2509,6 +4979,9 @@ pub(crate) fn editing_open_asset_row(app: &mut AppState, row: EditingImgRow) {
             panel_tab: 0,
             panel_scroll: 0.0,
             panel_collapsed: dff_default_collapsed(),
+            open_models: Vec::new(),
+            active_open_model: 0,
+            multi_select: false,
         }));
         frame_editing_camera(app, bounds);
         // A DFF whose textures cannot be resolved renders untextured and its
@@ -2580,6 +5053,54 @@ pub(crate) fn editing_update_txd_preview(app: &mut AppState) {
         .textures
         .get(txd.selected)
         .and_then(|entry| entry.thumbnail.clone());
+    txd.preview_zoom = 1.0;
+    txd.preview_pan = Vec2::ZERO;
+    txd.preview_dragging = false;
+}
+
+pub(crate) fn update_editing_txd_preview_input(
+    app: &mut AppState,
+    mouse: Vec2,
+    wheel_y: f32,
+) -> bool {
+    let preview = editing_txd_preview_rect();
+    let Some(EditingAsset::Txd(txd)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if txd.preview_texture.is_none() {
+        txd.preview_dragging = false;
+        return false;
+    }
+
+    let over_preview = preview.contains(mouse);
+    if over_preview && wheel_y.abs() > f32::EPSILON {
+        let old_zoom = txd.preview_zoom;
+        let new_zoom = (old_zoom * 1.15_f32.powf(wheel_y)).clamp(0.1, 32.0);
+        let center = preview.center() + txd.preview_pan;
+        let ratio = new_zoom / old_zoom;
+        txd.preview_pan += (mouse - center) * (1.0 - ratio);
+        txd.preview_zoom = new_zoom;
+        return true;
+    }
+
+    let pan_button_down =
+        is_mouse_button_down(MouseButton::Left) || is_mouse_button_down(MouseButton::Middle);
+    let pan_button_pressed =
+        is_mouse_button_pressed(MouseButton::Left) || is_mouse_button_pressed(MouseButton::Middle);
+    if over_preview && pan_button_pressed {
+        txd.preview_dragging = true;
+        txd.preview_drag_last = mouse;
+        return true;
+    }
+    if txd.preview_dragging {
+        if pan_button_down {
+            txd.preview_pan += mouse - txd.preview_drag_last;
+            txd.preview_drag_last = mouse;
+            return true;
+        }
+        txd.preview_dragging = false;
+    }
+    false
 }
 
 fn material_face_count(raw: &RawMesh, material: usize) -> usize {
@@ -2589,7 +5110,46 @@ fn material_face_count(raw: &RawMesh, material: usize) -> usize {
         .count()
 }
 
-pub(crate) fn recalc_raw_normals(raw: &mut RawMesh) {
+fn dff_face_indices_with_material(raw: &RawMesh, material: usize) -> BTreeSet<usize> {
+    raw.triangles
+        .iter()
+        .enumerate()
+        .filter_map(|(face, triangle)| (triangle.material as usize == material).then_some(face))
+        .collect()
+}
+
+pub(crate) fn editing_select_all_dff_material_faces(
+    app: &mut AppState,
+    dff_name: &str,
+    material: usize,
+) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if !dff.name.eq_ignore_ascii_case(dff_name) || material >= dff_material_slot_count(&dff.raw) {
+        app.status_message = "The selected DFF material is no longer available".to_string();
+        return false;
+    }
+    let faces = dff_face_indices_with_material(&dff.raw, material);
+    dff.selected_material = material;
+    dff.select_mode = EditingSelectMode::Face;
+    dff.selected_face = faces.iter().next_back().copied();
+    dff.selected_faces = faces;
+    dff.selected_edges.clear();
+    dff.selected_vertex = None;
+    dff.selected_vertices.clear();
+    dff.selected_2dfx = None;
+    sync_dff_uv_editor_material(dff);
+    app.transform_mode = TransformMode::Select;
+    let count = dff.selected_faces.len();
+    app.status_message = format!(
+        "Selected all {count} face{} using material #{material:02}",
+        if count == 1 { "" } else { "s" }
+    );
+    count > 0
+}
+
+fn raw_face_area_sums(raw: &RawMesh) -> Vec<Vec3> {
     let mut sums = vec![Vec3::ZERO; raw.vertices.len()];
     for tri in &raw.triangles {
         let a = tri.a as usize;
@@ -2604,22 +5164,104 @@ pub(crate) fn recalc_raw_normals(raw: &mut RawMesh) {
         // RawMesh triangles use RenderWare's clockwise front-face order.
         // Match the importer and normalized writer so topology edits do not
         // regenerate every authored normal toward the back face.
-        let normal = (pc - pa).cross(pb - pa).normalize_or_zero();
+        // Keep the cross product unnormalised: its magnitude is twice the
+        // triangle area, matching Blender's face-area weighted normal average.
+        let normal = (pc - pa).cross(pb - pa);
         sums[a] += normal;
         sums[b] += normal;
         sums[c] += normal;
     }
-    raw.normals = sums
-        .into_iter()
-        .map(|normal| {
-            let n = normal.normalize_or_zero();
-            V3 {
-                x: n.x,
-                y: n.y,
-                z: n.z,
+    sums
+}
+
+fn normalized_v3(normal: Vec3) -> V3 {
+    let normal = normal.normalize_or_zero();
+    V3 {
+        x: normal.x,
+        y: normal.y,
+        z: normal.z,
+    }
+}
+
+// RenderWare stores authored normals per vertex rather than carrying a
+// Blender-style sharp-edge flag.  A sharp edge in a stock DFF is therefore a
+// pair of coincident split vertices whose normals differ.  Use a small spatial
+// quantisation so normal-compressed/round-tripped LC, VC and SA meshes still
+// identify their matching split vertices without joining genuinely separate
+// nearby geometry.
+const DFF_SMOOTH_NORMAL_DOT: f32 = 0.999;
+const DFF_NORMAL_POSITION_SCALE: f32 = 100_000.0;
+
+type DffNormalPositionKey = (i32, i32, i32);
+
+fn dff_normal_position_key(vertex: V3) -> DffNormalPositionKey {
+    (
+        (vertex.x * DFF_NORMAL_POSITION_SCALE).round() as i32,
+        (vertex.y * DFF_NORMAL_POSITION_SCALE).round() as i32,
+        (vertex.z * DFF_NORMAL_POSITION_SCALE).round() as i32,
+    )
+}
+
+/// Infer native DFF sharp edges from split-vertex normals. Boundary edges are
+/// not treated as authored sharp edges, and duplicated UV/material seams stay
+/// smooth when their normals agree.
+pub(crate) fn inferred_dff_sharp_edges(raw: &RawMesh) -> Vec<(V3, V3)> {
+    if raw.normals.len() != raw.vertices.len() {
+        return Vec::new();
+    }
+
+    type EdgeKey = (DffNormalPositionKey, DffNormalPositionKey);
+    let mut occurrences = HashMap::<EdgeKey, Vec<(Vec3, Vec3, V3, V3)>>::new();
+    for tri in &raw.triangles {
+        let indices = [tri.a as usize, tri.b as usize, tri.c as usize];
+        if indices
+            .iter()
+            .any(|index| *index >= raw.vertices.len() || *index >= raw.normals.len())
+        {
+            continue;
+        }
+        for (a, b) in [
+            (indices[0], indices[1]),
+            (indices[1], indices[2]),
+            (indices[2], indices[0]),
+        ] {
+            let pa = raw.vertices[a];
+            let pb = raw.vertices[b];
+            let ka = dff_normal_position_key(pa);
+            let kb = dff_normal_position_key(pb);
+            let na = to_mq(raw.normals[a]).normalize_or_zero();
+            let nb = to_mq(raw.normals[b]).normalize_or_zero();
+            let (key, occurrence) = if ka <= kb {
+                ((ka, kb), (na, nb, pa, pb))
+            } else {
+                ((kb, ka), (nb, na, pb, pa))
+            };
+            occurrences.entry(key).or_default().push(occurrence);
+        }
+    }
+
+    occurrences
+        .into_values()
+        .filter_map(|sides| {
+            if sides.len() < 2 {
+                return None;
             }
+            let sharp = sides.iter().enumerate().any(|(index, left)| {
+                sides.iter().skip(index + 1).any(|right| {
+                    left.0.length_squared() > 0.0001
+                        && left.1.length_squared() > 0.0001
+                        && right.0.length_squared() > 0.0001
+                        && right.1.length_squared() > 0.0001
+                        && (left.0.dot(right.0) < DFF_SMOOTH_NORMAL_DOT
+                            || left.1.dot(right.1) < DFF_SMOOTH_NORMAL_DOT)
+                })
+            });
+            sharp.then(|| (sides[0].2, sides[0].3))
         })
-        .collect();
+        .collect()
+}
+
+fn mark_raw_breakables_stale(raw: &mut RawMesh) {
     // Fracture debris is an independent mesh whose source-face mapping and
     // positions no longer describe the intact mesh after a geometry edit.
     for breakable in raw
@@ -2629,6 +5271,471 @@ pub(crate) fn recalc_raw_normals(raw: &mut RawMesh) {
     {
         breakable.stale = true;
     }
+}
+
+/// Rebuild using only vertex identity. Coincident split vertices remain
+/// independent, so this is used when deliberately creating hard boundaries.
+fn recalc_raw_normals_topological(raw: &mut RawMesh) {
+    raw.normals = raw_face_area_sums(raw)
+        .into_iter()
+        .map(normalized_v3)
+        .collect();
+    sync_single_dff_component_ranges(raw);
+    mark_raw_breakables_stale(raw);
+}
+
+/// Area-weighted rebuild that preserves authored smoothing groups. Coincident
+/// UV/split vertices with matching existing normals stay smooth together;
+/// vertices whose authored normals differ remain a hard boundary.
+pub(crate) fn recalc_raw_normals(raw: &mut RawMesh) {
+    let face_sums = raw_face_area_sums(raw);
+    let previous = (raw.normals.len() == raw.vertices.len()).then(|| raw.normals.clone());
+    let mut positions = HashMap::<DffNormalPositionKey, Vec<usize>>::new();
+    for (index, vertex) in raw.vertices.iter().enumerate() {
+        positions
+            .entry(dff_normal_position_key(*vertex))
+            .or_default()
+            .push(index);
+    }
+    let mut rebuilt = vec![V3::default(); raw.vertices.len()];
+    for coincident in positions.values() {
+        let mut clusters = Vec::<(Vec3, Vec<usize>)>::new();
+        for index in coincident {
+            let prior = previous
+                .as_ref()
+                .and_then(|normals| normals.get(*index))
+                .map(|normal| to_mq(*normal).normalize_or_zero())
+                .filter(|normal| normal.length_squared() > 0.0001);
+            let target = if let Some(prior) = prior {
+                clusters.iter().position(|(representative, _)| {
+                    representative.length_squared() > 0.0001
+                        && representative.dot(prior) >= DFF_SMOOTH_NORMAL_DOT
+                })
+            } else {
+                clusters
+                    .iter()
+                    .position(|(representative, _)| representative.length_squared() <= 0.0001)
+            };
+            if let Some(target) = target {
+                clusters[target].1.push(*index);
+            } else {
+                clusters.push((prior.unwrap_or(Vec3::ZERO), vec![*index]));
+            }
+        }
+        if previous.is_none() && clusters.len() > 1 {
+            let all = clusters
+                .drain(..)
+                .flat_map(|(_, indices)| indices)
+                .collect::<Vec<_>>();
+            clusters.push((Vec3::ZERO, all));
+        }
+        for (_, indices) in clusters {
+            let sum = indices
+                .iter()
+                .fold(Vec3::ZERO, |sum, index| sum + face_sums[*index]);
+            let normal = normalized_v3(sum);
+            for index in indices {
+                rebuilt[index] = normal;
+            }
+        }
+    }
+    raw.normals = rebuilt;
+    sync_single_dff_component_ranges(raw);
+    mark_raw_breakables_stale(raw);
+}
+
+fn selected_dff_faces(dff: &EditingDffState) -> BTreeSet<usize> {
+    dff_selected_face_set(dff)
+        .into_iter()
+        .filter(|face| *face < dff.raw.triangles.len())
+        .collect()
+}
+
+fn editing_multi_selected_model_indices(dff: &EditingDffState) -> Vec<usize> {
+    dff.open_models
+        .iter()
+        .enumerate()
+        .filter_map(|(index, model)| {
+            let selected = match dff.select_mode {
+                EditingSelectMode::Face => {
+                    model.selected_face.is_some() || !model.selected_faces.is_empty()
+                }
+                EditingSelectMode::Edge => !model.selected_edges.is_empty(),
+                EditingSelectMode::Vertex => {
+                    model.selected_vertex.is_some() || !model.selected_vertices.is_empty()
+                }
+            };
+            selected.then_some(index)
+        })
+        .collect()
+}
+
+fn apply_dff_operation_to_multi_selection(
+    app: &mut AppState,
+    label: &str,
+    operation: fn(&mut AppState) -> bool,
+) -> Option<bool> {
+    let (enabled, original, indices) = match app.editing.asset.as_mut() {
+        Some(EditingAsset::Dff(dff)) => {
+            sync_active_open_dff_model(dff);
+            (
+                dff.multi_select && dff.open_models.len() > 1,
+                dff.active_open_model,
+                editing_multi_selected_model_indices(dff),
+            )
+        }
+        _ => return None,
+    };
+    if !enabled || indices.len() <= 1 {
+        return None;
+    }
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        dff.multi_select = false;
+    }
+    let mut changed = 0usize;
+    for index in indices.iter().copied() {
+        let _ = activate_open_dff_model(app, index);
+        if operation(app) {
+            changed += 1;
+        }
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            sync_active_open_dff_model(dff);
+        }
+    }
+    let _ = activate_open_dff_model(app, original);
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        dff.multi_select = true;
+    }
+    refresh_editing_dff_preview(app);
+    app.status_message = format!("{label} across {changed} selected model(s)");
+    Some(changed > 0)
+}
+
+fn apply_dff_void_operation_to_multi_selection(
+    app: &mut AppState,
+    label: &str,
+    operation: fn(&mut AppState),
+) -> bool {
+    let (enabled, original, indices) = match app.editing.asset.as_mut() {
+        Some(EditingAsset::Dff(dff)) => {
+            sync_active_open_dff_model(dff);
+            (
+                dff.multi_select && dff.open_models.len() > 1,
+                dff.active_open_model,
+                editing_multi_selected_model_indices(dff),
+            )
+        }
+        _ => return false,
+    };
+    if !enabled || indices.len() <= 1 {
+        return false;
+    }
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        dff.multi_select = false;
+    }
+    for index in indices.iter().copied() {
+        let _ = activate_open_dff_model(app, index);
+        operation(app);
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            sync_active_open_dff_model(dff);
+        }
+    }
+    let _ = activate_open_dff_model(app, original);
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        dff.multi_select = true;
+    }
+    refresh_editing_dff_preview(app);
+    app.status_message = format!("{label} across {} selected model(s)", indices.len());
+    true
+}
+
+/// Isolate selected face corners that are also used by unselected faces. DFF
+/// stores one normal per vertex, so this is the loop-normal split required to
+/// author selected normals without changing neighbouring faces.
+fn isolate_selected_normal_corners(raw: &mut RawMesh, selected: &BTreeSet<usize>) {
+    let mut selected_use = BTreeSet::new();
+    let mut unselected_use = BTreeSet::new();
+    for (face, tri) in raw.triangles.iter().enumerate() {
+        let target = if selected.contains(&face) {
+            &mut selected_use
+        } else {
+            &mut unselected_use
+        };
+        target.extend([tri.a as usize, tri.b as usize, tri.c as usize]);
+    }
+    let shared = selected_use
+        .intersection(&unselected_use)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut remap = BTreeMap::new();
+    for vertex in shared {
+        if vertex < raw.vertices.len() {
+            let copy = raw_append_vertex_copy(raw, vertex);
+            remap.insert(vertex, copy);
+        }
+    }
+    for face in selected {
+        let Some(tri) = raw.triangles.get_mut(*face) else {
+            continue;
+        };
+        for corner in [&mut tri.a, &mut tri.b, &mut tri.c] {
+            if let Some(copy) = remap.get(&(*corner as usize)) {
+                *corner = *copy as u32;
+            }
+        }
+    }
+}
+
+fn author_selected_dff_normals(app: &mut AppState, area_weighted: bool) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let selected = selected_dff_faces(dff);
+    if selected.is_empty() {
+        app.status_message = "Select DFF face(s) to author normals".to_string();
+        return false;
+    }
+    isolate_selected_normal_corners(&mut dff.raw, &selected);
+    if dff.raw.normals.len() != dff.raw.vertices.len() {
+        recalc_raw_normals(&mut dff.raw);
+    }
+    let mut sums = HashMap::<DffNormalPositionKey, Vec3>::new();
+    let mut corners = Vec::new();
+    for face in &selected {
+        let Some(tri) = dff.raw.triangles.get(*face).copied() else {
+            continue;
+        };
+        let indices = [tri.a as usize, tri.b as usize, tri.c as usize];
+        if indices.iter().any(|index| *index >= dff.raw.vertices.len()) {
+            continue;
+        }
+        let pa = to_mq(dff.raw.vertices[indices[0]]);
+        let pb = to_mq(dff.raw.vertices[indices[1]]);
+        let pc = to_mq(dff.raw.vertices[indices[2]]);
+        let cross = (pc - pa).cross(pb - pa);
+        let contribution = if area_weighted {
+            cross
+        } else {
+            cross.normalize_or_zero()
+        };
+        for index in indices {
+            let key = dff_normal_position_key(dff.raw.vertices[index]);
+            *sums.entry(key).or_default() += contribution;
+            corners.push((index, key));
+        }
+    }
+    for (index, key) in corners {
+        let normal = sums
+            .get(&key)
+            .copied()
+            .unwrap_or(Vec3::Z)
+            .normalize_or_zero();
+        dff.raw.normals[index] = from_mq(normal);
+    }
+    dff.dirty = true;
+    app.status_message = format!(
+        "Authored {} normals for {} selected face(s)",
+        if area_weighted {
+            "area-weighted"
+        } else {
+            "smooth"
+        },
+        selected.len()
+    );
+    refresh_editing_dff_preview(app);
+    true
+}
+
+pub(crate) fn editing_shade_selected_dff_smooth(app: &mut AppState) -> bool {
+    if let Some(changed) = apply_dff_operation_to_multi_selection(
+        app,
+        "Smoothed normals",
+        editing_shade_selected_dff_smooth,
+    ) {
+        return changed;
+    }
+    author_selected_dff_normals(app, false)
+}
+
+pub(crate) fn editing_area_weight_selected_dff_normals(app: &mut AppState) -> bool {
+    if let Some(changed) = apply_dff_operation_to_multi_selection(
+        app,
+        "Area-weighted normals",
+        editing_area_weight_selected_dff_normals,
+    ) {
+        return changed;
+    }
+    author_selected_dff_normals(app, true)
+}
+
+pub(crate) fn editing_shade_selected_dff_flat(app: &mut AppState) -> bool {
+    if let Some(changed) = apply_dff_operation_to_multi_selection(
+        app,
+        "Flat shaded faces",
+        editing_shade_selected_dff_flat,
+    ) {
+        return changed;
+    }
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let selected = selected_dff_faces(dff);
+    if selected.is_empty() {
+        app.status_message = "Select DFF face(s) to shade flat".to_string();
+        return false;
+    }
+    let source = dff.raw.triangles.clone();
+    let mut use_counts = vec![0usize; dff.raw.vertices.len()];
+    for triangle in &source {
+        for index in [
+            triangle.a as usize,
+            triangle.b as usize,
+            triangle.c as usize,
+        ] {
+            if let Some(count) = use_counts.get_mut(index) {
+                *count += 1;
+            }
+        }
+    }
+    for face in &selected {
+        let Some(tri) = source.get(*face).copied() else {
+            continue;
+        };
+        let src = [tri.a as usize, tri.b as usize, tri.c as usize];
+        if src.iter().any(|index| *index >= dff.raw.vertices.len()) {
+            continue;
+        }
+        let dst = src.map(|index| {
+            if use_counts[index] > 1 {
+                raw_append_vertex_copy(&mut dff.raw, index) as u32
+            } else {
+                index as u32
+            }
+        });
+        dff.raw.triangles[*face].a = dst[0];
+        dff.raw.triangles[*face].b = dst[1];
+        dff.raw.triangles[*face].c = dst[2];
+    }
+    if dff.raw.components.len() <= 1 {
+        compact_raw_vertices(&mut dff.raw);
+    }
+    recalc_raw_normals_topological(&mut dff.raw);
+    dff.selected_edges.clear();
+    dff.selected_vertex = None;
+    dff.selected_vertices.clear();
+    dff.dirty = true;
+    app.status_message = format!("Shaded {} selected DFF face(s) flat", selected.len());
+    refresh_editing_dff_preview(app);
+    true
+}
+
+pub(crate) fn editing_mark_selected_dff_edges_sharp(app: &mut AppState) -> bool {
+    if let Some(changed) = apply_dff_operation_to_multi_selection(
+        app,
+        "Marked sharp edges",
+        editing_mark_selected_dff_edges_sharp,
+    ) {
+        return changed;
+    }
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let selected = dff_selected_edge_set(dff);
+    if selected.is_empty() {
+        app.status_message = "Select DFF edge(s) to mark sharp".to_string();
+        return false;
+    }
+    let source = dff.raw.triangles.clone();
+    let mut face_vertices = BTreeSet::<(usize, usize)>::new();
+    for edge in &selected {
+        let incident = source
+            .iter()
+            .enumerate()
+            .filter_map(|(face, tri)| {
+                dff_triangle_edge_vertices(tri)
+                    .contains(edge)
+                    .then_some(face)
+            })
+            .collect::<Vec<_>>();
+        for face in incident.into_iter().skip(1) {
+            face_vertices.insert((face, edge.0));
+            face_vertices.insert((face, edge.1));
+        }
+    }
+    if face_vertices.is_empty() {
+        app.status_message = "Selected DFF edges are boundary edges or no longer exist".to_string();
+        return false;
+    }
+    let mut copies = BTreeMap::new();
+    for &(face, vertex) in &face_vertices {
+        if vertex < dff.raw.vertices.len() {
+            copies.insert((face, vertex), raw_append_vertex_copy(&mut dff.raw, vertex));
+        }
+    }
+    for (face, vertex) in face_vertices {
+        let Some(tri) = dff.raw.triangles.get_mut(face) else {
+            continue;
+        };
+        let Some(copy) = copies.get(&(face, vertex)).copied() else {
+            continue;
+        };
+        for corner in [&mut tri.a, &mut tri.b, &mut tri.c] {
+            if *corner as usize == vertex {
+                *corner = copy as u32;
+            }
+        }
+    }
+    recalc_raw_normals_topological(&mut dff.raw);
+    dff.selected_edges.clear();
+    dff.dirty = true;
+    app.status_message = format!("Marked {} DFF edge(s) sharp", selected.len());
+    refresh_editing_dff_preview(app);
+    true
+}
+
+pub(crate) fn editing_flip_selected_dff_faces(app: &mut AppState) -> bool {
+    if let Some(changed) = apply_dff_operation_to_multi_selection(
+        app,
+        "Flipped faces",
+        editing_flip_selected_dff_faces,
+    ) {
+        return changed;
+    }
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let selected = selected_dff_faces(dff);
+    if selected.is_empty() {
+        app.status_message = "Select DFF face(s) to flip".to_string();
+        return false;
+    }
+    for face in &selected {
+        if let Some(triangle) = dff.raw.triangles.get_mut(*face) {
+            std::mem::swap(&mut triangle.b, &mut triangle.c);
+        }
+    }
+    recalc_raw_normals(&mut dff.raw);
+    dff.dirty = true;
+    app.status_message = format!(
+        "Flipped winding and normals for {} selected DFF face(s)",
+        selected.len()
+    );
+    refresh_editing_dff_preview(app);
+    true
+}
+
+pub(crate) fn editing_toggle_dff_normal_preview(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    dff.show_normals = !dff.show_normals;
+    app.status_message = if dff.show_normals {
+        "DFF normal preview enabled"
+    } else {
+        "DFF normal preview disabled"
+    }
+    .to_string();
+    true
 }
 
 fn ensure_raw_uvs(raw: &mut RawMesh) {
@@ -2721,6 +5828,1481 @@ fn planar_unwrap_raw_vertices(raw: &mut RawMesh, vertices: &BTreeSet<usize>) -> 
     changed
 }
 
+fn uv_v3_sub(a: V3, b: V3) -> V3 {
+    V3 {
+        x: a.x - b.x,
+        y: a.y - b.y,
+        z: a.z - b.z,
+    }
+}
+
+fn uv_v3_dot(a: V3, b: V3) -> f32 {
+    a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+fn uv_v3_cross(a: V3, b: V3) -> V3 {
+    V3 {
+        x: a.y * b.z - a.z * b.y,
+        y: a.z * b.x - a.x * b.z,
+        z: a.x * b.y - a.y * b.x,
+    }
+}
+
+fn uv_v3_scale(value: V3, scale: f32) -> V3 {
+    V3 {
+        x: value.x * scale,
+        y: value.y * scale,
+        z: value.z * scale,
+    }
+}
+
+fn uv_v3_normalized(value: V3) -> Option<V3> {
+    let length = uv_v3_dot(value, value).sqrt();
+    (length > 0.00001).then(|| uv_v3_scale(value, 1.0 / length))
+}
+
+/// Continue the UV mapping of the closest existing face onto vertices which
+/// did not belong to geometry before this fill. Boundary vertices already
+/// carry the exact UVs of the surrounding road/terrain and must not move.
+fn contextualize_created_face_uvs(
+    raw: &mut RawMesh,
+    polygon: &[usize],
+    first_created_face: usize,
+    material: u16,
+) -> usize {
+    let referenced_before = raw.triangles[..first_created_face]
+        .iter()
+        .flat_map(|triangle| {
+            [
+                triangle.a as usize,
+                triangle.b as usize,
+                triangle.c as usize,
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    let targets = polygon
+        .iter()
+        .copied()
+        .filter(|index| !referenced_before.contains(index))
+        .collect::<BTreeSet<_>>();
+    if targets.is_empty() {
+        // Filling a hole reuses its boundary vertex records, so its UV border
+        // is already an exact continuation of every adjacent face.
+        return 0;
+    }
+    ensure_raw_uvs(raw);
+    let centroid = polygon
+        .iter()
+        .filter_map(|index| raw.vertices.get(*index).copied())
+        .fold(Vec3::ZERO, |sum, point| sum + to_mq(point))
+        / polygon.len().max(1) as f32;
+    let polygon_normal = polygon
+        .iter()
+        .enumerate()
+        .fold(Vec3::ZERO, |mut normal, (slot, index)| {
+            let Some(current) = raw.vertices.get(*index).map(|point| to_mq(*point)) else {
+                return normal;
+            };
+            let Some(next) = raw
+                .vertices
+                .get(polygon[(slot + 1) % polygon.len()])
+                .map(|point| to_mq(*point))
+            else {
+                return normal;
+            };
+            normal.x += (current.y - next.y) * (current.z + next.z);
+            normal.y += (current.z - next.z) * (current.x + next.x);
+            normal.z += (current.x - next.x) * (current.y + next.y);
+            normal
+        })
+        .normalize_or_zero();
+
+    let has_matching_material = raw.triangles[..first_created_face]
+        .iter()
+        .any(|triangle| triangle.material == material);
+    let source = raw.triangles[..first_created_face]
+        .iter()
+        .filter(|triangle| !has_matching_material || triangle.material == material)
+        .filter_map(|triangle| {
+            let indices = [
+                triangle.a as usize,
+                triangle.b as usize,
+                triangle.c as usize,
+            ];
+            if indices
+                .iter()
+                .any(|index| *index >= raw.vertices.len() || *index >= raw.uvs.len())
+            {
+                return None;
+            }
+            let points = indices.map(|index| to_mq(raw.vertices[index]));
+            let face_normal = (points[1] - points[0])
+                .cross(points[2] - points[0])
+                .normalize_or_zero();
+            if face_normal.length_squared() <= 0.000001 {
+                return None;
+            }
+            let face_center = (points[0] + points[1] + points[2]) / 3.0;
+            let alignment = face_normal.dot(polygon_normal).abs();
+            let score = face_center.distance_squared(centroid) * (2.0 - alignment);
+            Some((score, indices, points))
+        })
+        .min_by(|(a, ..), (b, ..)| a.total_cmp(b));
+    let Some((_, source_indices, source_points)) = source else {
+        return 0;
+    };
+    let edge_u = source_points[1] - source_points[0];
+    let edge_v = source_points[2] - source_points[0];
+    let uu = edge_u.dot(edge_u);
+    let uv = edge_u.dot(edge_v);
+    let vv = edge_v.dot(edge_v);
+    let determinant = uu * vv - uv * uv;
+    if determinant.abs() <= 0.00000001 {
+        return 0;
+    }
+    let coefficients = |point: Vec3| {
+        let delta = point - source_points[0];
+        let du = delta.dot(edge_u);
+        let dv = delta.dot(edge_v);
+        (
+            (du * vv - dv * uv) / determinant,
+            (dv * uu - du * uv) / determinant,
+        )
+    };
+    let source_primary = source_indices.map(|index| raw.uvs[index]);
+    for target in &targets {
+        let Some(point) = raw.vertices.get(*target).map(|point| to_mq(*point)) else {
+            continue;
+        };
+        let (a, b) = coefficients(point);
+        raw.uvs[*target] = V2 {
+            u: source_primary[0].u
+                + a * (source_primary[1].u - source_primary[0].u)
+                + b * (source_primary[2].u - source_primary[0].u),
+            v: source_primary[0].v
+                + a * (source_primary[1].v - source_primary[0].v)
+                + b * (source_primary[2].v - source_primary[0].v),
+        };
+        for set in &mut raw.secondary_uvs {
+            if set.len() != raw.vertices.len() {
+                continue;
+            }
+            let source_uvs = source_indices.map(|index| set[index]);
+            set[*target] = V2 {
+                u: source_uvs[0].u
+                    + a * (source_uvs[1].u - source_uvs[0].u)
+                    + b * (source_uvs[2].u - source_uvs[0].u),
+                v: source_uvs[0].v
+                    + a * (source_uvs[1].v - source_uvs[0].v)
+                    + b * (source_uvs[2].v - source_uvs[0].v),
+            };
+        }
+    }
+    targets.len()
+}
+
+/// Projects a selected polygon in its own orientation. The least-vertical boundary
+/// edges are treated as its bottom/top edges; averaging their directions keeps a
+/// slightly tapered or imperfectly modeled face upright instead of favoring just
+/// one triangle edge.
+fn face_aligned_unwrap_raw_vertices(
+    raw: &mut RawMesh,
+    vertices: &BTreeSet<usize>,
+    faces: &BTreeSet<usize>,
+) -> usize {
+    if vertices.is_empty() || faces.is_empty() {
+        return 0;
+    }
+
+    let mut boundary_edges_by_position = BTreeMap::<([i32; 3], [i32; 3]), (usize, V3, V3)>::new();
+    let mut normal_sum = V3::default();
+    let mut reference_normal = None;
+    for face_idx in faces {
+        let Some(indices) = raw_triangle_indices(raw, *face_idx) else {
+            continue;
+        };
+        let a = raw.vertices[indices[0]];
+        let ab = uv_v3_sub(raw.vertices[indices[1]], a);
+        let ac = uv_v3_sub(raw.vertices[indices[2]], a);
+        let mut normal = uv_v3_cross(ab, ac);
+        if uv_v3_dot(normal, normal) <= 0.00000001 {
+            continue;
+        }
+        if let Some(reference) = reference_normal {
+            if uv_v3_dot(normal, reference) < 0.0 {
+                normal = uv_v3_scale(normal, -1.0);
+            }
+        } else {
+            reference_normal = Some(normal);
+        }
+        normal_sum.x += normal.x;
+        normal_sum.y += normal.y;
+        normal_sum.z += normal.z;
+        for (a_idx, b_idx) in [
+            (indices[0], indices[1]),
+            (indices[1], indices[2]),
+            (indices[2], indices[0]),
+        ] {
+            let a = raw.vertices[a_idx];
+            let b = raw.vertices[b_idx];
+            let (Ok(a_key), Ok(b_key)) = (
+                linked_selection_position_key(a),
+                linked_selection_position_key(b),
+            ) else {
+                continue;
+            };
+            let key = if a_key <= b_key {
+                (a_key, b_key)
+            } else {
+                (b_key, a_key)
+            };
+            let entry = boundary_edges_by_position.entry(key).or_insert((0, a, b));
+            entry.0 += 1;
+        }
+    }
+    let Some(normal) =
+        uv_v3_normalized(normal_sum).or_else(|| reference_normal.and_then(uv_v3_normalized))
+    else {
+        return 0;
+    };
+
+    let world_up = V3 {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+    };
+    let projected_up = uv_v3_sub(world_up, uv_v3_scale(normal, uv_v3_dot(world_up, normal)));
+    let up_hint = uv_v3_normalized(projected_up);
+
+    let mut boundary_edges = Vec::<(V3, f32)>::new();
+    for (_, (count, a, b)) in boundary_edges_by_position {
+        if count != 1 {
+            continue;
+        }
+        let edge = uv_v3_sub(b, a);
+        let length = uv_v3_dot(edge, edge).sqrt();
+        if let Some(direction) = uv_v3_normalized(edge) {
+            boundary_edges.push((direction, length));
+        }
+    }
+    if boundary_edges.is_empty() {
+        return 0;
+    }
+
+    let seed = if let Some(up) = up_hint {
+        boundary_edges
+            .iter()
+            .min_by(|(a_dir, a_len), (b_dir, b_len)| {
+                uv_v3_dot(*a_dir, up)
+                    .abs()
+                    .total_cmp(&uv_v3_dot(*b_dir, up).abs())
+                    .then_with(|| b_len.total_cmp(a_len))
+            })
+            .map(|(direction, _)| *direction)
+    } else {
+        boundary_edges
+            .iter()
+            .max_by(|(_, a_len), (_, b_len)| a_len.total_cmp(b_len))
+            .map(|(direction, _)| *direction)
+    };
+    let Some(mut seed) = seed else {
+        return 0;
+    };
+
+    let orientation_reference = up_hint
+        .and_then(|up| uv_v3_normalized(uv_v3_cross(up, normal)))
+        .or_else(|| {
+            let world_x = V3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            };
+            uv_v3_normalized(uv_v3_sub(
+                world_x,
+                uv_v3_scale(normal, uv_v3_dot(world_x, normal)),
+            ))
+        });
+    if orientation_reference.is_some_and(|reference| uv_v3_dot(seed, reference) < 0.0) {
+        seed = uv_v3_scale(seed, -1.0);
+    }
+
+    let mut averaged = V3::default();
+    for (mut direction, length) in boundary_edges {
+        let alignment = uv_v3_dot(direction, seed);
+        if alignment.abs() < 0.5 {
+            continue;
+        }
+        if alignment < 0.0 {
+            direction = uv_v3_scale(direction, -1.0);
+        }
+        averaged.x += direction.x * length;
+        averaged.y += direction.y * length;
+        averaged.z += direction.z * length;
+    }
+    let Some(u_axis) = uv_v3_normalized(averaged) else {
+        return 0;
+    };
+    let Some(mut v_axis) = uv_v3_normalized(uv_v3_cross(normal, u_axis)) else {
+        return 0;
+    };
+    if up_hint.is_some_and(|up| uv_v3_dot(v_axis, up) < 0.0) {
+        v_axis = uv_v3_scale(v_axis, -1.0);
+    }
+
+    let mut projected = Vec::<(usize, f32, f32)>::new();
+    let (mut min_u, mut max_u) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut min_v, mut max_v) = (f32::INFINITY, f32::NEG_INFINITY);
+    for idx in vertices {
+        let Some(vertex) = raw.vertices.get(*idx).copied() else {
+            continue;
+        };
+        let u = uv_v3_dot(vertex, u_axis);
+        let v = uv_v3_dot(vertex, v_axis);
+        min_u = min_u.min(u);
+        max_u = max_u.max(u);
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+        projected.push((*idx, u, v));
+    }
+    let width = max_u - min_u;
+    let height = max_v - min_v;
+    let scale = width.max(height);
+    if projected.is_empty() || !scale.is_finite() || scale <= 0.00001 {
+        return 0;
+    }
+
+    ensure_raw_uvs(raw);
+    let u_padding = (1.0 - width / scale) * 0.5;
+    let v_padding = (1.0 - height / scale) * 0.5;
+    let mut changed = 0;
+    for (idx, u, v) in projected {
+        if let Some(uv) = raw.uvs.get_mut(idx) {
+            uv.u = u_padding + (u - min_u) / scale;
+            uv.v = v_padding + (v - min_v) / scale;
+            changed += 1;
+        }
+    }
+    changed
+}
+
+fn box_unwrap_raw_vertices(
+    raw: &mut RawMesh,
+    vertices: &BTreeSet<usize>,
+    faces: &BTreeSet<usize>,
+) -> usize {
+    if vertices.is_empty() {
+        return 0;
+    }
+    ensure_raw_uvs(raw);
+
+    let mut min = V3 {
+        x: f32::INFINITY,
+        y: f32::INFINITY,
+        z: f32::INFINITY,
+    };
+    let mut max = V3 {
+        x: f32::NEG_INFINITY,
+        y: f32::NEG_INFINITY,
+        z: f32::NEG_INFINITY,
+    };
+    for idx in vertices {
+        let Some(vertex) = raw.vertices.get(*idx) else {
+            continue;
+        };
+        min.x = min.x.min(vertex.x);
+        min.y = min.y.min(vertex.y);
+        min.z = min.z.min(vertex.z);
+        max.x = max.x.max(vertex.x);
+        max.y = max.y.max(vertex.y);
+        max.z = max.z.max(vertex.z);
+    }
+    if !min.x.is_finite() {
+        return 0;
+    }
+
+    let extent = V3 {
+        x: (max.x - min.x).abs().max(0.001),
+        y: (max.y - min.y).abs().max(0.001),
+        z: (max.z - min.z).abs().max(0.001),
+    };
+    let fallback_axis = if extent.x <= extent.y && extent.x <= extent.z {
+        0
+    } else if extent.y <= extent.x && extent.y <= extent.z {
+        1
+    } else {
+        2
+    };
+    let mut normal_sums = vec![V3::default(); raw.vertices.len()];
+    for (face_idx, tri) in raw.triangles.iter().enumerate() {
+        if !faces.is_empty() && !faces.contains(&face_idx) {
+            continue;
+        }
+        let indices = [tri.a as usize, tri.b as usize, tri.c as usize];
+        if !indices.iter().any(|idx| vertices.contains(idx))
+            || indices.iter().any(|idx| *idx >= raw.vertices.len())
+        {
+            continue;
+        }
+        let a = raw.vertices[indices[0]];
+        let b = raw.vertices[indices[1]];
+        let c = raw.vertices[indices[2]];
+        let ab = V3 {
+            x: b.x - a.x,
+            y: b.y - a.y,
+            z: b.z - a.z,
+        };
+        let ac = V3 {
+            x: c.x - a.x,
+            y: c.y - a.y,
+            z: c.z - a.z,
+        };
+        let normal = V3 {
+            x: ab.y * ac.z - ab.z * ac.y,
+            y: ab.z * ac.x - ab.x * ac.z,
+            z: ab.x * ac.y - ab.y * ac.x,
+        };
+        for idx in indices {
+            if vertices.contains(&idx) {
+                normal_sums[idx].x += normal.x;
+                normal_sums[idx].y += normal.y;
+                normal_sums[idx].z += normal.z;
+            }
+        }
+    }
+
+    let mut changed = 0usize;
+    for idx in vertices {
+        let Some(vertex) = raw.vertices.get(*idx).copied() else {
+            continue;
+        };
+        let mut normal = normal_sums.get(*idx).copied().unwrap_or_default();
+        if normal.x.abs() + normal.y.abs() + normal.z.abs() <= f32::EPSILON {
+            normal = raw.normals.get(*idx).copied().unwrap_or_default();
+        }
+        let abs = [normal.x.abs(), normal.y.abs(), normal.z.abs()];
+        let axis = if abs[0] + abs[1] + abs[2] <= f32::EPSILON {
+            fallback_axis
+        } else if abs[0] >= abs[1] && abs[0] >= abs[2] {
+            0
+        } else if abs[1] >= abs[2] {
+            1
+        } else {
+            2
+        };
+        let (u, v) = match axis {
+            0 => ((vertex.z - min.z) / extent.z, (vertex.y - min.y) / extent.y),
+            1 => ((vertex.x - min.x) / extent.x, (vertex.z - min.z) / extent.z),
+            _ => ((vertex.x - min.x) / extent.x, (vertex.y - min.y) / extent.y),
+        };
+        if let Some(uv) = raw.uvs.get_mut(*idx) {
+            uv.u = u;
+            uv.v = v;
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Box-project one material without normalizing it to the model bounds. UVs
+/// are derived from the selected placement's transformed coordinates, so the
+/// same multiplier produces the same texel density on differently sized
+/// world objects.
+fn world_uv_hash(mut value: u32) -> u32 {
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7feb_352d);
+    value ^= value >> 15;
+    value = value.wrapping_mul(0x846c_a68b);
+    value ^ (value >> 16)
+}
+
+fn world_uv_noise_corner(x: i32, y: i32, z: i32, seed: u32) -> Vec3 {
+    let value = (x as u32)
+        .wrapping_mul(0x8da6_b343)
+        .wrapping_add((y as u32).wrapping_mul(0xd816_3841))
+        .wrapping_add((z as u32).wrapping_mul(0xcb1a_b31f))
+        .wrapping_add(seed);
+    let signed = |salt| {
+        let bits = world_uv_hash(value ^ salt) >> 8;
+        bits as f32 * (2.0 / 16_777_215.0) - 1.0
+    };
+    vec3(
+        signed(0xa511_e9b3),
+        signed(0x63d8_35a7),
+        signed(0xc2b2_ae35),
+    )
+}
+
+/// Smooth, deterministic vector noise. Unlike a repeating sine pattern, the
+/// hashed lattice does not introduce another obvious direction or period into
+/// large grass and terrain surfaces.
+fn world_uv_noise(world: Vec3, cell_size: f32, seed: u32) -> Vec3 {
+    let position = world / cell_size;
+    let base = position.floor();
+    let fraction = position - base;
+    // Quintic interpolation has zero first and second derivatives at cell
+    // boundaries, so adjacent DFFs meet without a kink in the UV direction.
+    let fade = fraction * fraction * fraction * (fraction * (fraction * 6.0 - 15.0) + 10.0);
+    let x = base.x as i32;
+    let y = base.y as i32;
+    let z = base.z as i32;
+    let lerp_x = |y_offset, z_offset| {
+        world_uv_noise_corner(x, y + y_offset, z + z_offset, seed).lerp(
+            world_uv_noise_corner(x + 1, y + y_offset, z + z_offset, seed),
+            fade.x,
+        )
+    };
+    let low = lerp_x(0, 0).lerp(lerp_x(1, 0), fade.y);
+    let high = lerp_x(0, 1).lerp(lerp_x(1, 1), fade.y);
+    low.lerp(high, fade.z)
+}
+
+fn varied_world_uv_position(world: Vec3) -> Vec3 {
+    // Two differently seeded scales disrupt both broad repetition and the
+    // smaller grid visible in tiled grass. The mapping depends only on world
+    // position, so a point shared by separate DFFs still receives exactly the
+    // same UV and cannot open a texture seam.
+    let broad = world_uv_noise(world, 72.0, 0x9e37_79b9);
+    let local = world_uv_noise(world, 23.0, 0x243f_6a88);
+    world + broad * 5.5 + local * 1.75
+}
+
+fn world_scale_box_unwrap_material(
+    raw: &mut RawMesh,
+    material: usize,
+    placement: &Placement,
+    multiplier: f32,
+    variation: bool,
+) -> usize {
+    if raw.vertices.is_empty() || !multiplier.is_finite() || multiplier <= 0.0 {
+        return 0;
+    }
+    let faces = raw
+        .triangles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, triangle)| (triangle.material as usize == material).then_some(index))
+        .collect::<BTreeSet<_>>();
+    if faces.is_empty() {
+        return 0;
+    }
+    ensure_raw_uvs(raw);
+
+    let transform = placement_matrix(placement);
+    // Pick the projection plane per face rather than per vertex. A vertex on
+    // the crease where a slope meets flat ground is shared by faces that
+    // belong to different planes, and averaging their normals gave that
+    // vertex a plane neither of its faces uses - so a face could end up with
+    // corners measured on two planes at once and collapse into the smeared
+    // triangles seen on hillsides.
+    let mut faces_by_axis = [
+        BTreeSet::<usize>::new(),
+        BTreeSet::<usize>::new(),
+        BTreeSet::<usize>::new(),
+    ];
+    for face in &faces {
+        let Some([a, b, c]) = raw_triangle_indices(raw, *face) else {
+            continue;
+        };
+        let points = [a, b, c].map(|index| transform.transform_point3(to_mq(raw.vertices[index])));
+        let abs = (points[1] - points[0]).cross(points[2] - points[0]).abs();
+        let axis = if abs.x >= abs.y && abs.x >= abs.z {
+            0
+        } else if abs.y >= abs.z {
+            1
+        } else {
+            2
+        };
+        faces_by_axis[axis].insert(*face);
+    }
+
+    let mut changed = 0usize;
+    for (axis, group) in faces_by_axis.iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        // Detach the group boundary first. A DFF vertex owns one UV, so
+        // changing a vertex shared with another material - or with a face on
+        // another projection plane - would also distort that neighbour.
+        auto_split_unwrap_faces(raw, group);
+        let vertices = dff_uv_face_vertices(raw, group);
+        ensure_raw_uvs(raw);
+        for index in vertices {
+            let Some(vertex) = raw.vertices.get(index).copied() else {
+                continue;
+            };
+            let mut world = transform.transform_point3(to_mq(vertex));
+            if variation {
+                world = varied_world_uv_position(world);
+            }
+            let (u, v) = match axis {
+                0 => (world.y, world.z),
+                1 => (world.x, world.z),
+                // Horizontal terrain/grass uses the global X/Y plane. Keeping
+                // the world origin in the coordinates also aligns adjacent
+                // geometry.
+                _ => (world.x, world.y),
+            };
+            if let Some(uv) = raw.uvs.get_mut(index) {
+                *uv = V2 {
+                    u: u * multiplier,
+                    v: v * multiplier,
+                };
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
+fn preview_world_uv_source_raw(source: WaterTextureDffSource) -> Result<RawMesh, String> {
+    let raw = match source {
+        WaterTextureDffSource::Raw(raw) => *raw,
+        WaterTextureDffSource::Bytes(bytes) => parse_dff_mesh(&bytes),
+        WaterTextureDffSource::Entry(entry) => parse_dff_mesh(&read_img_entry(&entry)),
+        WaterTextureDffSource::Archive {
+            root,
+            gta_sa_dir,
+            dff_name,
+        } => parse_dff_mesh(&water_texture_source_bytes(&root, &gta_sa_dir, &dff_name)?),
+    };
+    if raw.vertices.is_empty() || raw.triangles.is_empty() {
+        Err("DFF has no readable geometry".to_string())
+    } else {
+        Ok(raw)
+    }
+}
+
+fn rewrite_preview_world_uv_target(
+    target: PreviewWorldUvWorkerTarget,
+    multiplier: f32,
+    variation: bool,
+) -> Option<PreviewWorldUvRewrite> {
+    let mut raw = preview_world_uv_source_raw(target.source).ok()?;
+    let frame = Path::new(&target.dff_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("model");
+    validate_normalized_dff_stage(&raw, frame).ok()?;
+    let mut changed = 0usize;
+    let mut changed_materials = 0usize;
+    for material in target.materials {
+        let material_changed = world_scale_box_unwrap_material(
+            &mut raw,
+            material,
+            &target.placement,
+            multiplier,
+            variation,
+        );
+        changed += material_changed;
+        changed_materials += usize::from(material_changed > 0);
+    }
+    (changed > 0).then_some(())?;
+    let bytes = write_normalized_dff_with_options(&raw, frame, target.write_options).ok()?;
+    Some(PreviewWorldUvRewrite {
+        dff_key: asset_key(&target.dff_name, ".dff"),
+        dff_name: target.dff_name,
+        raw,
+        bytes,
+        materials: changed_materials,
+        uvs: changed,
+    })
+}
+
+fn index_preview_world_uv_archive_sources(targets: &mut [PreviewWorldUvWorkerTarget]) {
+    let Some((root, gta_sa_dir)) = targets.iter().find_map(|target| match &target.source {
+        WaterTextureDffSource::Archive {
+            root, gta_sa_dir, ..
+        } => Some((root.clone(), gta_sa_dir.clone())),
+        _ => None,
+    }) else {
+        return;
+    };
+    let requested = targets
+        .iter()
+        .filter_map(|target| match &target.source {
+            WaterTextureDffSource::Archive { dff_name, .. } => Some(asset_key(dff_name, ".dff")),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut resolved = HashMap::<String, ImgEntry>::new();
+    let replacement_paths = [
+        wip_root_path(&root).join("imgs").join(REPLACEMENT_IMG),
+        root.join("imgs").join(REPLACEMENT_IMG),
+    ];
+    let paths = replacement_paths
+        .into_iter()
+        .chain(collect_resource_img_files(&root))
+        .chain(gta_sa_img_files(&gta_sa_dir));
+    for path in paths {
+        for entry in parse_img(&path) {
+            let key = asset_key(&entry.name, ".dff");
+            if requested.contains(&key) {
+                resolved.entry(key).or_insert(entry);
+            }
+        }
+        if resolved.len() == requested.len() {
+            break;
+        }
+    }
+    for target in targets {
+        let key = asset_key(&target.dff_name, ".dff");
+        if matches!(&target.source, WaterTextureDffSource::Archive { .. })
+            && let Some(entry) = resolved.get(&key)
+        {
+            target.source = WaterTextureDffSource::Entry(entry.clone());
+        }
+    }
+}
+
+fn rewrite_preview_world_uv_targets(
+    mut targets: Vec<PreviewWorldUvWorkerTarget>,
+    multiplier: f32,
+    variation: bool,
+) -> Result<PreviewWorldUvWorkerResult, String> {
+    index_preview_world_uv_archive_sources(&mut targets);
+    let target_count = targets.len();
+    let worker_count = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(target_count.max(1));
+    let mut buckets = (0..worker_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (index, target) in targets.into_iter().enumerate() {
+        buckets[index % worker_count].push(target);
+    }
+    let mut rewrites = thread::scope(|scope| {
+        let handles = buckets
+            .into_iter()
+            .map(|bucket| {
+                scope.spawn(move || {
+                    bucket
+                        .into_iter()
+                        .filter_map(|target| {
+                            rewrite_preview_world_uv_target(target, multiplier, variation)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut rewrites = Vec::new();
+        for handle in handles {
+            rewrites.extend(handle.join().map_err(|_| "world UV worker panicked")?);
+        }
+        Ok::<_, &'static str>(rewrites)
+    })
+    .map_err(str::to_string)?;
+    rewrites.sort_unstable_by(|left, right| left.dff_key.cmp(&right.dff_key));
+    let skipped_assets = target_count.saturating_sub(rewrites.len());
+    Ok(PreviewWorldUvWorkerResult {
+        rewrites: rewrites.into(),
+        skipped_assets,
+    })
+}
+
+fn clear_preview_world_scale_uv_visual(app: &mut AppState) -> bool {
+    let Some(preview) = app.preview_world_uv_visual.take() else {
+        return false;
+    };
+    refresh_live_dff_uvs_from_raw(app, &preview.dff_name, &preview.original_raw);
+    rebuild_world_cells_for_dff_keys(app, &HashSet::from([asset_key(&preview.dff_name, ".dff")]));
+    true
+}
+
+pub(crate) fn refresh_preview_world_scale_uv_visual(app: &mut AppState) -> bool {
+    let Some(preview) = app.preview_world_uv_visual.as_ref() else {
+        return false;
+    };
+    let Some(placement) = app.placements.get(preview.placement_index).cloned() else {
+        clear_preview_world_scale_uv_visual(app);
+        return false;
+    };
+    let mut raw = preview.original_raw.clone();
+    let changed = world_scale_box_unwrap_material(
+        &mut raw,
+        preview.material,
+        &placement,
+        app.preview_world_uv_scale.clamp(0.001, 1024.0),
+        app.preview_world_uv_variation,
+    );
+    if changed == 0 {
+        app.status_message = "The selected material has no faces to preview".to_string();
+        return false;
+    }
+    let dff_name = preview.dff_name.clone();
+    if !refresh_live_dff_uvs_from_raw(app, &dff_name, &raw) {
+        app.status_message = "Could not compile the world-scale UV preview".to_string();
+        return false;
+    }
+    rebuild_world_cells_for_dff_keys(app, &HashSet::from([asset_key(&dff_name, ".dff")]));
+    app.status_message = format!(
+        "Previewing {changed} world-scale UV(s) at {}x; no files changed",
+        fmt_f32(app.preview_world_uv_scale, 3)
+    );
+    true
+}
+
+pub(crate) fn toggle_preview_world_scale_uv_visual(app: &mut AppState) -> bool {
+    if app.preview_world_uv_visual.is_some() {
+        clear_preview_world_scale_uv_visual(app);
+        app.status_message = "World-scale UV preview cleared".to_string();
+        return true;
+    }
+    let Some((placement_index, material)) = app.preview_selected_material else {
+        app.status_message = "Select a texture material before previewing".to_string();
+        return false;
+    };
+    if placement_index != app.selected {
+        app.status_message = "Select a texture material on the current element first".to_string();
+        return false;
+    }
+    let Some(placement) = app.placements.get(placement_index) else {
+        app.status_message = "The selected element no longer exists".to_string();
+        return false;
+    };
+    let dff_name = placement_dff_key(placement, &app.definitions);
+    let source = water_texture_source_for_app(app, &dff_name);
+    let original_raw = match preview_world_uv_source_raw(source) {
+        Ok(raw) => raw,
+        Err(error) => {
+            app.status_message = format!("Could not prepare UV preview: {error}");
+            return false;
+        }
+    };
+    app.preview_world_uv_visual = Some(PreviewWorldUvVisual {
+        dff_name,
+        placement_index,
+        material,
+        original_raw,
+    });
+    refresh_preview_world_scale_uv_visual(app)
+}
+
+fn stage_preview_world_uv_without_refresh(app: &mut AppState, name: &str, bytes: Vec<u8>) {
+    let key = editing_key(name);
+    app.editing.modified_entries.insert(key.clone(), bytes);
+    if let Some(row) = app
+        .editing
+        .rows
+        .iter_mut()
+        .find(|row| editing_key(&row.entry.name) == key)
+    {
+        row.logical_size = app
+            .editing
+            .modified_entries
+            .get(&key)
+            .map(|bytes| replacement_entry_len(name, bytes))
+            .unwrap_or(row.logical_size);
+    }
+}
+
+pub(crate) fn apply_preview_world_scale_uv(app: &mut AppState) -> bool {
+    if app.preview_world_uv_job.is_some() {
+        app.status_message = "World-scale UV processing is already running".to_string();
+        return false;
+    }
+    clear_preview_world_scale_uv_visual(app);
+    if app.manual_save_job.is_some()
+        || app.autosave_rx.is_some()
+        || app.editing.save_rx.is_some()
+        || app.bake_job.is_some()
+        || app.dff_repair_rx.is_some()
+        || app.txd_cleanup_job.is_some()
+        || app.asset_optimization_job.is_some()
+        || app.dff_geometry_job.is_some()
+        || app.collision_generation_job.is_some()
+        || app.lod_generation_job.is_some()
+        || app.water_texture_conversion_job.is_some()
+    {
+        app.status_message =
+            "Wait for the active asset-writing job before world-scale unwrapping".to_string();
+        return false;
+    }
+    let Some((placement_index, material)) = app.preview_selected_material else {
+        app.status_message = "Select a texture material before world-scale unwrapping".to_string();
+        return false;
+    };
+    if placement_index != app.selected {
+        app.status_message = "Select a texture material on the current element first".to_string();
+        return false;
+    }
+    let Some(placement) = app.placements.get(placement_index).cloned() else {
+        app.status_message = "The selected element no longer exists".to_string();
+        return false;
+    };
+    let Some(selected_entry) = preview_material_entry(app, placement_index, material) else {
+        app.status_message = "The selected texture material is no longer available".to_string();
+        return false;
+    };
+    if selected_entry.texture_name.trim().is_empty() {
+        app.status_message = "The selected material has no texture to match".to_string();
+        return false;
+    }
+
+    let all_dffs = app.preview_world_uv_all_dffs;
+    if !all_dffs && selected_definition_is_readonly(app) {
+        app.status_message = "GTA:SA fallback DFFs are read-only".to_string();
+        return false;
+    }
+    let mut targets_by_dff = BTreeMap::new();
+    if !all_dffs {
+        targets_by_dff.insert(
+            placement_dff_key(&placement, &app.definitions),
+            (placement, BTreeSet::from([material])),
+        );
+    }
+    app.preview_world_uv_job = Some(PreviewWorldUvJob {
+        texture_name: selected_entry.texture_name.clone(),
+        multiplier: app.preview_world_uv_scale.clamp(0.001, 1024.0),
+        variation: app.preview_world_uv_variation,
+        all_dffs,
+        snapshot_index: if all_dffs { 0 } else { app.placements.len() },
+        targets_by_dff,
+        targets: Vec::new(),
+        source_index: 0,
+        worker_targets: Vec::new(),
+        skipped_readonly: 0,
+        rx: None,
+        result: None,
+        staged_dffs: 0,
+        staged_materials: 0,
+        staged_uvs: 0,
+    });
+    app.status_message = if all_dffs {
+        format!(
+            "Finding world DFFs using '{}'...",
+            selected_entry.texture_name
+        )
+    } else {
+        "Preparing object world-scale UV unwrap...".to_string()
+    };
+    true
+}
+
+pub(crate) fn update_preview_world_uv_job(app: &mut AppState) {
+    const SNAPSHOT_BATCH_MAX: usize = 2048;
+    const SNAPSHOT_BUDGET: Duration = Duration::from_millis(4);
+    const SOURCE_BATCH_MIN: usize = 16;
+    const SOURCE_BATCH_MAX: usize = 128;
+    const SOURCE_BUDGET: Duration = Duration::from_millis(5);
+    let Some(mut job) = app.preview_world_uv_job.take() else {
+        return;
+    };
+
+    if job.all_dffs && job.snapshot_index < app.placements.len() {
+        let started = Instant::now();
+        let start = job.snapshot_index;
+        while job.snapshot_index < app.placements.len()
+            && job.snapshot_index - start < SNAPSHOT_BATCH_MAX
+            && (job.snapshot_index == start || started.elapsed() < SNAPSHOT_BUDGET)
+        {
+            let index = job.snapshot_index;
+            job.snapshot_index += 1;
+            if !is_live_element(app, index) {
+                continue;
+            }
+            let placement = &app.placements[index];
+            let materials = preview_material_entries(app, index)
+                .into_iter()
+                .filter(|entry| entry.texture_name.eq_ignore_ascii_case(&job.texture_name))
+                .map(|entry| entry.material_index)
+                .collect::<BTreeSet<_>>();
+            if materials.is_empty() {
+                continue;
+            }
+            if app.readonly_definition_ids.contains(&placement.id) {
+                job.skipped_readonly += 1;
+                continue;
+            }
+            let dff_name = placement_dff_key(placement, &app.definitions);
+            let target = job
+                .targets_by_dff
+                .entry(dff_name)
+                .or_insert_with(|| (placement.clone(), BTreeSet::new()));
+            target.1.extend(materials);
+        }
+        app.status_message = format!(
+            "Finding world texture targets... {}/{} elements",
+            job.snapshot_index,
+            app.placements.len()
+        );
+        app.preview_world_uv_job = Some(job);
+        return;
+    }
+
+    if job.targets.is_empty() && job.source_index == 0 && job.worker_targets.is_empty() {
+        job.targets = std::mem::take(&mut job.targets_by_dff)
+            .into_iter()
+            .map(|(name, (placement, materials))| (name, placement, materials))
+            .collect();
+        if job.targets.is_empty() {
+            app.status_message = format!("No editable world DFFs use '{}'", job.texture_name);
+            return;
+        }
+    }
+
+    if job.rx.is_none() && job.result.is_none() && job.source_index < job.targets.len() {
+        let started = Instant::now();
+        let start = job.source_index;
+        while job.source_index < job.targets.len()
+            && job.source_index - start < SOURCE_BATCH_MAX
+            && (job.source_index - start < SOURCE_BATCH_MIN || started.elapsed() < SOURCE_BUDGET)
+        {
+            let index = job.source_index;
+            job.source_index += 1;
+            let (dff_name, placement, materials) = &job.targets[index];
+            let dff_key = asset_key(dff_name, ".dff");
+            if app.editing.deleted_entries.contains(&dff_key) {
+                continue;
+            }
+            job.worker_targets.push(PreviewWorldUvWorkerTarget {
+                dff_name: dff_name.clone(),
+                placement: placement.clone(),
+                materials: materials.clone(),
+                source: water_texture_source_for_app(app, dff_name),
+                write_options: dff_write_options_for_asset(app, dff_name),
+            });
+        }
+        app.status_message = format!(
+            "Preparing world texture assets... {}/{} DFFs",
+            job.source_index,
+            job.targets.len()
+        );
+        app.preview_world_uv_job = Some(job);
+        return;
+    }
+
+    if job.rx.is_none() && job.result.is_none() {
+        if job.worker_targets.is_empty() {
+            app.status_message = "No matching DFF could be prepared for UV processing".to_string();
+            return;
+        }
+        let targets = std::mem::take(&mut job.worker_targets);
+        let multiplier = job.multiplier;
+        let variation = job.variation;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| {
+                rewrite_preview_world_uv_targets(targets, multiplier, variation)
+            })
+            .map_err(|_| "world UV worker crashed".to_string())
+            .and_then(|result| result);
+            let _ = tx.send(result);
+        });
+        job.rx = Some(rx);
+        app.status_message = "World-scale UVs are processing in the background...".to_string();
+        app.preview_world_uv_job = Some(job);
+        return;
+    }
+
+    if job.result.is_none() {
+        match job
+            .rx
+            .as_ref()
+            .expect("world UV worker receiver")
+            .try_recv()
+        {
+            Ok(Ok(result)) => job.result = Some(result),
+            Ok(Err(error)) => {
+                app.status_message = format!("World-scale UV processing failed: {error}");
+                return;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                app.preview_world_uv_job = Some(job);
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                app.status_message = "World-scale UV worker disconnected".to_string();
+                return;
+            }
+        }
+    }
+
+    // The worker already produced final DFF bytes, so bulk application only
+    // updates staging maps. Recompiling every world RenderMesh here was the
+    // dominant cost and made large maps take hours. The lightweight UV-only
+    // refresh below updates every affected live mesh without re-resolving its
+    // textures, materials, bounds, normals, or topology.
+    const APPLY_MIN_PER_FRAME: usize = 32;
+    const APPLY_MAX_PER_FRAME: usize = 256;
+    const APPLY_FRAME_BUDGET: Duration = Duration::from_millis(6);
+    let apply_started = Instant::now();
+    let mut applied = 0usize;
+    let mut refreshed_dff_keys = HashSet::new();
+    while applied < APPLY_MAX_PER_FRAME
+        && (applied < APPLY_MIN_PER_FRAME || apply_started.elapsed() < APPLY_FRAME_BUDGET)
+    {
+        let Some(rewrite) = job
+            .result
+            .as_mut()
+            .expect("world UV result")
+            .rewrites
+            .pop_front()
+        else {
+            break;
+        };
+        stage_preview_world_uv_without_refresh(app, &rewrite.dff_name, rewrite.bytes);
+        refresh_live_dff_uvs_from_raw(app, &rewrite.dff_name, &rewrite.raw);
+        refreshed_dff_keys.insert(rewrite.dff_key.clone());
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+            && asset_key(&dff.name, ".dff") == rewrite.dff_key
+        {
+            dff.raw = rewrite.raw;
+            dff.dirty = false;
+            dff.normalized_warning = false;
+            dff.normalized_rewrite_confirmed = true;
+        }
+        job.staged_dffs += 1;
+        job.staged_materials += rewrite.materials;
+        job.staged_uvs += rewrite.uvs;
+        applied += 1;
+    }
+    if applied > 0 {
+        rebuild_world_cells_for_dff_keys(app, &refreshed_dff_keys);
+    }
+    if applied > 0
+        && !job
+            .result
+            .as_ref()
+            .expect("world UV result")
+            .rewrites
+            .is_empty()
+    {
+        app.status_message = format!(
+            "Staging world-scale UVs... {} DFF(s), {} UV(s) ({} this frame)",
+            job.staged_dffs, job.staged_uvs, applied
+        );
+        app.preview_world_uv_job = Some(job);
+        return;
+    }
+
+    let skipped =
+        job.skipped_readonly + job.result.as_ref().expect("world UV result").skipped_assets;
+    if job.staged_dffs == 0 {
+        app.status_message = "No matching DFF could be safely world-scale unwrapped".to_string();
+        return;
+    }
+    refresh_editing_dff_preview(app);
+    app.loaded_wip = true;
+    invalidate_validation_cache(app);
+    clear_history_for_external_change(app);
+    let scope = if job.all_dffs {
+        format!(
+            "World-scale unwrapped '{}' across {} DFF(s), {} material(s), and {} UV(s) at {}x",
+            job.texture_name,
+            job.staged_dffs,
+            job.staged_materials,
+            job.staged_uvs,
+            fmt_f32(job.multiplier, 3)
+        )
+    } else {
+        format!(
+            "World-scale unwrapped {} UV(s) on this object at {}x",
+            job.staged_uvs,
+            fmt_f32(job.multiplier, 3)
+        )
+    };
+    app.status_message = if skipped == 0 {
+        scope
+    } else {
+        format!("{scope}; skipped {skipped} read-only or unsupported target(s)")
+    };
+}
+
+/// Unrolls a connected, upright surface band (for example a cliff wall) into
+/// one continuous strip. U follows the band around Z, while V follows shortest
+/// surface distance between its upper and lower boundary loops. Using surface
+/// distance instead of Z alone keeps intermediate rows evenly spaced on sloped
+/// and irregular walls.
+fn cliff_wrap_unwrap_raw_vertices(raw: &mut RawMesh, faces: &BTreeSet<usize>) -> (usize, usize) {
+    if faces.is_empty() {
+        return (0, 0);
+    }
+
+    let mut position_nodes = BTreeMap::<[i32; 3], usize>::new();
+    let mut node_positions = Vec::<V3>::new();
+    let mut vertex_nodes = BTreeMap::<usize, usize>::new();
+    let mut selected_vertices = BTreeSet::<usize>::new();
+    for face_idx in faces {
+        let Some(indices) = raw_triangle_indices(raw, *face_idx) else {
+            continue;
+        };
+        for index in indices {
+            selected_vertices.insert(index);
+            let vertex = raw.vertices[index];
+            let node = match linked_selection_position_key(vertex) {
+                Ok(key) => *position_nodes.entry(key).or_insert_with(|| {
+                    let node = node_positions.len();
+                    node_positions.push(vertex);
+                    node
+                }),
+                Err(_) => {
+                    let node = node_positions.len();
+                    node_positions.push(vertex);
+                    node
+                }
+            };
+            vertex_nodes.insert(index, node);
+        }
+    }
+    if node_positions.len() < 3 {
+        return (0, 0);
+    }
+
+    let mut edge_counts = BTreeMap::<(usize, usize), usize>::new();
+    let mut graph = vec![BTreeMap::<usize, f32>::new(); node_positions.len()];
+    for face_idx in faces {
+        let Some(indices) = raw_triangle_indices(raw, *face_idx) else {
+            continue;
+        };
+        let Some(nodes) = indices
+            .iter()
+            .map(|index| vertex_nodes.get(index).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        for pair in [
+            (nodes[0], nodes[1]),
+            (nodes[1], nodes[2]),
+            (nodes[2], nodes[0]),
+        ] {
+            if pair.0 == pair.1 {
+                continue;
+            }
+            let edge = if pair.0 < pair.1 {
+                pair
+            } else {
+                (pair.1, pair.0)
+            };
+            *edge_counts.entry(edge).or_default() += 1;
+            let delta = uv_v3_sub(node_positions[pair.0], node_positions[pair.1]);
+            let length = uv_v3_dot(delta, delta).sqrt().max(0.00001);
+            graph[pair.0]
+                .entry(pair.1)
+                .and_modify(|old| *old = old.min(length))
+                .or_insert(length);
+            graph[pair.1]
+                .entry(pair.0)
+                .and_modify(|old| *old = old.min(length))
+                .or_insert(length);
+        }
+    }
+
+    let boundary_edges = edge_counts
+        .iter()
+        .filter_map(|(edge, count)| (*count == 1).then_some(*edge))
+        .collect::<Vec<_>>();
+    if boundary_edges.is_empty() {
+        return (0, 0);
+    }
+    let boundary_nodes = boundary_edges
+        .iter()
+        .flat_map(|(a, b)| [*a, *b])
+        .collect::<BTreeSet<_>>();
+    let mut boundary_graph = BTreeMap::<usize, BTreeSet<usize>>::new();
+    for (a, b) in boundary_edges {
+        boundary_graph.entry(a).or_default().insert(b);
+        boundary_graph.entry(b).or_default().insert(a);
+    }
+
+    let mut unseen = boundary_nodes.clone();
+    let mut boundary_components = Vec::<BTreeSet<usize>>::new();
+    while let Some(start) = unseen.iter().next().copied() {
+        let mut component = BTreeSet::new();
+        let mut stack = vec![start];
+        unseen.remove(&start);
+        while let Some(node) = stack.pop() {
+            component.insert(node);
+            for neighbor in boundary_graph.get(&node).into_iter().flatten() {
+                if unseen.remove(neighbor) {
+                    stack.push(*neighbor);
+                }
+            }
+        }
+        boundary_components.push(component);
+    }
+
+    let average_z = |component: &BTreeSet<usize>| {
+        component
+            .iter()
+            .map(|node| node_positions[*node].z)
+            .sum::<f32>()
+            / component.len().max(1) as f32
+    };
+    let (top_seeds, bottom_seeds) = if boundary_components.len() >= 2 {
+        let top = boundary_components
+            .iter()
+            .max_by(|a, b| average_z(a).total_cmp(&average_z(b)))
+            .cloned()
+            .unwrap_or_default();
+        let bottom = boundary_components
+            .iter()
+            .min_by(|a, b| average_z(a).total_cmp(&average_z(b)))
+            .cloned()
+            .unwrap_or_default();
+        (top, bottom)
+    } else {
+        let min_z = boundary_nodes
+            .iter()
+            .map(|node| node_positions[*node].z)
+            .fold(f32::INFINITY, f32::min);
+        let max_z = boundary_nodes
+            .iter()
+            .map(|node| node_positions[*node].z)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let tolerance = ((max_z - min_z) * 0.02).max(0.0001);
+        (
+            boundary_nodes
+                .iter()
+                .copied()
+                .filter(|node| node_positions[*node].z >= max_z - tolerance)
+                .collect(),
+            boundary_nodes
+                .iter()
+                .copied()
+                .filter(|node| node_positions[*node].z <= min_z + tolerance)
+                .collect(),
+        )
+    };
+    if top_seeds.is_empty()
+        || bottom_seeds.is_empty()
+        || top_seeds == bottom_seeds
+        || average_z(&top_seeds) <= average_z(&bottom_seeds) + 0.00001
+    {
+        return (0, 0);
+    }
+
+    let surface_distances = |seeds: &BTreeSet<usize>| {
+        let mut distances = vec![f32::INFINITY; graph.len()];
+        let mut visited = vec![false; graph.len()];
+        for seed in seeds {
+            distances[*seed] = 0.0;
+        }
+        for _ in 0..graph.len() {
+            let next = (0..graph.len())
+                .filter(|node| !visited[*node])
+                .min_by(|a, b| distances[*a].total_cmp(&distances[*b]));
+            let Some(node) = next else { break };
+            if !distances[node].is_finite() {
+                break;
+            }
+            visited[node] = true;
+            for (neighbor, length) in &graph[node] {
+                distances[*neighbor] = distances[*neighbor].min(distances[node] + *length);
+            }
+        }
+        distances
+    };
+    let distance_from_top = surface_distances(&top_seeds);
+    let distance_from_bottom = surface_distances(&bottom_seeds);
+    if distance_from_top
+        .iter()
+        .any(|distance| !distance.is_finite())
+        || distance_from_bottom
+            .iter()
+            .any(|distance| !distance.is_finite())
+    {
+        // A single unwrap must be one island; otherwise separate islands could
+        // silently collapse onto the default UV coordinate.
+        return (0, 0);
+    }
+
+    let center_x =
+        node_positions.iter().map(|point| point.x).sum::<f32>() / node_positions.len() as f32;
+    let center_y =
+        node_positions.iter().map(|point| point.y).sum::<f32>() / node_positions.len() as f32;
+    let mut angles = node_positions
+        .iter()
+        .enumerate()
+        .map(|(node, point)| {
+            let angle = (point.y - center_y)
+                .atan2(point.x - center_x)
+                .rem_euclid(std::f32::consts::TAU);
+            (node, angle)
+        })
+        .collect::<Vec<_>>();
+    angles.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut largest_gap = -1.0_f32;
+    let mut seam_angle = angles[0].1;
+    for index in 0..angles.len() {
+        let current = angles[index].1;
+        let next = if index + 1 < angles.len() {
+            angles[index + 1].1
+        } else {
+            angles[0].1 + std::f32::consts::TAU
+        };
+        if next - current > largest_gap {
+            largest_gap = next - current;
+            seam_angle = next.rem_euclid(std::f32::consts::TAU);
+        }
+    }
+    let u_span = (std::f32::consts::TAU - largest_gap).max(0.00001);
+    let mut node_uvs = vec![V2::default(); node_positions.len()];
+    for (node, angle) in angles {
+        let top = distance_from_top[node];
+        let bottom = distance_from_bottom[node];
+        if !top.is_finite() || !bottom.is_finite() || top + bottom <= 0.00001 {
+            continue;
+        }
+        node_uvs[node] = V2 {
+            u: ((angle - seam_angle).rem_euclid(std::f32::consts::TAU) / u_span).clamp(0.0, 1.0),
+            // RenderWare V=0 is the top of the texture.
+            v: (top / (top + bottom)).clamp(0.0, 1.0),
+        };
+    }
+
+    ensure_raw_uvs(raw);
+    for index in &selected_vertices {
+        if let (Some(node), Some(uv)) = (vertex_nodes.get(index), raw.uvs.get_mut(*index)) {
+            *uv = node_uvs[*node];
+        }
+    }
+
+    // Closed bands need one UV seam even though their geometry remains closed.
+    // Duplicate only the low-U side of triangles crossing the chosen seam.
+    let mut seam_copies = BTreeMap::<usize, usize>::new();
+    for face_idx in faces {
+        let Some(indices) = raw_triangle_indices(raw, *face_idx) else {
+            continue;
+        };
+        let us = indices.map(|index| raw.uvs[index].u);
+        if us.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - us.iter().copied().fold(f32::INFINITY, f32::min)
+            <= 0.5
+        {
+            continue;
+        }
+        let mut replacements = Vec::new();
+        for index in indices {
+            if raw.uvs[index].u < 0.5 {
+                let copy = if let Some(copy) = seam_copies.get(&index) {
+                    *copy
+                } else {
+                    let copy = raw_append_vertex_copy(raw, index);
+                    raw.uvs[copy].u += 1.0;
+                    seam_copies.insert(index, copy);
+                    copy
+                };
+                replacements.push((index, copy));
+            }
+        }
+        if let Some(triangle) = raw.triangles.get_mut(*face_idx) {
+            for (original, copy) in replacements {
+                for corner in [&mut triangle.a, &mut triangle.b, &mut triangle.c] {
+                    if *corner as usize == original {
+                        *corner = copy as u32;
+                    }
+                }
+            }
+        }
+    }
+
+    (
+        selected_vertices.len() + seam_copies.len(),
+        seam_copies.len(),
+    )
+}
+
 fn raw_triangle_indices(raw: &RawMesh, face_idx: usize) -> Option<[usize; 3]> {
     let tri = raw.triangles.get(face_idx)?;
     let indices = [tri.a as usize, tri.b as usize, tri.c as usize];
@@ -2783,6 +7365,45 @@ fn dff_selected_vertex_set(dff: &EditingDffState) -> BTreeSet<usize> {
     selected
 }
 
+fn unique_raw_vertex_positions(
+    raw: &RawMesh,
+    selected: &BTreeSet<usize>,
+    preferred: Option<usize>,
+) -> BTreeSet<usize> {
+    let mut ordered = Vec::with_capacity(selected.len());
+    if let Some(active) = preferred.filter(|index| selected.contains(index)) {
+        ordered.push(active);
+    }
+    ordered.extend(
+        selected
+            .iter()
+            .copied()
+            .filter(|index| Some(*index) != preferred),
+    );
+
+    let mut positions = BTreeSet::new();
+    let mut unique = BTreeSet::new();
+    for index in ordered {
+        let Some(vertex) = raw.vertices.get(index).copied() else {
+            continue;
+        };
+        match linked_selection_position_key(vertex) {
+            Ok(position) if positions.insert(position) => {
+                unique.insert(index);
+            }
+            Err(_) => {
+                unique.insert(index);
+            }
+            _ => {}
+        }
+    }
+    unique
+}
+
+fn dff_selected_vertex_positions(dff: &EditingDffState) -> BTreeSet<usize> {
+    unique_raw_vertex_positions(&dff.raw, &dff_selected_vertex_set(dff), dff.selected_vertex)
+}
+
 fn dff_explicit_selected_vertex_set(dff: &EditingDffState) -> BTreeSet<usize> {
     let mut selected = dff
         .selected_vertices
@@ -2843,6 +7464,55 @@ fn dff_selected_edge_set(dff: &EditingDffState) -> BTreeSet<(usize, usize)> {
         .collect()
 }
 
+fn dff_selected_vertex_boundary(raw: &RawMesh, selected: &BTreeSet<usize>) -> Option<Vec<usize>> {
+    let edges = raw
+        .triangles
+        .iter()
+        .flat_map(dff_triangle_edge_vertices)
+        .filter(|(a, b)| selected.contains(a) && selected.contains(b))
+        .collect::<BTreeSet<_>>();
+    let components = selected_edge_components(&edges)?;
+    match components.as_slice() {
+        [(polygon, true)] if polygon.len() == selected.len() => Some(polygon.clone()),
+        _ => None,
+    }
+}
+
+fn dff_edge_material(
+    raw: &RawMesh,
+    edge: (usize, usize),
+    preferred_face: Option<usize>,
+) -> Option<u16> {
+    preferred_face
+        .and_then(|face| raw.triangles.get(face))
+        .filter(|triangle| dff_triangle_edge_vertices(triangle).contains(&edge))
+        .or_else(|| {
+            raw.triangles
+                .iter()
+                .find(|triangle| dff_triangle_edge_vertices(triangle).contains(&edge))
+        })
+        .map(|triangle| triangle.material)
+}
+
+fn dff_topology_material(dff: &EditingDffState) -> u16 {
+    let selected_face = match dff.select_mode {
+        EditingSelectMode::Face => dff.selected_face,
+        EditingSelectMode::Vertex => dff.selected_face.or_else(|| {
+            dff.selected_vertex
+                .and_then(|vertex| dff_face_for_vertex(dff, vertex))
+        }),
+        // Edge clicks copy their incident face's material into selected_material.
+        EditingSelectMode::Edge => None,
+    };
+    selected_face
+        .and_then(|face| dff.raw.triangles.get(face))
+        .map(|triangle| triangle.material)
+        .unwrap_or_else(|| {
+            dff.selected_material
+                .min(dff_material_slot_count(&dff.raw).saturating_sub(1)) as u16
+        })
+}
+
 fn col_selected_edge_set(col: &EditingColState) -> BTreeSet<(usize, usize)> {
     col.selected_edges
         .iter()
@@ -2868,8 +7538,11 @@ fn bridge_edge_indices(
     let a1 = point_at(edge_a.1)?;
     let b0 = point_at(edge_b.0)?;
     let b1 = point_at(edge_b.1)?;
-    let direct = a0.distance_squared(b0) + a1.distance_squared(b1);
-    let crossed = a0.distance_squared(b1) + a1.distance_squared(b0);
+    // Compare the total connector length, not the sum of squared lengths.
+    // Squaring heavily penalizes a valid long/short pairing and can choose two
+    // medium diagonals instead, producing a bow-tie bridge in the viewport.
+    let direct = a0.distance(b0) + a1.distance(b1);
+    let crossed = a0.distance(b1) + a1.distance(b0);
     let mut indices = if direct <= crossed {
         [edge_a.0, edge_a.1, edge_b.1, edge_b.0]
     } else {
@@ -2887,7 +7560,7 @@ fn bridge_edge_indices(
     Some(indices)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum BridgeFace {
     Tri([usize; 3]),
     Quad([usize; 4]),
@@ -3085,6 +7758,186 @@ fn selected_edge_components(edges: &BTreeSet<(usize, usize)>) -> Option<Vec<(Vec
         components.push(ordered_selected_edge_component(&component_edges)?);
     }
     Some(components)
+}
+
+fn orient_polygon_toward_camera(
+    camera_pos: Vec3,
+    mut polygon: Vec<usize>,
+    point_at: impl Fn(usize) -> Option<Vec3>,
+) -> Option<Vec<usize>> {
+    if polygon.len() < 3 {
+        return None;
+    }
+    let points = polygon
+        .iter()
+        .map(|index| point_at(*index))
+        .collect::<Option<Vec<_>>>()?;
+    let centroid = points.iter().copied().sum::<Vec3>() / points.len() as f32;
+    let mut normal = Vec3::ZERO;
+    for index in 0..points.len() {
+        let current = points[index];
+        let next = points[(index + 1) % points.len()];
+        normal.x += (current.y - next.y) * (current.z + next.z);
+        normal.y += (current.z - next.z) * (current.x + next.x);
+        normal.z += (current.x - next.x) * (current.y + next.y);
+    }
+    if normal.length_squared() <= 0.00000001 {
+        return None;
+    }
+    if normal.dot(camera_pos - centroid) > 0.0 {
+        polygon[1..].reverse();
+    }
+    Some(polygon)
+}
+
+/// Triangulate a simple, approximately planar polygon. Ear clipping keeps a
+/// concave hole inside its actual boundary instead of fanning across notches.
+fn triangulate_dff_polygon(
+    polygon: &[usize],
+    point_at: impl Fn(usize) -> Option<Vec3>,
+) -> Option<Vec<[usize; 3]>> {
+    if polygon.len() < 3 {
+        return None;
+    }
+    let points = polygon
+        .iter()
+        .map(|index| point_at(*index))
+        .collect::<Option<Vec<_>>>()?;
+    let mut normal = Vec3::ZERO;
+    for index in 0..points.len() {
+        let current = points[index];
+        let next = points[(index + 1) % points.len()];
+        normal.x += (current.y - next.y) * (current.z + next.z);
+        normal.y += (current.z - next.z) * (current.x + next.x);
+        normal.z += (current.x - next.x) * (current.y + next.y);
+    }
+    let axis = {
+        let absolute = normal.abs();
+        if absolute.x >= absolute.y && absolute.x >= absolute.z {
+            0
+        } else if absolute.y >= absolute.z {
+            1
+        } else {
+            2
+        }
+    };
+    let project = |point: Vec3| match axis {
+        0 => Vec2::new(point.y, point.z),
+        1 => Vec2::new(point.x, point.z),
+        _ => Vec2::new(point.x, point.y),
+    };
+    let projected = points.iter().copied().map(project).collect::<Vec<_>>();
+    let signed_area = (0..projected.len())
+        .map(|index| {
+            let a = projected[index];
+            let b = projected[(index + 1) % projected.len()];
+            a.x * b.y - b.x * a.y
+        })
+        .sum::<f32>();
+    if signed_area.abs() <= 0.00000001 {
+        return None;
+    }
+    let winding = signed_area.signum();
+    let cross = |a: Vec2, b: Vec2, c: Vec2| (b - a).perp_dot(c - a);
+    let contains = |point: Vec2, a: Vec2, b: Vec2, c: Vec2| {
+        let ab = cross(a, b, point) * winding;
+        let bc = cross(b, c, point) * winding;
+        let ca = cross(c, a, point) * winding;
+        ab >= -0.000001 && bc >= -0.000001 && ca >= -0.000001
+    };
+    let mut remaining = (0..polygon.len()).collect::<Vec<_>>();
+    let mut triangles = Vec::with_capacity(polygon.len() - 2);
+    while remaining.len() > 3 {
+        let mut ear = None;
+        for slot in 0..remaining.len() {
+            let previous = remaining[(slot + remaining.len() - 1) % remaining.len()];
+            let current = remaining[slot];
+            let next = remaining[(slot + 1) % remaining.len()];
+            if cross(projected[previous], projected[current], projected[next]) * winding <= 0.000001
+            {
+                continue;
+            }
+            if remaining.iter().copied().any(|candidate| {
+                candidate != previous
+                    && candidate != current
+                    && candidate != next
+                    && contains(
+                        projected[candidate],
+                        projected[previous],
+                        projected[current],
+                        projected[next],
+                    )
+            }) {
+                continue;
+            }
+            ear = Some((slot, [polygon[previous], polygon[current], polygon[next]]));
+            break;
+        }
+        let (slot, triangle) = ear?;
+        triangles.push(triangle);
+        remaining.remove(slot);
+    }
+    triangles.push([
+        polygon[remaining[0]],
+        polygon[remaining[1]],
+        polygon[remaining[2]],
+    ]);
+    Some(triangles)
+}
+
+fn append_dff_polygon_fill(
+    raw: &mut RawMesh,
+    polygon: &[usize],
+    material: u16,
+) -> Option<(usize, usize)> {
+    let triangles = triangulate_dff_polygon(polygon, |index| {
+        raw.vertices.get(index).map(|point| to_mq(*point))
+    })?;
+    ensure_raw_uvs(raw);
+    let first = raw.triangles.len();
+    let referenced_before = raw.triangles[..first]
+        .iter()
+        .flat_map(|triangle| {
+            [
+                triangle.a as usize,
+                triangle.b as usize,
+                triangle.c as usize,
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    // RenderWare stores UVs on geometry vertices. Reusing an existing vertex
+    // would also reuse whatever unrelated UV it had on the old face, which is
+    // the usual cause of a newly made face becoming a stretched smear. Give
+    // every reused polygon corner an independent record before projection so
+    // the new face can have one coherent mapping without touching its
+    // surroundings.
+    let remap = polygon
+        .iter()
+        .copied()
+        .filter(|index| referenced_before.contains(index))
+        .map(|old| (old, raw_append_vertex_copy(raw, old)))
+        .collect::<BTreeMap<_, _>>();
+    let uv_polygon = polygon
+        .iter()
+        .map(|index| remap.get(index).copied().unwrap_or(*index))
+        .collect::<Vec<_>>();
+    for [a, b, c] in triangles {
+        raw.triangles.push(Tri {
+            a: remap.get(&a).copied().unwrap_or(a) as u32,
+            b: remap.get(&b).copied().unwrap_or(b) as u32,
+            c: remap.get(&c).copied().unwrap_or(c) as u32,
+            material,
+        });
+    }
+    if contextualize_created_face_uvs(raw, &uv_polygon, first, material) == 0 {
+        let created_faces = (first..raw.triangles.len()).collect::<BTreeSet<_>>();
+        face_aligned_unwrap_raw_vertices(
+            raw,
+            &uv_polygon.iter().copied().collect(),
+            &created_faces,
+        );
+    }
+    Some((first, raw.triangles.len() - first))
 }
 
 fn align_bridge_loop(
@@ -3315,30 +8168,109 @@ fn dff_boolean_box_for_raw(raw: &RawMesh) -> DffBooleanBox {
     }
 }
 
-fn dff_boolean_contains(cutter: DffBooleanBox, p: V3) -> bool {
-    (p.x - cutter.center.x).abs() <= cutter.half_extents.x
-        && (p.y - cutter.center.y).abs() <= cutter.half_extents.y
-        && (p.z - cutter.center.z).abs() <= cutter.half_extents.z
+/// Split a polygon against one of the six half-spaces defining the cutter.
+/// Negative distances are inside the box. The same interpolated vertex is
+/// shared by both halves so the resulting cut has a clean, editable boundary.
+fn dff_split_polygon_at_cutter_plane(
+    raw: &mut RawMesh,
+    polygon: &[usize],
+    axis: usize,
+    sign: f32,
+    limit: f32,
+) -> (Vec<usize>, Vec<usize>) {
+    let distance = |point: V3| match axis {
+        0 => sign * point.x - limit,
+        1 => sign * point.y - limit,
+        _ => sign * point.z - limit,
+    };
+    let mut inside = Vec::new();
+    let mut outside = Vec::new();
+    for edge in 0..polygon.len() {
+        let a = polygon[edge];
+        let b = polygon[(edge + 1) % polygon.len()];
+        let da = distance(raw.vertices[a]);
+        let db = distance(raw.vertices[b]);
+        let a_inside = da <= 1.0e-5;
+        if a_inside {
+            inside.push(a);
+        } else {
+            outside.push(a);
+        }
+        if a_inside != (db <= 1.0e-5) {
+            let t = (da / (da - db)).clamp(0.0, 1.0);
+            let cut = raw_append_vertex_lerp(raw, a, b, t);
+            inside.push(cut);
+            outside.push(cut);
+        }
+    }
+    (inside, outside)
 }
 
+fn dff_triangulate_polygon(output: &mut Vec<Tri>, polygon: &[usize], material: u16) {
+    for index in 1..polygon.len().saturating_sub(1) {
+        output.push(Tri {
+            a: polygon[0] as u32,
+            b: polygon[index] as u32,
+            c: polygon[index + 1] as u32,
+            material,
+        });
+    }
+}
+
+/// Subtract an axis-aligned box from the mesh. Intersected triangles are
+/// clipped at all six box planes; only the portion inside the cutter is
+/// discarded. The return value is the number of source faces that changed.
 pub(crate) fn apply_dff_boolean_box(raw: &mut RawMesh, cutter: DffBooleanBox) -> usize {
-    let before = raw.triangles.len();
-    raw.triangles.retain(|tri| {
-        let indices = [tri.a as usize, tri.b as usize, tri.c as usize];
-        if indices.iter().any(|idx| *idx >= raw.vertices.len()) {
-            return true;
+    let source = raw.triangles.clone();
+    let planes = [
+        (0, 1.0, cutter.center.x + cutter.half_extents.x),
+        (0, -1.0, -cutter.center.x + cutter.half_extents.x),
+        (1, 1.0, cutter.center.y + cutter.half_extents.y),
+        (1, -1.0, -cutter.center.y + cutter.half_extents.y),
+        (2, 1.0, cutter.center.z + cutter.half_extents.z),
+        (2, -1.0, -cutter.center.z + cutter.half_extents.z),
+    ];
+    let mut output = Vec::with_capacity(source.len());
+    let mut changed = 0usize;
+    for tri in source {
+        let original = [tri.a as usize, tri.b as usize, tri.c as usize];
+        if original.iter().any(|index| *index >= raw.vertices.len()) {
+            output.push(tri);
+            continue;
         }
-        let a = raw.vertices[indices[0]];
-        let b = raw.vertices[indices[1]];
-        let c = raw.vertices[indices[2]];
-        let centroid = V3 {
-            x: (a.x + b.x + c.x) / 3.0,
-            y: (a.y + b.y + c.y) / 3.0,
-            z: (a.z + b.z + c.z) / 3.0,
-        };
-        !dff_boolean_contains(cutter, centroid)
-    });
-    before.saturating_sub(raw.triangles.len())
+        let mut candidates = vec![original.to_vec()];
+        let mut retained = Vec::<Vec<usize>>::new();
+        for (axis, sign, limit) in planes {
+            let mut next = Vec::new();
+            for polygon in candidates {
+                let (inside, outside) =
+                    dff_split_polygon_at_cutter_plane(raw, &polygon, axis, sign, limit);
+                if outside.len() >= 3 {
+                    retained.push(outside);
+                }
+                if inside.len() >= 3 {
+                    next.push(inside);
+                }
+            }
+            candidates = next;
+            if candidates.is_empty() {
+                break;
+            }
+        }
+        // Polygons still in `candidates` lie inside every cutter plane and are
+        // intentionally discarded. A lone retained original triangle means
+        // this face never intersected the cutter.
+        let unchanged =
+            candidates.is_empty() && retained.len() == 1 && retained[0].as_slice() == original;
+        if !unchanged {
+            changed += 1;
+        }
+        for polygon in retained {
+            dff_triangulate_polygon(&mut output, &polygon, tri.material);
+        }
+    }
+    raw.triangles = output;
+    changed
 }
 
 pub(crate) fn compact_raw_vertices(raw: &mut RawMesh) {
@@ -3895,9 +8827,22 @@ pub(crate) fn editing_delete_selected_material(app: &mut AppState) {
 }
 
 pub(crate) fn editing_delete_selected_dff_face(app: &mut AppState) {
+    if apply_dff_void_operation_to_multi_selection(
+        app,
+        "Deleted faces",
+        editing_delete_selected_dff_face,
+    ) {
+        return;
+    }
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return;
     };
+    if dff.raw.components.len() > 1 {
+        app.status_message =
+            "Face deletion is disabled for multi-geometry DFFs; separate the target geometry first"
+                .to_string();
+        return;
+    }
     let selected = dff_selected_face_set(dff);
     if selected.is_empty() {
         app.status_message = "Pick a DFF face first".to_string();
@@ -3924,9 +8869,20 @@ pub(crate) fn editing_delete_selected_dff_face(app: &mut AppState) {
 }
 
 pub(crate) fn editing_delete_selected_dff_vertex(app: &mut AppState) {
+    if apply_dff_void_operation_to_multi_selection(
+        app,
+        "Deleted vertices",
+        editing_delete_selected_dff_vertex,
+    ) {
+        return;
+    }
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return;
     };
+    if dff.raw.components.len() > 1 {
+        app.status_message = "Vertex deletion is disabled for multi-geometry DFFs; separate the target geometry first".to_string();
+        return;
+    }
     let selected = dff_selected_vertex_set(dff);
     if selected.is_empty() {
         app.status_message = "Pick a DFF vertex first".to_string();
@@ -3950,9 +8906,22 @@ pub(crate) fn editing_delete_selected_dff_vertex(app: &mut AppState) {
 }
 
 pub(crate) fn editing_delete_selected_dff_edge(app: &mut AppState) {
+    if apply_dff_void_operation_to_multi_selection(
+        app,
+        "Deleted edges",
+        editing_delete_selected_dff_edge,
+    ) {
+        return;
+    }
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return;
     };
+    if dff.raw.components.len() > 1 {
+        app.status_message =
+            "Edge deletion is disabled for multi-geometry DFFs; separate the target geometry first"
+                .to_string();
+        return;
+    }
     let selected = dff_selected_edge_set(dff);
     if selected.is_empty() {
         app.status_message = "Select DFF edge(s) first".to_string();
@@ -4003,6 +8972,52 @@ pub(crate) fn selected_editing_dff_vertex_position(app: &AppState) -> Option<Vec
     (count > 0.0).then_some(sum / count)
 }
 
+pub(crate) fn selected_editing_dff_vertices(app: &AppState) -> Vec<(usize, V3)> {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        return Vec::new();
+    };
+    dff_selected_vertex_set(dff)
+        .into_iter()
+        .filter_map(|index| {
+            dff.raw
+                .vertices
+                .get(index)
+                .copied()
+                .map(|vertex| (index, vertex))
+        })
+        .collect()
+}
+
+pub(crate) fn scale_selected_editing_dff_vertices_from(
+    app: &mut AppState,
+    start_vertices: &[(usize, V3)],
+    pivot: V3,
+    factors: Vec3,
+) -> Result<usize, String> {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return Err("Open a DFF in Editing first".to_string());
+    };
+    if start_vertices.is_empty() {
+        return Err("Select DFF vertices, edges, or faces first".to_string());
+    }
+    let mut scaled = 0usize;
+    for (index, start) in start_vertices {
+        if let Some(vertex) = dff.raw.vertices.get_mut(*index) {
+            vertex.x = pivot.x + (start.x - pivot.x) * factors.x;
+            vertex.y = pivot.y + (start.y - pivot.y) * factors.y;
+            vertex.z = pivot.z + (start.z - pivot.z) * factors.z;
+            scaled += 1;
+        }
+    }
+    if scaled == 0 {
+        return Err("Selected DFF vertices no longer exist".to_string());
+    }
+    recalc_raw_normals(&mut dff.raw);
+    dff.dirty = true;
+    refresh_editing_dff_preview(app);
+    Ok(scaled)
+}
+
 pub(crate) fn selected_editing_dff_boolean_box_position(app: &AppState) -> Option<Vec3> {
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
         return None;
@@ -4021,10 +9036,144 @@ pub(crate) fn selected_editing_dff_2dfx_position(app: &AppState) -> Option<Vec3>
         .map(|effect| to_mq(effect.position))
 }
 
+fn dff_2dfx_effect_rotation(effect: &Dff2dEffect) -> Option<V3> {
+    match effect.effect_id {
+        // SA roadsigns store Euler degrees at payload offsets 8, 12, and 16.
+        7 if effect.payload.len() >= 20 => Some(V3 {
+            x: f32::from_le_bytes(read_payload(&effect.payload, 8)),
+            y: f32::from_le_bytes(read_payload(&effect.payload, 12)),
+            z: f32::from_le_bytes(read_payload(&effect.payload, 16)),
+        }),
+        _ => None,
+    }
+}
+
+pub(crate) fn dff_2dfx_rotation_matrix(rotation: V3) -> Mat4 {
+    // GTA:SA applies roadsign rotations in Y, X, Z order.
+    Mat4::from_rotation_z(rotation.z.to_radians())
+        * Mat4::from_rotation_x(rotation.x.to_radians())
+        * Mat4::from_rotation_y(rotation.y.to_radians())
+}
+
+pub(crate) fn selected_editing_dff_2dfx_rotation(app: &AppState) -> Option<V3> {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        return None;
+    };
+    let effect = dff.raw.effects_2dfx.get(dff.selected_2dfx?)?;
+    dff_2dfx_effect_rotation(effect)
+}
+
+fn set_dff_2dfx_effect_rotation(effect: &mut Dff2dEffect, rotation: V3) -> bool {
+    if effect.effect_id != 7 {
+        return false;
+    }
+    effect.payload.resize(effect.payload.len().max(88), 0);
+    for (offset, value) in [(8, rotation.x), (12, rotation.y), (16, rotation.z)] {
+        effect.payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    true
+}
+
+pub(crate) fn set_selected_editing_dff_2dfx_rotation(
+    app: &mut AppState,
+    rotation: V3,
+) -> Result<(), String> {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return Err("Open a DFF in Editing first".to_string());
+    };
+    let Some(idx) = dff.selected_2dfx else {
+        return Err("Select a DFF 2DFX entry first".to_string());
+    };
+    let Some(effect) = dff.raw.effects_2dfx.get_mut(idx) else {
+        return Err("Selected DFF 2DFX entry no longer exists".to_string());
+    };
+    if !set_dff_2dfx_effect_rotation(effect, rotation) {
+        return Err(format!(
+            "{} 2DFX effects do not expose an Euler rotation",
+            dff_2dfx_label(effect.effect_id)
+        ));
+    }
+    dff.dirty = true;
+    app.status_message = format!("Rotated DFF road sign {}", idx + 1);
+    Ok(())
+}
+
 pub(crate) fn set_selected_editing_dff_vertex_position(
     app: &mut AppState,
     position: V3,
 ) -> Result<(), String> {
+    let multi_move = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff))
+            if dff.multi_select && editing_multi_selected_model_indices(dff).len() > 1
+    );
+    if multi_move {
+        let moved = {
+            let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+                return Err("Open a DFF in Editing first".to_string());
+            };
+            sync_active_open_dff_model(dff);
+            let active = dff.active_open_model;
+            let active_vertices = dff_selected_vertex_set(dff);
+            let mut center = Vec3::ZERO;
+            let mut center_count = 0.0f32;
+            for index in &active_vertices {
+                if let Some(vertex) = dff.raw.vertices.get(*index) {
+                    center += to_mq(*vertex);
+                    center_count += 1.0;
+                }
+            }
+            if center_count <= 0.0 {
+                return Err("Selected DFF vertex no longer exists".to_string());
+            }
+            let delta = to_mq(position) - center / center_count;
+            let select_mode = dff.select_mode;
+            let mut moved = 0usize;
+            for model in &mut dff.open_models {
+                let mut selected = model.selected_vertices.clone();
+                selected.extend(model.selected_vertex);
+                if selected.is_empty() && select_mode == EditingSelectMode::Face {
+                    let mut faces = model.selected_faces.clone();
+                    faces.extend(model.selected_face);
+                    for face in faces {
+                        if let Some(triangle) = model.raw.triangles.get(face) {
+                            selected.extend([
+                                triangle.a as usize,
+                                triangle.b as usize,
+                                triangle.c as usize,
+                            ]);
+                        }
+                    }
+                }
+                if selected.is_empty() && select_mode == EditingSelectMode::Edge {
+                    for (a, b) in &model.selected_edges {
+                        selected.extend([*a, *b]);
+                    }
+                }
+                let mut model_moved = false;
+                for index in selected {
+                    if let Some(vertex) = model.raw.vertices.get_mut(index) {
+                        *vertex = from_mq(to_mq(*vertex) + delta);
+                        moved += 1;
+                        model_moved = true;
+                    }
+                }
+                if model_moved {
+                    recalc_raw_normals(&mut model.raw);
+                    model.preview_mesh = None;
+                    model.dirty = true;
+                }
+            }
+            if let Some(active_model) = dff.open_models.get(active) {
+                dff.raw = active_model.raw.clone();
+                dff.dirty = active_model.dirty;
+            }
+            moved
+        };
+        refresh_editing_dff_preview(app);
+        app.status_message = format!("Moved {moved} DFF vertices across selected models");
+        return Ok(());
+    }
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return Err("Open a DFF in Editing first".to_string());
     };
@@ -4081,6 +9230,10 @@ pub(crate) fn open_dff_merge_choice_dialog(app: &mut AppState) -> bool {
 pub(crate) fn editing_merge_selected_vertices(app: &mut AppState, target: DffMergeTarget) -> bool {
     match app.editing.asset.as_mut() {
         Some(EditingAsset::Dff(dff)) => {
+            if dff.raw.components.len() > 1 {
+                app.status_message = "Vertex merging is disabled for multi-geometry DFFs; separate the target geometry first".to_string();
+                return false;
+            }
             let selected = dff_selected_vertex_set(dff);
             if selected.len() < 2 {
                 app.status_message = "Select at least two DFF vertices to merge".to_string();
@@ -4194,29 +9347,34 @@ pub(crate) fn editing_merge_vertices_by_distance(app: &mut AppState, distance: f
     let mut status = None;
     let changed = match app.editing.asset.as_mut() {
         Some(EditingAsset::Dff(dff)) => {
-            let before_vertices = dff.raw.vertices.len();
-            let before_faces = dff.raw.triangles.len();
-            let merged = merge_raw_vertices_by_distance(&mut dff.raw, distance);
-            if merged == 0 {
-                status = Some(format!(
-                    "No DFF vertices within merge distance {:.6}",
-                    distance
-                ));
+            if dff.raw.components.len() > 1 {
+                status = Some("Merge by distance is disabled for multi-geometry DFFs; separate the target geometry first".to_string());
                 false
             } else {
-                compact_raw_vertices(&mut dff.raw);
-                let after_vertices = dff.raw.vertices.len();
-                let after_faces = dff.raw.triangles.len();
-                dff.selected_face = None;
-                dff.selected_vertex = None;
-                dff.selected_vertices.clear();
-                dff.dirty = true;
-                refresh_dff = true;
-                status = Some(format!(
-                    "Merged {merged} DFF vertex(es) by distance {:.6}; vertices {} -> {}, faces {} -> {}",
-                    distance, before_vertices, after_vertices, before_faces, after_faces
-                ));
-                true
+                let before_vertices = dff.raw.vertices.len();
+                let before_faces = dff.raw.triangles.len();
+                let merged = merge_raw_vertices_by_distance(&mut dff.raw, distance);
+                if merged == 0 {
+                    status = Some(format!(
+                        "No DFF vertices within merge distance {:.6}",
+                        distance
+                    ));
+                    false
+                } else {
+                    compact_raw_vertices(&mut dff.raw);
+                    let after_vertices = dff.raw.vertices.len();
+                    let after_faces = dff.raw.triangles.len();
+                    dff.selected_face = None;
+                    dff.selected_vertex = None;
+                    dff.selected_vertices.clear();
+                    dff.dirty = true;
+                    refresh_dff = true;
+                    status = Some(format!(
+                        "Merged {merged} DFF vertex(es) by distance {:.6}; vertices {} -> {}, faces {} -> {}",
+                        distance, before_vertices, after_vertices, before_faces, after_faces
+                    ));
+                    true
+                }
             }
         }
         Some(EditingAsset::Col(col)) => {
@@ -4276,18 +9434,41 @@ pub(crate) fn editing_dff_picker_texture_names(app: &AppState) -> Vec<String> {
     let Some(txd_name) = dff.txd_context.as_ref() else {
         return Vec::new();
     };
-    let txd_key = asset_key(txd_name, ".txd");
-    let mut names = Vec::new();
-    for (name, textures) in &app.txd_textures {
-        if textures
-            .iter()
-            .any(|texture| texture.txd_name.eq_ignore_ascii_case(&txd_key))
-        {
-            names.push(name.clone());
-        }
-    }
-    names.sort();
-    names
+    let query = lower(dff.texture_picker_search.trim());
+    dff.texture_picker_entries
+        .iter()
+        .filter(|entry| {
+            (query.is_empty() || lower(&entry.name).contains(&query))
+                && texture_matches_category(
+                    &app.material_classes,
+                    txd_name,
+                    &entry.name,
+                    &dff.texture_picker_category,
+                )
+        })
+        .map(|entry| entry.name.clone())
+        .collect()
+}
+
+fn populate_dff_texture_picker(app: &mut AppState, edits_material: bool) -> bool {
+    let Some(txd_name) = app.editing.asset.as_ref().and_then(|asset| match asset {
+        EditingAsset::Dff(dff) => dff.txd_context.clone(),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let entries = txd_texture_entries(app, &txd_name);
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    dff.texture_picker_edits_material = edits_material;
+    dff.texture_picker_open = true;
+    dff.texture_picker_scroll = 0.0;
+    dff.texture_picker_search.clear();
+    dff.texture_picker_category.clear();
+    dff.texture_picker_entries = entries;
+    drain_text_input();
+    true
 }
 
 pub(crate) fn default_dff_material() -> RawMaterial {
@@ -4365,6 +9546,13 @@ pub(crate) fn dff_material_slot_count(raw: &RawMesh) -> usize {
 }
 
 pub(crate) fn ensure_dff_material_slots(raw: &mut RawMesh, count: usize) {
+    // This helper is used before topology operations that target the selected
+    // material. `count` is therefore a minimum, not a requested new length:
+    // shrinking here would discard every material after the selection.
+    let count = count
+        .max(raw.material_textures.len())
+        .max(raw.materials.len())
+        .max(raw.material_animations.len());
     raw.material_textures.resize(count, String::new());
     raw.materials.resize(count, default_dff_material());
     raw.material_animations
@@ -4614,6 +9802,7 @@ pub(crate) fn apply_dff_optimize(app: &mut AppState, options: DffOptimizeOptions
         dff.hovered_vertex = None;
         let slots = dff_material_slot_count(&dff.raw);
         dff.selected_material = dff.selected_material.min(slots.saturating_sub(1));
+        sync_dff_uv_editor_material(dff);
     }
     commit_editing_history(app, "Optimize DFF", before);
     refresh_editing_dff_preview(app);
@@ -4662,6 +9851,7 @@ fn editing_set_dff_material_texture(
     match set_dff_material_texture(&mut dff.raw, material, texture_name) {
         Ok(true) => {
             dff.selected_material = material;
+            sync_dff_uv_editor_material(dff);
             dff.texture_picker_open = false;
             dff.dirty = true;
             app.status_message = format!(
@@ -4834,6 +10024,7 @@ pub(crate) fn editing_remove_unused_dff_materials(app: &mut AppState) -> bool {
         })
         .unwrap_or(0);
     dff.material_scroll = dff.selected_material as f32;
+    sync_dff_uv_editor_material(dff);
     dff.dirty = true;
     remap_dff_material_sidecar_keys(&mut app.material_emitters, &dff_name, &remap.old_to_new);
     remap_dff_material_sidecar_keys(&mut app.shadow_casting, &dff_name, &remap.old_to_new);
@@ -4877,6 +10068,7 @@ pub(crate) fn editing_create_material_for_selected_faces(app: &mut AppState) -> 
     assign_dff_faces_to_material(&mut dff.raw, &faces, new_material);
     dff.selected_material = new_material;
     dff.material_scroll = new_material as f32;
+    sync_dff_uv_editor_material(dff);
     dff.dirty = true;
     dff.texture_picker_open = false;
     app.status_message = format!(
@@ -4952,6 +10144,7 @@ pub(crate) fn reassign_selected_dff_faces_texture(app: &mut AppState, texture_na
     assign_dff_faces_to_material(&mut dff.raw, &faces, material_index);
     dff.selected_material = material_index;
     dff.material_scroll = material_index as f32;
+    sync_dff_uv_editor_material(dff);
     dff.dirty = true;
     dff.texture_picker_open = false;
     app.status_message = format!(
@@ -5015,6 +10208,62 @@ fn selected_material_emitter_keys(app: &AppState) -> Option<(String, Option<Stri
     Some((local, global))
 }
 
+pub(crate) fn dff_material_emitter(
+    app: &AppState,
+    dff_name: &str,
+    material: usize,
+) -> MaterialEmitter {
+    let local = material_emitter_key(dff_name, material);
+    if let Some(emitter) = app.material_emitters.get(&local) {
+        return *emitter;
+    }
+    let texture = match app.editing.asset.as_ref() {
+        Some(EditingAsset::Dff(dff)) if dff.name.eq_ignore_ascii_case(dff_name) => {
+            dff.raw.material_textures.get(material).map(String::as_str)
+        }
+        _ => None,
+    };
+    texture
+        .map(str::trim)
+        .filter(|texture| !texture.is_empty())
+        .and_then(|texture| {
+            app.material_emitters
+                .get(&material_emitter_texture_key(texture))
+        })
+        .copied()
+        .unwrap_or_default()
+}
+
+pub(crate) fn editing_toggle_dff_material_emitter(
+    app: &mut AppState,
+    dff_name: &str,
+    material: usize,
+) -> bool {
+    let valid = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff))
+            if dff.name.eq_ignore_ascii_case(dff_name)
+                && material < dff_material_slot_count(&dff.raw)
+    );
+    if !valid {
+        app.status_message = "The selected DFF material is no longer available".to_string();
+        return false;
+    }
+    let mut emitter = dff_material_emitter(app, dff_name, material);
+    emitter.enabled = !emitter.enabled;
+    app.material_emitters
+        .insert(material_emitter_key(dff_name, material), emitter);
+    persist_material_emitter_edit(
+        app,
+        if emitter.enabled {
+            "Material marked as a light source emitter"
+        } else {
+            "Material light source emitter disabled"
+        },
+    );
+    true
+}
+
 fn dff_face_casts_shadow_from_parts(
     overrides: &HashMap<String, bool>,
     dff_name: &str,
@@ -5058,7 +10307,7 @@ fn selected_shadow_casting(app: &AppState) -> bool {
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
         return true;
     };
-    if selected_dff_faces_are_emitter_target(dff) {
+    if dff_has_selected_faces(dff) {
         let faces = dff_selected_face_set(dff);
         return faces
             .iter()
@@ -5088,7 +10337,7 @@ fn selected_shadow_casting_is_global(app: &AppState) -> bool {
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
         return false;
     };
-    if selected_dff_faces_are_emitter_target(dff) {
+    if dff_has_selected_faces(dff) {
         return false;
     }
     let local = material_emitter_key(&dff.name, dff.selected_material);
@@ -5109,7 +10358,7 @@ fn persist_shadow_casting_edit(app: &mut AppState, message: &str) {
 fn toggle_selected_shadow_casting(app: &mut AppState) {
     let casts_shadow = !selected_shadow_casting(app);
     let face_target = match app.editing.asset.as_ref() {
-        Some(EditingAsset::Dff(dff)) if selected_dff_faces_are_emitter_target(dff) => Some((
+        Some(EditingAsset::Dff(dff)) if dff_has_selected_faces(dff) => Some((
             dff.name.clone(),
             dff_selected_face_set(dff).into_iter().collect::<Vec<_>>(),
         )),
@@ -5182,8 +10431,12 @@ fn toggle_selected_shadow_casting_scope(app: &mut AppState) {
     );
 }
 
-fn selected_dff_faces_are_emitter_target(dff: &EditingDffState) -> bool {
+fn dff_has_selected_faces(dff: &EditingDffState) -> bool {
     dff.select_mode == EditingSelectMode::Face && !dff_selected_face_set(dff).is_empty()
+}
+
+fn selected_dff_faces_are_emitter_target(dff: &EditingDffState) -> bool {
+    dff.emitter_targets_faces && dff_has_selected_faces(dff)
 }
 
 fn dff_face_emitter_entries(
@@ -5208,6 +10461,47 @@ fn dff_face_emitter_entries(
 
 pub(crate) fn dff_face_emitter_entry_count(app: &AppState, dff_name: &str) -> usize {
     dff_face_emitter_entries(app, dff_name).len()
+}
+
+pub(crate) fn editing_clear_dff_face_lighting(
+    app: &mut AppState,
+    dff_name: &str,
+    emitter_key: &str,
+) -> bool {
+    let dff_key = asset_key(dff_name, ".dff");
+    let entry_faces = material_emitter_face_group_from_key(emitter_key)
+        .filter(|(entry_dff, _)| *entry_dff == dff_key)
+        .map(|(_, faces)| faces)
+        .or_else(|| {
+            material_emitter_face_from_key(emitter_key)
+                .filter(|(entry_dff, _)| *entry_dff == dff_key)
+                .map(|(_, face)| vec![face])
+        });
+    let valid_asset = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.name.eq_ignore_ascii_case(dff_name)
+    );
+    let Some(faces) = entry_faces.filter(|_| valid_asset) else {
+        app.status_message = "The selected face lighting is no longer available".to_string();
+        return false;
+    };
+    if !app.material_emitters.contains_key(emitter_key) {
+        app.status_message = "The selected face lighting is no longer available".to_string();
+        return false;
+    }
+
+    let before = editing_history_snapshot_with_material_sidecars(app);
+    app.material_emitters.remove(emitter_key);
+    commit_editing_history(app, "Clear Face Lighting", before);
+    persist_material_emitter_edit(
+        app,
+        &format!(
+            "Cleared face lighting values from {} face{}",
+            faces.len(),
+            if faces.len() == 1 { "" } else { "s" }
+        ),
+    );
+    true
 }
 
 fn selected_face_emitter_keys(app: &AppState) -> Option<Vec<String>> {
@@ -5417,7 +10711,10 @@ fn default_dff_uv_animation(name: &str) -> DffUvAnimation {
             },
             DffUvAnimFrame {
                 time: 1.0,
-                uv: [0.0, 1.0, 1.0, 0.0, -0.25, 0.0],
+                // Move by one complete wrapped texture tile. The animation
+                // restarts at time zero, so a fractional offset visibly snaps
+                // backward while a whole-tile offset loops seamlessly.
+                uv: [0.0, 1.0, 1.0, 0.0, -1.0, 0.0],
                 prev: 0,
             },
         ],
@@ -5446,6 +10743,103 @@ fn selected_dff_uv_animation_name(dff: &EditingDffState) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn selected_dff_uv_animation(dff: &EditingDffState) -> Option<&DffUvAnimation> {
+    let name = selected_dff_uv_animation_name(dff)?;
+    dff.raw
+        .uv_animations
+        .iter()
+        .find(|animation| animation.name.eq_ignore_ascii_case(&name))
+}
+
+fn dff_uv_animation_is_continuous(animation: &DffUvAnimation) -> bool {
+    let (Some(first), Some(last)) = (animation.frames.first(), animation.frames.last()) else {
+        return false;
+    };
+    [4, 5].into_iter().all(|component| {
+        let motion = last.uv[component] - first.uv[component];
+        (motion - motion.round()).abs() < 0.0001
+    })
+}
+
+pub(crate) fn toggle_selected_material_uv_animation_continuous(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let Some(name) = selected_dff_uv_animation_name(dff) else {
+        app.status_message = "Assign a UV animation first".to_string();
+        return false;
+    };
+    let idx = ensure_dff_uv_animation(&mut dff.raw, &name);
+    if dff.raw.uv_animations[idx].frames.len() < 2 {
+        dff.raw.uv_animations[idx] = default_dff_uv_animation(&name);
+    }
+    let animation = &mut dff.raw.uv_animations[idx];
+    let continuous = dff_uv_animation_is_continuous(animation);
+    let first = animation.frames.first().copied().unwrap();
+    let last = animation.frames.last_mut().unwrap();
+    for component in [4, 5] {
+        let motion = last.uv[component] - first.uv[component];
+        last.uv[component] = if continuous {
+            first.uv[component]
+                + if motion.abs() < 0.0001 {
+                    0.0
+                } else {
+                    motion.signum() * 0.25
+                }
+        } else {
+            let whole_tiles = if motion.abs() < 0.0001 {
+                0.0
+            } else {
+                motion.signum() * motion.abs().round().max(1.0)
+            };
+            first.uv[component] + whole_tiles
+        };
+    }
+    if continuous
+        && (last.uv[4] - first.uv[4]).abs() < 0.0001
+        && (last.uv[5] - first.uv[5]).abs() < 0.0001
+    {
+        last.uv[4] = first.uv[4] - 0.25;
+    }
+    dff.dirty = true;
+    app.status_message = if continuous {
+        format!(
+            "UV animation '{}' seamless looping disabled",
+            animation.name
+        )
+    } else {
+        format!("UV animation '{}' now loops continuously", animation.name)
+    };
+    refresh_editing_dff_preview(app);
+    true
+}
+
+pub(crate) fn adjust_selected_material_uv_animation_speed(
+    app: &mut AppState,
+    faster: bool,
+) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let Some(name) = selected_dff_uv_animation_name(dff) else {
+        app.status_message = "Assign a UV animation first".to_string();
+        return false;
+    };
+    let idx = ensure_dff_uv_animation(&mut dff.raw, &name);
+    let animation = &mut dff.raw.uv_animations[idx];
+    let factor = if faster { 0.8 } else { 1.25 };
+    animation.duration = (animation.duration.max(0.05) * factor).clamp(0.05, 60.0);
+    dff.dirty = true;
+    app.status_message = format!(
+        "UV animation '{}' speed: {:.2} loops/sec ({:.2}s loop)",
+        animation.name,
+        1.0 / animation.duration,
+        animation.duration
+    );
+    refresh_editing_dff_preview(app);
+    true
+}
+
 pub(crate) fn adjust_selected_material_uv_animation_motion(
     app: &mut AppState,
     axis: usize,
@@ -5464,16 +10858,25 @@ pub(crate) fn adjust_selected_material_uv_animation_motion(
         *animation = default_dff_uv_animation(&name);
     }
     animation.duration = animation.duration.max(0.05);
+    let component = if axis == 0 { 4 } else { 5 };
+    let start = animation
+        .frames
+        .first()
+        .map(|frame| frame.uv[component])
+        .unwrap_or(0.0);
+    let continuous = dff_uv_animation_is_continuous(animation);
     let frame = animation
         .frames
         .last_mut()
         .expect("default animation has frames");
-    let component = if axis == 0 { 4 } else { 5 };
-    let delta = if positive { -0.25 } else { 0.25 };
-    frame.uv[component] = (frame.uv[component] + delta).clamp(-16.0, 16.0);
+    let step = if continuous { 1.0 } else { 0.25 };
+    let delta = if positive { -step } else { step };
+    let motion = frame.uv[component] - start;
+    let base = if continuous { motion.round() } else { motion };
+    frame.uv[component] = (start + base + delta).clamp(-16.0, 16.0);
     dff.dirty = true;
     app.status_message = format!(
-        "UV animation '{}' motion: U {:.2}, V {:.2}",
+        "UV animation '{}' continuous motion: U {:.0}, V {:.0} tiles/loop",
         animation.name, frame.uv[4], frame.uv[5]
     );
     refresh_editing_dff_preview(app);
@@ -5524,13 +10927,38 @@ pub(crate) fn clear_selected_material_uv_animation(app: &mut AppState) -> bool {
     dff.raw.material_animations[material].names.clear();
     dff.dirty = true;
     app.status_message = format!("Cleared UV animation from material {material}");
+    refresh_editing_dff_preview(app);
     true
 }
 
 pub(crate) fn update_dff_uv_anim_picker_text_input(app: &mut AppState) -> bool {
+    if app.editing.texture_category_menu.is_some() {
+        return false;
+    }
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return false;
     };
+    if dff.texture_picker_open {
+        if is_key_pressed(KeyCode::Escape) {
+            dff.texture_picker_open = false;
+            return true;
+        }
+        let mut changed = false;
+        if is_key_pressed(KeyCode::Backspace) && !dff.texture_picker_search.is_empty() {
+            dff.texture_picker_search.pop();
+            changed = true;
+        }
+        while let Some(ch) = get_char_pressed() {
+            if !ch.is_control() {
+                dff.texture_picker_search.push(ch);
+                changed = true;
+            }
+        }
+        if changed {
+            dff.texture_picker_scroll = 0.0;
+        }
+        return changed;
+    }
     if !dff.uv_anim_picker_open
         && !dff.dff_2dfx_type_picker_open
         && !dff.dff_2dfx_corona_preset_picker_open
@@ -5548,7 +10976,10 @@ pub(crate) fn update_dff_uv_anim_picker_text_input(app: &mut AppState) -> bool {
     }
     if dff.dff_2dfx_corona_preset_picker_open {
         drain_text_input();
-        return true;
+        // This picker has no text fields. Leave pointer input unclaimed so
+        // `handle_editing_2dfx_modal_click` can activate its rows and Close
+        // button later in the input pass.
+        return false;
     }
     if dff.dff_2dfx_payload_editor_open {
         if selected_dff_2dfx_effect_id(dff) == Some(0) && is_mouse_button_down(MouseButton::Left) {
@@ -5562,6 +10993,13 @@ pub(crate) fn update_dff_uv_anim_picker_text_input(app: &mut AppState) -> bool {
                     return true;
                 }
             }
+        }
+        if dff_2dfx_active_choice_info(dff).is_some() {
+            drain_text_input();
+            // Choice rows are pointer-driven. Do not consume the frame here:
+            // `handle_editing_2dfx_modal_click` still needs to receive the
+            // click so it can select an option or dismiss the dropdown.
+            return false;
         }
         if let Some(active) = dff.dff_2dfx_payload_active_field {
             let active_particle_name = dff_2dfx_active_payload_is_particle_name(dff);
@@ -5624,8 +11062,48 @@ pub(crate) fn update_dff_uv_anim_picker_text_input(app: &mut AppState) -> bool {
 pub(crate) fn editing_make_face_from_selected_vertices(app: &mut AppState) -> bool {
     match app.editing.asset.as_mut() {
         Some(EditingAsset::Dff(dff)) => {
+            if dff.raw.components.len() > 1 {
+                app.status_message = "Topology creation is disabled for multi-geometry DFFs because appended faces cannot be assigned safely; separate the target geometry first".to_string();
+                return false;
+            }
+            let material = dff_topology_material(dff);
             let selected_edges = dff_selected_edge_set(dff);
             if selected_edges.len() > 2 {
+                if let Some(components) = selected_edge_components(&selected_edges) {
+                    if let [(polygon, true)] = components.as_slice() {
+                        let Some(polygon) =
+                            orient_polygon_toward_camera(app.camera.pos, polygon.clone(), |idx| {
+                                dff.raw.vertices.get(idx).map(|vertex| to_mq(*vertex))
+                            })
+                        else {
+                            app.status_message =
+                                "Could not orient the selected DFF boundary".to_string();
+                            return false;
+                        };
+                        let Some((first, face_count)) =
+                            append_dff_polygon_fill(&mut dff.raw, &polygon, material)
+                        else {
+                            app.status_message =
+                                "The selected DFF boundary is not a simple, planar polygon"
+                                    .to_string();
+                            return false;
+                        };
+                        recalc_raw_normals(&mut dff.raw);
+                        sync_single_dff_component_ranges(&mut dff.raw);
+                        dff.selected_face = Some(first);
+                        dff.selected_faces = (first..dff.raw.triangles.len()).collect();
+                        dff.selected_edges.clear();
+                        dff.selected_vertices = dff_uv_face_vertices(&dff.raw, &dff.selected_faces);
+                        dff.selected_vertex = dff.selected_vertices.iter().next_back().copied();
+                        dff.dirty = true;
+                        app.status_message = format!(
+                            "Filled {}-edge DFF boundary with {face_count} contextual-UV face(s)",
+                            polygon.len()
+                        );
+                        refresh_editing_dff_preview(app);
+                        return true;
+                    }
+                }
                 let Some(faces) =
                     bridge_selected_edge_loops(app.camera.pos, &selected_edges, |idx| {
                         dff.raw.vertices.get(idx).map(|vertex| to_mq(*vertex))
@@ -5635,14 +11113,11 @@ pub(crate) fn editing_make_face_from_selected_vertices(app: &mut AppState) -> bo
                         "Select two matching DFF edge loops or chains to bridge".to_string();
                     return false;
                 };
-                let material = dff
-                    .selected_material
-                    .min(dff.raw.material_textures.len().saturating_sub(1))
-                    as u16;
                 let first = dff.raw.triangles.len();
                 let face_count = bridge_face_triangle_count(&faces);
                 push_dff_bridge_faces(&mut dff.raw, &faces, material);
                 recalc_raw_normals(&mut dff.raw);
+                sync_single_dff_component_ranges(&mut dff.raw);
                 dff.selected_face = Some(first);
                 dff.selected_faces = (first..dff.raw.triangles.len()).collect();
                 dff.dirty = true;
@@ -5660,10 +11135,6 @@ pub(crate) fn editing_make_face_from_selected_vertices(app: &mut AppState) -> bo
                     app.status_message = "Could not bridge selected DFF edges".to_string();
                     return false;
                 };
-                let material = dff
-                    .selected_material
-                    .min(dff.raw.material_textures.len().saturating_sub(1))
-                    as u16;
                 let first = dff.raw.triangles.len();
                 dff.raw.triangles.push(Tri {
                     a: indices[0] as u32,
@@ -5678,6 +11149,7 @@ pub(crate) fn editing_make_face_from_selected_vertices(app: &mut AppState) -> bo
                     material,
                 });
                 recalc_raw_normals(&mut dff.raw);
+                sync_single_dff_component_ranges(&mut dff.raw);
                 dff.selected_face = Some(first);
                 dff.selected_faces.clear();
                 dff.selected_faces.insert(first);
@@ -5687,52 +11159,13 @@ pub(crate) fn editing_make_face_from_selected_vertices(app: &mut AppState) -> bo
                 refresh_editing_dff_preview(app);
                 return true;
             }
-            let selected = dff_selected_vertex_set(dff);
-            if selected.len() >= 6 && selected.len() % 2 == 0 {
-                let selected_indices = selected.iter().copied().collect::<Vec<_>>();
-                let Some(quads) =
-                    bridge_vertex_loop_indices(app.camera.pos, &selected_indices, |idx| {
-                        dff.raw.vertices.get(idx).map(|vertex| to_mq(*vertex))
-                    })
-                else {
-                    app.status_message =
-                        "Could not split selected DFF vertices into two bridge loops".to_string();
-                    return false;
-                };
-                let material = dff
-                    .selected_material
-                    .min(dff.raw.material_textures.len().saturating_sub(1))
-                    as u16;
-                let first = dff.raw.triangles.len();
-                for indices in &quads {
-                    dff.raw.triangles.push(Tri {
-                        a: indices[0] as u32,
-                        b: indices[1] as u32,
-                        c: indices[2] as u32,
-                        material,
-                    });
-                    dff.raw.triangles.push(Tri {
-                        a: indices[0] as u32,
-                        b: indices[2] as u32,
-                        c: indices[3] as u32,
-                        material,
-                    });
-                }
-                recalc_raw_normals(&mut dff.raw);
-                dff.selected_face = Some(first);
-                dff.selected_faces = (first..dff.raw.triangles.len()).collect();
-                dff.dirty = true;
-                app.status_message = format!(
-                    "Bridged {} DFF vertices into {} face(s)",
-                    selected.len(),
-                    quads.len() * 2
-                );
-                refresh_editing_dff_preview(app);
-                return true;
-            }
-            if selected.len() < 3 || selected.len() > 4 {
+            // Box selection can select several UV-seam vertex records at one
+            // visible point. Topology creation operates on visible positions,
+            // so collapse those coincident records before ordering the polygon.
+            let selected = dff_selected_vertex_positions(dff);
+            if selected.len() < 3 {
                 app.status_message =
-                    "Select 3/4 DFF vertices, an even bridge loop, or 2 DFF edges".to_string();
+                    "Select at least 3 DFF vertices or a closed edge boundary".to_string();
                 return false;
             }
             if selected.iter().any(|idx| *idx >= dff.raw.vertices.len()) {
@@ -5740,41 +11173,45 @@ pub(crate) fn editing_make_face_from_selected_vertices(app: &mut AppState) -> bo
                 return false;
             }
             let selected_indices = selected.iter().copied().collect::<Vec<_>>();
+            let ordered_boundary =
+                if let Some(boundary) = dff_selected_vertex_boundary(&dff.raw, &selected) {
+                    boundary
+                } else {
+                    let Some(ordered) =
+                        camera_facing_vertex_order(app.camera.pos, &selected_indices, |idx| {
+                            dff.raw.vertices.get(idx).map(|vertex| to_mq(*vertex))
+                        })
+                    else {
+                        app.status_message = "Could not order selected DFF vertices".to_string();
+                        return false;
+                    };
+                    ordered
+                };
             let Some(indices) =
-                camera_facing_vertex_order(app.camera.pos, &selected_indices, |idx| {
+                orient_polygon_toward_camera(app.camera.pos, ordered_boundary, |idx| {
                     dff.raw.vertices.get(idx).map(|vertex| to_mq(*vertex))
                 })
             else {
                 app.status_message = "Could not order selected DFF vertices".to_string();
                 return false;
             };
-            let material =
-                dff.selected_material
-                    .min(dff.raw.material_textures.len().saturating_sub(1)) as u16;
-            dff.raw.triangles.push(Tri {
-                a: indices[0] as u32,
-                b: indices[1] as u32,
-                c: indices[2] as u32,
-                material,
-            });
-            if indices.len() == 4 {
-                dff.raw.triangles.push(Tri {
-                    a: indices[0] as u32,
-                    b: indices[2] as u32,
-                    c: indices[3] as u32,
-                    material,
-                });
-            }
+            let Some((first_face, face_count)) =
+                append_dff_polygon_fill(&mut dff.raw, &indices, material)
+            else {
+                app.status_message =
+                    "Selected DFF vertices do not form a simple, planar polygon".to_string();
+                return false;
+            };
             recalc_raw_normals(&mut dff.raw);
-            dff.selected_face =
-                dff.raw
-                    .triangles
-                    .len()
-                    .checked_sub(if indices.len() == 4 { 2 } else { 1 });
+            sync_single_dff_component_ranges(&mut dff.raw);
+            dff.selected_face = Some(first_face);
+            dff.selected_faces = (first_face..dff.raw.triangles.len()).collect();
+            dff.selected_edges.clear();
+            dff.selected_vertices = dff_uv_face_vertices(&dff.raw, &dff.selected_faces);
+            dff.selected_vertex = dff.selected_vertices.iter().next_back().copied();
             dff.dirty = true;
             app.status_message = format!(
-                "Created {} DFF face(s) from {} selected vertices",
-                if indices.len() == 4 { 2 } else { 1 },
+                "Created {face_count} contextual-UV DFF face(s) from {} selected vertices",
                 indices.len()
             );
             refresh_editing_dff_preview(app);
@@ -5986,7 +11423,31 @@ pub(crate) fn editing_make_face_from_selected_vertices(app: &mut AppState) -> bo
 }
 
 pub(crate) fn editing_extrude_selected(app: &mut AppState) -> bool {
+    if let Some(changed) =
+        apply_dff_operation_to_multi_selection(app, "Extruded geometry", editing_extrude_selected)
+    {
+        return changed;
+    }
+    if matches!(app.editing.asset.as_ref(), Some(EditingAsset::Dff(dff)) if dff.raw.components.len() > 1)
+    {
+        app.status_message =
+            "Extrusion is disabled for multi-geometry DFFs; separate the target geometry first"
+                .to_string();
+        return false;
+    }
     match app.editing.asset.as_ref() {
+        Some(EditingAsset::Dff(dff))
+            if dff.select_mode == EditingSelectMode::Face
+                && !dff_selected_face_set(dff).is_empty() =>
+        {
+            editing_extrude_selected_faces(app)
+        }
+        Some(EditingAsset::Col(col))
+            if col.select_mode == EditingSelectMode::Face
+                && !col_selected_face_set(col).is_empty() =>
+        {
+            editing_extrude_selected_faces(app)
+        }
         Some(EditingAsset::Dff(dff))
             if dff.select_mode == EditingSelectMode::Edge
                 && !dff_selected_edge_set(dff).is_empty() =>
@@ -6018,9 +11479,204 @@ pub(crate) fn editing_extrude_selected(app: &mut AppState) -> bool {
             editing_extrude_selected_edges(app)
         }
         _ => {
-            app.status_message = "Select vertex(es) or edge(s) before extruding".to_string();
+            app.status_message =
+                "Select face(s), edge(s), or vertex(es) before extruding".to_string();
             false
         }
+    }
+}
+
+fn editing_extrude_selected_faces(app: &mut AppState) -> bool {
+    match app.editing.asset.as_mut() {
+        Some(EditingAsset::Dff(dff)) => {
+            let selected = dff_selected_face_set(dff);
+            if selected.is_empty() {
+                app.status_message = "Select DFF face(s) before extruding".to_string();
+                return false;
+            }
+            let source = selected
+                .iter()
+                .filter_map(|&index| {
+                    dff.raw
+                        .triangles
+                        .get(index)
+                        .copied()
+                        .map(|tri| (index, tri))
+                })
+                .collect::<Vec<_>>();
+            let mut remap = BTreeMap::<usize, usize>::new();
+            let mut boundary = BTreeMap::<(usize, usize), (usize, usize, u16, usize)>::new();
+            for (_, tri) in &source {
+                for (a, b) in [
+                    (tri.a as usize, tri.b as usize),
+                    (tri.b as usize, tri.c as usize),
+                    (tri.c as usize, tri.a as usize),
+                ] {
+                    let entry =
+                        boundary
+                            .entry(editing_edge_key(a, b))
+                            .or_insert((a, b, tri.material, 0));
+                    entry.3 += 1;
+                }
+                for old in [tri.a as usize, tri.b as usize, tri.c as usize] {
+                    if old < dff.raw.vertices.len() && !remap.contains_key(&old) {
+                        let new = raw_append_vertex_copy(&mut dff.raw, old);
+                        remap.insert(old, new);
+                    }
+                }
+            }
+            if remap.is_empty() {
+                app.status_message = "Selected DFF face(s) no longer exist".to_string();
+                return false;
+            }
+            let mut cap_faces = BTreeSet::new();
+            for (index, tri) in source {
+                let (Some(a), Some(b), Some(c)) = (
+                    remap.get(&(tri.a as usize)).copied(),
+                    remap.get(&(tri.b as usize)).copied(),
+                    remap.get(&(tri.c as usize)).copied(),
+                ) else {
+                    continue;
+                };
+                dff.raw.triangles[index] = Tri {
+                    a: a as u32,
+                    b: b as u32,
+                    c: c as u32,
+                    material: tri.material,
+                };
+                cap_faces.insert(index);
+            }
+            for (_, (a, b, material, count)) in boundary {
+                if count != 1 {
+                    continue;
+                }
+                let (Some(na), Some(nb)) = (remap.get(&a).copied(), remap.get(&b).copied()) else {
+                    continue;
+                };
+                dff.raw.triangles.push(Tri {
+                    a: a as u32,
+                    b: b as u32,
+                    c: nb as u32,
+                    material,
+                });
+                dff.raw.triangles.push(Tri {
+                    a: a as u32,
+                    b: nb as u32,
+                    c: na as u32,
+                    material,
+                });
+            }
+            recalc_raw_normals(&mut dff.raw);
+            dff.selected_face = cap_faces.iter().next_back().copied();
+            dff.selected_faces = cap_faces;
+            dff.selected_edges.clear();
+            dff.selected_vertex = None;
+            dff.selected_vertices = remap.values().copied().collect();
+            dff.dirty = true;
+            app.transform_mode = TransformMode::Move;
+            app.status_message = format!("Extruded {} DFF face(s)", dff.selected_faces.len());
+            refresh_editing_dff_preview(app);
+            true
+        }
+        Some(EditingAsset::Col(col)) => {
+            let selected = col_selected_face_set(col);
+            if selected.is_empty() {
+                app.status_message = "Select COL face(s) before extruding".to_string();
+                return false;
+            }
+            if selected
+                .iter()
+                .any(|face| col_generated_primitive_for_face(col, *face).is_some())
+            {
+                app.status_message =
+                    "Generated capsule and rotated-box faces cannot be extruded; select the primitive instead"
+                        .to_string();
+                return false;
+            }
+            let source = selected
+                .iter()
+                .filter_map(|&index| col.mesh.faces.get(index).cloned().map(|face| (index, face)))
+                .collect::<Vec<_>>();
+            let mut remap = BTreeMap::<usize, usize>::new();
+            let mut boundary =
+                BTreeMap::<(usize, usize), (usize, usize, CollisionFace, usize)>::new();
+            for (_, face) in &source {
+                for (a, b) in [
+                    (face.a as usize, face.b as usize),
+                    (face.b as usize, face.c as usize),
+                    (face.c as usize, face.a as usize),
+                ] {
+                    let entry =
+                        boundary
+                            .entry(editing_edge_key(a, b))
+                            .or_insert((a, b, face.clone(), 0));
+                    entry.3 += 1;
+                }
+                for old in [face.a as usize, face.b as usize, face.c as usize] {
+                    if old >= col.mesh.vertices.len() || remap.contains_key(&old) {
+                        continue;
+                    }
+                    if col.mesh.vertices.len() > u16::MAX as usize {
+                        app.status_message = "COL has too many vertices to extrude".to_string();
+                        return false;
+                    }
+                    let new = col.mesh.vertices.len();
+                    col.mesh.vertices.push(col.mesh.vertices[old]);
+                    remap.insert(old, new);
+                }
+            }
+            if remap.is_empty() {
+                app.status_message = "Selected COL face(s) no longer exist".to_string();
+                return false;
+            }
+            let mut cap_faces = BTreeSet::new();
+            for (index, mut face) in source {
+                let (Some(a), Some(b), Some(c)) = (
+                    remap.get(&(face.a as usize)).copied(),
+                    remap.get(&(face.b as usize)).copied(),
+                    remap.get(&(face.c as usize)).copied(),
+                ) else {
+                    continue;
+                };
+                face.a = a as u16;
+                face.b = b as u16;
+                face.c = c as u16;
+                col.mesh.faces[index] = face;
+                cap_faces.insert(index);
+            }
+            for (_, (a, b, template, count)) in boundary {
+                if count != 1 {
+                    continue;
+                }
+                let (Some(na), Some(nb)) = (remap.get(&a).copied(), remap.get(&b).copied()) else {
+                    continue;
+                };
+                for (fa, fb, fc) in [(a, b, nb), (a, nb, na)] {
+                    col.mesh.faces.push(CollisionFace {
+                        a: fa as u16,
+                        b: fb as u16,
+                        c: fc as u16,
+                        material: template.material,
+                        light: template.light,
+                        img_path: template.img_path.clone(),
+                        material_file_offset: 0,
+                        light_file_offset: 0,
+                    });
+                }
+            }
+            refresh_editing_col_bounds(col);
+            col.selected_face = cap_faces.iter().next_back().copied().unwrap_or(usize::MAX);
+            col.selected_faces = cap_faces;
+            col.selected_edges.clear();
+            col.selected_vertex = 0;
+            col.selected_vertices = remap.values().copied().collect();
+            col.selected_primitive = None;
+            col.dirty = true;
+            app.transform_mode = TransformMode::Move;
+            app.status_message = format!("Extruded {} COL face(s)", col.selected_faces.len());
+            true
+        }
+        _ => false,
     }
 }
 
@@ -6339,33 +11995,230 @@ pub(crate) fn editing_unwrap_selected_dff_uvs(app: &mut AppState, material_scope
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return false;
     };
+    let selected_faces = if material_scope {
+        dff.raw
+            .triangles
+            .iter()
+            .enumerate()
+            .filter_map(|(face, triangle)| {
+                (triangle.material as usize == dff.selected_material).then_some(face)
+            })
+            .collect()
+    } else {
+        dff_selected_face_set(dff)
+    };
+    let fallback_vertices = dff_selected_vertex_set(dff);
+    let before_split = (!selected_faces.is_empty()).then(|| dff.raw.clone());
+    let split_count = auto_split_unwrap_faces(&mut dff.raw, &selected_faces);
+    let vertices = planar_unwrap_scope_vertices(
+        &dff.raw,
+        &selected_faces,
+        &fallback_vertices,
+        dff.selected_material,
+        material_scope,
+    );
+    let changed = planar_unwrap_raw_vertices(&mut dff.raw, &vertices);
+    if changed == 0 {
+        if let Some(before_split) = before_split {
+            dff.raw = before_split;
+        }
+        app.status_message = "Select a DFF face, material, or vertices to unwrap".to_string();
+        return false;
+    }
+    dff.dirty = true;
+    let action = if material_scope {
+        format!("Planar unwrapped {changed} DFF material vertex UV(s)")
+    } else {
+        format!("Planar unwrapped {changed} selected DFF UV(s)")
+    };
+    app.status_message = unwrap_status_with_split(action, split_count);
+    refresh_editing_dff_preview(app);
+    true
+}
+
+fn auto_split_unwrap_faces(raw: &mut RawMesh, faces: &BTreeSet<usize>) -> usize {
+    if faces.is_empty() {
+        return 0;
+    }
+    let selected = dff_uv_face_vertices(raw, faces);
+    let old_vertex_count = raw.vertices.len();
+    split_raw_uv_selection(raw, faces, &selected);
+    raw.vertices.len() - old_vertex_count
+}
+
+fn unwrap_status_with_split(action: String, split_count: usize) -> String {
+    if split_count == 0 {
+        action
+    } else {
+        format!("{action}; split {split_count} boundary UV point(s)")
+    }
+}
+
+fn planar_unwrap_scope_vertices(
+    raw: &RawMesh,
+    selected_faces: &BTreeSet<usize>,
+    fallback_vertices: &BTreeSet<usize>,
+    selected_material: usize,
+    material_scope: bool,
+) -> BTreeSet<usize> {
+    if material_scope {
+        return raw
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.material as usize == selected_material)
+            .flat_map(|triangle| {
+                [
+                    triangle.a as usize,
+                    triangle.b as usize,
+                    triangle.c as usize,
+                ]
+            })
+            .filter(|index| *index < raw.vertices.len())
+            .collect();
+    }
+
+    let face_vertices = dff_uv_face_vertices(raw, selected_faces);
+    if face_vertices.is_empty() {
+        fallback_vertices
+            .iter()
+            .copied()
+            .filter(|index| *index < raw.vertices.len())
+            .collect()
+    } else {
+        face_vertices
+    }
+}
+
+pub(crate) fn editing_face_aligned_unwrap_selected_dff_uvs(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let faces = dff_selected_face_set(dff);
+    let before_split = (!faces.is_empty()).then(|| dff.raw.clone());
+    let split_count = auto_split_unwrap_faces(&mut dff.raw, &faces);
+    let vertices = dff_uv_face_vertices(&dff.raw, &faces);
+    let changed = face_aligned_unwrap_raw_vertices(&mut dff.raw, &vertices, &faces);
+    if changed == 0 {
+        if let Some(before_split) = before_split {
+            dff.raw = before_split;
+        }
+        app.status_message =
+            "Select one or more connected DFF faces to unwrap face-aligned".to_string();
+        return false;
+    }
+    dff.dirty = true;
+    app.status_message = unwrap_status_with_split(
+        format!("Face-aligned unwrapped {changed} UV(s) using averaged top/bottom edges"),
+        split_count,
+    );
+    refresh_editing_dff_preview(app);
+    true
+}
+
+pub(crate) fn editing_box_unwrap_selected_dff_uvs(
+    app: &mut AppState,
+    material_scope: bool,
+) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let mut faces = BTreeSet::<usize>::new();
     let mut vertices = BTreeSet::<usize>::new();
     if material_scope {
-        for tri in &dff.raw.triangles {
+        for (face_idx, tri) in dff.raw.triangles.iter().enumerate() {
             if tri.material as usize == dff.selected_material {
+                faces.insert(face_idx);
                 vertices.insert(tri.a as usize);
                 vertices.insert(tri.b as usize);
                 vertices.insert(tri.c as usize);
             }
         }
-    } else if let Some(face_idx) = dff.selected_face {
-        if let Some(indices) = raw_triangle_indices(&dff.raw, face_idx) {
-            vertices.extend(indices);
-        }
     } else {
-        vertices = dff_selected_vertex_set(dff);
+        faces = dff_selected_face_set(dff);
+        for face_idx in &faces {
+            if let Some(indices) = raw_triangle_indices(&dff.raw, *face_idx) {
+                vertices.extend(indices);
+            }
+        }
+        if vertices.is_empty() {
+            vertices = dff_selected_vertex_set(dff);
+        }
     }
-    let changed = planar_unwrap_raw_vertices(&mut dff.raw, &vertices);
+    let before_split = (!faces.is_empty()).then(|| dff.raw.clone());
+    let split_count = auto_split_unwrap_faces(&mut dff.raw, &faces);
+    if !faces.is_empty() {
+        vertices = dff_uv_face_vertices(&dff.raw, &faces);
+    }
+    let changed = box_unwrap_raw_vertices(&mut dff.raw, &vertices, &faces);
     if changed == 0 {
-        app.status_message = "Select a DFF face, material, or vertices to unwrap".to_string();
+        if let Some(before_split) = before_split {
+            dff.raw = before_split;
+        }
+        app.status_message = "Select DFF faces, a material, or vertices to box unwrap".to_string();
         return false;
     }
     dff.dirty = true;
-    app.status_message = if material_scope {
-        format!("Planar unwrapped {changed} DFF material vertex UV(s)")
+    let action = if material_scope {
+        format!("Box unwrapped {changed} DFF material vertex UV(s)")
     } else {
-        format!("Planar unwrapped {changed} selected DFF UV(s)")
+        format!("Box unwrapped {changed} selected DFF UV(s)")
     };
+    app.status_message = unwrap_status_with_split(action, split_count);
+    refresh_editing_dff_preview(app);
+    true
+}
+
+pub(crate) fn editing_cliff_wrap_unwrap_selected_dff_uvs(
+    app: &mut AppState,
+    material_scope: bool,
+) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let faces = if material_scope {
+        dff.raw
+            .triangles
+            .iter()
+            .enumerate()
+            .filter_map(|(face, triangle)| {
+                (triangle.material as usize == dff.selected_material).then_some(face)
+            })
+            .collect::<BTreeSet<_>>()
+    } else {
+        dff_selected_face_set(dff)
+    };
+    if faces.is_empty() {
+        app.status_message = if material_scope {
+            "The selected DFF material has no faces to cliff-wrap unwrap"
+        } else {
+            "Select the connected DFF cliff-wall faces to cliff-wrap unwrap"
+        }
+        .to_string();
+        return false;
+    }
+
+    let before_split = dff.raw.clone();
+    let boundary_splits = auto_split_unwrap_faces(&mut dff.raw, &faces);
+    let (changed, seam_splits) = cliff_wrap_unwrap_raw_vertices(&mut dff.raw, &faces);
+    if changed == 0 {
+        dff.raw = before_split;
+        app.status_message =
+            "Cliff Wrap needs one connected upright wall band with open top and bottom edges"
+                .to_string();
+        return false;
+    }
+    dff.dirty = true;
+    let scope = if material_scope {
+        "selected material"
+    } else {
+        "selected faces"
+    };
+    app.status_message = unwrap_status_with_split(
+        format!(
+            "Cliff-wrap unwrapped {changed} {scope} UV(s); top/bottom pinned and center rows surface-spaced"
+        ),
+        boundary_splits + seam_splits,
+    );
     refresh_editing_dff_preview(app);
     true
 }
@@ -6439,51 +12292,69 @@ fn raw_append_vertex_average(raw: &mut RawMesh, indices: &[usize]) -> usize {
             });
         }
     }
-    if raw.prelit_colors.len() == n {
-        let mut acc = V3::default();
-        for &idx in indices {
-            let value = raw.prelit_colors[idx];
-            acc.x += value.x;
-            acc.y += value.y;
-            acc.z += value.z;
-        }
-        raw.prelit_colors.push(V3 {
-            x: acc.x / count,
-            y: acc.y / count,
-            z: acc.z / count,
-        });
+    if n > 0 && raw.prelit_colors.len() == n {
+        let color = if indices.is_empty() {
+            neutral_vertex_color()
+        } else {
+            let mut acc = V3::default();
+            for &idx in indices {
+                let value = raw.prelit_colors[idx];
+                acc.x += value.x;
+                acc.y += value.y;
+                acc.z += value.z;
+            }
+            V3 {
+                x: acc.x / count,
+                y: acc.y / count,
+                z: acc.z / count,
+            }
+        };
+        raw.prelit_colors.push(color);
     }
-    if raw.prelit_alphas.len() == n {
-        let value = indices
-            .iter()
-            .map(|&idx| raw.prelit_alphas[idx])
-            .sum::<f32>()
-            / count;
+    if n > 0 && raw.prelit_alphas.len() == n {
+        let value = if indices.is_empty() {
+            1.0
+        } else {
+            indices
+                .iter()
+                .map(|&idx| raw.prelit_alphas[idx])
+                .sum::<f32>()
+                / count
+        };
         raw.prelit_alphas.push(value);
     }
-    if raw.night_prelit_colors.len() == n {
-        let mut acc = V3::default();
-        for &idx in indices {
-            let value = raw.night_prelit_colors[idx];
-            acc.x += value.x;
-            acc.y += value.y;
-            acc.z += value.z;
-        }
-        raw.night_prelit_colors.push(V3 {
-            x: acc.x / count,
-            y: acc.y / count,
-            z: acc.z / count,
-        });
+    if n > 0 && raw.night_prelit_colors.len() == n {
+        let color = if indices.is_empty() {
+            neutral_vertex_color()
+        } else {
+            let mut acc = V3::default();
+            for &idx in indices {
+                let value = raw.night_prelit_colors[idx];
+                acc.x += value.x;
+                acc.y += value.y;
+                acc.z += value.z;
+            }
+            V3 {
+                x: acc.x / count,
+                y: acc.y / count,
+                z: acc.z / count,
+            }
+        };
+        raw.night_prelit_colors.push(color);
     }
-    if raw.night_prelit_alphas.len() == n {
-        let value = indices
-            .iter()
-            .map(|&idx| raw.night_prelit_alphas[idx])
-            .sum::<f32>()
-            / count;
+    if n > 0 && raw.night_prelit_alphas.len() == n {
+        let value = if indices.is_empty() {
+            1.0
+        } else {
+            indices
+                .iter()
+                .map(|&idx| raw.night_prelit_alphas[idx])
+                .sum::<f32>()
+                / count
+        };
         raw.night_prelit_alphas.push(value);
     }
-    if raw.light_flags.len() == n {
+    if n > 0 && raw.light_flags.len() == n {
         let flag = indices.iter().any(|&idx| raw.light_flags[idx]);
         raw.light_flags.push(flag);
     }
@@ -6541,11 +12412,357 @@ fn raw_append_vertex_copy(raw: &mut RawMesh, src: usize) -> usize {
     raw.vertices.len() - 1
 }
 
-/// Split each selected face into three by inserting its centroid.
-pub(crate) fn editing_subdivide_selected_dff_faces(app: &mut AppState) -> bool {
+/// Append a vertex on an existing edge while preserving every vertex-aligned
+/// RenderWare stream. This is used by topology tools so cuts do not smear UVs,
+/// prelighting, night colours, or additional UV channels.
+fn raw_append_vertex_lerp(raw: &mut RawMesh, a: usize, b: usize, t: f32) -> usize {
+    let index = raw_append_vertex_copy(raw, a);
+    let mix = |left: f32, right: f32| left + (right - left) * t;
+    let mix_v3 = |left: V3, right: V3| V3 {
+        x: mix(left.x, right.x),
+        y: mix(left.y, right.y),
+        z: mix(left.z, right.z),
+    };
+    let mix_v2 = |left: V2, right: V2| V2 {
+        u: mix(left.u, right.u),
+        v: mix(left.v, right.v),
+    };
+    raw.vertices[index] = mix_v3(raw.vertices[a], raw.vertices[b]);
+    if raw.normals.len() > index {
+        raw.normals[index] = mix_v3(raw.normals[a], raw.normals[b]);
+    }
+    if raw.uvs.len() > index {
+        raw.uvs[index] = mix_v2(raw.uvs[a], raw.uvs[b]);
+    }
+    for uvs in &mut raw.secondary_uvs {
+        if uvs.len() > index {
+            uvs[index] = mix_v2(uvs[a], uvs[b]);
+        }
+    }
+    if raw.prelit_colors.len() > index {
+        raw.prelit_colors[index] = mix_v3(raw.prelit_colors[a], raw.prelit_colors[b]);
+    }
+    if raw.prelit_alphas.len() > index {
+        raw.prelit_alphas[index] = mix(raw.prelit_alphas[a], raw.prelit_alphas[b]);
+    }
+    if raw.night_prelit_colors.len() > index {
+        raw.night_prelit_colors[index] =
+            mix_v3(raw.night_prelit_colors[a], raw.night_prelit_colors[b]);
+    }
+    if raw.night_prelit_alphas.len() > index {
+        raw.night_prelit_alphas[index] =
+            mix(raw.night_prelit_alphas[a], raw.night_prelit_alphas[b]);
+    }
+    if raw.light_flags.len() > index {
+        raw.light_flags[index] = if t < 0.5 {
+            raw.light_flags[a]
+        } else {
+            raw.light_flags[b]
+        };
+    }
+    index
+}
+
+pub(crate) fn editing_add_dff_vertex(app: &mut AppState) -> bool {
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return false;
     };
+    if dff.raw.components.len() > 1 {
+        app.status_message = "Adding vertices is disabled for multi-geometry DFFs; separate the target geometry first".to_string();
+        return false;
+    }
+    let selected = dff_selected_vertex_set(dff)
+        .into_iter()
+        .filter(|index| *index < dff.raw.vertices.len())
+        .collect::<Vec<_>>();
+    let index = raw_append_vertex_average(&mut dff.raw, &selected);
+    dff.select_mode = EditingSelectMode::Vertex;
+    dff.selected_face = None;
+    dff.selected_faces.clear();
+    dff.selected_edges.clear();
+    dff.selected_vertex = Some(index);
+    dff.selected_vertices.clear();
+    dff.selected_vertices.insert(index);
+    dff.dirty = true;
+    app.transform_mode = TransformMode::Move;
+    app.status_message = format!(
+        "Added DFF vertex {index} at {}; move it with the transform gizmo",
+        if selected.is_empty() {
+            "the origin"
+        } else {
+            "the selection center"
+        }
+    );
+    refresh_editing_dff_preview(app);
+    true
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DffPrimitiveKind {
+    Plane,
+    Cube,
+}
+
+fn raw_append_vertex_at(raw: &mut RawMesh, position: V3, uv: V2) -> usize {
+    let index = raw_append_vertex_average(raw, &[]);
+    raw.vertices[index] = position;
+    if let Some(target) = raw.uvs.get_mut(index) {
+        *target = uv;
+    }
+    index
+}
+
+fn dff_insertion_center(dff: &EditingDffState) -> V3 {
+    let selected = dff_selected_vertex_set(dff);
+    if selected.is_empty() {
+        return V3::default();
+    }
+    let (sum, count) = selected
+        .iter()
+        .fold((Vec3::ZERO, 0usize), |(sum, count), index| {
+            dff.raw
+                .vertices
+                .get(*index)
+                .map(|vertex| (sum + to_mq(*vertex), count + 1))
+                .unwrap_or((sum, count))
+        });
+    if count == 0 {
+        V3::default()
+    } else {
+        from_mq(sum / count as f32)
+    }
+}
+
+fn sync_single_dff_component_ranges(raw: &mut RawMesh) {
+    if let [component] = raw.components.as_mut_slice() {
+        component.vertex_start = 0;
+        component.vertex_end = raw.vertices.len();
+        component.tri_start = 0;
+        component.tri_end = raw.triangles.len();
+    }
+}
+
+pub(crate) fn editing_add_dff_primitive(app: &mut AppState, kind: DffPrimitiveKind) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff.raw.components.len() > 1 {
+        app.status_message =
+            "Add primitives is limited to single-geometry DFFs; separate or edit the target component first"
+                .to_string();
+        return false;
+    }
+    let material = dff_topology_material(dff);
+    let center = dff_insertion_center(dff);
+    let first_vertex = dff.raw.vertices.len();
+    let first_face = dff.raw.triangles.len();
+    let local_positions: &[(V3, V2)] = match kind {
+        DffPrimitiveKind::Plane => &[
+            (
+                V3 {
+                    x: -1.0,
+                    y: -1.0,
+                    z: 0.0,
+                },
+                V2 { u: 0.0, v: 0.0 },
+            ),
+            (
+                V3 {
+                    x: 1.0,
+                    y: -1.0,
+                    z: 0.0,
+                },
+                V2 { u: 1.0, v: 0.0 },
+            ),
+            (
+                V3 {
+                    x: 1.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V2 { u: 1.0, v: 1.0 },
+            ),
+            (
+                V3 {
+                    x: -1.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V2 { u: 0.0, v: 1.0 },
+            ),
+        ],
+        DffPrimitiveKind::Cube => &[
+            (
+                V3 {
+                    x: -1.0,
+                    y: -1.0,
+                    z: -1.0,
+                },
+                V2 { u: 0.0, v: 0.0 },
+            ),
+            (
+                V3 {
+                    x: 1.0,
+                    y: -1.0,
+                    z: -1.0,
+                },
+                V2 { u: 1.0, v: 0.0 },
+            ),
+            (
+                V3 {
+                    x: 1.0,
+                    y: 1.0,
+                    z: -1.0,
+                },
+                V2 { u: 1.0, v: 1.0 },
+            ),
+            (
+                V3 {
+                    x: -1.0,
+                    y: 1.0,
+                    z: -1.0,
+                },
+                V2 { u: 0.0, v: 1.0 },
+            ),
+            (
+                V3 {
+                    x: -1.0,
+                    y: -1.0,
+                    z: 1.0,
+                },
+                V2 { u: 0.0, v: 0.0 },
+            ),
+            (
+                V3 {
+                    x: 1.0,
+                    y: -1.0,
+                    z: 1.0,
+                },
+                V2 { u: 1.0, v: 0.0 },
+            ),
+            (
+                V3 {
+                    x: 1.0,
+                    y: 1.0,
+                    z: 1.0,
+                },
+                V2 { u: 1.0, v: 1.0 },
+            ),
+            (
+                V3 {
+                    x: -1.0,
+                    y: 1.0,
+                    z: 1.0,
+                },
+                V2 { u: 0.0, v: 1.0 },
+            ),
+        ],
+    };
+    for (position, uv) in local_positions {
+        raw_append_vertex_at(
+            &mut dff.raw,
+            V3 {
+                x: center.x + position.x,
+                y: center.y + position.y,
+                z: center.z + position.z,
+            },
+            *uv,
+        );
+    }
+    let faces: &[[u32; 3]] = match kind {
+        DffPrimitiveKind::Plane => &[[0, 3, 2], [0, 2, 1]],
+        DffPrimitiveKind::Cube => &[
+            [0, 1, 2],
+            [0, 2, 3],
+            [4, 6, 5],
+            [4, 7, 6],
+            [0, 5, 1],
+            [0, 4, 5],
+            [3, 6, 7],
+            [3, 2, 6],
+            [0, 7, 4],
+            [0, 3, 7],
+            [1, 6, 2],
+            [1, 5, 6],
+        ],
+    };
+    dff.raw.triangles.extend(faces.iter().map(|indices| Tri {
+        a: first_vertex as u32 + indices[0],
+        b: first_vertex as u32 + indices[1],
+        c: first_vertex as u32 + indices[2],
+        material,
+    }));
+    if kind == DffPrimitiveKind::Cube {
+        let source = dff.raw.triangles[first_face..].to_vec();
+        for (offset, triangle) in source.into_iter().enumerate() {
+            let corners = [
+                triangle.a as usize,
+                triangle.b as usize,
+                triangle.c as usize,
+            ]
+            .map(|index| raw_append_vertex_copy(&mut dff.raw, index) as u32);
+            dff.raw.triangles[first_face + offset] = Tri {
+                a: corners[0],
+                b: corners[1],
+                c: corners[2],
+                material,
+            };
+        }
+        compact_raw_vertices(&mut dff.raw);
+    }
+    sync_single_dff_component_ranges(&mut dff.raw);
+    if kind == DffPrimitiveKind::Cube {
+        recalc_raw_normals_topological(&mut dff.raw);
+    } else {
+        recalc_raw_normals(&mut dff.raw);
+    }
+    dff.select_mode = EditingSelectMode::Face;
+    dff.selected_face = Some(first_face);
+    dff.selected_faces = (first_face..dff.raw.triangles.len()).collect();
+    dff.selected_edges.clear();
+    dff.selected_vertex = None;
+    dff.selected_vertices = dff.raw.triangles[first_face..]
+        .iter()
+        .flat_map(|triangle| {
+            [
+                triangle.a as usize,
+                triangle.b as usize,
+                triangle.c as usize,
+            ]
+        })
+        .collect();
+    dff.dirty = true;
+    app.transform_mode = TransformMode::Move;
+    app.status_message = format!(
+        "Added DFF {} with {} face(s); move it with the transform gizmo",
+        match kind {
+            DffPrimitiveKind::Plane => "plane",
+            DffPrimitiveKind::Cube => "cube",
+        },
+        faces.len()
+    );
+    refresh_editing_dff_preview(app);
+    true
+}
+
+/// Split each selected face into three by inserting its centroid.
+pub(crate) fn editing_subdivide_selected_dff_faces(app: &mut AppState) -> bool {
+    if let Some(changed) = apply_dff_operation_to_multi_selection(
+        app,
+        "Subdivided faces",
+        editing_subdivide_selected_dff_faces,
+    ) {
+        return changed;
+    }
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff.raw.components.len() > 1 {
+        app.status_message =
+            "Subdivision is disabled for multi-geometry DFFs; separate the target geometry first"
+                .to_string();
+        return false;
+    }
     let selected = dff_selected_face_set(dff);
     if selected.is_empty() {
         app.status_message = "Pick DFF face(s) to subdivide".to_string();
@@ -6588,6 +12805,122 @@ pub(crate) fn editing_subdivide_selected_dff_faces(app: &mut AppState) -> bool {
     app.status_message = format!(
         "Subdivided {subdivided} DFF face(s) into {}",
         subdivided * 3
+    );
+    refresh_editing_dff_preview(app);
+    true
+}
+
+/// Cut selected edges at their midpoints and retriangulate every attached
+/// face. In face mode, the longest edge of each selected face is used, which
+/// keeps the tool useful without requiring a mode switch first.
+pub(crate) fn editing_knife_selected_dff_faces(app: &mut AppState) -> bool {
+    if let Some(changed) = apply_dff_operation_to_multi_selection(
+        app,
+        "Knife cut faces",
+        editing_knife_selected_dff_faces,
+    ) {
+        return changed;
+    }
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff.raw.components.len() > 1 {
+        app.status_message =
+            "Knife is disabled for multi-geometry DFFs; separate the target geometry first"
+                .to_string();
+        return false;
+    }
+    let mut cut_edges = dff_selected_edge_set(dff);
+    if cut_edges.is_empty() {
+        for face in dff_selected_face_set(dff) {
+            let Some(tri) = dff.raw.triangles.get(face) else {
+                continue;
+            };
+            if [tri.a as usize, tri.b as usize, tri.c as usize]
+                .iter()
+                .any(|index| *index >= dff.raw.vertices.len())
+            {
+                continue;
+            }
+            let edges = dff_triangle_edge_vertices(tri);
+            let longest = edges.into_iter().max_by(|(a0, b0), (a1, b1)| {
+                let length = |a: usize, b: usize| {
+                    let a = to_mq(dff.raw.vertices[a]);
+                    let b = to_mq(dff.raw.vertices[b]);
+                    (b - a).length_squared()
+                };
+                length(*a0, *b0).total_cmp(&length(*a1, *b1))
+            });
+            if let Some(edge) = longest {
+                cut_edges.insert(edge);
+            }
+        }
+    }
+    if cut_edges.is_empty() {
+        app.status_message = "Select DFF edge(s) or face(s) to cut".to_string();
+        return false;
+    }
+
+    let source = dff.raw.triangles.clone();
+    let mut midpoints = BTreeMap::<(usize, usize), usize>::new();
+    let mut output = Vec::with_capacity(source.len() + cut_edges.len() * 2);
+    let mut selected_faces = BTreeSet::new();
+    let mut cut_face_count = 0usize;
+    for tri in source {
+        let corners = [tri.a as usize, tri.b as usize, tri.c as usize];
+        if corners.iter().any(|index| *index >= dff.raw.vertices.len()) {
+            output.push(tri);
+            continue;
+        }
+        let mut polygon = Vec::with_capacity(6);
+        let mut face_cut = false;
+        for edge_index in 0..3 {
+            let a = corners[edge_index];
+            let b = corners[(edge_index + 1) % 3];
+            polygon.push(a);
+            let edge = editing_edge_key(a, b);
+            if cut_edges.contains(&edge) {
+                let midpoint = *midpoints
+                    .entry(edge)
+                    .or_insert_with(|| raw_append_vertex_lerp(&mut dff.raw, a, b, 0.5));
+                polygon.push(midpoint);
+                face_cut = true;
+            }
+        }
+        if face_cut {
+            let start = output.len();
+            dff_triangulate_polygon(&mut output, &polygon, tri.material);
+            selected_faces.extend(start..output.len());
+            cut_face_count += 1;
+        } else {
+            output.push(tri);
+        }
+    }
+    if cut_face_count == 0 {
+        app.status_message = "Selected DFF edge(s) have no attached faces".to_string();
+        return false;
+    }
+    dff.raw.triangles = output;
+    sync_single_dff_component_ranges(&mut dff.raw);
+    recalc_raw_normals(&mut dff.raw);
+    for breakable in dff
+        .raw
+        .components
+        .iter_mut()
+        .filter_map(|component| component.breakable.as_mut())
+    {
+        breakable.stale = true;
+    }
+    dff.select_mode = EditingSelectMode::Face;
+    dff.selected_face = selected_faces.iter().next().copied();
+    dff.selected_faces = selected_faces;
+    dff.selected_edges.clear();
+    dff.selected_vertex = None;
+    dff.selected_vertices.clear();
+    dff.dirty = true;
+    app.status_message = format!(
+        "Knife cut {cut_face_count} DFF face(s) across {} edge(s)",
+        midpoints.len()
     );
     refresh_editing_dff_preview(app);
     true
@@ -6666,9 +12999,20 @@ pub(crate) fn editing_transform_selected_dff_uvs(
 /// Duplicate the selected faces with copied vertices so the copy can be moved
 /// independently. The duplicates become the new selection.
 pub(crate) fn editing_duplicate_selected_dff_faces(app: &mut AppState) -> bool {
+    if let Some(changed) = apply_dff_operation_to_multi_selection(
+        app,
+        "Duplicated faces",
+        editing_duplicate_selected_dff_faces,
+    ) {
+        return changed;
+    }
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return false;
     };
+    if dff.raw.components.len() > 1 {
+        app.status_message = "Face duplication is disabled for multi-geometry DFFs; separate the target geometry first".to_string();
+        return false;
+    }
     let selected = dff_selected_face_set(dff);
     if selected.is_empty() {
         app.status_message = "Pick DFF face(s) to duplicate".to_string();
@@ -6717,11 +13061,196 @@ pub(crate) fn editing_duplicate_selected_dff_faces(app: &mut AppState) -> bool {
     true
 }
 
+/// Duplicate the active DFF/COL mesh selection in place. The copied geometry
+/// becomes the active selection so a following gizmo drag moves only the copy.
+pub(crate) fn editing_duplicate_selected_mesh(app: &mut AppState) -> bool {
+    match app.editing.asset.as_ref() {
+        Some(EditingAsset::Dff(dff)) if dff.select_mode == EditingSelectMode::Face => {
+            return editing_duplicate_selected_dff_faces(app);
+        }
+        Some(EditingAsset::Col(col)) if col.selected_primitive.is_some() => {
+            return editing_duplicate_selected_col_primitive(app);
+        }
+        _ => {}
+    }
+
+    match app.editing.asset.as_mut() {
+        Some(EditingAsset::Dff(dff)) => {
+            if dff.raw.components.len() > 1 {
+                app.status_message =
+                    "Selection duplication is disabled for multi-geometry DFFs; separate the target geometry first"
+                        .to_string();
+                return false;
+            }
+            let selected_edges = if dff.select_mode == EditingSelectMode::Edge {
+                dff_selected_edge_set(dff)
+            } else {
+                BTreeSet::new()
+            };
+            let selected_vertices = if selected_edges.is_empty() {
+                dff_explicit_selected_vertex_set(dff)
+            } else {
+                selected_edges.iter().flat_map(|(a, b)| [*a, *b]).collect()
+            };
+            if selected_vertices.is_empty() {
+                app.status_message =
+                    "Select DFF face(s), edge(s), or vertex(es) to duplicate".to_string();
+                return false;
+            }
+            let mut remap = BTreeMap::<usize, usize>::new();
+            for old in selected_vertices {
+                if old < dff.raw.vertices.len() {
+                    let new = raw_append_vertex_copy(&mut dff.raw, old);
+                    remap.insert(old, new);
+                }
+            }
+            if remap.is_empty() {
+                return false;
+            }
+            dff.selected_edges = selected_edges
+                .into_iter()
+                .filter_map(|(a, b)| Some(editing_edge_key(*remap.get(&a)?, *remap.get(&b)?)))
+                .collect();
+            dff.selected_vertices = remap.values().copied().collect();
+            dff.selected_vertex = dff.selected_vertices.iter().next_back().copied();
+            dff.selected_face = None;
+            dff.selected_faces.clear();
+            dff.dirty = true;
+            let count = dff.selected_vertices.len();
+            app.status_message = format!("Duplicated {count} DFF vertex(es)");
+            refresh_editing_dff_preview(app);
+            true
+        }
+        Some(EditingAsset::Col(col)) if col.select_mode == EditingSelectMode::Face => {
+            let selected = col_selected_face_set(col);
+            if selected.is_empty() {
+                app.status_message = "Select COL face(s) to duplicate".to_string();
+                return false;
+            }
+            if selected
+                .iter()
+                .any(|face| col_generated_primitive_for_face(col, *face).is_some())
+            {
+                app.status_message =
+                    "Generated capsule and rotated-box faces cannot be duplicated; select the primitive instead"
+                        .to_string();
+                return false;
+            }
+            let source = selected
+                .iter()
+                .filter_map(|&index| col.mesh.faces.get(index).cloned())
+                .collect::<Vec<_>>();
+            let mut remap = BTreeMap::<usize, usize>::new();
+            let mut new_faces = BTreeSet::new();
+            for mut face in source {
+                let old = [face.a as usize, face.b as usize, face.c as usize];
+                if old.iter().any(|index| *index >= col.mesh.vertices.len()) {
+                    continue;
+                }
+                let mut copied = [0usize; 3];
+                for (slot, source) in copied.iter_mut().zip(old) {
+                    let new = if let Some(&new) = remap.get(&source) {
+                        new
+                    } else {
+                        if col.mesh.vertices.len() > u16::MAX as usize {
+                            app.status_message =
+                                "COL has too many vertices to duplicate".to_string();
+                            return false;
+                        }
+                        let new = col.mesh.vertices.len();
+                        col.mesh.vertices.push(col.mesh.vertices[source]);
+                        remap.insert(source, new);
+                        new
+                    };
+                    *slot = new;
+                }
+                face.a = copied[0] as u16;
+                face.b = copied[1] as u16;
+                face.c = copied[2] as u16;
+                face.material_file_offset = 0;
+                face.light_file_offset = 0;
+                new_faces.insert(col.mesh.faces.len());
+                col.mesh.faces.push(face);
+            }
+            if new_faces.is_empty() {
+                app.status_message = "Selected COL face(s) no longer exist".to_string();
+                return false;
+            }
+            refresh_editing_col_bounds(col);
+            let count = new_faces.len();
+            col.selected_face = new_faces.iter().next_back().copied().unwrap_or(usize::MAX);
+            col.selected_faces = new_faces;
+            col.selected_edges.clear();
+            col.selected_vertex = 0;
+            col.selected_vertices = remap.values().copied().collect();
+            col.selected_primitive = None;
+            col.dirty = true;
+            app.status_message = format!("Duplicated {count} COL face(s)");
+            true
+        }
+        Some(EditingAsset::Col(col)) => {
+            let selected_edges = if col.select_mode == EditingSelectMode::Edge {
+                col_selected_edge_set(col)
+            } else {
+                BTreeSet::new()
+            };
+            let selected_vertices = if selected_edges.is_empty() {
+                col_explicit_selected_vertex_set(col)
+            } else {
+                selected_edges.iter().flat_map(|(a, b)| [*a, *b]).collect()
+            };
+            if selected_vertices.is_empty() {
+                app.status_message =
+                    "Select COL face(s), edge(s), or vertex(es) to duplicate".to_string();
+                return false;
+            }
+            if col_vertices_touch_generated_primitive(col, selected_vertices.iter().copied()) {
+                app.status_message =
+                    "Generated capsule and rotated-box mesh cannot be duplicated; select the primitive instead"
+                        .to_string();
+                return false;
+            }
+            let mut remap = BTreeMap::<usize, usize>::new();
+            for old in selected_vertices {
+                if old >= col.mesh.vertices.len() {
+                    continue;
+                }
+                if col.mesh.vertices.len() > u16::MAX as usize {
+                    app.status_message = "COL has too many vertices to duplicate".to_string();
+                    return false;
+                }
+                let new = col.mesh.vertices.len();
+                col.mesh.vertices.push(col.mesh.vertices[old]);
+                remap.insert(old, new);
+            }
+            if remap.is_empty() {
+                return false;
+            }
+            refresh_editing_col_bounds(col);
+            col.selected_edges = selected_edges
+                .into_iter()
+                .filter_map(|(a, b)| Some(editing_edge_key(*remap.get(&a)?, *remap.get(&b)?)))
+                .collect();
+            col.selected_vertices = remap.values().copied().collect();
+            col.selected_face = usize::MAX;
+            col.selected_faces.clear();
+            col.selected_vertex = 0;
+            col.selected_primitive = None;
+            col.dirty = true;
+            let count = col.selected_vertices.len();
+            app.status_message = format!("Duplicated {count} COL vertex(es)");
+            true
+        }
+        _ => false,
+    }
+}
+
 const DFF_GEOMETRY_PLACEMENT_BATCH: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DffGeometryOperationKind {
     Separate,
+    SplitMaterialLimits,
     Pivot,
 }
 
@@ -7126,10 +13655,16 @@ enum DffGeometryPlacementChange {
         placement: Placement,
         state: ElementState,
     },
-    Move {
+    Transform {
         index: usize,
         position: V3,
+        rotation: V3,
     },
+}
+
+struct DffPivotColAsset {
+    name: String,
+    bytes: Vec<u8>,
 }
 
 struct DffGeometryResult {
@@ -7137,11 +13672,13 @@ struct DffGeometryResult {
     source_name: String,
     source_raw: RawMesh,
     source_bytes: Vec<u8>,
-    new_asset: Option<(String, RawMesh, Vec<u8>)>,
+    new_assets: Vec<(String, RawMesh, Vec<u8>)>,
     definitions: Vec<(String, Definition)>,
     placement_changes: Vec<DffGeometryPlacementChange>,
     face_count: usize,
     pivot: Option<V3>,
+    pivot_rotation: Option<V3>,
+    pivot_cols: Vec<DffPivotColAsset>,
 }
 
 pub(crate) struct DffGeometryJob {
@@ -7152,6 +13689,386 @@ pub(crate) struct DffGeometryJob {
     refresh_index: usize,
     scene_rebuilt: bool,
     started_at: Instant,
+}
+
+struct DffMaterialLimitRepairResult {
+    scanned: usize,
+    unsafe_count: usize,
+    repaired: usize,
+    assets: Vec<(String, Vec<u8>)>,
+    definitions: Vec<(String, Definition)>,
+    placements: Vec<(Placement, ElementState)>,
+    errors: Vec<String>,
+}
+
+pub(crate) struct DffMaterialLimitRepairJob {
+    rx: mpsc::Receiver<DffMaterialLimitRepairResult>,
+    result: Option<DffMaterialLimitRepairResult>,
+    definitions_applied: bool,
+    asset_index: usize,
+    placement_index: usize,
+    scene_rebuilt: bool,
+    started_at: Instant,
+}
+
+struct DffMaterialLimitRepairTarget {
+    name: String,
+    bytes: Vec<u8>,
+    options: DffWriteOptions,
+}
+
+struct OversizedChunkTarget {
+    name: String,
+    bytes: Vec<u8>,
+    options: DffWriteOptions,
+}
+
+fn oversized_chunk_size(dialog: &OversizedChunkDialog) -> Result<f32, String> {
+    match dialog.chunk_size.trim().parse::<f32>() {
+        Ok(value) if value.is_finite() && (16.0..=10_000.0).contains(&value) => Ok(value),
+        _ => Err("Chunk size must be a number from 16 to 10,000".to_string()),
+    }
+}
+
+fn default_oversized_chunk_size() -> String {
+    format!("{DEFAULT_SLICER_CHUNK_SIZE:.0}")
+}
+
+pub(crate) fn refresh_oversized_chunk_candidates(app: &mut AppState) -> bool {
+    let Some(dialog) = app.oversized_chunk_dialog.as_ref() else {
+        return false;
+    };
+    let size = match oversized_chunk_size(dialog) {
+        Ok(size) => size,
+        Err(error) => {
+            if let Some(dialog) = app.oversized_chunk_dialog.as_mut() {
+                dialog.error = Some(error);
+            }
+            return false;
+        }
+    };
+    let lod_target_ids = app
+        .placements
+        .iter()
+        .filter_map(|placement| placement.attrs.get("lodParent"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("self"))
+        .map(str::to_ascii_lowercase)
+        .collect::<HashSet<_>>();
+    let mut grouped = BTreeMap::<String, OversizedChunkCandidate>::new();
+    for (index, placement) in app.placements.iter().enumerate() {
+        if app
+            .element_states
+            .get(index)
+            .is_some_and(|state| state.deleted)
+        {
+            continue;
+        }
+        let dff_name = placement_dff_key(placement, &app.definitions);
+        let Some(mesh) = app
+            .meshes
+            .get(&placement_mesh_key(placement, &app.definitions))
+        else {
+            continue;
+        };
+        let extents = V3 {
+            x: mesh.bounds.max.x - mesh.bounds.min.x,
+            y: mesh.bounds.max.y - mesh.bounds.min.y,
+            z: mesh.bounds.max.z - mesh.bounds.min.z,
+        };
+        if extents.x <= size && extents.y <= size && extents.z <= size {
+            continue;
+        }
+        let mut reason = None;
+        if app.readonly_definition_ids.contains(&placement.id) {
+            reason = Some("read-only definition".to_string());
+        } else if placement.attrs.contains_key("lodParent")
+            || lod_target_ids.contains(&placement.id.to_ascii_lowercase())
+        {
+            reason = Some("LOD-coupled element".to_string());
+        } else if mesh.components.len() > 1 {
+            reason = Some("multi-geometry DFF".to_string());
+        } else if !mesh.effects_2dfx.is_empty() || !mesh.uv_animations.is_empty() {
+            reason = Some("contains 2DFX or UV animation".to_string());
+        }
+        grouped
+            .entry(dff_name.clone())
+            .and_modify(|candidate| {
+                candidate.placement_count += 1;
+                candidate.extents.x = candidate.extents.x.max(extents.x);
+                candidate.extents.y = candidate.extents.y.max(extents.y);
+                candidate.extents.z = candidate.extents.z.max(extents.z);
+                if candidate.blocked_reason.is_none() {
+                    candidate.blocked_reason = reason.clone();
+                }
+                candidate.selected &= candidate.blocked_reason.is_none();
+            })
+            .or_insert_with(|| OversizedChunkCandidate {
+                dff_name,
+                extents,
+                placement_count: 1,
+                selected: reason.is_none(),
+                blocked_reason: reason,
+            });
+    }
+    if let Some(dialog) = app.oversized_chunk_dialog.as_mut() {
+        dialog.candidates = grouped.into_values().collect();
+        dialog.scroll = 0.0;
+        dialog.error = None;
+    }
+    true
+}
+
+pub(crate) fn open_oversized_chunk_dialog(app: &mut AppState) {
+    if app.oversized_chunk_job.is_some() {
+        app.status_message = "Oversized-element chunking is already running".to_string();
+        return;
+    }
+    let chunk_size = default_oversized_chunk_size();
+    app.oversized_chunk_dialog = Some(OversizedChunkDialog {
+        chunk_size_cursor: chunk_size.len(),
+        chunk_size_selection_anchor: Some(0),
+        chunk_size,
+        candidates: Vec::new(),
+        scroll: 0.0,
+        error: None,
+    });
+    refresh_oversized_chunk_candidates(app);
+    app.status_message = "Review oversized elements before spatial chunking".to_string();
+}
+
+fn unique_spatial_chunk_stem(
+    source_stem: &str,
+    part: usize,
+    reserved: &mut HashSet<String>,
+) -> String {
+    let max_stem_len = IMG_RUNTIME_SAFE_ENTRY_NAME_BYTES - ".dff".len();
+    for attempt in 1usize.. {
+        let suffix = if attempt == 1 {
+            format!("_c{part}")
+        } else {
+            format!("_c{part}_{attempt}")
+        };
+        let keep = max_stem_len.saturating_sub(suffix.len());
+        let prefix = source_stem.chars().take(keep).collect::<String>();
+        let stem = format!("{prefix}{suffix}");
+        if reserved.insert(asset_key(&stem, ".dff")) {
+            return stem;
+        }
+    }
+    unreachable!()
+}
+
+pub(crate) fn start_oversized_chunking(app: &mut AppState) -> bool {
+    let Some(dialog) = app.oversized_chunk_dialog.as_ref() else {
+        return false;
+    };
+    let size = match oversized_chunk_size(dialog) {
+        Ok(size) => size,
+        Err(error) => {
+            if let Some(dialog) = app.oversized_chunk_dialog.as_mut() {
+                dialog.error = Some(error);
+            }
+            return false;
+        }
+    };
+    let selected = dialog
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.selected && candidate.blocked_reason.is_none())
+        .map(|candidate| candidate.dff_name.clone())
+        .collect::<BTreeSet<_>>();
+    if selected.is_empty() {
+        if let Some(dialog) = app.oversized_chunk_dialog.as_mut() {
+            dialog.error = Some("Select at least one supported oversized element".to_string());
+        }
+        return false;
+    }
+    if let Some(conflict) = validation_operation_conflict(app) {
+        app.status_message = format!("Wait for the background {conflict} to finish first.");
+        return false;
+    }
+    let entries = collect_resource_dff_entries(&app.root);
+    let mut targets = Vec::new();
+    let mut target_errors = Vec::new();
+    for name in &selected {
+        let bytes = app
+            .editing
+            .modified_entries
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                app.pending_replacement_assets
+                    .get(name)
+                    .map(|(_, bytes)| bytes.clone())
+            })
+            .or_else(|| entries.get(name).map(read_img_entry));
+        if let Some(bytes) = bytes {
+            targets.push(OversizedChunkTarget {
+                name: name.clone(),
+                bytes,
+                options: dff_write_options_for_asset(app, name),
+            });
+        } else {
+            target_errors.push(format!("{name}: selected DFF asset could not be read"));
+        }
+    }
+    if targets.is_empty() {
+        if let Some(dialog) = app.oversized_chunk_dialog.as_mut() {
+            dialog.error = Some("Selected DFF assets could not be read".to_string());
+        }
+        return false;
+    }
+    let scanned = dialog.candidates.len();
+    let requested = selected.len();
+    let placements = app.placements.clone();
+    let element_states = app.element_states.clone();
+    let definitions = app.definitions.clone();
+    let mut reserved_assets = entries.keys().cloned().collect::<HashSet<_>>();
+    reserved_assets.extend(app.pending_replacement_assets.keys().cloned());
+    reserved_assets.extend(app.editing.modified_entries.keys().cloned());
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut result = OversizedChunkResult {
+            scanned,
+            requested,
+            chunked: 0,
+            assets: Vec::new(),
+            definitions: Vec::new(),
+            added_placements: Vec::new(),
+            errors: target_errors,
+        };
+        let mut reserved_ids = definitions.keys().cloned().collect::<HashSet<_>>();
+        reserved_ids.extend(placements.iter().map(|placement| placement.id.clone()));
+        for target in targets {
+            // A single source DFF is an atomic unit: if any sibling fails to
+            // serialize, discard everything prepared for that source.
+            let asset_start = result.assets.len();
+            let definition_start = result.definitions.len();
+            let added_start = result.added_placements.len();
+            let reserved_assets_before = reserved_assets.clone();
+            let reserved_ids_before = reserved_ids.clone();
+            let operation = (|| -> Result<(), String> {
+                let source_key = asset_key(&target.name, ".dff");
+                let source_stem = dff_name_stem(&target.name).to_string();
+                let source = parse_dff_mesh(&target.bytes);
+                let chunks = crate::blender_native::split_raw_mesh_spatial(
+                    &source,
+                    V3 {
+                        x: size,
+                        y: size,
+                        z: size,
+                    },
+                )?;
+                if chunks.len() <= 1 {
+                    return Err("model no longer exceeds the selected chunk size".to_string());
+                }
+                let referenced = placements
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, placement)| {
+                        placement_dff_key(placement, &definitions) == source_key
+                    })
+                    .collect::<Vec<_>>();
+                if referenced.is_empty() {
+                    return Err("no live placement references this DFF".to_string());
+                }
+                // Keep the source chunk in the original model coordinate
+                // frame. Moving its placement would also move the original
+                // COL, while sibling chunks are deliberately render-only.
+                let mut source_raw = chunks[0].raw.clone();
+                for vertex in &mut source_raw.vertices {
+                    vertex.x += chunks[0].center.x;
+                    vertex.y += chunks[0].center.y;
+                    vertex.z += chunks[0].center.z;
+                }
+                let source_bytes =
+                    write_normalized_dff_with_options(&source_raw, &source_stem, target.options)?;
+                result.assets.push((target.name.clone(), source_bytes));
+                for (chunk_index, chunk) in chunks.iter().enumerate().skip(1) {
+                    let stem = unique_spatial_chunk_stem(
+                        &source_stem,
+                        chunk_index + 1,
+                        &mut reserved_assets,
+                    );
+                    let name = format!("{stem}.dff");
+                    let bytes =
+                        write_normalized_dff_with_options(&chunk.raw, &stem, target.options)?;
+                    result.assets.push((name, bytes));
+                    let mut definition_ids = HashMap::<String, String>::new();
+                    for (placement_index, placement) in &referenced {
+                        let id = if let Some(id) = definition_ids.get(&placement.id) {
+                            id.clone()
+                        } else {
+                            let id = unique_separated_definition_id(
+                                &mut reserved_ids,
+                                &stem,
+                                &placement.id,
+                                definition_ids.is_empty(),
+                            );
+                            let mut definition = definitions
+                                .get(&placement.id)
+                                .cloned()
+                                .unwrap_or_else(|| Definition {
+                                    id: placement.id.clone(),
+                                    zone: placement.zone.clone(),
+                                    attrs: BTreeMap::new(),
+                                });
+                            definition.id = id.clone();
+                            definition.attrs.insert("id".to_string(), id.clone());
+                            definition.attrs.insert("dff".to_string(), stem.clone());
+                            definition.attrs.remove("col");
+                            result.definitions.push((id.clone(), definition));
+                            definition_ids.insert(placement.id.clone(), id.clone());
+                            id
+                        };
+                        let offset =
+                            crate::blender_native::rotate_placement(chunk.center, placement.rot);
+                        let mut clone = (*placement).clone();
+                        clone.id = id;
+                        clone.dff = stem.clone();
+                        clone.pos = V3 {
+                            x: placement.pos.x + offset.x,
+                            y: placement.pos.y + offset.y,
+                            z: placement.pos.z + offset.z,
+                        };
+                        clone.attrs.remove("lodParent");
+                        sync_placement_attrs(&mut clone);
+                        result.added_placements.push((
+                            clone,
+                            element_states
+                                .get(*placement_index)
+                                .copied()
+                                .unwrap_or_default(),
+                        ));
+                    }
+                }
+                result.chunked += 1;
+                Ok(())
+            })();
+            if let Err(error) = operation {
+                result.assets.truncate(asset_start);
+                result.definitions.truncate(definition_start);
+                result.added_placements.truncate(added_start);
+                reserved_assets = reserved_assets_before;
+                reserved_ids = reserved_ids_before;
+                result.errors.push(format!("{}: {error}", target.name));
+            }
+        }
+        let _ = tx.send(result);
+    });
+    app.oversized_chunk_dialog = None;
+    app.oversized_chunk_job = Some(OversizedChunkJob {
+        rx,
+        result: None,
+        definitions_applied: false,
+        added_placement_index: 0,
+        asset_index: 0,
+        scene_rebuilt: false,
+        started_at: Instant::now(),
+    });
+    app.status_message = format!("Chunking {requested} oversized DFF(s) at {size:.0} units...");
+    true
 }
 
 fn selected_dff_geometry_vertices(dff: &EditingDffState) -> BTreeSet<usize> {
@@ -7243,28 +14160,193 @@ fn unique_separated_definition_id(
     unreachable!()
 }
 
-fn shift_raw_mesh_pivot(raw: &mut RawMesh, pivot: V3) {
+pub(crate) fn dff_pivot_rotation_matrix(rotation: V3) -> Mat4 {
+    Mat4::from_rotation_z(rotation.z.to_radians())
+        * Mat4::from_rotation_y(rotation.y.to_radians())
+        * Mat4::from_rotation_x(rotation.x.to_radians())
+}
+
+fn roadsign_matrix_rotation_degrees(matrix: Mat4) -> V3 {
+    // Decompose the road-sign Rz * Rx * Ry convention.
+    let x = matrix.y_axis.z.clamp(-1.0, 1.0).asin();
+    let cx = x.cos();
+    let (y, z) = if cx.abs() > 0.00001 {
+        (
+            (-matrix.x_axis.z).atan2(matrix.z_axis.z),
+            (-matrix.y_axis.x).atan2(matrix.y_axis.y),
+        )
+    } else {
+        (0.0, matrix.x_axis.y.atan2(matrix.x_axis.x))
+    };
+    V3 {
+        x: x.to_degrees(),
+        y: y.to_degrees(),
+        z: z.to_degrees(),
+    }
+}
+
+fn transform_raw_mesh_pivot(raw: &mut RawMesh, pivot: DffFreeformPivot) {
+    let inverse_rotation = dff_pivot_rotation_matrix(pivot.rotation).inverse();
+    let transform_point = |value: V3| {
+        from_mq(inverse_rotation.transform_vector3(to_mq(value) - to_mq(pivot.position)))
+    };
+    let transform_direction = |value: V3| {
+        let transformed = inverse_rotation.transform_vector3(to_mq(value));
+        if transformed.length_squared() > 0.000001 {
+            from_mq(transformed.normalize())
+        } else {
+            value
+        }
+    };
     for vertex in &mut raw.vertices {
-        vertex.x -= pivot.x;
-        vertex.y -= pivot.y;
-        vertex.z -= pivot.z;
+        *vertex = transform_point(*vertex);
+    }
+    for normal in &mut raw.normals {
+        *normal = transform_direction(*normal);
     }
     for effect in &mut raw.effects_2dfx {
-        effect.position.x -= pivot.x;
-        effect.position.y -= pivot.y;
-        effect.position.z -= pivot.z;
+        effect.position = transform_point(effect.position);
+        if let Some(rotation) = dff_2dfx_effect_rotation(effect) {
+            let transformed = inverse_rotation * dff_2dfx_rotation_matrix(rotation);
+            set_dff_2dfx_effect_rotation(effect, roadsign_matrix_rotation_degrees(transformed));
+        }
     }
+    // Do not transform RenderWare frames here. GTA creates the model entity
+    // from the clump/atomic frame hierarchy, and moving those frames along with
+    // the geometry cancels the authored pivot once the game instantiates the
+    // model. Baking the inverse transform into geometry while retaining the
+    // source frames makes the entity origin the actual new in-game pivot.
     for breakable in raw
         .components
         .iter_mut()
         .filter_map(|component| component.breakable.as_mut())
     {
         for vertex in &mut breakable.vertices {
-            vertex.position.x -= pivot.x;
-            vertex.position.y -= pivot.y;
-            vertex.position.z -= pivot.z;
+            vertex.position = transform_point(vertex.position);
         }
     }
+}
+
+fn transform_collision_mesh_pivot(
+    mesh: &mut CollisionMesh,
+    pivot: DffFreeformPivot,
+) -> Result<(), String> {
+    let inverse_rotation = dff_pivot_rotation_matrix(pivot.rotation).inverse();
+    let transform_point = |value: V3| {
+        from_mq(inverse_rotation.transform_vector3(to_mq(value) - to_mq(pivot.position)))
+    };
+    let original_bounds = mesh.bounds;
+    let rotating =
+        pivot.rotation.x.abs() + pivot.rotation.y.abs() + pivot.rotation.z.abs() > 0.000001;
+
+    if rotating && !mesh.boxes.is_empty() {
+        // Native COL boxes are axis-aligned. Preserve an arbitrarily rotated
+        // pivot exactly by materializing each box as its equivalent triangle
+        // cuboid before transforming the shared vertex stream.
+        let boxes = std::mem::take(&mut mesh.boxes);
+        for col_box in boxes {
+            let center = from_mq((to_mq(col_box.min) + to_mq(col_box.max)) * 0.5);
+            let half_extents = from_mq((to_mq(col_box.max) - to_mq(col_box.min)).abs() * 0.5);
+            append_cuboid_artifacts(mesh, center, half_extents, V3::default(), col_box.surface)?;
+        }
+    }
+
+    for vertex in &mut mesh.vertices {
+        *vertex = transform_point(*vertex);
+    }
+    for vertex in &mut mesh.shadow_vertices {
+        *vertex = transform_point(*vertex);
+    }
+    for sphere in &mut mesh.spheres {
+        sphere.center = transform_point(sphere.center);
+    }
+    for col_box in &mut mesh.boxes {
+        col_box.min = transform_point(col_box.min);
+        col_box.max = transform_point(col_box.max);
+        let min = V3 {
+            x: col_box.min.x.min(col_box.max.x),
+            y: col_box.min.y.min(col_box.max.y),
+            z: col_box.min.z.min(col_box.max.z),
+        };
+        let max = V3 {
+            x: col_box.min.x.max(col_box.max.x),
+            y: col_box.min.y.max(col_box.max.y),
+            z: col_box.min.z.max(col_box.max.z),
+        };
+        col_box.min = min;
+        col_box.max = max;
+    }
+
+    let has_geometry =
+        !mesh.vertices.is_empty() || !mesh.spheres.is_empty() || !mesh.boxes.is_empty();
+    mesh.bounds = if has_geometry {
+        collision_mesh_bounds(&mesh.vertices, &mesh.spheres, &mesh.boxes)
+    } else {
+        let corners = [
+            V3 {
+                x: original_bounds.min.x,
+                y: original_bounds.min.y,
+                z: original_bounds.min.z,
+            },
+            V3 {
+                x: original_bounds.max.x,
+                y: original_bounds.min.y,
+                z: original_bounds.min.z,
+            },
+            V3 {
+                x: original_bounds.min.x,
+                y: original_bounds.max.y,
+                z: original_bounds.min.z,
+            },
+            V3 {
+                x: original_bounds.max.x,
+                y: original_bounds.max.y,
+                z: original_bounds.min.z,
+            },
+            V3 {
+                x: original_bounds.min.x,
+                y: original_bounds.min.y,
+                z: original_bounds.max.z,
+            },
+            V3 {
+                x: original_bounds.max.x,
+                y: original_bounds.min.y,
+                z: original_bounds.max.z,
+            },
+            V3 {
+                x: original_bounds.min.x,
+                y: original_bounds.max.y,
+                z: original_bounds.max.z,
+            },
+            V3 {
+                x: original_bounds.max.x,
+                y: original_bounds.max.y,
+                z: original_bounds.max.z,
+            },
+        ]
+        .map(transform_point);
+        bounds_from_vertices(&corners)
+    };
+    Ok(())
+}
+
+#[cfg(test)]
+fn shift_raw_mesh_pivot(raw: &mut RawMesh, pivot: V3) {
+    transform_raw_mesh_pivot(
+        raw,
+        DffFreeformPivot {
+            position: pivot,
+            rotation: V3::default(),
+        },
+    );
+}
+
+fn compensated_dff_pivot_placement(placement: &Placement, pivot: DffFreeformPivot) -> (V3, V3) {
+    let position = placement_matrix(placement).transform_point3(to_mq(pivot.position));
+    let rotation = matrix_rotation_degrees(
+        placement_rotation_matrix(placement) * dff_pivot_rotation_matrix(pivot.rotation),
+    );
+    (from_mq(position), rotation)
 }
 
 fn split_raw_mesh_faces(
@@ -7311,6 +14393,410 @@ fn split_raw_mesh_faces(
     Ok((remaining, separated))
 }
 
+fn split_raw_mesh_by_material_limit(source: &RawMesh) -> Result<Vec<RawMesh>, String> {
+    let mut source = source.clone();
+    compact_unused_dff_material_slots(&mut source);
+    let material_count = dff_material_slot_count(&source);
+    if material_count <= GTA_DFF_MATERIAL_LIMIT {
+        return Ok(vec![source]);
+    }
+    if source.components.len() > 1 {
+        return Err(
+            "automatic material splitting currently requires a single-geometry DFF".to_string(),
+        );
+    }
+    if source
+        .components
+        .iter()
+        .any(|component| component.breakable.is_some())
+    {
+        return Err(
+            "automatic material splitting cannot preserve breakable fragment data".to_string(),
+        );
+    }
+
+    let group_count = material_count.div_ceil(GTA_DFF_MATERIAL_LIMIT);
+    let mut groups = Vec::with_capacity(group_count);
+    for group in 0..group_count {
+        let first_material = group * GTA_DFF_MATERIAL_LIMIT;
+        let last_material = ((group + 1) * GTA_DFF_MATERIAL_LIMIT).min(material_count);
+        let mut raw = source.clone();
+        raw.triangles.retain(|triangle| {
+            let material = triangle.material as usize;
+            material >= first_material && material < last_material
+        });
+        if raw.triangles.is_empty() {
+            continue;
+        }
+        if group > 0 {
+            // These entries belong to the source object's authored frame and
+            // must not be duplicated across every co-located render element.
+            raw.effects_2dfx.clear();
+        }
+        compact_raw_vertices(&mut raw);
+        compact_unused_dff_material_slots(&mut raw);
+        if let Some(component) = raw.components.first_mut() {
+            component.vertex_start = 0;
+            component.vertex_end = raw.vertices.len();
+            component.tri_start = 0;
+            component.tri_end = raw.triangles.len();
+        }
+        if dff_material_slot_count(&raw) > GTA_DFF_MATERIAL_LIMIT {
+            return Err("material split produced an unsafe DFF chunk".to_string());
+        }
+        groups.push(raw);
+    }
+    Ok(groups)
+}
+
+fn unique_material_split_stem(
+    source_stem: &str,
+    part: usize,
+    reserved: &mut HashSet<String>,
+) -> String {
+    let max_stem_len = IMG_RUNTIME_SAFE_ENTRY_NAME_BYTES - ".dff".len();
+    for attempt in 1usize.. {
+        let suffix = if attempt == 1 {
+            format!("_m{part}")
+        } else {
+            format!("_m{part}_{attempt}")
+        };
+        let keep = max_stem_len.saturating_sub(suffix.len());
+        let prefix = source_stem.chars().take(keep).collect::<String>();
+        let stem = format!("{prefix}{suffix}");
+        if reserved.insert(asset_key(&stem, ".dff")) {
+            return stem;
+        }
+    }
+    unreachable!()
+}
+
+pub(crate) fn start_dff_material_limit_split(app: &mut AppState) -> bool {
+    if app.dff_geometry_job.is_some() || other_dff_asset_writer_active(app) {
+        app.status_message =
+            "Wait for the current background asset operation to finish".to_string();
+        return false;
+    }
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        return false;
+    };
+    if dff.read_only {
+        app.status_message = "This GTA:SA DFF preview is read-only".to_string();
+        return false;
+    }
+    let material_count = dff_material_slot_count(&dff.raw);
+    if material_count <= GTA_DFF_MATERIAL_LIMIT {
+        app.status_message = format!(
+            "This DFF uses {material_count} material(s), within GTA:SA's {GTA_DFF_MATERIAL_LIMIT}-material limit"
+        );
+        return false;
+    }
+
+    let source_name = asset_key(&dff.name, ".dff");
+    let source_key = asset_key(&source_name, ".dff");
+    let source_stem = dff_name_stem(&source_name).to_string();
+    let source_raw = dff.raw.clone();
+    let options = dff_write_options_for_asset(app, &source_name);
+    let root = app.root.clone();
+    let placements = app.placements.clone();
+    let element_states = app.element_states.clone();
+    let definitions = app.definitions.clone();
+    let mut reserved_asset_names = app
+        .pending_replacement_assets
+        .keys()
+        .chain(app.editing.modified_entries.keys())
+        .chain(app.editing.rows.iter().map(|row| &row.entry.name))
+        .map(|name| asset_key(name, ".dff"))
+        .collect::<HashSet<_>>();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = std::panic::catch_unwind(move || {
+            let mut groups = split_raw_mesh_by_material_limit(&source_raw)?;
+            let source_raw = groups.remove(0);
+            let source_bytes =
+                write_normalized_dff_with_options(&source_raw, &source_stem, options)?;
+
+            let mut new_assets = Vec::with_capacity(groups.len());
+            for (index, raw) in groups.into_iter().enumerate() {
+                let stem = loop {
+                    let candidate = unique_material_split_stem(
+                        &source_stem,
+                        index + 2,
+                        &mut reserved_asset_names,
+                    );
+                    if find_dff_entry(&root, &candidate).is_none() {
+                        break candidate;
+                    }
+                };
+                let name = format!("{stem}.dff");
+                let bytes = write_normalized_dff_with_options(&raw, &stem, options)?;
+                new_assets.push((name, raw, bytes));
+            }
+
+            let mut reserved_ids = definitions.keys().cloned().collect::<HashSet<_>>();
+            reserved_ids.extend(placements.iter().map(|placement| placement.id.clone()));
+            let mut new_definitions = Vec::new();
+            let mut placement_changes = Vec::new();
+            for (asset_index, (name, _, _)) in new_assets.iter().enumerate() {
+                let stem = dff_name_stem(name);
+                let mut definition_ids = HashMap::<String, String>::new();
+                for (placement_index, placement) in placements.iter().enumerate() {
+                    if placement_dff_key(placement, &definitions) != source_key {
+                        continue;
+                    }
+                    let next_id = if let Some(existing) = definition_ids.get(&placement.id) {
+                        existing.clone()
+                    } else {
+                        let id = unique_separated_definition_id(
+                            &mut reserved_ids,
+                            stem,
+                            &placement.id,
+                            asset_index == 0 && definition_ids.is_empty(),
+                        );
+                        let mut definition = definitions
+                            .get(&placement.id)
+                            .cloned()
+                            .unwrap_or_else(|| Definition {
+                                id: placement.id.clone(),
+                                zone: placement.zone.clone(),
+                                attrs: BTreeMap::new(),
+                            });
+                        definition.id = id.clone();
+                        definition.attrs.insert("id".to_string(), id.clone());
+                        definition.attrs.insert("dff".to_string(), stem.to_string());
+                        // The original element retains the full collision. The
+                        // render-only siblings must not duplicate that COL.
+                        definition.attrs.remove("col");
+                        new_definitions.push((id.clone(), definition));
+                        definition_ids.insert(placement.id.clone(), id.clone());
+                        id
+                    };
+                    let mut clone = placement.clone();
+                    clone.id = next_id;
+                    clone.dff = stem.to_string();
+                    sync_placement_attrs(&mut clone);
+                    placement_changes.push(DffGeometryPlacementChange::Add {
+                        placement: clone,
+                        state: element_states
+                            .get(placement_index)
+                            .copied()
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+            if !new_assets.is_empty() && placement_changes.is_empty() {
+                return Err(format!(
+                    "No map placements reference {source_name}; open the DFF from a placed object"
+                ));
+            }
+            Ok(DffGeometryResult {
+                kind: DffGeometryOperationKind::SplitMaterialLimits,
+                source_name,
+                source_raw,
+                source_bytes,
+                new_assets,
+                definitions: new_definitions,
+                placement_changes,
+                face_count: 0,
+                pivot: None,
+                pivot_rotation: None,
+                pivot_cols: Vec::new(),
+            })
+        })
+        .unwrap_or_else(|_| Err("DFF material-limit split worker crashed".to_string()));
+        let _ = tx.send(result);
+    });
+    app.dff_geometry_job = Some(DffGeometryJob {
+        rx,
+        result: None,
+        base_applied: false,
+        placement_index: 0,
+        refresh_index: 0,
+        scene_rebuilt: false,
+        started_at: Instant::now(),
+    });
+    app.status_message =
+        format!("Splitting {material_count} materials into GTA-safe DFF elements...");
+    true
+}
+
+pub(crate) fn request_automatic_dff_material_limit_repair(app: &mut AppState) {
+    if app.dff_material_limit_repair_job.is_some() {
+        app.status_message = "Automatic DFF material repair is already running".to_string();
+        return;
+    }
+    if let Some(conflict) = validation_operation_conflict(app) {
+        app.status_message = format!("Wait for the background {conflict} to finish first.");
+        return;
+    }
+
+    let entries = collect_resource_dff_entries(&app.root);
+    // Match Validation's definition-based reference inventory. Placement::dff
+    // is a derived cache and can lag behind definitions after a bulk import.
+    let active_ids = app
+        .placements
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            !app.element_states
+                .get(*index)
+                .is_some_and(|state| state.deleted)
+        })
+        .map(|(_, placement)| placement.id.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let referenced = app
+        .definitions
+        .values()
+        .filter(|definition| active_ids.contains(&definition.id.to_ascii_lowercase()))
+        .map(|definition| asset_key_opt(definition.attrs.get("dff"), &definition.id, ".dff"))
+        .collect::<BTreeSet<_>>();
+    let mut targets = Vec::new();
+    for name in &referenced {
+        let bytes = app
+            .editing
+            .modified_entries
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                app.pending_replacement_assets
+                    .get(name)
+                    .map(|(_, bytes)| bytes.clone())
+            })
+            .or_else(|| entries.get(name).map(read_img_entry));
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        if max_dff_geometry_material_count(&bytes).is_ok_and(|count| count > GTA_DFF_MATERIAL_LIMIT)
+        {
+            targets.push(DffMaterialLimitRepairTarget {
+                name: name.clone(),
+                bytes,
+                options: dff_write_options_for_asset(app, name),
+            });
+        }
+    }
+    if targets.is_empty() {
+        app.status_message = "No referenced DFF exceeds GTA:SA's material limit".to_string();
+        return;
+    }
+
+    let scanned = referenced.len();
+    let unsafe_count = targets.len();
+    let placements = app.placements.clone();
+    let element_states = app.element_states.clone();
+    let definitions = app.definitions.clone();
+    let mut reserved_assets = entries.keys().cloned().collect::<HashSet<_>>();
+    reserved_assets.extend(app.pending_replacement_assets.keys().cloned());
+    reserved_assets.extend(app.editing.modified_entries.keys().cloned());
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut result = DffMaterialLimitRepairResult {
+            scanned,
+            unsafe_count,
+            repaired: 0,
+            assets: Vec::new(),
+            definitions: Vec::new(),
+            placements: Vec::new(),
+            errors: Vec::new(),
+        };
+        let mut reserved_ids = definitions.keys().cloned().collect::<HashSet<_>>();
+        reserved_ids.extend(placements.iter().map(|placement| placement.id.clone()));
+
+        for target in targets {
+            let repair = (|| -> Result<(), String> {
+                let mut target_assets = Vec::new();
+                let mut target_definitions = Vec::new();
+                let mut target_placements = Vec::new();
+                let source_key = asset_key(&target.name, ".dff");
+                let source_stem = dff_name_stem(&target.name).to_string();
+                let source = parse_dff_mesh(&target.bytes);
+                if source.vertices.is_empty() || source.triangles.is_empty() {
+                    return Err("DFF has no readable geometry".to_string());
+                }
+                let mut groups = split_raw_mesh_by_material_limit(&source)?;
+                let source_raw = groups.remove(0);
+                let source_bytes =
+                    write_normalized_dff_with_options(&source_raw, &source_stem, target.options)?;
+                target_assets.push((target.name.clone(), source_bytes));
+
+                for (group_index, raw) in groups.into_iter().enumerate() {
+                    let stem = unique_material_split_stem(
+                        &source_stem,
+                        group_index + 2,
+                        &mut reserved_assets,
+                    );
+                    let name = format!("{stem}.dff");
+                    let bytes = write_normalized_dff_with_options(&raw, &stem, target.options)?;
+                    target_assets.push((name, bytes));
+
+                    let mut definition_ids = HashMap::<String, String>::new();
+                    for (placement_index, placement) in placements.iter().enumerate() {
+                        if placement_dff_key(placement, &definitions) != source_key {
+                            continue;
+                        }
+                        let next_id = if let Some(id) = definition_ids.get(&placement.id) {
+                            id.clone()
+                        } else {
+                            let id = unique_separated_definition_id(
+                                &mut reserved_ids,
+                                &stem,
+                                &placement.id,
+                                definition_ids.is_empty(),
+                            );
+                            let mut definition = definitions
+                                .get(&placement.id)
+                                .cloned()
+                                .unwrap_or_else(|| Definition {
+                                    id: placement.id.clone(),
+                                    zone: placement.zone.clone(),
+                                    attrs: BTreeMap::new(),
+                                });
+                            definition.id = id.clone();
+                            definition.attrs.insert("id".to_string(), id.clone());
+                            definition.attrs.insert("dff".to_string(), stem.clone());
+                            definition.attrs.remove("col");
+                            target_definitions.push((id.clone(), definition));
+                            definition_ids.insert(placement.id.clone(), id.clone());
+                            id
+                        };
+                        let mut clone = placement.clone();
+                        clone.id = next_id;
+                        clone.dff = stem.clone();
+                        sync_placement_attrs(&mut clone);
+                        target_placements.push((
+                            clone,
+                            element_states
+                                .get(placement_index)
+                                .copied()
+                                .unwrap_or_default(),
+                        ));
+                    }
+                }
+                result.assets.extend(target_assets);
+                result.definitions.extend(target_definitions);
+                result.placements.extend(target_placements);
+                result.repaired += 1;
+                Ok(())
+            })();
+            if let Err(error) = repair {
+                result.errors.push(format!("{}: {error}", target.name));
+            }
+        }
+        let _ = tx.send(result);
+    });
+    app.dff_material_limit_repair_job = Some(DffMaterialLimitRepairJob {
+        rx,
+        result: None,
+        definitions_applied: false,
+        asset_index: 0,
+        placement_index: 0,
+        scene_rebuilt: false,
+        started_at: Instant::now(),
+    });
+    app.status_message =
+        format!("Automatically repairing {unsafe_count} material-unsafe DFF(s)...");
+}
+
 fn other_dff_asset_writer_active(app: &AppState) -> bool {
     app.editing.save_rx.is_some()
         || app.dff_repair_rx.is_some()
@@ -7324,6 +14810,8 @@ fn other_dff_asset_writer_active(app: &AppState) -> bool {
         || app.shadow_mesh_generation_job.is_some()
         || app.lod_generation_job.is_some()
         || app.instance_lod_removal_job.is_some()
+        || app.dff_material_limit_repair_job.is_some()
+        || app.oversized_chunk_job.is_some()
 }
 
 fn start_dff_separation_worker(app: &mut AppState, new_name: String, new_stem: String) -> bool {
@@ -7387,7 +14875,7 @@ fn start_dff_separation_worker(app: &mut AppState, new_name: String, new_stem: S
             let mut new_definitions = Vec::new();
             let mut placement_changes = Vec::new();
             for (index, placement) in placements.iter().enumerate() {
-                if asset_key(&placement.dff, ".dff") != source_key {
+                if placement_dff_key(placement, &definitions) != source_key {
                     continue;
                 }
                 let next_id = if let Some(existing) = definition_ids.get(&placement.id) {
@@ -7438,11 +14926,13 @@ fn start_dff_separation_worker(app: &mut AppState, new_name: String, new_stem: S
                 source_name,
                 source_raw: remaining,
                 source_bytes,
-                new_asset: Some((new_name, separated, new_bytes)),
+                new_assets: vec![(new_name, separated, new_bytes)],
                 definitions: new_definitions,
                 placement_changes,
                 face_count: selected_faces.len(),
                 pivot: None,
+                pivot_rotation: None,
+                pivot_cols: Vec::new(),
             })
         })
         .unwrap_or_else(|_| Err("DFF separation worker crashed".to_string()));
@@ -7461,17 +14951,89 @@ fn start_dff_separation_worker(app: &mut AppState, new_name: String, new_stem: S
     true
 }
 
-fn start_dff_pivot_worker(app: &mut AppState, pivot: V3) -> bool {
+fn dff_pivot_col_sources(
+    app: &AppState,
+    source_dff_key: &str,
+    source_name: &str,
+) -> Vec<(String, Vec<u8>)> {
+    let mut names = BTreeSet::new();
+    for placement in &app.placements {
+        if placement_dff_key(placement, &app.definitions) != source_dff_key {
+            continue;
+        }
+        let dff_stem = source_dff_key
+            .strip_suffix(".dff")
+            .unwrap_or(source_dff_key);
+        let col = app
+            .definitions
+            .get(&placement.id)
+            .map(|definition| asset_key_opt(definition.attrs.get("col"), dff_stem, ".col"))
+            .unwrap_or_else(|| asset_key(dff_stem, ".col"));
+        names.insert(col);
+    }
+    if names.is_empty() {
+        names.insert(asset_key(dff_name_stem(source_name), ".col"));
+    }
+
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let key = editing_key(&name);
+            let bytes = app
+                .editing
+                .modified_entries
+                .get(&key)
+                .cloned()
+                .or_else(|| {
+                    app.pending_replacement_assets
+                        .get(&key)
+                        .map(|(_, bytes)| bytes.clone())
+                })
+                .or_else(|| {
+                    app.editing
+                        .rows
+                        .iter()
+                        .find(|row| row.entry.name.eq_ignore_ascii_case(&name))
+                        .and_then(|row| editing_entry_bytes(app, row).ok())
+                })
+                .or_else(|| {
+                    let entry = find_col_entry(&app.root, &name)?;
+                    let bytes = read_img_entry(&entry);
+                    (!bytes.is_empty()).then_some(bytes)
+                })?;
+            Some((name, bytes))
+        })
+        .collect()
+}
+
+fn start_dff_pivot_worker(app: &mut AppState, pivot: DffFreeformPivot) -> bool {
     if app.dff_geometry_job.is_some() || other_dff_asset_writer_active(app) {
         app.status_message =
             "Wait for the current background asset operation to finish".to_string();
         return false;
     }
-    if !pivot.x.is_finite() || !pivot.y.is_finite() || !pivot.z.is_finite() {
-        app.status_message = "Pivot coordinates must be finite".to_string();
+    if ![
+        pivot.position.x,
+        pivot.position.y,
+        pivot.position.z,
+        pivot.rotation.x,
+        pivot.rotation.y,
+        pivot.rotation.z,
+    ]
+    .into_iter()
+    .all(f32::is_finite)
+    {
+        app.status_message = "Pivot position and rotation must be finite".to_string();
         return false;
     }
-    if pivot.x.abs() + pivot.y.abs() + pivot.z.abs() <= 0.000001 {
+    if pivot.position.x.abs()
+        + pivot.position.y.abs()
+        + pivot.position.z.abs()
+        + pivot.rotation.x.abs()
+        + pivot.rotation.y.abs()
+        + pivot.rotation.z.abs()
+        <= 0.000001
+    {
         app.status_message = "The chosen pivot is already at the object origin".to_string();
         return false;
     }
@@ -7480,45 +15042,70 @@ fn start_dff_pivot_worker(app: &mut AppState, pivot: V3) -> bool {
     };
     let source_name = asset_key(&dff.name, ".dff");
     let source_key = asset_key(&source_name, ".dff");
+    let pivot_col_sources = dff_pivot_col_sources(app, &source_key, &source_name);
     let mut source_raw = dff.raw.clone();
     let options = dff_write_options_for_asset(app, &source_name);
     let placements = app.placements.clone();
+    let definitions = app.definitions.clone();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let result = std::panic::catch_unwind(move || {
-            shift_raw_mesh_pivot(&mut source_raw, pivot);
+            transform_raw_mesh_pivot(&mut source_raw, pivot);
             let source_bytes = write_normalized_dff_with_options(
                 &source_raw,
                 dff_name_stem(&source_name),
                 options,
             )?;
-            let mut placement_changes = Vec::new();
-            for (index, placement) in placements.iter().enumerate() {
-                if asset_key(&placement.dff, ".dff") != source_key {
-                    continue;
+            let mut pivot_cols = Vec::new();
+            for (name, bytes) in pivot_col_sources {
+                let entry = ImgEntry {
+                    img_path: PathBuf::from(&name),
+                    name: name.clone(),
+                    offset: 0,
+                    size: bytes.len().min(u32::MAX as usize) as u32,
+                };
+                let (mut mesh, identity) = parse_col_mesh_with_identity(&bytes, &entry)
+                    .ok_or_else(|| format!("{name}: paired COL could not be parsed"))?;
+                transform_collision_mesh_pivot(&mut mesh, pivot)
+                    .map_err(|error| format!("{name}: {error}"))?;
+                let updated = write_col_mesh_replacing_model(&bytes, &identity, &mesh)
+                    .map_err(|error| format!("{name}: {error}"))?;
+                let issues = validate_col_for_game_load(&name, &updated);
+                if let Some(issue) = issues
+                    .iter()
+                    .find(|issue| issue.severity == ColLoadIssueSeverity::Error)
+                {
+                    return Err(format!("{name}: {}", issue.message));
                 }
-                let offset = placement_matrix(placement).transform_vector3(to_mq(pivot));
-                placement_changes.push(DffGeometryPlacementChange::Move {
-                    index,
-                    position: from_mq(to_mq(placement.pos) + offset),
+                pivot_cols.push(DffPivotColAsset {
+                    name,
+                    bytes: updated,
                 });
             }
-            if placement_changes.is_empty() {
-                return Err(format!(
-                    "No map placements reference {}; open the DFF from a placed object",
-                    source_name
-                ));
+            let mut placement_changes = Vec::new();
+            for (index, placement) in placements.iter().enumerate() {
+                if placement_dff_key(placement, &definitions) != source_key {
+                    continue;
+                }
+                let (position, rotation) = compensated_dff_pivot_placement(placement, pivot);
+                placement_changes.push(DffGeometryPlacementChange::Transform {
+                    index,
+                    position,
+                    rotation,
+                });
             }
             Ok(DffGeometryResult {
                 kind: DffGeometryOperationKind::Pivot,
                 source_name,
                 source_raw,
                 source_bytes,
-                new_asset: None,
+                new_assets: Vec::new(),
                 definitions: Vec::new(),
                 placement_changes,
                 face_count: 0,
-                pivot: Some(pivot),
+                pivot: Some(pivot.position),
+                pivot_rotation: Some(pivot.rotation),
+                pivot_cols,
             })
         })
         .unwrap_or_else(|_| Err("DFF pivot worker crashed".to_string()));
@@ -7534,22 +15121,46 @@ fn start_dff_pivot_worker(app: &mut AppState, pivot: V3) -> bool {
         started_at: Instant::now(),
     });
     app.status_message = format!(
-        "Adjusting DFF pivot to {:.3}, {:.3}, {:.3}...",
-        pivot.x, pivot.y, pivot.z
+        "Adjusting DFF pivot to {:.3}, {:.3}, {:.3} / {:.1}°, {:.1}°, {:.1}°...",
+        pivot.position.x,
+        pivot.position.y,
+        pivot.position.z,
+        pivot.rotation.x,
+        pivot.rotation.y,
+        pivot.rotation.z
     );
     true
 }
 
 pub(crate) fn open_dff_separate_dialog(app: &mut AppState) -> bool {
-    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return false;
     };
-    let selected = dff_selected_face_set(dff);
-    if selected.is_empty() {
+    sync_active_open_dff_model(dff);
+    let multi_selected = dff.multi_select
+        && dff
+            .open_models
+            .iter()
+            .filter(|model| model.selected_face.is_some() || !model.selected_faces.is_empty())
+            .count()
+            > 1;
+    let selected_count = if multi_selected {
+        dff.open_models
+            .iter()
+            .map(|model| {
+                let mut faces = model.selected_faces.clone();
+                faces.extend(model.selected_face);
+                faces.len()
+            })
+            .sum()
+    } else {
+        dff_selected_face_set(dff).len()
+    };
+    if selected_count == 0 {
         app.status_message = "Select one or more DFF faces to separate".to_string();
         return false;
     }
-    if selected.len() >= dff.raw.triangles.len() {
+    if !multi_selected && selected_count >= dff.raw.triangles.len() {
         app.status_message =
             "Leave at least one face in the original object when separating".to_string();
         return false;
@@ -7571,6 +15182,194 @@ pub(crate) fn open_dff_separate_dialog(app: &mut AppState) -> bool {
     true
 }
 
+fn start_multi_dff_separation(app: &mut AppState, new_name: String, new_stem: String) -> bool {
+    let before = world_editing_history_snapshot(app);
+    let selected_models = {
+        let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+            return false;
+        };
+        sync_active_open_dff_model(dff);
+        dff.open_models
+            .iter()
+            .enumerate()
+            .filter_map(|(index, model)| {
+                let mut faces = model.selected_faces.clone();
+                faces.extend(model.selected_face);
+                (!faces.is_empty()).then(|| (index, model.clone(), faces))
+            })
+            .collect::<Vec<_>>()
+    };
+    if selected_models.len() <= 1 {
+        return start_dff_separation_worker(app, new_name, new_stem);
+    }
+    let new_key = asset_key(&new_name, ".dff");
+    if app.editing.modified_entries.contains_key(&new_key)
+        || app
+            .editing
+            .rows
+            .iter()
+            .any(|row| editing_key(&row.entry.name) == new_key)
+        || find_dff_entry(&app.root, &new_name).is_some()
+    {
+        app.status_message = format!("A DFF named {new_name} already exists");
+        return false;
+    }
+
+    let anchor_model = selected_models[0].1.clone();
+    let Some(anchor_placement) = app.placements.get(anchor_model.placement_index).cloned() else {
+        app.status_message = "The separation anchor placement no longer exists".to_string();
+        return false;
+    };
+    let mut chunks = Vec::new();
+    let mut remaining = Vec::<(usize, RawMesh)>::new();
+    let mut removed_models = Vec::new();
+    let mut selected_face_count = 0usize;
+    for (index, model, faces) in &selected_models {
+        if faces.iter().any(|face| *face >= model.raw.triangles.len()) {
+            app.status_message = format!("{} selection changed before separation", model.name);
+            return false;
+        }
+        selected_face_count += faces.len();
+        if faces.len() == model.raw.triangles.len() {
+            chunks.push((model.name.clone(), model.raw.clone()));
+            removed_models.push((*index, model.placement_index));
+        } else {
+            let Ok((rest, chunk)) = split_raw_mesh_faces(&model.raw, faces) else {
+                app.status_message =
+                    format!("Could not separate selected faces from {}", model.name);
+                return false;
+            };
+            remaining.push((*index, rest));
+            chunks.push((model.name.clone(), chunk));
+        }
+    }
+    let mut chunks = chunks.into_iter();
+    let Some((first_name, mut combined)) = chunks.next() else {
+        return false;
+    };
+    let mut combined_name = first_name;
+    for (name, chunk) in chunks {
+        combined = match combine_editor_dff_chunks(&combined_name, combined, &name, chunk) {
+            Ok(combined) => combined,
+            Err(error) => {
+                app.status_message = format!("Could not combine separated geometry: {error}");
+                return false;
+            }
+        };
+        combined_name = new_name.clone();
+    }
+    // The new placement inherits the anchor transform, so serialize the
+    // workspace-space union back into that placement's local coordinates.
+    let mut local_new = combined.clone();
+    transform_editor_raw_mesh(&mut local_new, anchor_model.to_workspace.inverse());
+    let options = dff_write_options_for_asset(app, &new_name);
+    let bytes = match write_normalized_dff_with_options(&local_new, &new_stem, options) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            app.status_message = format!("Could not write separated DFF: {error}");
+            return false;
+        }
+    };
+
+    let mut reserved_ids = app.definitions.keys().cloned().collect::<HashSet<_>>();
+    reserved_ids.extend(app.placements.iter().map(|placement| placement.id.clone()));
+    let new_id =
+        unique_separated_definition_id(&mut reserved_ids, &new_stem, &anchor_placement.id, true);
+    let mut definition = app
+        .definitions
+        .get(&anchor_placement.id)
+        .cloned()
+        .unwrap_or_else(|| Definition {
+            id: new_id.clone(),
+            zone: anchor_placement.zone.clone(),
+            attrs: BTreeMap::new(),
+        });
+    definition.id = new_id.clone();
+    definition.attrs.insert("id".to_string(), new_id.clone());
+    definition.attrs.insert("dff".to_string(), new_stem.clone());
+    definition.attrs.remove("col");
+    app.definitions.insert(new_id.clone(), definition);
+    let mut placement = anchor_placement;
+    placement.id = new_id;
+    placement.dff = new_stem;
+    sync_placement_attrs(&mut placement);
+    app.placements.push(placement);
+    app.element_states.push(ElementState::default());
+    app.outliner_labels.push(None);
+    let new_placement_index = app.placements.len() - 1;
+
+    let fallback_img = app.root.join("imgs").join(REPLACEMENT_IMG);
+    editing_stage_added_entry(&mut app.editing, fallback_img, &new_name, bytes.clone());
+    refresh_live_asset_from_editing_entry(app, &new_name, &bytes);
+    for (_, placement_index) in &removed_models {
+        if let Some(state) = app.element_states.get_mut(*placement_index) {
+            state.deleted = true;
+        }
+    }
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        for (index, raw) in remaining {
+            if let Some(model) = dff.open_models.get_mut(index) {
+                model.raw = raw;
+                model.dirty = true;
+                model.preview_mesh = None;
+                model.selected_face = None;
+                model.selected_faces.clear();
+                model.selected_edges.clear();
+                model.selected_vertex = None;
+                model.selected_vertices.clear();
+            }
+        }
+        for (index, _) in removed_models.iter().rev() {
+            dff.open_models.remove(*index);
+        }
+        dff.open_models.push(EditingDffOpenModel {
+            name: new_name.clone(),
+            placement_index: new_placement_index,
+            to_workspace: anchor_model.to_workspace,
+            raw: combined.clone(),
+            preview_mesh: None,
+            txd_context: anchor_model.txd_context.clone(),
+            txd_source_label: anchor_model.txd_source_label.clone(),
+            dirty: false,
+            selected_face: None,
+            selected_faces: BTreeSet::new(),
+            selected_edges: BTreeSet::new(),
+            selected_vertex: None,
+            selected_vertices: BTreeSet::new(),
+        });
+        let active = dff.open_models.len() - 1;
+        dff.active_open_model = active;
+        dff.name = new_name.clone();
+        dff.raw = combined;
+        dff.preview_mesh = None;
+        dff.txd_context = anchor_model.txd_context;
+        dff.txd_source_label = anchor_model.txd_source_label;
+        dff.dirty = false;
+        dff.selected_face = None;
+        dff.selected_faces.clear();
+        dff.selected_edges.clear();
+        dff.selected_vertex = None;
+        dff.selected_vertices.clear();
+    }
+    app.selected = new_placement_index;
+    app.selected_elements = BTreeSet::from([new_placement_index]);
+    app.selected_element_order = vec![new_placement_index];
+    invalidate_outliner_labels(app);
+    invalidate_validation_cache(app);
+    rebuild_render_cells(app);
+    refresh_editing_dff_preview(app);
+    commit_scoped_history(
+        app,
+        "Separate Multi-Model Selection",
+        ScopedHistorySnapshot::WorldEditing(before),
+    );
+    app.status_message = format!(
+        "Separated {selected_face_count} faces from {} models into {new_name}",
+        selected_models.len()
+    );
+    true
+}
+
 pub(crate) fn start_dff_separation(app: &mut AppState, typed_name: &str) -> bool {
     let (new_name, new_stem) = match validate_separated_dff_name(typed_name) {
         Ok(name) => name,
@@ -7579,7 +15378,15 @@ pub(crate) fn start_dff_separation(app: &mut AppState, typed_name: &str) -> bool
             return false;
         }
     };
-    start_dff_separation_worker(app, new_name, new_stem)
+    let multi = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.multi_select && editing_multi_selected_model_indices(dff).len() > 1
+    );
+    if multi {
+        start_multi_dff_separation(app, new_name, new_stem)
+    } else {
+        start_dff_separation_worker(app, new_name, new_stem)
+    }
 }
 
 pub(crate) fn editing_pivot_to_selection(app: &mut AppState) -> bool {
@@ -7591,7 +15398,13 @@ pub(crate) fn editing_pivot_to_selection(app: &mut AppState) -> bool {
         app.status_message = "Select DFF vertices, edges, or faces for the new pivot".to_string();
         return false;
     };
-    start_dff_pivot_worker(app, pivot)
+    start_dff_pivot_worker(
+        app,
+        DffFreeformPivot {
+            position: pivot,
+            rotation: V3::default(),
+        },
+    )
 }
 
 pub(crate) fn editing_pivot_to_bounds(app: &mut AppState) -> bool {
@@ -7603,7 +15416,77 @@ pub(crate) fn editing_pivot_to_bounds(app: &mut AppState) -> bool {
         app.status_message = "The DFF has no geometry for a bounds pivot".to_string();
         return false;
     };
+    start_dff_pivot_worker(
+        app,
+        DffFreeformPivot {
+            position: pivot,
+            rotation: V3::default(),
+        },
+    )
+}
+
+pub(crate) fn editing_begin_freeform_pivot(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff.read_only {
+        app.status_message = "Preview-only GTA:SA DFFs cannot be edited".to_string();
+        return false;
+    }
+    dff.freeform_pivot = Some(DffFreeformPivot::default());
+    dff.boolean_box = None;
+    dff.selected_2dfx = None;
+    app.transform_mode = TransformMode::Move;
+    app.transform_space = TransformSpace::Local;
+    app.status_message =
+        "Freeform pivot active: use Move/Rotate (2/3), then Apply Pivot".to_string();
+    true
+}
+
+pub(crate) fn editing_cancel_freeform_pivot(app: &mut AppState) -> bool {
+    if app.dff_geometry_job.is_some() {
+        app.status_message = "Wait for the pivot operation to finish".to_string();
+        return false;
+    }
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff.freeform_pivot.take().is_none() {
+        return false;
+    }
+    app.gizmo_drag = None;
+    app.hovered_gizmo = None;
+    app.status_message = "Cancelled freeform pivot".to_string();
+    true
+}
+
+pub(crate) fn editing_apply_freeform_pivot(app: &mut AppState) -> bool {
+    let pivot = match app.editing.asset.as_ref() {
+        Some(EditingAsset::Dff(dff)) => dff.freeform_pivot,
+        _ => None,
+    };
+    let Some(pivot) = pivot else {
+        return false;
+    };
     start_dff_pivot_worker(app, pivot)
+}
+
+pub(crate) fn selected_editing_dff_freeform_pivot(app: &AppState) -> Option<DffFreeformPivot> {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        return None;
+    };
+    dff.freeform_pivot
+}
+
+pub(crate) fn set_editing_dff_freeform_pivot(app: &mut AppState, pivot: DffFreeformPivot) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let Some(current) = dff.freeform_pivot.as_mut() else {
+        return false;
+    };
+    *current = pivot;
+    true
 }
 
 impl DffGeometryJob {
@@ -7614,16 +15497,20 @@ impl DffGeometryJob {
         if index == 0 {
             return Some((result.source_name.clone(), result.source_bytes.clone()));
         }
-        (index == 1)
-            .then(|| result.new_asset.as_ref())
-            .flatten()
-            .map(|(name, _, bytes)| (name.clone(), bytes.clone()))
+        let index = index.saturating_sub(1);
+        if let Some((name, _, bytes)) = result.new_assets.get(index) {
+            return Some((name.clone(), bytes.clone()));
+        }
+        result
+            .pivot_cols
+            .get(index.saturating_sub(result.new_assets.len()))
+            .map(|asset| (asset.name.clone(), asset.bytes.clone()))
     }
 
     fn refresh_count(&self) -> usize {
         self.result
             .as_ref()
-            .map(|result| 1 + usize::from(result.new_asset.is_some()))
+            .map(|result| 1 + result.new_assets.len() + result.pivot_cols.len())
             .unwrap_or(0)
     }
 
@@ -7651,7 +15538,7 @@ impl DffGeometryJob {
             app.editing
                 .modified_entries
                 .insert(source_key, result.source_bytes.clone());
-            if let Some((name, _, bytes)) = result.new_asset.as_ref() {
+            for (name, _, bytes) in &result.new_assets {
                 let key = editing_key(name);
                 app.editing
                     .modified_entries
@@ -7675,6 +15562,23 @@ impl DffGeometryJob {
                     });
                 }
             }
+            for asset in &result.pivot_cols {
+                let key = editing_key(&asset.name);
+                if app
+                    .editing
+                    .rows
+                    .iter()
+                    .any(|row| row.entry.name.eq_ignore_ascii_case(&asset.name))
+                {
+                    app.editing
+                        .modified_entries
+                        .insert(key, asset.bytes.clone());
+                } else {
+                    app.pending_replacement_assets
+                        .insert(key, (asset.name.clone(), asset.bytes.clone()));
+                    app.loaded_wip = true;
+                }
+            }
             for (id, definition) in &result.definitions {
                 app.definitions.insert(id.clone(), definition.clone());
             }
@@ -7687,6 +15591,9 @@ impl DffGeometryJob {
                 dff.selected_edges.clear();
                 dff.selected_vertex = None;
                 dff.selected_vertices.clear();
+                if result.kind == DffGeometryOperationKind::Pivot {
+                    dff.freeform_pivot = None;
+                }
                 dff.dirty = false;
                 dff.normalized_warning = false;
                 dff.normalized_rewrite_confirmed = true;
@@ -7706,9 +15613,14 @@ impl DffGeometryJob {
                         app.element_states.push(*state);
                         app.outliner_labels.push(None);
                     }
-                    DffGeometryPlacementChange::Move { index, position } => {
+                    DffGeometryPlacementChange::Transform {
+                        index,
+                        position,
+                        rotation,
+                    } => {
                         if let Some(placement) = app.placements.get_mut(*index) {
                             placement.pos = *position;
+                            placement.rot = *rotation;
                             sync_placement_attrs(placement);
                             invalidate_outliner_label(app, *index);
                         }
@@ -7753,8 +15665,8 @@ impl DffGeometryJob {
         app.status_message = match result.kind {
             DffGeometryOperationKind::Separate => {
                 let name = result
-                    .new_asset
-                    .as_ref()
+                    .new_assets
+                    .first()
                     .map(|(name, _, _)| name.as_str())
                     .unwrap_or("new DFF");
                 format!(
@@ -7763,13 +15675,23 @@ impl DffGeometryJob {
                     result.placement_changes.len()
                 )
             }
+            DffGeometryOperationKind::SplitMaterialLimits => format!(
+                "Repaired the unsafe DFF into {} GTA-safe render element(s) and created {} sibling placement(s) in {elapsed:.1}s. The original retains collision; Save to apply. Undo history cleared.",
+                result.new_assets.len() + 1,
+                result.placement_changes.len()
+            ),
             DffGeometryOperationKind::Pivot => {
                 let pivot = result.pivot.unwrap_or_default();
+                let rotation = result.pivot_rotation.unwrap_or_default();
                 format!(
-                    "Moved pivot to {:.3}, {:.3}, {:.3} and compensated {} placement(s) in {elapsed:.1}s. Save to apply; undo history cleared.",
+                    "Set pivot to {:.3}, {:.3}, {:.3} / {:.1}°, {:.1}°, {:.1}°; updated {} paired COL asset(s) and compensated {} placement(s) in {elapsed:.1}s. Save to apply; undo history cleared.",
                     pivot.x,
                     pivot.y,
                     pivot.z,
+                    rotation.x,
+                    rotation.y,
+                    rotation.z,
+                    result.pivot_cols.len(),
                     result.placement_changes.len()
                 )
             }
@@ -7784,6 +15706,229 @@ pub(crate) fn update_dff_geometry_job(app: &mut AppState) {
     };
     if !job.step(app) {
         app.dff_geometry_job = Some(job);
+    }
+}
+
+impl DffMaterialLimitRepairJob {
+    fn step(&mut self, app: &mut AppState) -> bool {
+        if self.result.is_none() {
+            match self.rx.try_recv() {
+                Ok(result) => self.result = Some(result),
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    app.status_message =
+                        "Automatic DFF material repair worker disconnected".to_string();
+                    return true;
+                }
+            }
+        }
+        let result = self.result.as_ref().expect("repair result available");
+
+        if !self.definitions_applied {
+            for (id, definition) in &result.definitions {
+                app.definitions.insert(id.clone(), definition.clone());
+            }
+            self.definitions_applied = true;
+            return false;
+        }
+
+        // Add placements before compiling their DFFs. Live mesh keys include
+        // the placement's resolved TXD scope; compiling a new sibling first
+        // cached only an unscoped mesh, so the sibling existed but rendered as
+        // missing until the project was reloaded.
+        if self.placement_index < result.placements.len() {
+            let end =
+                (self.placement_index + DFF_GEOMETRY_PLACEMENT_BATCH).min(result.placements.len());
+            for (placement, state) in &result.placements[self.placement_index..end] {
+                app.placements.push(placement.clone());
+                app.element_states.push(*state);
+                app.outliner_labels.push(None);
+            }
+            self.placement_index = end;
+            app.status_message = format!(
+                "Creating material-safe sibling elements: {}/{}",
+                self.placement_index,
+                result.placements.len()
+            );
+            return false;
+        }
+
+        if self.asset_index < result.assets.len() {
+            let end = (self.asset_index + 4).min(result.assets.len());
+            for (name, bytes) in &result.assets[self.asset_index..end] {
+                app.pending_replacement_assets
+                    .insert(asset_key(name, ".dff"), (name.clone(), bytes.clone()));
+                refresh_live_asset_from_editing_entry(app, name, bytes);
+                if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+                    && asset_key(&dff.name, ".dff") == asset_key(name, ".dff")
+                {
+                    dff.raw = parse_dff_mesh(bytes);
+                    dff.dirty = false;
+                    dff.normalized_warning = false;
+                    dff.normalized_rewrite_confirmed = true;
+                }
+            }
+            self.asset_index = end;
+            app.status_message = format!(
+                "Staging repaired DFF assets: {}/{}",
+                self.asset_index,
+                result.assets.len()
+            );
+            return false;
+        }
+
+        if !self.scene_rebuilt {
+            rebuild_outliner_filter(app);
+            rebuild_render_cells(app);
+            invalidate_validation_cache(app);
+            clear_history_for_external_change(app);
+            self.scene_rebuilt = true;
+            return false;
+        }
+
+        let elapsed = self.started_at.elapsed().as_secs_f32();
+        app.status_message = if result.errors.is_empty() {
+            format!(
+                "Scanned {} referenced DFF(s) and repaired {}/{} unsafe DFF(s), creating {} sibling element(s), in {elapsed:.1}s. Save to apply.",
+                result.scanned,
+                result.repaired,
+                result.unsafe_count,
+                result.placements.len()
+            )
+        } else {
+            let details = result
+                .errors
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let more = result.errors.len().saturating_sub(3);
+            format!(
+                "Scanned {} referenced DFF(s), repaired {}/{} unsafe DFF(s); skipped {}: {}{}. Save to apply successful repairs.",
+                result.scanned,
+                result.repaired,
+                result.unsafe_count,
+                result.errors.len(),
+                details,
+                if more > 0 {
+                    format!(" | and {more} more")
+                } else {
+                    String::new()
+                }
+            )
+        };
+        true
+    }
+}
+
+pub(crate) fn update_dff_material_limit_repair_job(app: &mut AppState) {
+    let Some(mut job) = app.dff_material_limit_repair_job.take() else {
+        return;
+    };
+    if !job.step(app) {
+        app.dff_material_limit_repair_job = Some(job);
+    }
+}
+
+impl OversizedChunkJob {
+    fn step(&mut self, app: &mut AppState) -> bool {
+        if self.result.is_none() {
+            match self.rx.try_recv() {
+                Ok(result) => self.result = Some(result),
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    app.status_message = "Oversized-element chunk worker disconnected".to_string();
+                    return true;
+                }
+            }
+        }
+        let result = self.result.as_ref().expect("chunk result available");
+        if !self.definitions_applied {
+            for (id, definition) in &result.definitions {
+                app.definitions.insert(id.clone(), definition.clone());
+            }
+            self.definitions_applied = true;
+            return false;
+        }
+        if self.added_placement_index < result.added_placements.len() {
+            let end = (self.added_placement_index + DFF_GEOMETRY_PLACEMENT_BATCH)
+                .min(result.added_placements.len());
+            for (placement, state) in &result.added_placements[self.added_placement_index..end] {
+                app.placements.push(placement.clone());
+                app.element_states.push(*state);
+                app.outliner_labels.push(None);
+            }
+            self.added_placement_index = end;
+            app.status_message = format!(
+                "Creating chunk sibling elements: {}/{}",
+                end,
+                result.added_placements.len()
+            );
+            return false;
+        }
+        if self.asset_index < result.assets.len() {
+            let end = (self.asset_index + 4).min(result.assets.len());
+            for (name, bytes) in &result.assets[self.asset_index..end] {
+                app.pending_replacement_assets
+                    .insert(asset_key(name, ".dff"), (name.clone(), bytes.clone()));
+                refresh_live_asset_from_editing_entry(app, name, bytes);
+            }
+            self.asset_index = end;
+            app.status_message = format!(
+                "Staging spatial DFF chunks: {}/{}",
+                end,
+                result.assets.len()
+            );
+            return false;
+        }
+        if !self.scene_rebuilt {
+            rebuild_outliner_filter(app);
+            rebuild_render_cells(app);
+            invalidate_validation_cache(app);
+            clear_history_for_external_change(app);
+            app.autosave_next_at = 0.0;
+            self.scene_rebuilt = true;
+            return false;
+        }
+        let elapsed = self.started_at.elapsed().as_secs_f32();
+        let status = format!(
+            "Chunked {}/{} selected oversized DFF(s) from {} reviewed candidate(s), creating {} sibling element(s), in {elapsed:.1}s. Save to apply.",
+            result.chunked,
+            result.requested,
+            result.scanned,
+            result.added_placements.len()
+        );
+        app.status_message = if result.errors.is_empty() {
+            status.clone()
+        } else {
+            format!(
+                "{status} Skipped {} model(s); see the log.",
+                result.errors.len()
+            )
+        };
+        let mut log = vec![status];
+        log.extend(result.errors.iter().cloned());
+        set_save_log(
+            app,
+            if result.errors.is_empty() {
+                "Oversized-element chunking completed"
+            } else {
+                "Oversized-element chunking completed with warnings"
+            },
+            log,
+            !result.errors.is_empty(),
+        );
+        true
+    }
+}
+
+pub(crate) fn update_oversized_chunk_job(app: &mut AppState) {
+    let Some(mut job) = app.oversized_chunk_job.take() else {
+        return;
+    };
+    if !job.step(app) {
+        app.oversized_chunk_job = Some(job);
     }
 }
 
@@ -7884,19 +16029,25 @@ pub(crate) fn open_txd_texture_rename_dialog(app: &mut AppState) -> bool {
     true
 }
 
-pub(crate) fn open_dff_texture_view_dialog(app: &mut AppState) -> bool {
+fn decoded_dff_material_texture(
+    app: &AppState,
+    dff_name: &str,
+    material: usize,
+) -> Result<(String, String, u16, u16, Vec<u8>), String> {
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
-        return false;
+        return Err("The DFF editor is no longer open".to_string());
     };
+    if !dff.name.eq_ignore_ascii_case(dff_name) {
+        return Err("The selected DFF changed".to_string());
+    }
     let Some(texture_name) = dff
         .raw
         .material_textures
-        .get(dff.selected_material)
+        .get(material)
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
     else {
-        app.status_message = "The selected material has no texture to view".to_string();
-        return false;
+        return Err("The selected material has no texture".to_string());
     };
     let txd_key = dff.txd_context.as_ref().map(|txd| asset_key(txd, ".txd"));
     let source = app
@@ -7924,21 +16075,34 @@ pub(crate) fn open_dff_texture_view_dialog(app: &mut AppState) -> bool {
             Some((width, height, image.into_raw(), "Loose PNG".to_string()))
         });
     let Some((width, height, rgba, source_label)) = decoded else {
-        app.status_message = if let Some(txd_key) = txd_key {
+        return Err(if let Some(txd_key) = txd_key {
             format!("Could not decode texture '{texture_name}' from {txd_key}")
         } else {
             format!("Could not decode texture '{texture_name}'")
-        };
-        return false;
+        });
     };
     let Ok(width_u16) = u16::try_from(width) else {
-        app.status_message = format!("Texture '{texture_name}' is too wide to preview");
-        return false;
+        return Err(format!("Texture '{texture_name}' is too wide to preview"));
     };
     let Ok(height_u16) = u16::try_from(height) else {
-        app.status_message = format!("Texture '{texture_name}' is too tall to preview");
-        return false;
+        return Err(format!("Texture '{texture_name}' is too tall to preview"));
     };
+    Ok((texture_name, source_label, width_u16, height_u16, rgba))
+}
+
+pub(crate) fn open_dff_material_texture_view_dialog(
+    app: &mut AppState,
+    dff_name: &str,
+    material: usize,
+) -> bool {
+    let (texture_name, source_label, width_u16, height_u16, rgba) =
+        match decoded_dff_material_texture(app, dff_name, material) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                app.status_message = error;
+                return false;
+            }
+        };
     let texture = Texture2D::from_rgba8(width_u16, height_u16, &rgba);
     texture.set_filter(FilterMode::Nearest);
     app.dff_texture_view_dialog = Some(DffTextureViewDialog {
@@ -7948,6 +16112,52 @@ pub(crate) fn open_dff_texture_view_dialog(app: &mut AppState) -> bool {
         height: height_u16,
         texture: Some(texture),
         raw_texture: 0,
+        rgba: Some(rgba),
+    });
+    true
+}
+
+pub(crate) fn open_dff_texture_view_dialog(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        return false;
+    };
+    let dff_name = dff.name.clone();
+    let material = dff.selected_material;
+    open_dff_material_texture_view_dialog(app, &dff_name, material)
+}
+
+pub(crate) fn open_dff_material_texture_export_picker(
+    app: &mut AppState,
+    dff_name: &str,
+    material: usize,
+) -> bool {
+    let (texture_name, _, width, height, rgba) =
+        match decoded_dff_material_texture(app, dff_name, material) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                app.status_message = error;
+                return false;
+            }
+        };
+    drain_text_input();
+    if app.dff_picker_rx.is_some() {
+        app.status_message = "File browser is already open".to_string();
+        return false;
+    }
+    let default_path = load_last_dff_export_dir().join(format!("{}.png", lower(&texture_name)));
+    let (tx, rx) = mpsc::channel();
+    app.dff_picker_rx = Some(rx);
+    app.status_message = format!("Opening texture export browser for {texture_name}...");
+    thread::spawn(move || {
+        let _ = tx.send((
+            DffPickerKind::ExportTexturePng {
+                texture_name,
+                width: width as u32,
+                height: height as u32,
+                rgba,
+            },
+            choose_export_png_path(default_path),
+        ));
     });
     true
 }
@@ -8257,7 +16467,7 @@ pub(crate) fn editing_rename_selected_dff_texture(
             .unwrap_or(0);
         txd.textures = textures;
         txd.scroll = 0.0;
-        if !editing_txd_filtered_indices(txd).contains(&txd.selected) {
+        if !editing_txd_filtered_indices(txd, &app.material_classes).contains(&txd.selected) {
             txd.search.clear();
             txd.search_cursor = 0;
             txd.search_anchor = None;
@@ -8345,6 +16555,7 @@ pub(crate) fn editing_duplicate_selected_dff_material(app: &mut AppState) -> boo
     dff.selected_material = new_material;
     dff.selected_2dfx = None;
     dff.material_scroll = new_material as f32;
+    sync_dff_uv_editor_material(dff);
     dff.dirty = true;
     let source_key = material_emitter_key(&dff_name, material);
     if let Some(emitter) = app.material_emitters.get(&source_key).copied() {
@@ -8373,7 +16584,6 @@ pub(crate) fn set_selected_editing_dff_boolean_box_position(
         return Err("Add a boolean cutter first".to_string());
     };
     cutter.center = position;
-    dff.dirty = true;
     app.status_message = "Moved DFF boolean cutter".to_string();
     Ok(())
 }
@@ -8400,7 +16610,7 @@ pub(crate) fn set_selected_editing_dff_2dfx_position(
 fn dff_2dfx_default_light_payload() -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&[255, 240, 190, 255]);
-    for value in [60.0f32, 12.0, 1.5, 0.0] {
+    for value in [60.0f32, 12.0, 0.75, 0.0] {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     payload.extend_from_slice(&[0, 1, 0, 0, 0x40]);
@@ -8440,7 +16650,7 @@ const DFF_CORONA_PRESETS: [DffCoronaPreset; 10] = [
         color: [255, 0, 0, 200],
         far_clip: 100.0,
         pointlight_range: 18.0,
-        corona_size: 1.0,
+        corona_size: 0.6,
         shadow_size: 8.0,
         show_mode: 7,
         reflection: 1,
@@ -8457,7 +16667,7 @@ const DFF_CORONA_PRESETS: [DffCoronaPreset; 10] = [
         color: [255, 210, 52, 200],
         far_clip: 100.0,
         pointlight_range: 18.0,
-        corona_size: 1.0,
+        corona_size: 0.6,
         shadow_size: 8.0,
         show_mode: 7,
         reflection: 1,
@@ -8474,7 +16684,7 @@ const DFF_CORONA_PRESETS: [DffCoronaPreset; 10] = [
         color: [0, 255, 0, 200],
         far_clip: 100.0,
         pointlight_range: 18.0,
-        corona_size: 1.0,
+        corona_size: 0.6,
         shadow_size: 8.0,
         show_mode: 7,
         reflection: 1,
@@ -8491,7 +16701,7 @@ const DFF_CORONA_PRESETS: [DffCoronaPreset; 10] = [
         color: [249, 145, 34, 200],
         far_clip: 100.0,
         pointlight_range: 12.0,
-        corona_size: 2.5,
+        corona_size: 1.25,
         shadow_size: 8.0,
         show_mode: 0,
         reflection: 1,
@@ -8508,7 +16718,7 @@ const DFF_CORONA_PRESETS: [DffCoronaPreset; 10] = [
         color: [255, 255, 255, 200],
         far_clip: 100.0,
         pointlight_range: 12.0,
-        corona_size: 1.0,
+        corona_size: 0.6,
         shadow_size: 8.0,
         show_mode: 0,
         reflection: 1,
@@ -8525,7 +16735,7 @@ const DFF_CORONA_PRESETS: [DffCoronaPreset; 10] = [
         color: [255, 255, 255, 200],
         far_clip: 180.0,
         pointlight_range: 12.0,
-        corona_size: 0.75,
+        corona_size: 0.45,
         shadow_size: 6.0,
         show_mode: 0,
         reflection: 1,
@@ -8542,7 +16752,7 @@ const DFF_CORONA_PRESETS: [DffCoronaPreset; 10] = [
         color: [255, 65, 28, 200],
         far_clip: 100.0,
         pointlight_range: 12.0,
-        corona_size: 0.6,
+        corona_size: 0.4,
         shadow_size: 0.0,
         show_mode: 6,
         reflection: 0,
@@ -8559,7 +16769,7 @@ const DFF_CORONA_PRESETS: [DffCoronaPreset; 10] = [
         color: [255, 0, 0, 200],
         far_clip: 100.0,
         pointlight_range: 18.0,
-        corona_size: 1.0,
+        corona_size: 0.6,
         shadow_size: 8.0,
         show_mode: 8,
         reflection: 0,
@@ -8576,7 +16786,7 @@ const DFF_CORONA_PRESETS: [DffCoronaPreset; 10] = [
         color: [148, 0, 0, 200],
         far_clip: 100.0,
         pointlight_range: 1.5,
-        corona_size: 1.0,
+        corona_size: 0.6,
         shadow_size: 8.0,
         show_mode: 3,
         reflection: 0,
@@ -8593,7 +16803,7 @@ const DFF_CORONA_PRESETS: [DffCoronaPreset; 10] = [
         color: [225, 185, 149, 200],
         far_clip: 62.0,
         pointlight_range: 5.0,
-        corona_size: 1.0,
+        corona_size: 0.6,
         shadow_size: 8.0,
         show_mode: 1,
         reflection: 0,
@@ -8834,7 +17044,7 @@ const DFF_GENERATED_CORONA_FLAGS2_MARKER: u8 = 0xA0;
 const DFF_GENERATED_CORONA_FLAGS2_MARKER_MASK: u8 = 0xE0;
 const DFF_GENERATED_GAME_COLOR_LIFT: f32 = 0.72;
 const DFF_GENERATED_CORONA_ALPHA: u8 = 255;
-const DFF_GENERATED_CORONA_SIZE: f32 = 0.60;
+const DFF_GENERATED_CORONA_SIZE: f32 = 0.40;
 const DFF_GENERATED_SHADOW_SIZE: f32 = 14.0;
 const DFF_GENERATED_POINTLIGHT_HEIGHT_MULTIPLIER: f32 = 2.75;
 const DFF_GENERATED_POINTLIGHT_RANGE_ADDITIVE: f32 = 8.0;
@@ -9438,6 +17648,20 @@ struct CollisionGenerationBatchResult {
     discarded_backed_flat_components: usize,
     errors: Vec<String>,
 }
+
+struct CollisionGenerationEntryIndex {
+    dffs: HashMap<String, ImgEntry>,
+    cols: HashMap<String, ImgEntry>,
+}
+
+struct CollisionGenerationSourceResult {
+    generated: Option<GeneratedCollisionAsset>,
+    discarded_backed_flat_components: usize,
+    errors: Vec<String>,
+}
+
+const COLLISION_GENERATION_MAX_WORKERS: usize = 8;
+const COLLISION_GENERATION_PROGRESS_BATCH_SIZE: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CollisionGenerationScope {
@@ -10335,18 +18559,11 @@ fn empty_collision_mesh(name: &str, bounds: Bounds) -> CollisionMesh {
 }
 
 fn serialize_generated_collision(
-    root: &Path,
-    byte_overrides: &BTreeMap<String, (String, Vec<u8>)>,
     source: &CollisionGenerationSource,
     mesh: CollisionMesh,
+    template_bytes: &[u8],
 ) -> Result<GeneratedCollisionAsset, String> {
-    let col_key = asset_key(&source.col_name, ".col");
-    let template_bytes = byte_overrides
-        .get(&col_key)
-        .map(|(_, bytes)| bytes.clone())
-        .or_else(|| find_col_entry(root, &source.col_name).map(|entry| read_img_entry(&entry)))
-        .unwrap_or_default();
-    let template = col_regeneration_template(&template_bytes, &source.col_name);
+    let template = col_regeneration_template(template_bytes, &source.col_name);
     let header_bounds = mesh.bounds;
     let mut bytes = write_col_mesh_from_template_with_bounds(&template, &mesh, Some(header_bounds))
         .map_err(|err| {
@@ -10371,6 +18588,212 @@ fn serialize_generated_collision(
     })
 }
 
+fn index_collision_generation_entries(
+    context: &CollisionGenerationContext,
+) -> CollisionGenerationEntryIndex {
+    let wanted_dffs = context
+        .sources
+        .iter()
+        .filter(|source| source.raw_override.is_none())
+        .map(|source| asset_key(&source.dff_name, ".dff"))
+        .filter(|key| !context.byte_overrides.contains_key(key))
+        .collect::<HashSet<_>>();
+    let wanted_cols = context
+        .sources
+        .iter()
+        .map(|source| asset_key(&source.col_name, ".col"))
+        .filter(|key| !context.byte_overrides.contains_key(key))
+        .collect::<HashSet<_>>();
+
+    // Match find_dff_entry/find_col_entry precedence, but parse every archive
+    // directory only once for the entire generation run. The old per-source
+    // lookup made a global regeneration scan all IMG directories tens of
+    // thousands of times.
+    let mut paths = vec![
+        wip_root_path(&context.root)
+            .join("imgs")
+            .join(REPLACEMENT_IMG),
+        context.root.join("imgs").join(REPLACEMENT_IMG),
+    ];
+    paths.extend(collect_resource_img_files(&context.root));
+    paths.extend(gta_sa_img_files(&load_gta_sa_dir_preference()));
+    let mut seen_paths = HashSet::new();
+    paths.retain(|path| seen_paths.insert(path.clone()));
+
+    let mut dffs = HashMap::with_capacity(wanted_dffs.len());
+    let mut cols = HashMap::with_capacity(wanted_cols.len());
+    for path in paths {
+        for entry in parse_img(&path) {
+            let lower_name = lower(&entry.name);
+            if lower_name.ends_with(".dff") {
+                let key = asset_key(&entry.name, ".dff");
+                if wanted_dffs.contains(&key) {
+                    dffs.entry(key).or_insert(entry);
+                }
+            } else if lower_name.ends_with(".col") {
+                let key = asset_key(&entry.name, ".col");
+                if wanted_cols.contains(&key) {
+                    cols.entry(key).or_insert(entry);
+                }
+            }
+        }
+        if dffs.len() == wanted_dffs.len() && cols.len() == wanted_cols.len() {
+            break;
+        }
+    }
+    CollisionGenerationEntryIndex { dffs, cols }
+}
+
+fn collision_generation_worker_count(total: usize) -> usize {
+    let available = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    available
+        .saturating_sub(1)
+        .max(1)
+        .min(COLLISION_GENERATION_MAX_WORKERS)
+        .min(total.max(1))
+}
+
+fn read_collision_generation_entry(
+    entry: &ImgEntry,
+    files: &mut HashMap<PathBuf, fs::File>,
+) -> Vec<u8> {
+    if !files.contains_key(&entry.img_path) {
+        let Ok(file) = fs::File::open(&entry.img_path) else {
+            return Vec::new();
+        };
+        files.insert(entry.img_path.clone(), file);
+    }
+    files
+        .get_mut(&entry.img_path)
+        .map(|file| read_img_entry_from(file, entry))
+        .unwrap_or_default()
+}
+
+fn generate_collision_source(
+    context: &CollisionGenerationContext,
+    entries: &CollisionGenerationEntryIndex,
+    source: &CollisionGenerationSource,
+    files: &mut HashMap<PathBuf, fs::File>,
+) -> CollisionGenerationSourceResult {
+    let mut errors = Vec::new();
+    let raw = match source.raw_override.as_ref() {
+        Some(raw) => Some(raw.clone()),
+        None => {
+            let key = asset_key(&source.dff_name, ".dff");
+            let bytes = context
+                .byte_overrides
+                .get(&key)
+                .map(|(_, bytes)| bytes.clone())
+                .or_else(|| {
+                    entries
+                        .dffs
+                        .get(&key)
+                        .map(|entry| read_collision_generation_entry(entry, files))
+                });
+            if bytes.is_none() {
+                errors.push(format!("{}: DFF source was not found", source.dff_name));
+            }
+            bytes.map(|bytes| parse_dff_mesh(&bytes))
+        }
+    };
+    let mut discarded_backed_flat_components = 0;
+    let mesh = match raw {
+        Some(raw) if !raw.vertices.is_empty() && !raw.triangles.is_empty() => {
+            let (source_materials, excluded_source_materials) =
+                collision_generation_source_materials(
+                    &context.material_classes,
+                    &context.txd_textures,
+                    source.txd_name.as_deref(),
+                    &raw,
+                    context.fallback_material,
+                );
+            let settings = CollisionGenerationSettings::for_preset(
+                context.preset,
+                context.fallback_material,
+                source_materials,
+            )
+            .with_excluded_source_materials(excluded_source_materials)
+            .with_empty_collision(source.lod_only);
+            match generate_collision(&raw, &source.col_name, &settings) {
+                Ok(result) => {
+                    discarded_backed_flat_components =
+                        result.stats.discarded_backed_flat_components;
+                    result.mesh
+                }
+                Err(err) => {
+                    errors.push(format!(
+                        "{}: {err}; old referenced collision was cleared",
+                        source.dff_name
+                    ));
+                    empty_collision_mesh(&source.col_name, bounds_from_vertices(&raw.vertices))
+                }
+            }
+        }
+        Some(raw) => {
+            errors.push(format!(
+                "{}: DFF has no usable geometry; old referenced collision was cleared",
+                source.dff_name
+            ));
+            empty_collision_mesh(&source.col_name, bounds_from_vertices(&raw.vertices))
+        }
+        None => empty_collision_mesh(
+            &source.col_name,
+            Bounds {
+                min: Vec3::ZERO,
+                max: Vec3::ZERO,
+            },
+        ),
+    };
+    let col_key = asset_key(&source.col_name, ".col");
+    let template_bytes = context
+        .byte_overrides
+        .get(&col_key)
+        .map(|(_, bytes)| bytes.clone())
+        .or_else(|| {
+            entries
+                .cols
+                .get(&col_key)
+                .map(|entry| read_collision_generation_entry(entry, files))
+        })
+        .unwrap_or_default();
+    let was_empty = mesh.faces.is_empty() && mesh.boxes.is_empty() && mesh.spheres.is_empty();
+    let dff_bounds = mesh.bounds;
+    let generated = match serialize_generated_collision(source, mesh, &template_bytes) {
+        Ok(asset) => Some(asset),
+        Err(err) => {
+            errors.push(err);
+            if was_empty {
+                None
+            } else {
+                match serialize_generated_collision(
+                    source,
+                    empty_collision_mesh(&source.col_name, dff_bounds),
+                    &template_bytes,
+                ) {
+                    Ok(asset) => {
+                        errors.push(format!(
+                            "{}: old referenced collision was cleared after regeneration failed",
+                            source.col_name
+                        ));
+                        Some(asset)
+                    }
+                    Err(empty_err) => {
+                        errors.push(empty_err);
+                        None
+                    }
+                }
+            }
+        }
+    };
+    CollisionGenerationSourceResult {
+        generated,
+        discarded_backed_flat_components,
+        errors,
+    }
+}
+
 fn run_collision_generation(
     context: CollisionGenerationContext,
     progress: &mpsc::Sender<String>,
@@ -10383,105 +18806,57 @@ fn run_collision_generation(
     target_keys.sort();
     target_keys.dedup();
     let total = context.sources.len();
+    let _ = progress.send(format!(
+        "Collision generation: indexing source archives for {total} target(s)..."
+    ));
+    let entries = index_collision_generation_entries(&context);
+    let workers = collision_generation_worker_count(total);
+    let _ = progress.send(format!(
+        "Collision generation: processing {total} target(s) with {workers} worker(s)"
+    ));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let completed = std::sync::atomic::AtomicUsize::new(0);
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let result_tx = result_tx.clone();
+            let next = &next;
+            let completed = &completed;
+            let context = &context;
+            let entries = &entries;
+            scope.spawn(move || {
+                let mut files = HashMap::new();
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(source) = context.sources.get(index) else {
+                        break;
+                    };
+                    let result = generate_collision_source(context, entries, source, &mut files);
+                    let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if done == total || done % COLLISION_GENERATION_PROGRESS_BATCH_SIZE == 0 {
+                        let _ = progress.send(format!(
+                            "Collision generation: completed {done}/{total} ({} workers; latest {})",
+                            workers, source.dff_name
+                        ));
+                    }
+                    if result_tx.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    drop(result_tx);
+    let mut source_results = result_rx.into_iter().collect::<BTreeMap<_, _>>();
     let mut generated = Vec::new();
     let mut discarded_backed_flat_components = 0usize;
     let mut errors = Vec::new();
-    for (index, source) in context.sources.into_iter().enumerate() {
-        let _ = progress.send(format!(
-            "Collision generation: processing {} ({}/{total})",
-            source.dff_name,
-            index + 1
-        ));
-        let raw = match source.raw_override.as_ref() {
-            Some(raw) => Some(raw.clone()),
-            None => {
-                let key = asset_key(&source.dff_name, ".dff");
-                let bytes = context
-                    .byte_overrides
-                    .get(&key)
-                    .map(|(_, bytes)| bytes.clone())
-                    .or_else(|| {
-                        find_dff_entry(&context.root, &source.dff_name)
-                            .map(|entry| read_img_entry(&entry))
-                    });
-                if bytes.is_none() {
-                    errors.push(format!("{}: DFF source was not found", source.dff_name));
-                }
-                bytes.map(|bytes| parse_dff_mesh(&bytes))
-            }
-        };
-        let mesh = match raw {
-            Some(raw) if !raw.vertices.is_empty() && !raw.triangles.is_empty() => {
-                let (source_materials, excluded_source_materials) =
-                    collision_generation_source_materials(
-                        &context.material_classes,
-                        &context.txd_textures,
-                        source.txd_name.as_deref(),
-                        &raw,
-                        context.fallback_material,
-                    );
-                let settings = CollisionGenerationSettings::for_preset(
-                    context.preset,
-                    context.fallback_material,
-                    source_materials,
-                )
-                .with_excluded_source_materials(excluded_source_materials)
-                .with_empty_collision(source.lod_only);
-                match generate_collision(&raw, &source.col_name, &settings) {
-                    Ok(result) => {
-                        discarded_backed_flat_components +=
-                            result.stats.discarded_backed_flat_components;
-                        result.mesh
-                    }
-                    Err(err) => {
-                        errors.push(format!(
-                            "{}: {err}; old referenced collision was cleared",
-                            source.dff_name
-                        ));
-                        empty_collision_mesh(&source.col_name, bounds_from_vertices(&raw.vertices))
-                    }
-                }
-            }
-            Some(raw) => {
-                errors.push(format!(
-                    "{}: DFF has no usable geometry; old referenced collision was cleared",
-                    source.dff_name
-                ));
-                empty_collision_mesh(&source.col_name, bounds_from_vertices(&raw.vertices))
-            }
-            None => empty_collision_mesh(
-                &source.col_name,
-                Bounds {
-                    min: Vec3::ZERO,
-                    max: Vec3::ZERO,
-                },
-            ),
-        };
-        let was_empty = mesh.faces.is_empty() && mesh.boxes.is_empty() && mesh.spheres.is_empty();
-        let dff_bounds = mesh.bounds;
-        match serialize_generated_collision(&context.root, &context.byte_overrides, &source, mesh) {
-            Ok(asset) => generated.push(asset),
-            Err(err) => {
-                errors.push(err);
-                if !was_empty {
-                    match serialize_generated_collision(
-                        &context.root,
-                        &context.byte_overrides,
-                        &source,
-                        empty_collision_mesh(&source.col_name, dff_bounds),
-                    ) {
-                        Ok(asset) => {
-                            errors.push(format!(
-                                "{}: old referenced collision was cleared after regeneration failed",
-                                source.col_name
-                            ));
-                            generated.push(asset);
-                        }
-                        Err(empty_err) => errors.push(empty_err),
-                    }
-                }
-            }
+    for (_, result) in source_results.iter_mut() {
+        discarded_backed_flat_components += result.discarded_backed_flat_components;
+        if let Some(asset) = result.generated.take() {
+            generated.push(asset);
         }
+        errors.append(&mut result.errors);
     }
     generated.sort_by(|a, b| lower(&a.col_name).cmp(&lower(&b.col_name)));
     let generated_keys = generated
@@ -10606,19 +18981,44 @@ impl CollisionGenerationJob {
                             col.dirty = true;
                         }
                     } else {
-                        let fallback_img_path = app.root.join("imgs").join(REPLACEMENT_IMG);
-                        editing_stage_added_entry(
-                            &mut app.editing,
-                            fallback_img_path,
+                        if generated_col_stages_in_open_archive(
+                            &app.root,
+                            &app.editing,
                             &asset.col_name,
-                            asset.bytes,
-                        );
+                        ) {
+                            let fallback_img_path = app.root.join("imgs").join(REPLACEMENT_IMG);
+                            app.pending_replacement_assets.remove(&col_key);
+                            editing_stage_added_entry(
+                                &mut app.editing,
+                                fallback_img_path,
+                                &asset.col_name,
+                                asset.bytes.clone(),
+                            );
+                        } else {
+                            // Keep the generated asset in project-level staging so normal Save
+                            // routes it into the existing COL archive. Adding it to the currently
+                            // open DFF/TXD archive would make "Save IMG" commit it to the wrong
+                            // archive.
+                            if app.editing.added_entries.remove(&col_key) {
+                                app.editing.modified_entries.remove(&col_key);
+                                app.editing.deleted_entries.remove(&col_key);
+                                app.editing
+                                    .rows
+                                    .retain(|row| editing_key(&row.entry.name) != col_key);
+                            }
+                            app.pending_replacement_assets.insert(
+                                col_key.clone(),
+                                (asset.col_name.clone(), asset.bytes.clone()),
+                            );
+                        }
                         if asset.mesh.faces.is_empty()
                             && asset.mesh.boxes.is_empty()
                             && asset.mesh.spheres.is_empty()
                         {
+                            invalidate_collision_render_cache(app, &col_key);
                             app.collisions.remove(&col_key);
                         } else {
+                            invalidate_collision_render_cache(app, &col_key);
                             app.collisions.insert(col_key.clone(), asset.mesh);
                         }
                     }
@@ -10636,8 +19036,10 @@ impl CollisionGenerationJob {
                         && asset.mesh.boxes.is_empty()
                         && asset.mesh.spheres.is_empty()
                     {
+                        invalidate_collision_render_cache(app, &col_key);
                         app.collisions.remove(&col_key);
                     } else {
+                        invalidate_collision_render_cache(app, &col_key);
                         app.collisions.insert(col_key.clone(), asset.mesh);
                     }
                     app.pending_replacement_assets
@@ -10650,6 +19052,7 @@ impl CollisionGenerationJob {
                     .and_then(|result| result.delete_keys.pop())
             {
                 clear_staged_collision_replacement(app, &col_key);
+                invalidate_collision_render_cache(app, &col_key);
                 app.collisions.remove(&col_key);
                 app.pending_asset_deletes.insert(col_key);
             } else {
@@ -11142,7 +19545,9 @@ pub(crate) fn request_global_collision_generation(
                     txd_name,
                     raw_override: None,
                     lod_only,
-                    definition_ids_to_assign: Vec::new(),
+                    definition_ids_to_assign: definition
+                        .map(|definition| vec![definition.id.clone()])
+                        .unwrap_or_default(),
                 });
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
@@ -11167,6 +19572,18 @@ pub(crate) fn request_global_collision_generation(
                 // A COL target used by any detail placement must remain full
                 // collision even if it is also referenced by an LOD.
                 entry.get_mut().lod_only = existing_lod_only && lod_only;
+                if let Some(definition) = definition
+                    && !entry
+                        .get()
+                        .definition_ids_to_assign
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(&definition.id))
+                {
+                    entry
+                        .get_mut()
+                        .definition_ids_to_assign
+                        .push(definition.id.clone());
+                }
             }
         }
     }
@@ -11297,7 +19714,10 @@ fn dff_2dfx_default_payload(effect_id: u32) -> Vec<u8> {
                 payload.extend_from_slice(&value.to_le_bytes());
             }
             payload.extend_from_slice(&0u16.to_le_bytes());
-            payload.extend_from_slice(&[0; 66]);
+            // SA reads all 16 character cells in each line; '_' is its blank
+            // glyph. NUL padding can index outside the roadsign font atlas.
+            payload.extend_from_slice(&[b'_'; 64]);
+            payload.extend_from_slice(&[0; 2]);
             payload
         }
         8 => 0u32.to_le_bytes().to_vec(),
@@ -11364,11 +19784,14 @@ enum Dff2dfxPropKind {
     PosZ,
     F32(usize),
     U8(usize),
-    U16(usize),
     U32(usize),
     I16(usize),
     I32(usize),
     Str(usize, usize),
+    RoadSignStr(usize),
+    RoadSignLines,
+    RoadSignLetters,
+    RoadSignPalette,
     RawHex,
 }
 
@@ -11628,8 +20051,16 @@ fn dff_2dfx_prop_specs(effect_id: u32) -> Vec<Dff2dfxPropSpec> {
                     kind: Dff2dfxPropKind::F32(16),
                 },
                 Dff2dfxPropSpec {
-                    label: "Flags",
-                    kind: Dff2dfxPropKind::U16(20),
+                    label: "Text Lines",
+                    kind: Dff2dfxPropKind::RoadSignLines,
+                },
+                Dff2dfxPropSpec {
+                    label: "Characters / Line",
+                    kind: Dff2dfxPropKind::RoadSignLetters,
+                },
+                Dff2dfxPropSpec {
+                    label: "Text Color",
+                    kind: Dff2dfxPropKind::RoadSignPalette,
                 },
             ]);
             for (idx, offset) in [22, 38, 54, 70].into_iter().enumerate() {
@@ -11640,7 +20071,7 @@ fn dff_2dfx_prop_specs(effect_id: u32) -> Vec<Dff2dfxPropSpec> {
                         2 => "Text Line 3",
                         _ => "Text Line 4",
                     },
-                    kind: Dff2dfxPropKind::Str(offset, 16),
+                    kind: Dff2dfxPropKind::RoadSignStr(offset),
                 });
             }
         }
@@ -11731,6 +20162,19 @@ fn fixed_string(payload: &[u8], offset: usize, len: usize) -> String {
         .collect()
 }
 
+fn road_sign_string(payload: &[u8], offset: usize) -> String {
+    payload
+        .get(offset..offset + 16)
+        .unwrap_or(&[])
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0)
+        .map(|byte| if byte == b'_' { ' ' } else { char::from(byte) })
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
 fn dff_2dfx_prop_value(effect: &Dff2dEffect, kind: Dff2dfxPropKind) -> String {
     match kind {
         Dff2dfxPropKind::PosX => format!("{:.4}", effect.position.x),
@@ -11743,9 +20187,6 @@ fn dff_2dfx_prop_value(effect: &Dff2dEffect, kind: Dff2dfxPropKind) -> String {
             )
         }
         Dff2dfxPropKind::U8(offset) => effect.payload.get(offset).copied().unwrap_or(0).to_string(),
-        Dff2dfxPropKind::U16(offset) => {
-            u16::from_le_bytes(read_payload(&effect.payload, offset)).to_string()
-        }
         Dff2dfxPropKind::U32(offset) => {
             u32::from_le_bytes(read_payload(&effect.payload, offset)).to_string()
         }
@@ -11756,6 +20197,23 @@ fn dff_2dfx_prop_value(effect: &Dff2dEffect, kind: Dff2dfxPropKind) -> String {
             i32::from_le_bytes(read_payload(&effect.payload, offset)).to_string()
         }
         Dff2dfxPropKind::Str(offset, len) => fixed_string(&effect.payload, offset, len),
+        Dff2dfxPropKind::RoadSignStr(offset) => road_sign_string(&effect.payload, offset),
+        Dff2dfxPropKind::RoadSignLines => {
+            let encoded = u16::from_le_bytes(read_payload(&effect.payload, 20)) & 0x3;
+            if encoded == 0 { 4 } else { encoded }.to_string()
+        }
+        Dff2dfxPropKind::RoadSignLetters => {
+            match (u16::from_le_bytes(read_payload(&effect.payload, 20)) >> 2) & 0x3 {
+                1 => 2,
+                2 => 4,
+                3 => 8,
+                _ => 16,
+            }
+            .to_string()
+        }
+        Dff2dfxPropKind::RoadSignPalette => {
+            ((u16::from_le_bytes(read_payload(&effect.payload, 20)) >> 4) & 0x3).to_string()
+        }
         Dff2dfxPropKind::RawHex => bytes_to_hex(&effect.payload),
     }
 }
@@ -11779,6 +20237,113 @@ pub(crate) fn dff_2dfx_active_payload_is_particle_name(dff: &EditingDffState) ->
             .map(|spec| spec.kind),
         Some(Dff2dfxPropKind::Str(0, 24))
     )
+}
+
+const DFF_2DFX_BOOLEAN_CHOICES: [(&str, &str); 2] = [("0", "Disabled"), ("1", "Enabled")];
+const DFF_2DFX_SHOW_MODE_CHOICES: [(&str, &str); 8] = [
+    ("0", "Constant / standard"),
+    ("1", "Random flash"),
+    ("3", "Once per second"),
+    ("4", "Twice per second"),
+    ("5", "Five times per second"),
+    ("6", "Alternating flasher"),
+    ("7", "Traffic light"),
+    ("8", "Rail crossing"),
+];
+const DFF_2DFX_ROAD_LINES_CHOICES: [(&str, &str); 4] = [
+    ("1", "1 line"),
+    ("2", "2 lines"),
+    ("3", "3 lines"),
+    ("4", "4 lines"),
+];
+const DFF_2DFX_ROAD_LETTERS_CHOICES: [(&str, &str); 4] = [
+    ("2", "2 characters"),
+    ("4", "4 characters"),
+    ("8", "8 characters"),
+    ("16", "16 characters"),
+];
+const DFF_2DFX_ROAD_PALETTE_CHOICES: [(&str, &str); 4] =
+    [("0", "White"), ("1", "Black"), ("2", "Green"), ("3", "Red")];
+const DFF_2DFX_COVER_CHOICES: [(&str, &str); 2] = [("0", "Low cover"), ("1", "High cover")];
+const DFF_2DFX_ESCALATOR_CHOICES: [(&str, &str); 2] = [("0", "Up"), ("1", "Down")];
+
+fn dff_2dfx_prop_choices(
+    effect_id: u32,
+    spec: Dff2dfxPropSpec,
+) -> &'static [(&'static str, &'static str)] {
+    match (effect_id, spec.label) {
+        (0, "Corona Show Mode") => &DFF_2DFX_SHOW_MODE_CHOICES,
+        (0, "Reflection") => &DFF_2DFX_BOOLEAN_CHOICES,
+        (7, "Text Lines") => &DFF_2DFX_ROAD_LINES_CHOICES,
+        (7, "Characters / Line") => &DFF_2DFX_ROAD_LETTERS_CHOICES,
+        (7, "Text Color") => &DFF_2DFX_ROAD_PALETTE_CHOICES,
+        (9, "Cover Type") => &DFF_2DFX_COVER_CHOICES,
+        (10, "Direction") => &DFF_2DFX_ESCALATOR_CHOICES,
+        _ => &[],
+    }
+}
+
+fn dff_2dfx_prop_help(effect_id: u32, spec: Dff2dfxPropSpec) -> &'static str {
+    match (effect_id, spec.label) {
+        (0, "Corona Far Clip") => "Maximum distance at which the corona sprite remains visible.",
+        (0, "Pointlight Range") => "Radius of the dynamic light cast on nearby objects.",
+        (0, "Corona Size") => "Diameter of the visible glow sprite; smaller values look tighter.",
+        (0, "Shadow Size") => "Size of the projected ground-light texture; 0 disables it.",
+        (0, "Corona Show Mode") => {
+            "Controls steady, flashing, traffic-light, and crossing behavior."
+        }
+        (0, "Reflection") => "Allows the light to contribute a reflected corona on wet roads.",
+        (0, "Flags 1") => {
+            "Runtime light flags (day/night, fog, and view behavior); edit with care."
+        }
+        (0, "Flags 2") => "Additional runtime blink and view flags; edit with care.",
+        (1, "Particle Name") => {
+            "Name of an effect defined by effects.fxp; choose a known entry below."
+        }
+        (7, "Text Lines") => "Number of roadsign text rows rendered by San Andreas.",
+        (7, "Characters / Line") => "Font grid width. Shorter rows use larger glyphs.",
+        (7, "Text Color") => "Selects one of the four built-in roadsign font palettes.",
+        (7, "Text Line 1" | "Text Line 2" | "Text Line 3" | "Text Line 4") => {
+            "Spaces are saved as GTA's '_' blank glyph; '^' can be used for the arrow glyph."
+        }
+        (9, "Cover Type") => "Chooses whether pedestrians treat this as low or high cover.",
+        (10, "Direction") => "Direction in which the escalator carries pedestrians.",
+        _ => "Edit the value, then Apply to write it into the DFF 2DFX payload.",
+    }
+}
+
+fn dff_2dfx_active_choice_info(
+    dff: &EditingDffState,
+) -> Option<(usize, &'static [(&'static str, &'static str)])> {
+    let field = dff.dff_2dfx_payload_active_field?;
+    let effect_id = selected_dff_2dfx_effect_id(dff)?;
+    let specs = dff_2dfx_prop_specs(effect_id);
+    let choices = dff_2dfx_prop_choices(effect_id, *specs.get(field)?);
+    (!choices.is_empty()).then_some((field, choices))
+}
+
+fn editing_dff_2dfx_choice_picker_rect(choice_count: usize) -> Rect {
+    let popup = editing_dff_2dfx_payload_editor_rect();
+    let height = choice_count as f32 * 26.0 + 8.0;
+    Rect::new(
+        popup.x + 138.0,
+        popup.y + popup.h - 46.0 - height,
+        popup.w - 150.0,
+        height,
+    )
+}
+
+fn dff_2dfx_choice_at_mouse(app: &AppState, mouse: Vec2) -> Option<(usize, &'static str)> {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        return None;
+    };
+    let (field, choices) = dff_2dfx_active_choice_info(dff)?;
+    let picker = editing_dff_2dfx_choice_picker_rect(choices.len());
+    if !picker.contains(mouse) {
+        return None;
+    }
+    let row = ((mouse.y - picker.y - 4.0) / 26.0).floor().max(0.0) as usize;
+    choices.get(row).map(|(value, _)| (field, *value))
 }
 
 pub(crate) fn dff_2dfx_particle_name_options(app: &AppState, dff: &EditingDffState) -> Vec<String> {
@@ -11883,6 +20448,25 @@ fn write_fixed_string(payload: &mut [u8], offset: usize, len: usize, value: &str
     }
 }
 
+fn write_road_sign_string(payload: &mut [u8], offset: usize, value: &str) {
+    let Some(slice) = payload.get_mut(offset..offset + 16) else {
+        return;
+    };
+    slice.fill(b'_');
+    for (dst, src) in slice.iter_mut().zip(value.bytes()) {
+        *dst = if src == b' ' || src == 0 { b'_' } else { src };
+    }
+}
+
+fn write_road_sign_flag_bits(payload: &mut [u8], shift: u16, value: u16) {
+    let Some(slice) = payload.get_mut(20..22) else {
+        return;
+    };
+    let mut flags = u16::from_le_bytes([slice[0], slice[1]]);
+    flags = (flags & !(0x3 << shift)) | ((value & 0x3) << shift);
+    slice.copy_from_slice(&flags.to_le_bytes());
+}
+
 fn apply_dff_2dfx_field_value(
     effect_id: u32,
     payload: &mut Vec<u8>,
@@ -11924,12 +20508,6 @@ fn apply_dff_2dfx_field_value(
                 *byte = parsed;
             }
         }
-        Dff2dfxPropKind::U16(offset) => {
-            let parsed: u16 = parse_intish(value, spec.label)?;
-            if let Some(slice) = payload.get_mut(offset..offset + 2) {
-                slice.copy_from_slice(&parsed.to_le_bytes());
-            }
-        }
         Dff2dfxPropKind::U32(offset) => {
             let parsed: u32 = parse_intish(value, spec.label)?;
             if let Some(slice) = payload.get_mut(offset..offset + 4) {
@@ -11949,6 +20527,34 @@ fn apply_dff_2dfx_field_value(
             }
         }
         Dff2dfxPropKind::Str(offset, len) => write_fixed_string(payload, offset, len, value),
+        Dff2dfxPropKind::RoadSignStr(offset) => write_road_sign_string(payload, offset, value),
+        Dff2dfxPropKind::RoadSignLines => {
+            let value: u16 = parse_intish(value, spec.label)?;
+            let encoded = match value {
+                1..=3 => value,
+                4 => 0,
+                _ => return Err("Text Lines must be 1, 2, 3, or 4".to_string()),
+            };
+            write_road_sign_flag_bits(payload, 0, encoded);
+        }
+        Dff2dfxPropKind::RoadSignLetters => {
+            let value: u16 = parse_intish(value, spec.label)?;
+            let encoded = match value {
+                2 => 1,
+                4 => 2,
+                8 => 3,
+                16 => 0,
+                _ => return Err("Characters / Line must be 2, 4, 8, or 16".to_string()),
+            };
+            write_road_sign_flag_bits(payload, 2, encoded);
+        }
+        Dff2dfxPropKind::RoadSignPalette => {
+            let value: u16 = parse_intish(value, spec.label)?;
+            if value > 3 {
+                return Err("Text Color must be White, Black, Green, or Red".to_string());
+            }
+            write_road_sign_flag_bits(payload, 4, value);
+        }
         Dff2dfxPropKind::RawHex => {
             *payload = parse_hex_bytes(value)?;
             if effect_id != 4 && payload.is_empty() {
@@ -12105,6 +20711,47 @@ pub(crate) fn apply_selected_dff_2dfx_payload_hex(app: &mut AppState) -> bool {
     true
 }
 
+/// Builds the selected effect as it currently appears in the payload editor.
+/// The renderer uses this copy so roadsign text and other visual properties
+/// preview while the user is typing, without committing history until Apply.
+pub(crate) fn editing_dff_2dfx_draft_effect(dff: &EditingDffState) -> Option<(usize, Dff2dEffect)> {
+    if !dff.dff_2dfx_payload_editor_open {
+        return None;
+    }
+    let index = dff.selected_2dfx?;
+    let effect = dff.raw.effects_2dfx.get(index)?;
+    let specs = dff_2dfx_prop_specs(effect.effect_id);
+    if specs.len() != dff.dff_2dfx_payload_fields.len() {
+        return None;
+    }
+    let mut draft = effect.clone();
+    let mut payload = if matches!(
+        specs.last().map(|spec| spec.kind),
+        Some(Dff2dfxPropKind::RawHex)
+    ) {
+        effect.payload.clone()
+    } else {
+        let mut payload = dff_2dfx_default_payload(effect.effect_id);
+        payload.resize(
+            dff_2dfx_payload_len(effect.effect_id, effect.payload.len()),
+            0,
+        );
+        payload
+    };
+    let mut position = effect.position;
+    for (spec, value) in specs
+        .iter()
+        .copied()
+        .zip(dff.dff_2dfx_payload_fields.iter())
+    {
+        apply_dff_2dfx_field_value(effect.effect_id, &mut payload, &mut position, spec, value)
+            .ok()?;
+    }
+    draft.position = position;
+    draft.payload = payload;
+    Some((index, draft))
+}
+
 pub(crate) fn editing_delete_selected_dff_2dfx(app: &mut AppState) {
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return;
@@ -12133,10 +20780,51 @@ pub(crate) fn editing_add_dff_boolean_box(app: &mut AppState) {
         return;
     };
     dff.boolean_box = Some(dff_boolean_box_for_raw(&dff.raw));
+    app.transform_mode = TransformMode::Move;
+    app.status_message =
+        "Added DFF boolean cutter; move it with the gizmo, then press Apply".to_string();
+}
+
+pub(crate) fn editing_apply_dff_boolean_box(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let Some(cutter) = dff.boolean_box else {
+        app.status_message = "Add a boolean cutter first".to_string();
+        return false;
+    };
+    if dff.raw.components.len() > 1 {
+        app.status_message =
+            "Boolean Apply is disabled for multi-geometry DFFs; separate the target geometry first"
+                .to_string();
+        return false;
+    }
+    let changed = apply_dff_boolean_box(&mut dff.raw, cutter);
+    if changed == 0 {
+        app.status_message = "Boolean cutter does not intersect the DFF mesh".to_string();
+        return false;
+    }
+    compact_raw_vertices(&mut dff.raw);
+    sync_single_dff_component_ranges(&mut dff.raw);
+    recalc_raw_normals(&mut dff.raw);
+    for breakable in dff
+        .raw
+        .components
+        .iter_mut()
+        .filter_map(|component| component.breakable.as_mut())
+    {
+        breakable.stale = true;
+    }
+    dff.boolean_box = None;
     dff.selected_face = None;
+    dff.selected_faces.clear();
+    dff.selected_edges.clear();
     dff.selected_vertex = None;
+    dff.selected_vertices.clear();
     dff.dirty = true;
-    app.status_message = "Added non-destructive DFF boolean cutter".to_string();
+    app.status_message = format!("Applied boolean cut across {changed} DFF face(s)");
+    refresh_editing_dff_preview(app);
+    true
 }
 
 pub(crate) fn editing_clear_dff_boolean_box(app: &mut AppState) {
@@ -12144,7 +20832,6 @@ pub(crate) fn editing_clear_dff_boolean_box(app: &mut AppState) {
         return;
     };
     dff.boolean_box = None;
-    dff.dirty = true;
     app.status_message = "Cleared DFF boolean cutter".to_string();
 }
 
@@ -12162,7 +20849,6 @@ pub(crate) fn editing_resize_dff_boolean_box(app: &mut AppState, axis: usize, de
         _ => &mut cutter.half_extents.z,
     };
     *value = (*value + delta).max(0.05);
-    dff.dirty = true;
     app.status_message = format!(
         "Boolean cutter size {:.2}, {:.2}, {:.2}",
         cutter.half_extents.x * 2.0,
@@ -12215,6 +20901,72 @@ fn editing_confirm_normalized_rewrite_and_stage(app: &mut AppState) -> bool {
 }
 
 pub(crate) fn editing_stage_dff_asset(app: &mut AppState) -> bool {
+    if matches!(app.editing.asset.as_ref(), Some(EditingAsset::Dff(dff)) if dff.read_only) {
+        app.status_message = "This GTA:SA DFF preview is read-only".to_string();
+        return false;
+    }
+    if matches!(app.editing.asset.as_ref(), Some(EditingAsset::Dff(dff)) if dff.boolean_box.is_some())
+    {
+        app.status_message =
+            "Apply or clear the active boolean cutter before staging the DFF".to_string();
+        return false;
+    }
+    let multi_model_count = match app.editing.asset.as_ref() {
+        Some(EditingAsset::Dff(dff)) => dff.open_models.len(),
+        _ => 0,
+    };
+    if multi_model_count > 0 {
+        let models = {
+            let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+                return false;
+            };
+            if let Some(active) = dff.open_models.get_mut(dff.active_open_model) {
+                active.raw = dff.raw.clone();
+                active.dirty |= dff.dirty;
+            }
+            dff.open_models.clone()
+        };
+        let mut staged = Vec::new();
+        for model in &models {
+            if !model.dirty {
+                continue;
+            }
+            let mut local_raw = model.raw.clone();
+            transform_editor_raw_mesh(&mut local_raw, model.to_workspace.inverse());
+            let frame = Path::new(&model.name)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("model");
+            if let Err(error) = validate_normalized_dff_stage(&local_raw, frame) {
+                app.status_message = format!("Could not write DFF {}: {error}", model.name);
+                return false;
+            }
+            match write_normalized_dff(&local_raw, frame) {
+                Ok(bytes) => staged.push((model.name.clone(), bytes)),
+                Err(error) => {
+                    app.status_message = format!("Could not write DFF {}: {error}", model.name);
+                    return false;
+                }
+            }
+        }
+        for (name, bytes) in &staged {
+            editing_stage_modified_entry(app, name, bytes.clone());
+        }
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            for model in &mut dff.open_models {
+                model.dirty = false;
+            }
+            dff.dirty = false;
+            dff.normalized_warning = false;
+            dff.normalized_rewrite_confirmed = true;
+        }
+        app.status_message = format!(
+            "Staged {} changed DFF model{} from the shared workspace",
+            staged.len(),
+            if staged.len() == 1 { "" } else { "s" }
+        );
+        return true;
+    }
     let traffic_dff_name = app.editing.asset.as_ref().and_then(|asset| match asset {
         EditingAsset::Dff(dff)
             if dff
@@ -12282,22 +21034,7 @@ pub(crate) fn editing_stage_dff_asset(app: &mut AppState) -> bool {
         app.status_message = format!("Could not write DFF {}: {error}", dff.name);
         return false;
     }
-    let mut raw = dff.raw.clone();
-    let removed_by_boolean = dff
-        .boolean_box
-        .map(|cutter| apply_dff_boolean_box(&mut raw, cutter))
-        .unwrap_or(0);
-    if removed_by_boolean > 0 {
-        for breakable in raw
-            .components
-            .iter_mut()
-            .filter_map(|component| component.breakable.as_mut())
-        {
-            breakable.stale = true;
-        }
-        compact_raw_vertices(&mut raw);
-        recalc_raw_normals(&mut raw);
-    }
+    let raw = dff.raw.clone();
     match write_normalized_dff(&raw, frame) {
         Ok(bytes) => {
             let refresh_name = dff.name.clone();
@@ -12308,19 +21045,7 @@ pub(crate) fn editing_stage_dff_asset(app: &mut AppState) -> bool {
             dff.dirty = false;
             dff.normalized_warning = false;
             dff.normalized_rewrite_confirmed = true;
-            if removed_by_boolean > 0 {
-                dff.raw = raw;
-                dff.boolean_box = None;
-                dff.selected_face = None;
-                dff.selected_vertex = None;
-                app.status_message = format!(
-                    "Staged normalized DFF {}; boolean removed {removed_by_boolean} face(s)",
-                    dff.name
-                );
-                refresh_editing_dff_preview(app);
-            } else {
-                app.status_message = format!("Staged normalized DFF {}", dff.name);
-            }
+            app.status_message = format!("Staged normalized DFF {}", dff.name);
             refresh_live_asset_from_editing_entry(app, &refresh_name, &refresh_bytes);
             if let Some(dff_name) = traffic_dff_name.as_deref() {
                 let binding = ensure_traffic_native_model_for_dff(app, dff_name);
@@ -12736,6 +21461,7 @@ pub(crate) fn set_selected_collision_tab_material(
         .get_mut(selected.face)
         .ok_or_else(|| "Selected collision face no longer exists".to_string())?;
     face.material = material;
+    invalidate_collision_render_cache(app, &key);
     stage_collision_tab_col_replacement(app, &key)?;
     app.status_message = format!(
         "COL face material set to {}; replacement staged",
@@ -12792,6 +21518,7 @@ pub(crate) fn set_selected_collision_tab_vertex_position_live(
         .ok_or_else(|| "Selected collision vertex no longer exists".to_string())?;
     *vertex = local;
     mesh.bounds = bounds_from_vertices(&mesh.vertices);
+    invalidate_collision_render_cache(app, &key);
     app.status_message = format!("Moved COL vertex {vertex_idx}");
     Ok(())
 }
@@ -12966,7 +21693,13 @@ fn normalized_editing_col_mesh(col: &EditingColState) -> CollisionMesh {
         std::mem::swap(&mut mesh.vertices, &mut mesh.shadow_vertices);
         std::mem::swap(&mut mesh.faces, &mut mesh.shadow_faces);
     }
-    mesh.bounds = collision_mesh_bounds(&mesh.vertices, &mesh.spheres, &mesh.boxes);
+    if !mesh.vertices.is_empty()
+        || !mesh.faces.is_empty()
+        || !mesh.spheres.is_empty()
+        || !mesh.boxes.is_empty()
+    {
+        mesh.bounds = collision_mesh_bounds(&mesh.vertices, &mesh.spheres, &mesh.boxes);
+    }
     mesh
 }
 
@@ -14658,6 +23391,72 @@ pub(crate) fn editing_add_col_box(app: &mut AppState) -> bool {
     true
 }
 
+fn fit_selected_col_box_to_bounds(col: &mut EditingColState, bounds: Bounds) -> Result<(), String> {
+    let selected = col
+        .selected_primitive
+        .ok_or_else(|| "Select a COL box first".to_string())?;
+    match selected.kind {
+        CollisionPrimitiveKind::Box => {
+            let col_box = col
+                .mesh
+                .boxes
+                .get_mut(selected.index)
+                .ok_or_else(|| "Selected COL box no longer exists".to_string())?;
+            col_box.min = from_mq(bounds.min);
+            col_box.max = from_mq(bounds.max);
+        }
+        CollisionPrimitiveKind::Cuboid => {
+            let cuboid = col
+                .cuboids
+                .get_mut(selected.index)
+                .ok_or_else(|| "Selected rotated COL box no longer exists".to_string())?;
+            cuboid.center = from_mq((bounds.min + bounds.max) * 0.5);
+            cuboid.half_extents = from_mq((bounds.max - bounds.min) * 0.5);
+            cuboid.rotation = V3::default();
+            refresh_cuboid_artifacts(col, selected.index)?;
+        }
+        _ => return Err("Select a COL box first".to_string()),
+    }
+    refresh_editing_col_bounds(col);
+    col.dirty = true;
+    Ok(())
+}
+
+fn editing_fit_selected_col_box_to_object(app: &mut AppState) -> bool {
+    let needs_overlay =
+        app.editing.asset.as_ref().is_some_and(
+            |asset| matches!(asset, EditingAsset::Col(col) if col.dff_overlay.is_none()),
+        );
+    if needs_overlay {
+        refresh_editing_col_dff_overlay(app);
+    }
+    let Some((bounds, overlay_name)) = app.editing.asset.as_ref().and_then(|asset| {
+        let EditingAsset::Col(col) = asset else {
+            return None;
+        };
+        Some((
+            col.dff_overlay.as_ref()?.bounds,
+            col.dff_overlay_name.clone(),
+        ))
+    }) else {
+        app.status_message =
+            "No DFF object is paired with this COL. Pick a DFF overlay first.".to_string();
+        return false;
+    };
+    let Some(EditingAsset::Col(col)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if let Err(error) = fit_selected_col_box_to_bounds(col, bounds) {
+        app.status_message = error;
+        return false;
+    }
+    app.status_message = format!(
+        "Fit selected COL box to {} bounds",
+        overlay_name.as_deref().unwrap_or("DFF object")
+    );
+    true
+}
+
 pub(crate) fn editing_add_col_capsule(app: &mut AppState) -> bool {
     let Some(EditingAsset::Col(col)) = app.editing.asset.as_mut() else {
         return false;
@@ -16051,6 +24850,58 @@ fn editing_stage_added_entry(
     editing.added_entries.insert(key);
 }
 
+fn existing_col_archive(root: &Path, col_name: &str) -> Option<PathBuf> {
+    let target = asset_key(col_name, ".col");
+    let archives = collect_resource_img_files(root)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| !name.eq_ignore_ascii_case(REPLACEMENT_IMG))
+        })
+        .collect::<Vec<_>>();
+    let mut hinted = None;
+    let mut populated = None;
+    for path in archives {
+        let entries = parse_img(&path);
+        if entries
+            .iter()
+            .any(|entry| editing_key(&entry.name) == target)
+        {
+            return Some(path);
+        }
+        if hinted.is_none()
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| lower(stem).contains("col"))
+        {
+            hinted = Some(path.clone());
+        }
+        if populated.is_none()
+            && entries
+                .iter()
+                .any(|entry| lower(&entry.name).ends_with(".col"))
+        {
+            populated = Some(path);
+        }
+    }
+    hinted.or(populated)
+}
+
+fn generated_col_stages_in_open_archive(
+    root: &Path,
+    editing: &EditingState,
+    col_name: &str,
+) -> bool {
+    existing_col_archive(root, col_name).is_none_or(|col_archive| {
+        editing
+            .img_path
+            .as_ref()
+            .is_some_and(|open_archive| *open_archive == col_archive)
+    })
+}
+
 fn refresh_live_asset_from_editing_entry(app: &mut AppState, name: &str, bytes: &[u8]) {
     let key = lower(name.trim());
     if key.ends_with(".col") {
@@ -16065,9 +24916,13 @@ fn refresh_live_asset_from_editing_entry(app: &mut AppState, name: &str, bytes: 
             size: bytes.len().min(u32::MAX as usize) as u32,
         };
         if let Some(mesh) = parse_col_mesh(bytes, &entry) {
-            app.collisions.insert(lower(&entry.name), mesh);
+            let collision_key = lower(&entry.name);
+            invalidate_collision_render_cache(app, &collision_key);
+            app.collisions.insert(collision_key, mesh);
         } else if !col_validation_has_errors(&validate_col_for_game_load(&entry.name, bytes)) {
-            app.collisions.remove(&lower(&entry.name));
+            let collision_key = lower(&entry.name);
+            invalidate_collision_render_cache(app, &collision_key);
+            app.collisions.remove(&collision_key);
         }
         return;
     }
@@ -16093,7 +24948,11 @@ pub(crate) fn refresh_live_dff_from_raw(
     let dff_key = asset_key(name, ".dff");
     let mut txd_scopes = BTreeSet::<Option<String>>::new();
     for placement in &app.placements {
-        if asset_key(&placement.dff, ".dff") == dff_key {
+        // Definition::dff is authoritative; Placement::dff is only a cache
+        // and can be stale after imports or definition edits. Refreshing from
+        // the cache compiled the preview under the wrong mesh/TXD key, making
+        // the Preview and optimized Apply paths appear to do nothing.
+        if placement_dff_key(placement, &app.definitions) == dff_key {
             txd_scopes
                 .insert(definition_txd_name(&app.definitions, &placement.id).map(str::to_owned));
         }
@@ -16107,6 +24966,80 @@ pub(crate) fn refresh_live_dff_from_raw(
             refresh_live_dff_scope_from_raw(app, name, raw, texture_files, txd_scope.as_deref());
     }
     refreshed
+}
+
+/// Refresh only the primary UV stream of every loaded TXD-scoped instance of
+/// a DFF. World-scale unwrap does not change triangle order or material slots,
+/// so rebuilding texture resolution, bounds, normals, and every RenderPart is
+/// unnecessary and dramatically slower on large maps.
+fn refresh_live_dff_uvs_from_raw(app: &mut AppState, name: &str, raw: &RawMesh) -> bool {
+    if raw.uvs.len() != raw.vertices.len() {
+        return false;
+    }
+    let dff_key = asset_key(name, ".dff");
+    let mut txd_scopes = BTreeSet::<Option<String>>::new();
+    for placement in &app.placements {
+        if placement_dff_key(placement, &app.definitions) == dff_key {
+            txd_scopes
+                .insert(definition_txd_name(&app.definitions, &placement.id).map(str::to_owned));
+        }
+    }
+    if txd_scopes.is_empty() {
+        txd_scopes.insert(None);
+    }
+    let ambient_lift = scene_ambient_lift_from_timecyc(&app.timecyc);
+    let mut refreshed = false;
+    for txd_scope in txd_scopes {
+        let mesh_key = mesh_key_from_dff_txd(&dff_key, txd_scope.as_deref());
+        let Some(mesh) = app.meshes.get_mut(&mesh_key) else {
+            continue;
+        };
+        let mut mesh_changed = false;
+        for part in &mut mesh.parts {
+            let mut part_changed = false;
+            for (triangle_slot, face_index) in part.face_indices.iter().copied().enumerate() {
+                let Some(triangle) = raw.triangles.get(face_index) else {
+                    continue;
+                };
+                for (corner, vertex_index) in
+                    [triangle.a, triangle.b, triangle.c].into_iter().enumerate()
+                {
+                    let Some(vertex) = part.cpu_vertices.get_mut(triangle_slot * 3 + corner) else {
+                        continue;
+                    };
+                    let Some(uv) = raw.uvs.get(vertex_index as usize).copied() else {
+                        continue;
+                    };
+                    vertex.uv = uv;
+                    part_changed = true;
+                }
+            }
+            if part_changed {
+                rebuild_render_part_list_with_lift(part, ambient_lift);
+                mesh_changed = true;
+            }
+        }
+        refreshed |= mesh_changed;
+    }
+    refreshed
+}
+
+fn rebuild_world_cells_for_dff_keys(app: &mut AppState, dff_keys: &HashSet<String>) {
+    if dff_keys.is_empty() {
+        return;
+    }
+    let before = PlacementTransformHistorySnapshot {
+        placements: app
+            .placements
+            .iter()
+            .enumerate()
+            .filter(|(_, placement)| {
+                dff_keys.contains(&placement_dff_key(placement, &app.definitions))
+            })
+            .map(|(index, placement)| (index, placement.clone()))
+            .collect(),
+    };
+    rebuild_render_cells_for_placement_transforms(app, &before);
 }
 
 pub(crate) fn refresh_live_dff_scope_from_raw(
@@ -16533,24 +25466,75 @@ pub(crate) fn open_editing_txd_texture_picker(app: &mut AppState, replace: bool)
         return;
     }
     drain_text_input();
-    if app.dff_picker_rx.is_some() {
+    if app.dff_picker_rx.is_some() || app.editing.txd_source_picker_rx.is_some() {
         app.status_message = "File browser is already open".to_string();
         return;
     }
     let start_dir = app.root.join("txd_build");
-    let kind = if replace {
-        DffPickerKind::EditingTextureReplace {
-            entry_name,
-            texture_name: texture_name.unwrap(),
-        }
-    } else {
-        DffPickerKind::EditingTextureAdd { entry_name }
+    if !replace {
+        let (tx, rx) = mpsc::channel();
+        app.editing.txd_source_picker_rx = Some(rx);
+        app.status_message = "Choose one or more PNG textures...".to_string();
+        thread::spawn(move || {
+            let result = choose_texture_image_paths(start_dir);
+            let _ = tx.send(EditingTxdSourcePickerResult {
+                entry_name,
+                kind: EditingTxdSourcePickerKind::Files,
+                result,
+            });
+        });
+        return;
+    }
+    let kind = DffPickerKind::EditingTextureReplace {
+        entry_name,
+        texture_name: texture_name.unwrap(),
     };
     let (tx, rx) = mpsc::channel();
     app.dff_picker_rx = Some(rx);
     thread::spawn(move || {
         let _ = tx.send((kind, choose_texture_image_path(start_dir)));
     });
+}
+
+pub(crate) fn open_editing_txd_folder_picker(app: &mut AppState) {
+    let Some(EditingAsset::Txd(txd)) = app.editing.asset.as_ref() else {
+        return;
+    };
+    if app.dff_picker_rx.is_some() || app.editing.txd_source_picker_rx.is_some() {
+        app.status_message = "File browser is already open".to_string();
+        return;
+    }
+    let entry_name = txd.name.clone();
+    let start_dir = app.root.join("txd_build");
+    let (tx, rx) = mpsc::channel();
+    app.editing.txd_source_picker_rx = Some(rx);
+    app.status_message = "Choose a folder of PNG textures...".to_string();
+    thread::spawn(move || {
+        let result = choose_editing_texture_folder(start_dir)
+            .map(|folder| folder.map(|folder| texture_paths_in_folder(&folder)));
+        let _ = tx.send(EditingTxdSourcePickerResult {
+            entry_name,
+            kind: EditingTxdSourcePickerKind::Folder,
+            result,
+        });
+    });
+}
+
+pub(crate) fn texture_paths_in_folder(folder: &Path) -> Vec<PathBuf> {
+    let mut paths = WalkDir::new(folder)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|a, b| lower(&a.to_string_lossy()).cmp(&lower(&b.to_string_lossy())));
+    paths
 }
 
 pub(crate) fn open_editing_txd_export_all_picker(app: &mut AppState) {
@@ -16575,7 +25559,7 @@ pub(crate) fn open_editing_txd_export_all_picker(app: &mut AppState) {
 }
 
 pub(crate) fn open_dff_face_texture_picker(app: &mut AppState) {
-    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
         return;
     };
     if dff.txd_context.is_none() {
@@ -16586,13 +25570,11 @@ pub(crate) fn open_dff_face_texture_picker(app: &mut AppState) {
         app.status_message = "Select one or more DFF faces first".to_string();
         return;
     }
-    dff.texture_picker_edits_material = false;
-    dff.texture_picker_open = true;
-    dff.texture_picker_scroll = 0.0;
+    populate_dff_texture_picker(app, false);
 }
 
 pub(crate) fn open_dff_material_texture_picker(app: &mut AppState) {
-    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
         return;
     };
     if dff.txd_context.is_none() {
@@ -16603,9 +25585,7 @@ pub(crate) fn open_dff_material_texture_picker(app: &mut AppState) {
         app.status_message = "Select a valid DFF material first".to_string();
         return;
     }
-    dff.texture_picker_edits_material = true;
-    dff.texture_picker_open = true;
-    dff.texture_picker_scroll = 0.0;
+    populate_dff_texture_picker(app, true);
 }
 
 pub(crate) fn start_dff_face_texture_browse(app: &mut AppState) {
@@ -16664,6 +25644,57 @@ pub(crate) fn start_dff_material_texture_browse(app: &mut AppState) {
     thread::spawn(move || {
         let _ = tx.send((kind, choose_texture_image_path(start_dir)));
     });
+}
+
+pub(crate) fn start_dff_material_texture_replace_browse(
+    app: &mut AppState,
+    dff_name: &str,
+    material: usize,
+) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        return false;
+    };
+    if !dff.name.eq_ignore_ascii_case(dff_name) {
+        app.status_message = "The selected DFF changed".to_string();
+        return false;
+    }
+    if dff.read_only {
+        app.status_message = "Preview-only GTA assets cannot be modified".to_string();
+        return false;
+    }
+    let Some(txd_name) = dff.txd_context.clone() else {
+        app.status_message = "This model has no resolved TXD to replace textures in".to_string();
+        return false;
+    };
+    let Some(texture_name) = dff
+        .raw
+        .material_textures
+        .get(material)
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+    else {
+        app.status_message = "The selected material has no texture to replace".to_string();
+        return false;
+    };
+    drain_text_input();
+    if app.dff_picker_rx.is_some() {
+        app.status_message = "File browser is already open".to_string();
+        return false;
+    }
+    let kind = DffPickerKind::EditingMaterialTextureReplace {
+        txd_name,
+        dff_name: dff.name.clone(),
+        material,
+        texture_name: texture_name.clone(),
+    };
+    let start_dir = load_last_dff_export_dir();
+    let (tx, rx) = mpsc::channel();
+    app.dff_picker_rx = Some(rx);
+    app.status_message = format!("Choose an image to replace '{texture_name}'...");
+    thread::spawn(move || {
+        let _ = tx.send((kind, choose_texture_image_path(start_dir)));
+    });
+    true
 }
 
 pub(crate) fn editing_add_entry_from_path(app: &mut AppState, path: PathBuf) {
@@ -16874,13 +25905,39 @@ pub(crate) fn editing_import_texture_from_path(
     texture_name: Option<String>,
     path: PathBuf,
 ) {
-    let target_texture = texture_name.unwrap_or_else(|| {
-        path.file_stem()
+    editing_import_textures_from_paths(app, entry_name, texture_name, vec![path]);
+}
+
+pub(crate) fn editing_import_textures_from_paths(
+    app: &mut AppState,
+    entry_name: String,
+    texture_name: Option<String>,
+    paths: Vec<PathBuf>,
+) {
+    let paths = paths
+        .into_iter()
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        app.status_message = "No PNG textures were selected".to_string();
+        return;
+    }
+    if texture_name.is_some() && paths.len() != 1 {
+        app.status_message = "Replacing a texture requires exactly one image".to_string();
+        return;
+    }
+    let target_texture = sanitize_texture_name(&texture_name.unwrap_or_else(|| {
+        paths
+            .last()
+            .and_then(|path| path.file_stem())
             .and_then(|stem| stem.to_str())
             .unwrap_or("texture")
             .to_string()
-    });
-    if app.editing.txd_import_rx.is_some() || app.editing.txd_refresh_job.is_some() {
+    }));
+    if app.editing.txd_import_rx.is_some()
+        || app.editing.dff_texture_replace_rx.is_some()
+        || app.editing.txd_refresh_job.is_some()
+    {
         app.status_message = "Wait for the current TXD import to finish".to_string();
         return;
     }
@@ -16928,13 +25985,25 @@ pub(crate) fn editing_import_texture_from_path(
     let worker_texture_name = target_texture.clone();
     let (tx, rx) = mpsc::channel();
     app.editing.txd_import_rx = Some(rx);
+    let imported_count = paths.len();
     app.status_message =
-        format!("Importing {target_texture} into {entry_name} in the background...");
+        format!("Importing {imported_count} texture(s) into {entry_name} in the background...");
     thread::spawn(move || {
         let result = (|| {
-            let native = imported_image_texture_native(&path, &worker_texture_name)?;
-            let updated =
-                replace_or_append_texture_native_in_txd(bytes, &native, &worker_texture_name)?;
+            let mut updated = bytes;
+            for path in &paths {
+                let name = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("texture");
+                let name = if paths.len() == 1 {
+                    worker_texture_name.as_str()
+                } else {
+                    name
+                };
+                let native = imported_image_texture_native(path, name)?;
+                updated = replace_or_append_texture_native_in_txd(updated, &native, name)?;
+            }
             let wip_root = wip_root_path(&root);
             upsert_replacement_txd(&wip_root, &worker_entry_name, &updated)?;
 
@@ -16961,6 +26030,7 @@ pub(crate) fn editing_import_texture_from_path(
         let _ = tx.send(EditingTxdImportResult {
             entry_name: worker_entry_name,
             target_texture: worker_texture_name,
+            imported_count,
             linked_definition_ids,
             result,
         });
@@ -16968,6 +26038,34 @@ pub(crate) fn editing_import_texture_from_path(
 }
 
 pub(crate) fn update_editing_txd_import(app: &mut AppState) {
+    if let Some(rx) = app.editing.txd_source_picker_rx.as_ref() {
+        let received = match rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                app.editing.txd_source_picker_rx = None;
+                app.status_message = "Texture picker closed unexpectedly".to_string();
+                return;
+            }
+        };
+        if let Some(picked) = received {
+            app.editing.txd_source_picker_rx = None;
+            match picked.result {
+                Ok(Some(paths)) if !paths.is_empty() => {
+                    editing_import_textures_from_paths(app, picked.entry_name, None, paths)
+                }
+                Ok(_) => {
+                    app.status_message = match picked.kind {
+                        EditingTxdSourcePickerKind::Files => "Add textures cancelled".to_string(),
+                        EditingTxdSourcePickerKind::Folder => {
+                            "No PNG textures found in the selected folder".to_string()
+                        }
+                    }
+                }
+                Err(err) => app.status_message = format!("Texture picker failed: {err}"),
+            }
+        }
+    }
     if let Some(rx) = app.editing.txd_import_rx.as_ref() {
         let received = match rx.try_recv() {
             Ok(result) => Some(result),
@@ -16997,7 +26095,12 @@ pub(crate) fn update_editing_txd_import(app: &mut AppState) {
                         search_cursor: 0,
                         search_anchor: None,
                         search_active: false,
+                        category_filter: String::new(),
                         preview_texture: None,
+                        preview_zoom: 1.0,
+                        preview_pan: Vec2::ZERO,
+                        preview_dragging: false,
+                        preview_drag_last: Vec2::ZERO,
                         material_picker_open: false,
                         material_picker_search: String::new(),
                         material_picker_scroll: 0.0,
@@ -17018,8 +26121,8 @@ pub(crate) fn update_editing_txd_import(app: &mut AppState) {
                     });
                     invalidate_validation_cache(app);
                     app.status_message = format!(
-                        "Staged texture in {}; refreshing linked DFFs...",
-                        result.entry_name
+                        "Staged {} texture(s) in {}; refreshing linked DFFs...",
+                        result.imported_count, result.entry_name
                     );
                 }
                 Err(err) => app.status_message = format!("Could not update TXD: {err}"),
@@ -17166,6 +26269,165 @@ pub(crate) fn editing_import_material_texture_from_path(
     };
 }
 
+pub(crate) fn editing_replace_material_texture_from_path(
+    app: &mut AppState,
+    txd_name: String,
+    dff_name: String,
+    material: usize,
+    texture_name: String,
+    path: PathBuf,
+) {
+    let still_valid = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff))
+            if !dff.read_only
+                && dff.name.eq_ignore_ascii_case(&dff_name)
+                && dff.txd_context.as_ref().is_some_and(|current| current.eq_ignore_ascii_case(&txd_name))
+                && dff.raw.material_textures.get(material).is_some_and(|current| current.eq_ignore_ascii_case(&texture_name))
+    );
+    if !still_valid {
+        app.status_message =
+            "The DFF, material, or texture changed while the browser was open".to_string();
+        return;
+    }
+    if app.editing.txd_import_rx.is_some()
+        || app.editing.dff_texture_replace_rx.is_some()
+        || app.editing.txd_refresh_job.is_some()
+    {
+        app.status_message = "Wait for the current TXD update to finish".to_string();
+        return;
+    }
+    if app.manual_save_job.is_some()
+        || app.editing.save_rx.is_some()
+        || app.autosave_rx.is_some()
+        || app.autosave_cleanup_rx.is_some()
+        || app.txd_cleanup_job.is_some()
+        || app.asset_optimization_scan_rx.is_some()
+        || app.asset_optimization_job.is_some()
+    {
+        app.status_message =
+            "Texture replacement cannot start while another asset writer is running".to_string();
+        return;
+    }
+    let Some(destination) = find_txd_entry_for_app(app, &txd_name) else {
+        app.status_message = format!("Could not locate destination TXD {txd_name}");
+        return;
+    };
+    let linked_definition_ids = app
+        .definitions
+        .iter()
+        .filter_map(|(id, definition)| {
+            definition_txd_name_from_attrs(definition)
+                .is_some_and(|name| asset_key(name, ".txd") == asset_key(&txd_name, ".txd"))
+                .then(|| id.clone())
+        })
+        .collect::<Vec<_>>();
+    let root = app.root.clone();
+    let worker_txd_name = asset_key(&txd_name, ".txd");
+    let worker_dff_name = dff_name.clone();
+    let worker_texture_name = texture_name.clone();
+    let worker_path = path.clone();
+    let (tx, rx) = mpsc::channel();
+    app.editing.dff_texture_replace_rx = Some(rx);
+    app.status_message = format!("Replacing '{texture_name}' in {txd_name} in the background...");
+    thread::spawn(move || {
+        let result = (|| {
+            let bytes = read_txd_entry_bytes(&destination);
+            let native = imported_image_texture_native(&worker_path, &worker_texture_name)?;
+            let updated =
+                replace_or_append_texture_native_in_txd(bytes, &native, &worker_texture_name)?;
+            let wip_root = wip_root_path(&root);
+            upsert_replacement_txd(&wip_root, &worker_txd_name, &updated)?;
+
+            let replacement_img = wip_root.join("imgs").join(REPLACEMENT_IMG);
+            let replacement_entries = parse_img(&replacement_img);
+            let replacement_txd_names = replacement_entries
+                .iter()
+                .filter(|entry| lower(&entry.name).ends_with(".txd"))
+                .map(|entry| asset_key(&entry.name, ".txd"))
+                .collect::<HashSet<_>>();
+            let mut indexed = TxdTextureIndex::new();
+            index_txd_entries(&replacement_img, &replacement_entries, &mut indexed);
+            let mut indexed_textures = indexed.into_iter().collect::<Vec<_>>();
+            indexed_textures.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(EditingDffTextureReplaceOutput {
+                indexed_textures,
+                replacement_txd_names,
+            })
+        })();
+        let _ = tx.send(EditingDffTextureReplaceResult {
+            txd_name: worker_txd_name,
+            dff_name: worker_dff_name,
+            material,
+            texture_name: worker_texture_name,
+            source_path: worker_path,
+            linked_definition_ids,
+            result,
+        });
+    });
+}
+
+pub(crate) fn update_editing_dff_texture_replace(app: &mut AppState) {
+    let Some(rx) = app.editing.dff_texture_replace_rx.as_ref() else {
+        return;
+    };
+    let received = match rx.try_recv() {
+        Ok(result) => Some(result),
+        Err(mpsc::TryRecvError::Empty) => None,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            app.editing.dff_texture_replace_rx = None;
+            app.status_message = "Texture replacement worker stopped unexpectedly".to_string();
+            return;
+        }
+    };
+    let Some(result) = received else {
+        return;
+    };
+    app.editing.dff_texture_replace_rx = None;
+    let still_valid = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff))
+            if dff.name.eq_ignore_ascii_case(&result.dff_name)
+                && dff.raw.material_textures.get(result.material)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&result.texture_name))
+    );
+    match result.result {
+        Ok(output) => {
+            app.pending_txd_writes.insert(result.txd_name.clone());
+            app.loaded_wip = true;
+            app.editing.txd_refresh_job = Some(EditingTxdRefreshJob {
+                txd_name: result.txd_name.clone(),
+                texture_name: result.texture_name.clone(),
+                indexed_textures: output.indexed_textures.into(),
+                replacement_txd_names: output.replacement_txd_names,
+                linked_definition_ids: result.linked_definition_ids.into(),
+                recompiled: 0,
+                index_complete: false,
+            });
+            invalidate_validation_cache(app);
+            app.status_message = if still_valid {
+                format!(
+                    "Replaced '{}' in {} from {}; refreshing linked DFFs...",
+                    result.texture_name,
+                    result.txd_name,
+                    result.source_path.display()
+                )
+            } else {
+                format!(
+                    "Replaced '{}' in {}; the originally selected DFF or material changed",
+                    result.texture_name, result.txd_name
+                )
+            };
+        }
+        Err(error) => {
+            app.status_message = format!(
+                "Could not replace '{}' in {}: {error}",
+                result.texture_name, result.txd_name
+            );
+        }
+    }
+}
+
 fn build_gif_uv_animation(name: &str, fb: &GifFlipbook) -> DffUvAnimation {
     let inv_cols = 1.0 / fb.cols as f32;
     let inv_rows = 1.0 / fb.rows as f32;
@@ -17289,6 +26551,7 @@ pub(crate) fn editing_import_gif_anim_from_path(
         }
         dff.raw.material_animations[material].names = vec![anim_name.clone()];
         dff.selected_material = material;
+        sync_dff_uv_editor_material(dff);
         dff.dirty = true;
         assigned = true;
         app.status_message = format!(
@@ -17355,15 +26618,211 @@ pub(crate) fn open_img_entry_in_editing_unchecked(app: &mut AppState, entry: Img
     }
 }
 
+fn scene_camera_relative_to_placement(
+    camera: CameraState,
+    placement: &Placement,
+) -> Option<CameraState> {
+    let inverse = placement_matrix(placement).inverse();
+    let local_pos = inverse.transform_point3(camera.pos);
+    let (world_forward, _) = camera_vectors(&camera);
+    let local_forward = inverse.transform_vector3(world_forward).normalize_or_zero();
+    if !local_pos.is_finite() || !local_forward.is_finite() || local_forward.length_squared() < 0.5
+    {
+        return None;
+    }
+    let mut local = camera;
+    local.pos = local_pos;
+    local.yaw = local_forward.x.atan2(local_forward.y);
+    local.pitch = local_forward
+        .z
+        .atan2(Vec2::new(local_forward.x, local_forward.y).length());
+    local.looking = false;
+    Some(local)
+}
+
+fn selected_scene_dff_camera(app: &AppState, placement: &Placement) -> Option<CameraState> {
+    if app.active_tab == AppTab::Editing
+        || !is_visible_element(app, app.selected)
+        || !app.options.render
+    {
+        return None;
+    }
+    let mesh = element_mesh(app, placement)?;
+    let model = placement_matrix(placement);
+    let world_bounds = transformed_bounds(mesh.bounds, &model.to_cols_array());
+    let closest = app.camera.pos.clamp(world_bounds.min, world_bounds.max);
+    if app.camera.pos.distance(closest) > DFF_SCENE_CAMERA_TRANSFER_MAX_DISTANCE {
+        return None;
+    }
+    let viewport = editor_viewport_rect();
+    let frustum = frustum_planes(view_projection(app, viewport));
+    if !aabb_in_frustum(&frustum, world_bounds.min, world_bounds.max) {
+        return None;
+    }
+    scene_camera_relative_to_placement(app.camera, placement)
+}
+
+pub(crate) fn open_scene_dff_in_editing_unchecked(
+    app: &mut AppState,
+    entry: ImgEntry,
+    camera: Option<CameraState>,
+) {
+    let entry_name = entry.name.clone();
+    open_img_entry_in_editing_unchecked(app, entry);
+    let opened = app.active_tab == AppTab::Editing
+        && matches!(
+            app.editing.asset.as_ref(),
+            Some(EditingAsset::Dff(dff)) if dff.name.eq_ignore_ascii_case(&entry_name)
+        );
+    if opened && let Some(mut camera) = camera {
+        camera.last_mouse = mouse_position().into();
+        camera.looking = false;
+        app.camera = camera;
+        app.camera_mode = CameraMode::Freeroam;
+        app.editing.camera = Some(camera);
+        app.editing.camera_mode = Some(CameraMode::Freeroam);
+        app.editing.camera_focus = Some(app.camera_focus);
+    }
+}
+
+pub(crate) fn open_scene_dffs_in_editing_unchecked(
+    app: &mut AppState,
+    models: Vec<(usize, Placement, ImgEntry)>,
+    camera: Option<CameraState>,
+) {
+    let Some((_, anchor_placement, anchor_entry)) = models.first().cloned() else {
+        return;
+    };
+    open_scene_dff_in_editing_unchecked(app, anchor_entry, camera);
+    if !matches!(app.editing.asset.as_ref(), Some(EditingAsset::Dff(_))) {
+        return;
+    }
+    let anchor_inverse = placement_matrix(&anchor_placement).inverse();
+    let mut open_models = Vec::with_capacity(models.len());
+    for (placement_index, placement, entry) in models {
+        let name = entry.name.clone();
+        let raw = if open_models.is_empty() {
+            match app.editing.asset.as_ref() {
+                Some(EditingAsset::Dff(dff)) => dff.raw.clone(),
+                _ => return,
+            }
+        } else {
+            let key = editing_key(&name);
+            let bytes = app
+                .editing
+                .modified_entries
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| read_img_entry(&entry));
+            parse_dff_mesh(&bytes)
+        };
+        if raw.vertices.is_empty() {
+            continue;
+        }
+        let to_workspace = anchor_inverse * placement_matrix(&placement);
+        let mut workspace_raw = raw;
+        transform_editor_raw_mesh(&mut workspace_raw, to_workspace);
+        let (txd_context, txd_source_label) = resolve_editing_dff_txd_context(app, &name);
+        let preview_mesh = build_editing_dff_preview(app, &workspace_raw, txd_context.as_deref());
+        open_models.push(EditingDffOpenModel {
+            name,
+            placement_index,
+            to_workspace,
+            raw: workspace_raw,
+            preview_mesh,
+            txd_context,
+            txd_source_label,
+            dirty: false,
+            selected_face: None,
+            selected_faces: BTreeSet::new(),
+            selected_edges: BTreeSet::new(),
+            selected_vertex: None,
+            selected_vertices: BTreeSet::new(),
+        });
+    }
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        if let Some(anchor) = open_models.first().cloned() {
+            dff.raw = anchor.raw;
+            dff.preview_mesh = anchor.preview_mesh;
+            dff.txd_context = anchor.txd_context;
+            dff.txd_source_label = anchor.txd_source_label;
+        }
+        dff.open_models = open_models;
+        dff.active_open_model = 0;
+        dff.multi_select = false;
+        let count = dff.open_models.len();
+        app.editing.message = format!("Opened {count} scene DFF models at relative offsets");
+        app.status_message = app.editing.message.clone();
+    }
+}
+
 pub(crate) fn open_selected_dff_in_editing(app: &mut AppState) {
-    let Some(placement) = selected_placement(app).cloned() else {
+    let Some(active_placement) = selected_placement(app).cloned() else {
         app.status_message = "Select an element before opening the DFF editor".to_string();
         return;
     };
-    if let Some(entry) = find_dff_entry_for_app(app, &placement.dff) {
-        open_img_entry_in_editing(app, entry);
+    let mut indices = vec![app.selected];
+    for index in app
+        .selected_element_order
+        .iter()
+        .copied()
+        .chain(app.selected_elements.iter().copied())
+    {
+        if !indices.contains(&index) {
+            indices.push(index);
+        }
+    }
+    let mut seen_assets = HashSet::new();
+    let mut models = Vec::new();
+    for index in indices {
+        let Some(placement) = app.placements.get(index).cloned() else {
+            continue;
+        };
+        if app
+            .element_states
+            .get(index)
+            .is_some_and(|state| state.deleted)
+        {
+            continue;
+        }
+        // Match the game-view loader: the definition's explicit DFF reference
+        // is authoritative, while Placement::dff is only a cache.
+        let dff_key = placement_dff_key(&placement, &app.definitions);
+        if !seen_assets.insert(dff_key.clone()) {
+            continue;
+        }
+        let Some(entry) = find_dff_entry_for_app(app, &dff_key) else {
+            app.status_message = format!("Could not resolve DFF {dff_key}");
+            return;
+        };
+        models.push((index, placement, entry));
+    }
+    if let Some((_, _, entry)) = models.first() {
+        let camera = selected_scene_dff_camera(app, &active_placement);
+        let target = if models.len() > 1 {
+            format!("{} selected DFF models", models.len())
+        } else {
+            entry.name.clone()
+        };
+        let same_archive = app
+            .editing
+            .img_path
+            .as_ref()
+            .is_some_and(|path| path == &entry.img_path);
+        let action = ConfirmAction::OpenSceneDffsInEditing {
+            models: models.clone(),
+            camera,
+        };
+        let blocked = if same_archive {
+            request_discard_active_editing_asset(app, action, &target)
+        } else {
+            request_discard_editing_context(app, action, &target)
+        };
+        if !blocked {
+            open_scene_dffs_in_editing_unchecked(app, models, camera);
+        }
     } else {
-        app.status_message = format!("Could not resolve DFF {}", placement.dff);
+        app.status_message = "None of the selected elements has a readable DFF".to_string();
     }
 }
 
@@ -17379,7 +26838,7 @@ pub(crate) fn open_selected_txd_in_editing(app: &mut AppState) {
     }
 }
 
-fn open_staged_asset_in_editing(app: &mut AppState, name: &str) -> bool {
+pub(crate) fn open_staged_asset_in_editing(app: &mut AppState, name: &str) -> bool {
     if request_discard_active_editing_asset(
         app,
         ConfirmAction::OpenEditingStagedAsset(name.to_string()),
@@ -17388,6 +26847,77 @@ fn open_staged_asset_in_editing(app: &mut AppState, name: &str) -> bool {
         return true;
     }
     open_staged_asset_in_editing_unchecked(app, name)
+}
+
+fn normalized_new_txd_name(value: &str) -> Result<(String, String), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Enter a name for the new TXD".to_string());
+    }
+    if trimmed.contains(['/', '\\']) {
+        return Err("TXD names cannot contain path separators".to_string());
+    }
+    let stem = if Path::new(trimmed)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("txd"))
+    {
+        Path::new(trimmed)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("")
+    } else {
+        trimmed
+    };
+    if stem.is_empty()
+        || !stem
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err("Use only letters, numbers, underscores, and hyphens".to_string());
+    }
+    let entry_name = format!("{stem}.txd");
+    if entry_name.len() > 23 {
+        return Err("TXD names must be at most 19 ASCII characters".to_string());
+    }
+    Ok((stem.to_string(), entry_name))
+}
+
+pub(crate) fn create_empty_txd_for_selected(app: &mut AppState, value: &str) -> bool {
+    let (stem, entry_name) = match normalized_new_txd_name(value) {
+        Ok(names) => names,
+        Err(error) => {
+            app.status_message = error;
+            return false;
+        }
+    };
+    let key = asset_key(&entry_name, ".txd");
+    let already_exists = find_txd_entry_for_app(app, &entry_name).is_some()
+        || app.editing.modified_entries.contains_key(&key)
+        || scene_txd_names(app)
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&stem));
+    if already_exists {
+        app.status_message = format!("TXD {stem} already exists; select it from the list");
+        return false;
+    }
+
+    let bytes = rw_chunk(0x16, rw_chunk(0x01, vec![0, 0, 0, 0]));
+    let wip_root = wip_root_path(&app.root);
+    if let Err(error) = upsert_replacement_asset(&wip_root, &entry_name, &bytes) {
+        app.status_message = format!("Could not create TXD {stem}: {error}");
+        return false;
+    }
+    let fallback_img_path = wip_root.join("imgs").join(REPLACEMENT_IMG);
+    editing_stage_added_entry(&mut app.editing, fallback_img_path, &entry_name, bytes);
+    app.pending_txd_writes.insert(key);
+    app.loaded_wip = true;
+    assign_selected_definition_txd(app, &stem);
+    invalidate_validation_cache(app);
+    if open_staged_asset_in_editing(app, &entry_name) {
+        app.status_message = format!("Created and assigned TXD {stem}");
+    }
+    true
 }
 
 pub(crate) fn open_staged_asset_in_editing_unchecked(app: &mut AppState, name: &str) -> bool {
@@ -17508,6 +27038,26 @@ fn update_editing_search_input(app: &mut AppState, mouse: Vec2) -> bool {
 
 fn update_editing_txd_search_input(app: &mut AppState, mouse: Vec2) -> bool {
     let rect = editing_txd_search_rect();
+    if is_mouse_button_pressed(MouseButton::Left) && editing_txd_category_rect().contains(mouse) {
+        let current = app.editing.asset.as_ref().and_then(|asset| match asset {
+            EditingAsset::Txd(txd) => Some(txd.category_filter.clone()),
+            _ => None,
+        });
+        if let Some(current) = current {
+            let next = next_texture_category_filter(&current, &app.material_classes);
+            if let Some(EditingAsset::Txd(txd)) = app.editing.asset.as_mut() {
+                txd.category_filter = next;
+                txd.search_active = false;
+                txd.scroll = 0.0;
+                txd.selected = editing_txd_filtered_indices(txd, &app.material_classes)
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
+            }
+            editing_update_txd_preview(app);
+            return true;
+        }
+    }
     let Some(EditingAsset::Txd(txd)) = app.editing.asset.as_mut() else {
         return false;
     };
@@ -17573,7 +27123,7 @@ fn update_editing_txd_search_input(app: &mut AppState, mouse: Vec2) -> bool {
     }
     if changed {
         txd.scroll = 0.0;
-        txd.selected = editing_txd_filtered_indices(txd)
+        txd.selected = editing_txd_filtered_indices(txd, &app.material_classes)
             .first()
             .copied()
             .unwrap_or(0);
@@ -17772,7 +27322,7 @@ fn editing_nearest_dff_vertex_screen(
                 continue;
             };
             let distance = screen.distance(mouse);
-            if distance > EDIT_VERTEX_PICK_RADIUS {
+            if distance > DFF_VERTEX_PICK_RADIUS {
                 continue;
             }
             if let Some((origin, dir)) = ray {
@@ -17809,15 +27359,33 @@ fn editing_pick_dff_face(
     viewport: Rect,
     mouse: Vec2,
 ) -> Option<usize> {
+    editing_pick_dff_face_hit(app, dff, viewport, mouse).map(|(face, _)| face)
+}
+
+fn editing_pick_dff_face_hit(
+    app: &AppState,
+    dff: &EditingDffState,
+    viewport: Rect,
+    mouse: Vec2,
+) -> Option<(usize, f32)> {
+    editing_pick_raw_dff_face_hit(app, &dff.raw, viewport, mouse)
+}
+
+fn editing_pick_raw_dff_face_hit(
+    app: &AppState,
+    raw: &RawMesh,
+    viewport: Rect,
+    mouse: Vec2,
+) -> Option<(usize, f32)> {
     let (origin, dir) = viewport_ray(app, viewport, mouse)?;
     let mut best = None;
     let mut best_t = f32::MAX;
-    for (face_idx, tri) in dff.raw.triangles.iter().enumerate() {
+    for (face_idx, tri) in raw.triangles.iter().enumerate() {
         let (a, b, c) = (tri.a as usize, tri.b as usize, tri.c as usize);
         let (Some(a), Some(b), Some(c)) = (
-            dff.raw.vertices.get(a).map(|v| to_mq(*v)),
-            dff.raw.vertices.get(b).map(|v| to_mq(*v)),
-            dff.raw.vertices.get(c).map(|v| to_mq(*v)),
+            raw.vertices.get(a).map(|v| to_mq(*v)),
+            raw.vertices.get(b).map(|v| to_mq(*v)),
+            raw.vertices.get(c).map(|v| to_mq(*v)),
         ) else {
             continue;
         };
@@ -17828,7 +27396,29 @@ fn editing_pick_dff_face(
             }
         }
     }
-    best
+    best.map(|face| (face, best_t))
+}
+
+fn editing_pick_open_dff_model(
+    app: &AppState,
+    dff: &EditingDffState,
+    viewport: Rect,
+    mouse: Vec2,
+) -> Option<usize> {
+    dff.open_models
+        .iter()
+        .enumerate()
+        .filter_map(|(index, model)| {
+            let raw = if index == dff.active_open_model {
+                &dff.raw
+            } else {
+                &model.raw
+            };
+            editing_pick_raw_dff_face_hit(app, raw, viewport, mouse)
+                .map(|(_, depth)| (index, depth))
+        })
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(index, _)| index)
 }
 
 fn editing_pick_dff_edge(
@@ -17837,9 +27427,20 @@ fn editing_pick_dff_edge(
     viewport: Rect,
     mouse: Vec2,
 ) -> Option<(usize, usize)> {
-    let mut best: Option<((usize, usize), f32)> = None;
-    for tri in &dff.raw.triangles {
+    let ray = viewport_ray(app, viewport, mouse);
+    let face_hit = editing_pick_dff_face_hit(app, dff, viewport, mouse);
+    let hovered_face = face_hit.map(|(face, _)| face);
+    let front_depth = face_hit.map(|(_, depth)| depth);
+    let mut visited = BTreeSet::new();
+    // Prefer an edge belonging to the surface directly under the pointer,
+    // then rank by screen distance and depth. This prevents back-side edges
+    // projected through a dense mesh from stealing the click.
+    let mut best: Option<((usize, usize), bool, f32, f32)> = None;
+    for (face_idx, tri) in dff.raw.triangles.iter().enumerate() {
         for edge in dff_triangle_edge_vertices(tri) {
+            if !visited.insert(edge) {
+                continue;
+            }
             let (Some(a), Some(b)) = (dff.raw.vertices.get(edge.0), dff.raw.vertices.get(edge.1))
             else {
                 continue;
@@ -17851,13 +27452,52 @@ fn editing_pick_dff_edge(
                 continue;
             };
             let dist = dist_to_segment(mouse, sa, sb);
-            if dist <= EDIT_VERTEX_PICK_RADIUS && best.is_none_or(|(_, best_dist)| dist < best_dist)
-            {
-                best = Some((edge, dist));
+            if dist > EDIT_EDGE_PICK_RADIUS {
+                continue;
+            }
+            let segment_t = closest_segment_parameter(mouse, sa, sb);
+            let point = to_mq(*a).lerp(to_mq(*b), segment_t);
+            let depth = ray.map_or(f32::MAX, |(origin, dir)| {
+                ray_depth_to_point(origin, dir, point)
+            });
+            if depth <= 0.0 {
+                continue;
+            }
+            if front_depth.is_some_and(|front| {
+                front + VERTEX_OCCLUSION_TOLERANCE < depth
+                    && !on_dff_face_edge(dff, hovered_face, edge)
+            }) {
+                continue;
+            }
+            let on_hovered_face =
+                hovered_face == Some(face_idx) || on_dff_face_edge(dff, hovered_face, edge);
+            let better = best.is_none_or(|(_, best_on_face, best_dist, best_depth)| {
+                (on_hovered_face && !best_on_face)
+                    || (on_hovered_face == best_on_face
+                        && (dist < best_dist
+                            || ((dist - best_dist).abs() < 0.25 && depth < best_depth)))
+            });
+            if better {
+                best = Some((edge, on_hovered_face, dist, depth));
             }
         }
     }
-    best.map(|(edge, _)| edge)
+    best.map(|(edge, _, _, _)| edge)
+}
+
+fn on_dff_face_edge(dff: &EditingDffState, face: Option<usize>, edge: (usize, usize)) -> bool {
+    face.and_then(|face| dff.raw.triangles.get(face))
+        .is_some_and(|tri| dff_triangle_edge_vertices(tri).contains(&edge))
+}
+
+fn closest_segment_parameter(point: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let segment = b - a;
+    let length_squared = segment.length_squared();
+    if length_squared <= f32::EPSILON {
+        0.0
+    } else {
+        ((point - a).dot(segment) / length_squared).clamp(0.0, 1.0)
+    }
 }
 
 fn dff_face_for_vertex(dff: &EditingDffState, vertex: usize) -> Option<usize> {
@@ -18005,10 +27645,137 @@ pub(crate) fn box_select_editing_vertices(app: &mut AppState, start: Vec2, end: 
     if app.active_tab != AppTab::Editing {
         return false;
     }
-    let viewport = editing_center_rect();
+    let viewport = editing_preview_rect(app);
     let rect = normalized_screen_rect(start, end);
     if rect.w < 4.0 || rect.h < 4.0 {
         return false;
+    }
+    let multi_dff = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.multi_select && dff.open_models.len() > 1
+    );
+    if multi_dff {
+        let selections = {
+            let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+                return false;
+            };
+            dff.open_models
+                .iter()
+                .map(|model| match dff.select_mode {
+                    EditingSelectMode::Vertex => (
+                        model
+                            .raw
+                            .vertices
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, vertex)| {
+                                world_to_screen(app, viewport, to_mq(*vertex))
+                                    .filter(|screen| rect.contains(*screen))
+                                    .map(|_| index)
+                            })
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::new(),
+                        BTreeSet::new(),
+                    ),
+                    EditingSelectMode::Face => (
+                        BTreeSet::new(),
+                        model
+                            .raw
+                            .triangles
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, triangle)| {
+                                let a = model.raw.vertices.get(triangle.a as usize)?;
+                                let b = model.raw.vertices.get(triangle.b as usize)?;
+                                let c = model.raw.vertices.get(triangle.c as usize)?;
+                                let center = to_mq(V3 {
+                                    x: (a.x + b.x + c.x) / 3.0,
+                                    y: (a.y + b.y + c.y) / 3.0,
+                                    z: (a.z + b.z + c.z) / 3.0,
+                                });
+                                world_to_screen(app, viewport, center)
+                                    .filter(|screen| rect.contains(*screen))
+                                    .map(|_| index)
+                            })
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::new(),
+                    ),
+                    EditingSelectMode::Edge => (
+                        BTreeSet::new(),
+                        BTreeSet::new(),
+                        model
+                            .raw
+                            .triangles
+                            .iter()
+                            .flat_map(dff_triangle_edge_vertices)
+                            .filter_map(|edge| {
+                                let a = model.raw.vertices.get(edge.0)?;
+                                let b = model.raw.vertices.get(edge.1)?;
+                                let center = to_mq(V3 {
+                                    x: (a.x + b.x) * 0.5,
+                                    y: (a.y + b.y) * 0.5,
+                                    z: (a.z + b.z) * 0.5,
+                                });
+                                world_to_screen(app, viewport, center)
+                                    .filter(|screen| rect.contains(*screen))
+                                    .map(|_| edge)
+                            })
+                            .collect::<BTreeSet<_>>(),
+                    ),
+                })
+                .collect::<Vec<_>>()
+        };
+        let hits = selections
+            .iter()
+            .map(|(vertices, faces, edges)| vertices.len() + faces.len() + edges.len())
+            .sum::<usize>();
+        let mode = app.box_select_mode;
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            for (model, (vertices, faces, edges)) in dff.open_models.iter_mut().zip(selections) {
+                match dff.select_mode {
+                    EditingSelectMode::Vertex => {
+                        apply_box_selection_set(&mut model.selected_vertices, vertices, mode);
+                        model.selected_vertex = model.selected_vertices.iter().next_back().copied();
+                        model.selected_face = None;
+                        model.selected_faces.clear();
+                        model.selected_edges.clear();
+                    }
+                    EditingSelectMode::Face => {
+                        apply_box_selection_set(&mut model.selected_faces, faces, mode);
+                        model.selected_face = model.selected_faces.iter().next_back().copied();
+                        model.selected_vertex = None;
+                        model.selected_vertices.clear();
+                        model.selected_edges.clear();
+                    }
+                    EditingSelectMode::Edge => {
+                        apply_box_selection_set(&mut model.selected_edges, edges, mode);
+                        model.selected_face = None;
+                        model.selected_faces.clear();
+                        model.selected_vertex = None;
+                        model.selected_vertices.clear();
+                    }
+                }
+            }
+            if let Some(active) = dff.open_models.get(dff.active_open_model).cloned() {
+                dff.selected_face = active.selected_face;
+                dff.selected_faces = active.selected_faces;
+                dff.selected_edges = active.selected_edges;
+                dff.selected_vertex = active.selected_vertex;
+                dff.selected_vertices = active.selected_vertices;
+                if let Some(face) = dff
+                    .selected_face
+                    .and_then(|face| dff.raw.triangles.get(face))
+                {
+                    dff.selected_material = face.material as usize;
+                }
+            }
+        }
+        app.status_message = format!(
+            "Box {} {} item(s) across the open DFF models",
+            mode.verb(),
+            hits
+        );
+        return true;
     }
     enum BoxSelection {
         Dff(BTreeSet<usize>),
@@ -18150,6 +27917,7 @@ pub(crate) fn box_select_editing_vertices(app: &mut AppState, start: Vec2, end: 
             let active = selected.iter().next_back().copied();
             apply_box_selection_set(&mut dff.selected_vertices, selected, mode);
             dff.selected_faces.clear();
+            dff.selected_edges.clear();
             dff.selected_vertex = dff.selected_vertices.iter().next_back().copied().or(active);
             dff.selected_face = dff
                 .selected_vertex
@@ -18173,6 +27941,7 @@ pub(crate) fn box_select_editing_vertices(app: &mut AppState, start: Vec2, end: 
             dff.selected_face = dff.selected_faces.iter().next_back().copied();
             dff.selected_vertex = None;
             dff.selected_vertices.clear();
+            dff.selected_edges.clear();
             if let Some(face) = dff.selected_face.and_then(|idx| dff.raw.triangles.get(idx)) {
                 dff.selected_material = face.material as usize;
             }
@@ -18188,11 +27957,16 @@ pub(crate) fn box_select_editing_vertices(app: &mut AppState, start: Vec2, end: 
                 app.status_message = "Box selected 0 DFF edges".to_string();
                 return true;
             }
+            let active = selected.iter().next_back().copied();
             apply_box_selection_set(&mut dff.selected_edges, selected, mode);
             dff.selected_faces.clear();
             dff.selected_face = None;
             dff.selected_vertices.clear();
             dff.selected_vertex = None;
+            if let Some(material) = active.and_then(|edge| dff_edge_material(&dff.raw, edge, None))
+            {
+                dff.selected_material = material as usize;
+            }
             app.status_message = format!(
                 "Box {} DFF edges; {} selected",
                 mode.verb(),
@@ -18765,7 +28539,7 @@ fn handle_editing_nested_scrollbar_drag(app: &mut AppState, mouse: Vec2) -> bool
             }
             (EditingScrollbarDrag::TxdTextures, Some(EditingAsset::Txd(txd))) => {
                 let list = editing_txd_list_rect();
-                let total = editing_txd_filtered_indices(txd).len();
+                let total = editing_txd_filtered_indices(txd, &app.material_classes).len();
                 let visible = (list.h / 32.0).floor().max(1.0) as usize;
                 let track = Rect::new(list.x + list.w - 5.0, list.y, 3.0, list.h - 4.0);
                 let thumb = (track.h * visible as f32 / total.max(1) as f32).clamp(16.0, track.h);
@@ -18851,7 +28625,7 @@ fn handle_editing_nested_scrollbar_drag(app: &mut AppState, mouse: Vec2) -> bool
             let list = editing_txd_list_rect();
             Some((
                 list,
-                editing_txd_filtered_indices(txd).len(),
+                editing_txd_filtered_indices(txd, &app.material_classes).len(),
                 (list.h / 32.0).floor().max(1.0) as usize,
             ))
         }
@@ -19036,14 +28810,392 @@ fn clear_nested_scroll_focus_on_parent_click(app: &mut AppState, mouse: Vec2) {
     }
 }
 
+fn handle_editing_2dfx_modal_click(app: &mut AppState, mouse: Vec2) -> bool {
+    if !is_mouse_button_pressed(MouseButton::Left) {
+        return false;
+    }
+    let corona_open = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.dff_2dfx_corona_preset_picker_open
+    );
+    if corona_open {
+        let popup = editing_dff_2dfx_corona_preset_picker_rect();
+        if editing_dff_2dfx_corona_preset_close_rect().contains(mouse) {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.dff_2dfx_corona_preset_picker_open = false;
+            }
+            return true;
+        }
+        let list = editing_dff_2dfx_corona_preset_list_rect();
+        if list.contains(mouse) {
+            let row = ((mouse.y - list.y) / 42.0).floor() as usize;
+            if row < DFF_CORONA_PRESETS.len() {
+                let before = editing_history_snapshot(app);
+                if add_dff_2dfx_corona_preset(app, row) {
+                    commit_editing_history(app, "Add DFF Corona Preset", before);
+                }
+            }
+        } else if !popup.contains(mouse)
+            && let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+        {
+            dff.dff_2dfx_corona_preset_picker_open = false;
+        }
+        return true;
+    }
+
+    let type_open = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.dff_2dfx_type_picker_open
+    );
+    if type_open {
+        let popup = editing_dff_2dfx_type_picker_rect();
+        if editing_dff_2dfx_type_picker_close_rect().contains(mouse) {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.dff_2dfx_type_picker_open = false;
+            }
+            return true;
+        }
+        let list = editing_dff_2dfx_type_picker_list_rect();
+        if list.contains(mouse) {
+            let picked = match app.editing.asset.as_ref() {
+                Some(EditingAsset::Dff(dff)) => {
+                    let types = dff_2dfx_filtered_types(&dff.dff_2dfx_type_picker_search);
+                    let visible = (list.h / 28.0).floor().max(1.0) as usize;
+                    let max_start = types.len().saturating_sub(visible) as f32;
+                    let start = dff
+                        .dff_2dfx_type_picker_scroll
+                        .floor()
+                        .max(0.0)
+                        .min(max_start) as usize;
+                    let row = ((mouse.y - list.y) / 28.0).floor() as usize;
+                    types.get(start + row).map(|(id, _)| *id)
+                }
+                _ => None,
+            };
+            if let Some(effect_id) = picked {
+                let edits_selected = matches!(
+                    app.editing.asset.as_ref(),
+                    Some(EditingAsset::Dff(dff)) if dff.selected_2dfx.is_some()
+                );
+                let before = editing_history_snapshot(app);
+                let changed = if edits_selected {
+                    set_selected_dff_2dfx_type(app, effect_id)
+                } else {
+                    add_dff_2dfx_of_type(app, effect_id)
+                };
+                if changed {
+                    commit_editing_history(
+                        app,
+                        if edits_selected {
+                            "Set DFF 2DFX Type"
+                        } else {
+                            "Add DFF 2DFX"
+                        },
+                        before,
+                    );
+                }
+            }
+        } else if !popup.contains(mouse)
+            && let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+        {
+            dff.dff_2dfx_type_picker_open = false;
+        }
+        return true;
+    }
+
+    let payload_open = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.dff_2dfx_payload_editor_open
+    );
+    if !payload_open {
+        return false;
+    }
+    let popup = editing_dff_2dfx_payload_editor_rect();
+    if editing_dff_2dfx_payload_close_rect().contains(mouse) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.dff_2dfx_payload_editor_open = false;
+        }
+        return true;
+    }
+    if editing_dff_2dfx_payload_apply_rect().contains(mouse) {
+        let before = editing_history_snapshot(app);
+        if apply_selected_dff_2dfx_payload_hex(app) {
+            commit_editing_history(app, "Edit DFF 2DFX Payload", before);
+        }
+        return true;
+    }
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+        && selected_dff_2dfx_effect_id(dff) == Some(0)
+    {
+        for channel in 0..3 {
+            let rect = editing_dff_2dfx_light_color_bar_rect(channel);
+            if rect.contains(mouse) {
+                let value = (((mouse.x - rect.x) / rect.w).clamp(0.0, 1.0) * 255.0).round() as u8;
+                set_dff_2dfx_light_color_value(dff, channel, value);
+                return true;
+            }
+        }
+    }
+    if let Some((field, value)) = dff_2dfx_choice_at_mouse(app, mouse) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+            && let Some(target) = dff.dff_2dfx_payload_fields.get_mut(field)
+        {
+            *target = value.to_string();
+            dff.dff_2dfx_payload_active_field = None;
+        }
+        return true;
+    }
+    // A click outside an open choice list dismisses it. Continue below so a
+    // property-row click can immediately activate a different field and a
+    // click outside the payload popup can still close the whole editor.
+    if matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff_2dfx_active_choice_info(dff).is_some()
+    ) && let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+    {
+        dff.dff_2dfx_payload_active_field = None;
+    }
+    let particle_picker_open = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff_2dfx_active_payload_is_particle_name(dff)
+    );
+    if particle_picker_open {
+        let picker = editing_dff_2dfx_particle_picker_rect();
+        if picker.contains(mouse) {
+            let picked = match app.editing.asset.as_ref() {
+                Some(EditingAsset::Dff(dff)) => {
+                    let names = dff_2dfx_particle_name_options(app, dff);
+                    let visible = (picker.h / 26.0).floor().max(1.0) as usize;
+                    let max_start = names.len().saturating_sub(visible) as f32;
+                    let start = dff
+                        .dff_2dfx_particle_picker_scroll
+                        .floor()
+                        .max(0.0)
+                        .min(max_start) as usize;
+                    let row = ((mouse.y - picker.y) / 26.0).floor() as usize;
+                    names.get(start + row).cloned()
+                }
+                _ => None,
+            };
+            if let Some(name) = picked
+                && let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+                && let Some(active) = dff.dff_2dfx_payload_active_field
+                && let Some(value) = dff.dff_2dfx_payload_fields.get_mut(active)
+            {
+                *value = name;
+            }
+            return true;
+        }
+    }
+    let list = editing_dff_2dfx_payload_text_rect();
+    if list.contains(mouse) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            let visible = (list.h / 34.0).floor().max(1.0) as usize;
+            let max_start = dff.dff_2dfx_payload_fields.len().saturating_sub(visible) as f32;
+            let start = dff
+                .dff_2dfx_payload_field_scroll
+                .floor()
+                .max(0.0)
+                .min(max_start) as usize;
+            let idx = start + ((mouse.y - list.y) / 34.0).floor() as usize;
+            if idx < dff.dff_2dfx_payload_fields.len() {
+                dff.dff_2dfx_payload_active_field = Some(idx);
+                dff.dff_2dfx_particle_picker_scroll = 0.0;
+            }
+        }
+        return true;
+    }
+    if !popup.contains(mouse)
+        && let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+    {
+        dff.dff_2dfx_payload_editor_open = false;
+    }
+    true
+}
+
+/// The texture chooser is drawn over the material controls, so it must own all
+/// pointer input while it is visible. In particular, its rows overlap the
+/// material colour sliders on shorter windows.
+fn handle_editing_dff_texture_picker(app: &mut AppState, mouse: Vec2) -> bool {
+    let picker_open = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.texture_picker_open
+    );
+    if !picker_open {
+        return false;
+    }
+
+    let popup = editing_dff_texture_picker_rect();
+    let list = editing_dff_texture_picker_list_rect();
+    let (_, wheel_y) = safe_mouse_wheel();
+    if list.contains(mouse) && wheel_y.abs() > 0.0 {
+        let names = editing_dff_picker_texture_names(app);
+        let visible = (list.h / DFF_TEXTURE_PICKER_ROW_H).floor().max(1.0) as usize;
+        let max_scroll = names.len().saturating_sub(visible) as f32;
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.texture_picker_scroll =
+                (dff.texture_picker_scroll - wheel_y * 3.0).clamp(0.0, max_scroll);
+        }
+        return true;
+    }
+
+    if is_mouse_button_pressed(MouseButton::Right) && list.contains(mouse) {
+        let (scroll, txd_name) = match app.editing.asset.as_ref() {
+            Some(EditingAsset::Dff(dff)) => (
+                dff.texture_picker_scroll,
+                dff.txd_context.clone().unwrap_or_default(),
+            ),
+            _ => (0.0, String::new()),
+        };
+        let names = editing_dff_picker_texture_names(app);
+        let visible = (list.h / DFF_TEXTURE_PICKER_ROW_H).floor().max(1.0) as usize;
+        let start = scroll
+            .floor()
+            .max(0.0)
+            .min(names.len().saturating_sub(visible) as f32) as usize;
+        let row = ((mouse.y - list.y) / DFF_TEXTURE_PICKER_ROW_H).floor() as usize;
+        if let Some(texture_name) = names.get(start + row).cloned() {
+            app.context_menu = Some(ContextMenu {
+                pos: mouse,
+                target: ContextMenuTarget::EditingTexture {
+                    txd_name,
+                    texture_name,
+                },
+            });
+        }
+        return true;
+    }
+
+    if !is_mouse_button_pressed(MouseButton::Left) {
+        return true;
+    }
+    if editing_dff_texture_picker_close_rect().contains(mouse) {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.texture_picker_open = false;
+        }
+        return true;
+    }
+    if editing_dff_texture_picker_category_rect().contains(mouse) {
+        let current = app.editing.asset.as_ref().and_then(|asset| match asset {
+            EditingAsset::Dff(dff) => Some(dff.texture_picker_category.clone()),
+            _ => None,
+        });
+        if let Some(current) = current {
+            let next = next_texture_category_filter(&current, &app.material_classes);
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.texture_picker_category = next;
+                dff.texture_picker_scroll = 0.0;
+            }
+        }
+        return true;
+    }
+    if editing_dff_texture_picker_search_rect().contains(mouse) {
+        drain_text_input();
+        return true;
+    }
+    if list.contains(mouse) {
+        let (scroll, edits_material) = match app.editing.asset.as_ref() {
+            Some(EditingAsset::Dff(dff)) => {
+                (dff.texture_picker_scroll, dff.texture_picker_edits_material)
+            }
+            _ => (0.0, false),
+        };
+        let names = editing_dff_picker_texture_names(app);
+        let visible = (list.h / DFF_TEXTURE_PICKER_ROW_H).floor().max(1.0) as usize;
+        let max_start = names.len().saturating_sub(visible) as f32;
+        let start = scroll.floor().max(0.0).min(max_start) as usize;
+        let row = ((mouse.y - list.y) / DFF_TEXTURE_PICKER_ROW_H).floor() as usize;
+        if let Some(name) = names.get(start + row).cloned() {
+            let before = editing_history_snapshot(app);
+            let changed = if edits_material {
+                editing_set_selected_dff_material_texture(app, &name)
+            } else {
+                reassign_selected_dff_faces_texture(app, &name)
+            };
+            if changed {
+                commit_editing_history(
+                    app,
+                    if edits_material {
+                        "Set DFF Material Texture"
+                    } else {
+                        "Create DFF Material"
+                    },
+                    before,
+                );
+            }
+        }
+        return true;
+    }
+    if !popup.contains(mouse)
+        && let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+    {
+        dff.texture_picker_open = false;
+    }
+    true
+}
+
 pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
     if app.active_tab != AppTab::Editing {
         return false;
+    }
+    if handle_editing_texture_category_menu(app, mouse) {
+        return true;
     }
     refresh_editing_img_paths(app);
     // The archive menu overlaps the viewport, so it must receive clicks before
     // scene selection and camera controls.
     if handle_editing_archive_picker(app, mouse) {
+        return true;
+    }
+    // 2DFX popups are modal. They are drawn over the asset panel and viewport,
+    // so they must claim the pointer before either surface can act on it.
+    if handle_editing_2dfx_modal_click(app, mouse) {
+        return true;
+    }
+    if handle_editing_dff_texture_picker(app, mouse) {
+        return true;
+    }
+    let multi_select_toggle = is_mouse_button_pressed(MouseButton::Left)
+        && app.editing.asset.as_ref().is_some_and(|asset| {
+            matches!(asset, EditingAsset::Dff(dff) if dff.open_models.len() > 1 && editing_dff_multi_select_rect(dff).contains(mouse))
+        });
+    if multi_select_toggle {
+        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+            dff.multi_select = !dff.multi_select;
+            app.status_message = if dff.multi_select {
+                "Multi Select enabled: selections are retained across open models".to_string()
+            } else {
+                "Multi Select disabled: mesh tools target only the active model".to_string()
+            };
+        }
+        return true;
+    }
+    let model_click = if is_mouse_button_pressed(MouseButton::Left) {
+        app.editing.asset.as_ref().and_then(|asset| match asset {
+            EditingAsset::Dff(dff) if dff.open_models.len() > 1 => {
+                (0..dff.open_models.len().min(7)).find_map(|index| {
+                    if index != dff.active_open_model
+                        && editing_dff_model_move_rect(dff, index).contains(mouse)
+                    {
+                        Some((index, true))
+                    } else if editing_dff_model_row_rect(dff, index).contains(mouse) {
+                        Some((index, false))
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        })
+    } else {
+        None
+    };
+    if let Some((index, move_chunk)) = model_click {
+        if move_chunk {
+            let _ = move_selected_dff_chunk_to_model(app, index);
+        } else if activate_open_dff_model(app, index) {
+            refresh_editing_dff_preview(app);
+        }
         return true;
     }
     // The DFF category rail intentionally floats over the viewport rather than
@@ -19065,10 +29217,38 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         })
         .flatten();
     if let Some(tab) = clicked_dff_tab {
+        let uv_transform_active = matches!(
+            app.editing.asset.as_ref(),
+            Some(EditingAsset::Dff(dff)) if dff.uv_editor.transform.is_some()
+        );
+        if uv_transform_active {
+            finish_dff_uv_edit(app, "Transform UVs");
+        }
         if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
             dff.panel_tab = tab;
             dff.panel_scroll = 0.0;
         }
+        return true;
+    }
+    // The UV canvas owns the center viewport, but not the DFF side-tab rail
+    // above. This keeps every DFF category available while editing UVs.
+    if handle_dff_uv_editor(app, mouse) {
+        return true;
+    }
+    let read_only_dff = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.read_only
+    );
+    if read_only_dff && editing_asset_rect().contains(mouse) {
+        if is_mouse_button_pressed(MouseButton::Left) {
+            app.status_message = "This GTA:SA DFF preview is read-only".to_string();
+        }
+        return true;
+    }
+    if read_only_dff
+        && editing_preview_rect(app).contains(mouse)
+        && is_mouse_button_down(MouseButton::Left)
+    {
         return true;
     }
     if handle_editing_nested_scrollbar_drag(app, mouse) {
@@ -19105,7 +29285,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
     }
     if let Some(EditingAsset::Txd(txd)) = app.editing.asset.as_mut() {
         let list = editing_txd_list_rect();
-        let filtered = editing_txd_filtered_indices(txd);
+        let filtered = editing_txd_filtered_indices(txd, &app.material_classes);
         let visible = (list.h / 32.0).floor().max(1.0) as usize;
         if editing_asset_rect().contains(mouse) && is_key_pressed(KeyCode::Up) {
             let position = filtered
@@ -19222,26 +29402,36 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         }
     }
     if matches!(app.editing.asset, Some(EditingAsset::Dff(_))) {
-        let center = editing_center_rect();
-        let (hovered_face, hovered_vertex) =
+        let center = editing_preview_rect(app);
+        let (hovered_face, hovered_vertex, hovered_edge) =
             app.editing
                 .asset
                 .as_ref()
-                .map_or((None, None), |asset| match asset {
+                .map_or((None, None, None), |asset| match asset {
                     EditingAsset::Dff(dff)
                         if center.contains(mouse) && dff.fracture_preview_started_at.is_none() =>
                     {
-                        let vertex_hover = editing_hover_dff_face_vertex(app, dff, center, mouse);
+                        let vertex_hover = (dff.select_mode == EditingSelectMode::Vertex)
+                            .then(|| editing_hover_dff_face_vertex(app, dff, center, mouse))
+                            .flatten();
+                        let edge_hover = (dff.select_mode == EditingSelectMode::Edge)
+                            .then(|| editing_pick_dff_edge(app, dff, center, mouse))
+                            .flatten();
                         let face_hover = vertex_hover
                             .map(|(face, _)| face)
                             .or_else(|| editing_pick_dff_face(app, dff, center, mouse));
-                        (face_hover, vertex_hover.map(|(_, vertex)| vertex))
+                        (
+                            face_hover,
+                            vertex_hover.map(|(_, vertex)| vertex),
+                            edge_hover,
+                        )
                     }
-                    _ => (None, None),
+                    _ => (None, None, None),
                 });
         if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
             dff.hovered_face = hovered_face;
             dff.hovered_vertex = hovered_vertex;
+            dff.hovered_edge = hovered_edge;
         }
     }
     if is_key_pressed(KeyCode::L)
@@ -19249,7 +29439,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         && !is_key_down(KeyCode::RightControl)
         && !is_key_down(KeyCode::LeftAlt)
         && !is_key_down(KeyCode::RightAlt)
-        && editing_center_rect().contains(mouse)
+        && editing_preview_rect(app).contains(mouse)
         && matches!(
             app.editing.asset,
             Some(EditingAsset::Dff(_) | EditingAsset::Col(_))
@@ -19357,6 +29547,76 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             }
         }
     }
+    if is_mouse_button_pressed(MouseButton::Right) {
+        let context_target = match app.editing.asset.as_ref() {
+            Some(EditingAsset::Txd(txd)) => {
+                let list = editing_txd_list_rect();
+                if !list.contains(mouse) {
+                    None
+                } else {
+                    let filtered = editing_txd_filtered_indices(txd, &app.material_classes);
+                    let visible = (list.h / 32.0).floor().max(1.0) as usize;
+                    let start =
+                        (txd.scroll.floor() as usize).min(filtered.len().saturating_sub(visible));
+                    let row = ((mouse.y - list.y) / 32.0).floor().max(0.0) as usize;
+                    filtered
+                        .get(start + row)
+                        .and_then(|index| txd.textures.get(*index))
+                        .map(|entry| ContextMenuTarget::EditingTexture {
+                            txd_name: txd.name.clone(),
+                            texture_name: entry.name.clone(),
+                        })
+                }
+            }
+            Some(EditingAsset::Dff(dff)) => {
+                let entries = dff_face_emitter_entries(app, &dff.name);
+                let layout = dff_panel_layout(dff, selected_material_emitter(app), entries.len());
+                layout
+                    .lighting_rows
+                    .iter()
+                    .position(|rect| rect.contains(mouse))
+                    .and_then(|row| entries.get(row))
+                    .map(
+                        |(emitter_key, _, _)| ContextMenuTarget::EditingDffFaceLighting {
+                            dff_name: dff.name.clone(),
+                            emitter_key: emitter_key.clone(),
+                        },
+                    )
+                    .or_else(|| {
+                        let list = layout.material_list?;
+                        if !list.contains(mouse) {
+                            return None;
+                        }
+                        let total = dff_material_slot_count(&dff.raw);
+                        let visible = layout.material_visible.max(1);
+                        let max_start = total.saturating_sub(visible);
+                        let start = (dff.material_scroll.floor().max(0.0) as usize).min(max_start);
+                        let row = ((mouse.y - list.y) / DFF_MAT_ROW_H).floor().max(0.0) as usize;
+                        let material = start + row;
+                        (material < total).then(|| ContextMenuTarget::EditingDffMaterial {
+                            dff_name: dff.name.clone(),
+                            material,
+                        })
+                    })
+            }
+            _ => None,
+        };
+        if let Some(target) = context_target {
+            if let ContextMenuTarget::EditingDffMaterial { material, .. } = &target
+                && let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+            {
+                dff.selected_material = *material;
+                dff.selected_2dfx = None;
+                sync_dff_uv_editor_material(dff);
+                app.editing.nested_scroll_focus = Some(EditingNestedScrollFocus::DffMaterials);
+            }
+            app.camera.looking = false;
+            set_cursor_grab(false);
+            show_mouse(true);
+            app.context_menu = Some(ContextMenu { pos: mouse, target });
+            return true;
+        }
+    }
     if !is_mouse_button_pressed(MouseButton::Left) {
         return false;
     }
@@ -19378,8 +29638,21 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         return true;
     }
     if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() {
-        let center = editing_center_rect();
+        let center = editing_preview_rect(app);
         if center.contains(mouse) {
+            let multi_model_pick = dff
+                .multi_select
+                .then(|| editing_pick_open_dff_model(app, dff, center, mouse))
+                .flatten();
+            let active_model = dff.active_open_model;
+            if let Some(model) = multi_model_pick
+                && model != active_model
+            {
+                let _ = activate_open_dff_model(app, model);
+            }
+            let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+                return true;
+            };
             if dff.fracture_preview_started_at.is_some() {
                 app.status_message =
                     "Reset the fracture preview before editing the intact mesh".to_string();
@@ -19455,6 +29728,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 }
             } else if dff.select_mode == EditingSelectMode::Edge {
                 if let Some(edge) = editing_pick_dff_edge(app, dff, center, mouse) {
+                    let material = dff_edge_material(&dff.raw, edge, dff.hovered_face);
                     if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
                         if shift_down {
                             toggle_edge_selection(&mut dff.selected_edges, edge);
@@ -19466,6 +29740,9 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                         dff.selected_vertices.clear();
                         dff.selected_face = None;
                         dff.selected_faces.clear();
+                        if let Some(material) = material {
+                            dff.selected_material = material as usize;
+                        }
                     }
                     app.status_message = format!("Selected DFF edge v{}-v{}", edge.0, edge.1);
                 } else if editing_pick_dff_face(app, dff, center, mouse).is_none() && !shift_down {
@@ -19474,6 +29751,9 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                     }
                     app.status_message = "Deselected DFF edge selection".to_string();
                 }
+            }
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                sync_active_open_dff_model(dff);
             }
             return true;
         }
@@ -19715,6 +29995,10 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         open_external_editing_img_picker(app);
         return true;
     }
+    if editing_create_dff_rect().contains(mouse) {
+        start_create_empty_dff(app);
+        return true;
+    }
     if editing_img_save_rect().contains(mouse) {
         editing_save_img(app);
         return true;
@@ -19733,12 +30017,17 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         return true;
     }
     if editing_select_edge_mode_rect().contains(mouse) {
-        match app.editing.asset.as_mut() {
-            Some(EditingAsset::Dff(dff)) => dff.select_mode = EditingSelectMode::Edge,
-            Some(EditingAsset::Col(col)) => col.select_mode = EditingSelectMode::Edge,
+        app.status_message = match app.editing.asset.as_mut() {
+            Some(EditingAsset::Dff(dff)) => {
+                dff.select_mode = EditingSelectMode::Edge;
+                "Editing selection mode: Edge (authored sharp edges are magenta)".to_string()
+            }
+            Some(EditingAsset::Col(col)) => {
+                col.select_mode = EditingSelectMode::Edge;
+                "Editing selection mode: Edge".to_string()
+            }
             _ => return false,
-        }
-        app.status_message = "Editing selection mode: Edge".to_string();
+        };
         return true;
     }
     if editing_select_face_mode_rect().contains(mouse) {
@@ -19783,7 +30072,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
     }
     if let Some(EditingAsset::Txd(txd)) = app.editing.asset.as_mut() {
         let list = editing_txd_list_rect();
-        let filtered = editing_txd_filtered_indices(txd);
+        let filtered = editing_txd_filtered_indices(txd, &app.material_classes);
         let visible = (list.h / 32.0).floor().max(1.0) as usize;
         let start = (txd.scroll.floor() as usize).min(filtered.len().saturating_sub(visible));
         for row in 0..visible {
@@ -19800,6 +30089,10 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             open_editing_txd_texture_picker(app, false);
             return true;
         }
+        if editing_txd_import_folder_rect().contains(mouse) {
+            open_editing_txd_folder_picker(app);
+            return true;
+        }
         if editing_txd_replace_rect().contains(mouse) {
             open_editing_txd_texture_picker(app, true);
             return true;
@@ -19813,10 +30106,6 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             return true;
         }
     }
-    let picker_open = matches!(
-        app.editing.asset.as_ref(),
-        Some(EditingAsset::Dff(dff)) if dff.texture_picker_open
-    );
     let uv_anim_picker_open = matches!(
         app.editing.asset.as_ref(),
         Some(EditingAsset::Dff(dff)) if dff.uv_anim_picker_open
@@ -20050,57 +30339,6 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         }
         return true;
     }
-    if picker_open {
-        let popup = editing_dff_texture_picker_rect();
-        if editing_dff_texture_picker_close_rect().contains(mouse) {
-            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
-                dff.texture_picker_open = false;
-            }
-            return true;
-        }
-        let list = editing_dff_texture_picker_list_rect();
-        if list.contains(mouse) {
-            let scroll = match app.editing.asset.as_ref() {
-                Some(EditingAsset::Dff(dff)) => dff.texture_picker_scroll,
-                _ => 0.0,
-            };
-            let edits_material = matches!(
-                app.editing.asset.as_ref(),
-                Some(EditingAsset::Dff(dff)) if dff.texture_picker_edits_material
-            );
-            let names = editing_dff_picker_texture_names(app);
-            let visible = (list.h / DFF_TEXTURE_PICKER_ROW_H).floor().max(1.0) as usize;
-            let max_start = names.len().saturating_sub(visible) as f32;
-            let start = scroll.floor().max(0.0).min(max_start) as usize;
-            let row = ((mouse.y - list.y) / DFF_TEXTURE_PICKER_ROW_H).floor() as usize;
-            if let Some(name) = names.get(start + row).cloned() {
-                let before = editing_history_snapshot(app);
-                let changed = if edits_material {
-                    editing_set_selected_dff_material_texture(app, &name)
-                } else {
-                    reassign_selected_dff_faces_texture(app, &name)
-                };
-                if changed {
-                    commit_editing_history(
-                        app,
-                        if edits_material {
-                            "Set DFF Material Texture"
-                        } else {
-                            "Create DFF Material"
-                        },
-                        before,
-                    );
-                }
-            }
-            return true;
-        }
-        if !popup.contains(mouse) {
-            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
-                dff.texture_picker_open = false;
-            }
-        }
-        return true;
-    }
     let selected_emitter = selected_material_emitter(app);
     let lighting_entry_count = match app.editing.asset.as_ref() {
         Some(EditingAsset::Dff(dff)) => dff_face_emitter_entries(app, &dff.name).len(),
@@ -20294,6 +30532,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                         .map(|triangle| triangle.material as usize)
                     {
                         dff.selected_material = material;
+                        sync_dff_uv_editor_material(dff);
                     }
                     app.status_message = format!(
                         "Selected face lighting {} ({} face{})",
@@ -20318,6 +30557,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                         if material < total {
                             dff.selected_material = material;
                             dff.selected_2dfx = None;
+                            sync_dff_uv_editor_material(dff);
                         }
                     }
                     return true;
@@ -20325,6 +30565,19 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             }
             if layout.view_texture.is_some_and(|rect| rect.contains(mouse)) {
                 open_dff_texture_view_dialog(app);
+                return true;
+            }
+            if layout
+                .select_material_faces
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let target = match app.editing.asset.as_ref() {
+                    Some(EditingAsset::Dff(dff)) => Some((dff.name.clone(), dff.selected_material)),
+                    _ => None,
+                };
+                if let Some((dff_name, material)) = target {
+                    editing_select_all_dff_material_faces(app, &dff_name, material);
+                }
                 return true;
             }
             if layout
@@ -20457,6 +30710,20 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 return true;
             }
             if layout
+                .emitter_target
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                    dff.emitter_targets_faces = !dff.emitter_targets_faces;
+                    app.status_message = if dff.emitter_targets_faces {
+                        "Emitter controls now target the selected faces".to_string()
+                    } else {
+                        "Emitter controls now target the selected material or texture".to_string()
+                    };
+                }
+                return true;
+            }
+            if layout
                 .emitter_toggle
                 .is_some_and(|rect| rect.contains(mouse))
             {
@@ -20508,6 +30775,23 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                             MaterialEmitterCastMode::Point => {
                                 "Emitter casting mode changed to Point"
                             }
+                        },
+                    );
+                }
+                return true;
+            }
+            if layout
+                .emitter_casts_shadow
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let casts_shadow = !selected_material_emitter(app).casts_shadow;
+                if update_selected_emitters(app, |emitter| emitter.casts_shadow = casts_shadow) {
+                    persist_material_emitter_edit(
+                        app,
+                        if casts_shadow {
+                            "Area emitter shadows enabled"
+                        } else {
+                            "Area emitter shadows disabled"
                         },
                     );
                 }
@@ -20566,6 +30850,27 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 }
                 return true;
             }
+            if layout
+                .anim_continuous
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if toggle_selected_material_uv_animation_continuous(app) {
+                    commit_editing_history(app, "Toggle Continuous UV Animation", before);
+                }
+                return true;
+            }
+            if let Some(speed) = layout.anim_speed {
+                for (idx, rect) in speed.iter().enumerate() {
+                    if rect.contains(mouse) {
+                        let before = editing_history_snapshot(app);
+                        if adjust_selected_material_uv_animation_speed(app, idx == 1) {
+                            commit_editing_history(app, "Adjust UV Animation Speed", before);
+                        }
+                        return true;
+                    }
+                }
+            }
             if let Some(motion) = layout.anim_motion {
                 for (idx, rect) in motion.iter().enumerate() {
                     if rect.contains(mouse) {
@@ -20579,6 +30884,13 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 }
             }
             // UV tools.
+            if layout
+                .uv_editor_open
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                open_dff_uv_editor(app);
+                return true;
+            }
             if let Some(nudge) = layout.uv_nudge {
                 for (idx, rect) in nudge.iter().enumerate() {
                     if rect.contains(mouse) {
@@ -20621,6 +30933,16 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 }
             }
             if layout
+                .uv_blend_neighbors
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if editing_blend_selected_dff_uvs_with_neighbors(app) {
+                    commit_editing_history(app, "Blend DFF UVs with neighbors", before);
+                }
+                return true;
+            }
+            if layout
                 .uv_unwrap_face
                 .is_some_and(|rect| rect.contains(mouse))
             {
@@ -20640,6 +30962,56 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 }
                 return true;
             }
+            if layout
+                .uv_face_aligned_unwrap
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if editing_face_aligned_unwrap_selected_dff_uvs(app) {
+                    commit_editing_history(app, "Face-Aligned Unwrap DFF UVs", before);
+                }
+                return true;
+            }
+            if layout
+                .uv_box_unwrap_face
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if editing_box_unwrap_selected_dff_uvs(app, false) {
+                    commit_editing_history(app, "Box Unwrap DFF UVs", before);
+                }
+                return true;
+            }
+            if layout
+                .uv_box_unwrap_material
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if editing_box_unwrap_selected_dff_uvs(app, true) {
+                    commit_editing_history(app, "Box Unwrap DFF Material UVs", before);
+                }
+                return true;
+            }
+            if layout
+                .uv_cliff_unwrap_face
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if editing_cliff_wrap_unwrap_selected_dff_uvs(app, false) {
+                    commit_editing_history(app, "Cliff-Wrap Unwrap DFF UVs", before);
+                }
+                return true;
+            }
+            if layout
+                .uv_cliff_unwrap_material
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if editing_cliff_wrap_unwrap_selected_dff_uvs(app, true) {
+                    commit_editing_history(app, "Cliff-Wrap Unwrap DFF Material UVs", before);
+                }
+                return true;
+            }
             // Mesh tools.
             if layout
                 .mesh_import_set
@@ -20652,6 +31024,27 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 let before = editing_history_snapshot(app);
                 if editing_make_face_from_selected_vertices(app) {
                     commit_editing_history(app, "Make DFF Face", before);
+                }
+                return true;
+            }
+            if layout.add_vertex.is_some_and(|rect| rect.contains(mouse)) {
+                let before = editing_history_snapshot(app);
+                if editing_add_dff_vertex(app) {
+                    commit_editing_history(app, "Add DFF Vertex", before);
+                }
+                return true;
+            }
+            if layout.add_plane.is_some_and(|rect| rect.contains(mouse)) {
+                let before = editing_history_snapshot(app);
+                if editing_add_dff_primitive(app, DffPrimitiveKind::Plane) {
+                    commit_editing_history(app, "Add DFF Plane", before);
+                }
+                return true;
+            }
+            if layout.add_cube.is_some_and(|rect| rect.contains(mouse)) {
+                let before = editing_history_snapshot(app);
+                if editing_add_dff_primitive(app, DffPrimitiveKind::Cube) {
+                    commit_editing_history(app, "Add DFF Cube", before);
                 }
                 return true;
             }
@@ -20711,6 +31104,13 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 }
                 return true;
             }
+            if layout.knife.is_some_and(|rect| rect.contains(mouse)) {
+                let before = editing_history_snapshot(app);
+                if editing_knife_selected_dff_faces(app) {
+                    commit_editing_history(app, "Knife Cut DFF Faces", before);
+                }
+                return true;
+            }
             if layout
                 .duplicate_faces
                 .is_some_and(|rect| rect.contains(mouse))
@@ -20719,6 +31119,54 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 if editing_duplicate_selected_dff_faces(app) {
                     commit_editing_history(app, "Duplicate DFF Faces", before);
                 }
+                return true;
+            }
+            if layout.shade_flat.is_some_and(|rect| rect.contains(mouse)) {
+                let before = editing_history_snapshot(app);
+                if editing_shade_selected_dff_flat(app) {
+                    commit_editing_history(app, "Shade DFF Faces Flat", before);
+                }
+                return true;
+            }
+            if layout.shade_smooth.is_some_and(|rect| rect.contains(mouse)) {
+                let before = editing_history_snapshot(app);
+                if editing_shade_selected_dff_smooth(app) {
+                    commit_editing_history(app, "Shade DFF Faces Smooth", before);
+                }
+                return true;
+            }
+            if layout
+                .mark_edges_sharp
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if editing_mark_selected_dff_edges_sharp(app) {
+                    commit_editing_history(app, "Mark DFF Edges Sharp", before);
+                }
+                return true;
+            }
+            if layout
+                .area_weighted_normals
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if editing_area_weight_selected_dff_normals(app) {
+                    commit_editing_history(app, "Area Weight DFF Normals", before);
+                }
+                return true;
+            }
+            if layout
+                .flip_selected_faces
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if editing_flip_selected_dff_faces(app) {
+                    commit_editing_history(app, "Flip Selected DFF Faces", before);
+                }
+                return true;
+            }
+            if layout.show_normals.is_some_and(|rect| rect.contains(mouse)) {
+                editing_toggle_dff_normal_preview(app);
                 return true;
             }
             if layout
@@ -20739,6 +31187,13 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 return true;
             }
             if layout
+                .split_material_limits
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                start_dff_material_limit_split(app);
+                return true;
+            }
+            if layout
                 .pivot_to_selection
                 .is_some_and(|rect| rect.contains(mouse))
             {
@@ -20752,6 +31207,27 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 editing_pivot_to_bounds(app);
                 return true;
             }
+            if layout
+                .freeform_pivot
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                editing_begin_freeform_pivot(app);
+                return true;
+            }
+            if layout
+                .freeform_pivot_apply
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                editing_apply_freeform_pivot(app);
+                return true;
+            }
+            if layout
+                .freeform_pivot_cancel
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                editing_cancel_freeform_pivot(app);
+                return true;
+            }
             // Boolean cutter.
             if layout.cutter_add.is_some_and(|rect| rect.contains(mouse)) {
                 editing_add_dff_boolean_box(app);
@@ -20759,6 +31235,13 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             }
             if layout.cutter_clear.is_some_and(|rect| rect.contains(mouse)) {
                 editing_clear_dff_boolean_box(app);
+                return true;
+            }
+            if layout.cutter_apply.is_some_and(|rect| rect.contains(mouse)) {
+                let before = editing_history_snapshot(app);
+                if editing_apply_dff_boolean_box(app) {
+                    commit_editing_history(app, "Apply DFF Boolean Cutter", before);
+                }
                 return true;
             }
             if let Some(resize) = layout.cutter_resize {
@@ -20872,6 +31355,16 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 let before = editing_history_snapshot(app);
                 if editing_add_col_capsule(app) {
                     commit_editing_history(app, "Add COL Capsule", before);
+                }
+                return true;
+            }
+            if layout
+                .fit_box_to_object
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if editing_fit_selected_col_box_to_object(app) {
+                    commit_editing_history(app, "Fit COL Box to Object", before);
                 }
                 return true;
             }
@@ -21527,9 +32020,17 @@ fn editing_img_save_entries(
     deleted_entries: &BTreeSet<String>,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut entries = Vec::with_capacity(rows.len());
+    let mut retained_names = HashSet::new();
     for row in rows {
         let key = editing_key(&row.entry.name);
         if deleted_entries.contains(&key) {
+            continue;
+        }
+        // Some legacy archives contain repeated directory names. All editor
+        // lookups resolve the first matching entry, so later copies are
+        // shadowed and cannot be addressed independently. Preserve that same
+        // effective asset while sanitizing the archive for a safe rewrite.
+        if !retained_names.insert(key.clone()) {
             continue;
         }
         let bytes = if let Some(bytes) = modified_entries.get(&key) {
@@ -21549,6 +32050,21 @@ fn editing_img_save_entries(
     Ok(entries)
 }
 
+fn editing_img_duplicate_names(rows: &[EditingImgRow]) -> Vec<(String, usize)> {
+    let mut counts = BTreeMap::<String, (String, usize)>::new();
+    for row in rows {
+        let key = editing_key(&row.entry.name);
+        let entry = counts
+            .entry(key)
+            .or_insert_with(|| (row.entry.name.clone(), 0));
+        entry.1 += 1;
+    }
+    counts
+        .into_values()
+        .filter(|(_, count)| *count > 1)
+        .collect()
+}
+
 fn reconcile_saved_global_asset_staging(
     pending_replacements: &mut BTreeMap<String, (String, Vec<u8>)>,
     pending_txd_writes: &mut HashSet<String>,
@@ -21565,11 +32081,20 @@ fn reconcile_saved_global_asset_staging(
 }
 
 pub(crate) fn editing_save_img(app: &mut AppState) {
+    editing_save_img_impl(app, false);
+}
+
+pub(crate) fn editing_save_img_after_duplicate_confirmation(app: &mut AppState) {
+    editing_save_img_impl(app, true);
+}
+
+fn editing_save_img_impl(app: &mut AppState, duplicate_cleanup_confirmed: bool) {
     if app.manual_save_job.is_some()
         || app.editing.save_rx.is_some()
         || app.editing.merge_rx.is_some()
         || app.editing.merge_apply_job.is_some()
         || app.editing.txd_import_rx.is_some()
+        || app.editing.dff_texture_replace_rx.is_some()
         || app.editing.txd_refresh_job.is_some()
         || app.autosave_rx.is_some()
         || app.autosave_cleanup_rx.is_some()
@@ -21601,6 +32126,46 @@ pub(crate) fn editing_save_img(app: &mut AppState) {
     if !editing_stage_active_asset_for_save(app) {
         return;
     }
+    let duplicate_names = editing_img_duplicate_names(&app.editing.rows);
+    if !duplicate_cleanup_confirmed && !duplicate_names.is_empty() {
+        let duplicate_entry_count = duplicate_names
+            .iter()
+            .map(|(_, count)| count.saturating_sub(1))
+            .sum::<usize>();
+        let mut listed = duplicate_names
+            .iter()
+            .take(8)
+            .map(|(name, count)| format!("{name} ({count} copies)"))
+            .collect::<Vec<_>>();
+        if duplicate_names.len() > listed.len() {
+            listed.push(format!(
+                "and {} more duplicate name(s)",
+                duplicate_names.len() - listed.len()
+            ));
+        }
+        app.confirm_dialog = Some(ConfirmDialog {
+            action: ConfirmAction::SaveEditingImgWithDuplicateCleanup,
+            title: "Duplicate IMG Entries".to_string(),
+            body: format!(
+                "This archive contains {duplicate_entry_count} shadowed duplicate entr{} across {} name(s). Remove them and continue saving?",
+                if duplicate_entry_count == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                duplicate_names.len(),
+            ),
+            detail: format!(
+                "The first entry for each name is the asset currently resolved by Eagle and will be retained. Later entries cannot be addressed independently.\n{}",
+                listed.join(", ")
+            ),
+            primary_label: "Remove Duplicates & Save".to_string(),
+            secondary_label: None,
+            secondary_action: None,
+        });
+        app.status_message = "Confirm duplicate IMG cleanup before saving".to_string();
+        return;
+    }
     let camera = app.camera;
     let selected_row = app.editing.selected_row;
     let selected_name = editing_selected_row(app).map(|row| row.entry.name.clone());
@@ -21621,10 +32186,17 @@ pub(crate) fn editing_save_img(app: &mut AppState) {
             let entries = editing_img_save_entries(rows, &modified_entries, &deleted_entries)?;
             let backup = safe_write_img_archive(&path, &entries)?;
             let refreshed_rows = load_editing_img_rows(&path)?;
+            let mut txd_index = TxdTextureIndex::new();
+            let refreshed_entries = refreshed_rows
+                .iter()
+                .map(|row| row.entry.clone())
+                .collect::<Vec<_>>();
+            index_txd_entries(&path, &refreshed_entries, &mut txd_index);
             Ok(EditingImgSaveOutcome {
                 path,
                 backup,
                 rows: refreshed_rows,
+                txd_index,
                 camera,
                 selected_row,
                 selected_name,
@@ -21653,7 +32225,17 @@ pub(crate) fn poll_editing_img_save(app: &mut AppState) {
     };
     app.editing.save_rx = None;
     match result {
-        Ok(outcome) => {
+        Ok(mut outcome) => {
+            // The preview texture cache can keep an already uploaded model
+            // looking correct after an IMG rewrite, while thumbnail decoding
+            // reads the now-stale TXD offsets and marks every material missing.
+            // Atomically replace this archive's index before another DFF can be
+            // opened from the refreshed row list.
+            install_txd_archive_index(
+                &outcome.path,
+                std::mem::take(&mut outcome.txd_index),
+                &mut app.txd_textures,
+            );
             let modified_entry_keys = outcome
                 .saved_modified_entries
                 .keys()
@@ -21739,7 +32321,7 @@ pub(crate) fn poll_editing_img_save(app: &mut AppState) {
 fn editing_stage_active_asset_for_save(app: &mut AppState) -> bool {
     let active = app.editing.asset.as_ref().map(|asset| match asset {
         EditingAsset::Txd(txd) => (txd.name.clone(), false),
-        EditingAsset::Dff(dff) => (dff.name.clone(), dff.dirty),
+        EditingAsset::Dff(dff) => (dff.name.clone(), editing_dff_dirty(dff)),
         EditingAsset::Col(col) => (col.name.clone(), col.dirty),
     });
     let Some((name, dirty)) = active else {
@@ -21849,6 +32431,12 @@ pub(crate) fn draw_editing_panel(app: &AppState) {
     );
     text_button(
         &app.ui_font,
+        editing_create_dff_rect(),
+        "Create new DFF",
+        false,
+    );
+    text_button(
+        &app.ui_font,
         editing_img_save_rect(),
         if app.editing.img_path.is_some() {
             if dirty { "Write IMG *" } else { "Write IMG" }
@@ -21887,25 +32475,33 @@ fn draw_editing_center_overlay(app: &AppState) {
             );
             ui_text_bold(&txd.name, center.x + 16.0, center.y + 30.0, 18, WHITE);
             if let Some(texture) = txd.preview_texture.as_ref() {
-                let preview = Rect::new(
-                    center.x + 22.0,
-                    center.y + 52.0,
-                    center.w - 44.0,
-                    center.h - 82.0,
-                );
+                let preview = editing_txd_preview_rect();
                 let size = texture.size();
-                let scale = (preview.w / size.x).min(preview.h / size.y).min(1.0);
+                let scale =
+                    (preview.w / size.x).min(preview.h / size.y).min(1.0) * txd.preview_zoom;
                 let w = (size.x * scale).max(1.0);
                 let h = (size.y * scale).max(1.0);
+                begin_ui_clip(preview);
                 draw_texture_ex(
                     texture,
-                    preview.x + (preview.w - w) * 0.5,
-                    preview.y + (preview.h - h) * 0.5,
+                    preview.x + (preview.w - w) * 0.5 + txd.preview_pan.x,
+                    preview.y + (preview.h - h) * 0.5 + txd.preview_pan.y,
                     WHITE,
                     DrawTextureParams {
                         dest_size: Some(vec2(w, h)),
                         ..Default::default()
                     },
+                );
+                end_ui_clip();
+                ui_text(
+                    &app.ui_font,
+                    &format!(
+                        "Scroll to zoom · drag to pan · {}%",
+                        (txd.preview_zoom * 100.0).round()
+                    ),
+                    preview.x,
+                    preview.y + preview.h + 18.0,
+                    ui_muted(),
                 );
             } else {
                 ui_text(
@@ -21945,20 +32541,111 @@ fn draw_editing_center_overlay(app: &AppState) {
             draw_editing_txd_material_picker(app, txd);
         }
         Some(EditingAsset::Dff(dff)) => {
-            ui_text_bold(
-                &format!("DFF Preview: {}", ellipsize(&dff.name, 42)),
-                center.x + 14.0,
-                center.y + 24.0,
-                18,
-                WHITE,
-            );
-            ui_text(
-                &app.ui_font,
-                "Selected material is highlighted in yellow.",
-                center.x + 14.0,
-                center.y + 48.0,
-                ui_dim(),
-            );
+            if dff.uv_editor.open {
+                draw_dff_uv_editor(app, dff);
+            } else {
+                ui_text_bold(
+                    &format!("DFF Preview: {}", ellipsize(&dff.name, 42)),
+                    center.x + 14.0,
+                    center.y + 24.0,
+                    18,
+                    WHITE,
+                );
+                ui_text(
+                    &app.ui_font,
+                    "Selected material is highlighted in yellow.",
+                    center.x + 14.0,
+                    center.y + 48.0,
+                    ui_dim(),
+                );
+            }
+            if dff.open_models.len() > 1 {
+                let list = editing_dff_models_rect(dff);
+                draw_rrect_bordered(
+                    list.x,
+                    list.y,
+                    list.w,
+                    list.h,
+                    7.0,
+                    1.0,
+                    Color::new(0.035, 0.043, 0.054, 0.94),
+                    ui_border(),
+                );
+                ui_text_bold(
+                    &format!("OPEN MODELS  ·  {}", dff.open_models.len()),
+                    list.x + 12.0,
+                    list.y + 19.0,
+                    14,
+                    WHITE,
+                );
+                ui_text_size(
+                    &app.ui_font,
+                    "Hover to identify · click to edit",
+                    list.x + 12.0,
+                    list.y + 36.0,
+                    12,
+                    ui_dim(),
+                );
+                text_button(
+                    &app.ui_font,
+                    editing_dff_multi_select_rect(dff),
+                    if dff.multi_select {
+                        "Multi Select ✓"
+                    } else {
+                        "Multi Select"
+                    },
+                    dff.multi_select,
+                );
+                let mouse: Vec2 = mouse_position().into();
+                for (index, model) in dff.open_models.iter().take(7).enumerate() {
+                    let row = editing_dff_model_row_rect(dff, index);
+                    let active = index == dff.active_open_model;
+                    let hovered = row.contains(mouse);
+                    draw_rrect_bordered(
+                        row.x,
+                        row.y,
+                        row.w,
+                        row.h,
+                        5.0,
+                        1.0,
+                        if active || hovered {
+                            ui_surface_active()
+                        } else {
+                            ui_surface()
+                        },
+                        if active || hovered {
+                            ui_accent()
+                        } else {
+                            ui_border()
+                        },
+                    );
+                    draw_circle(
+                        row.x + 12.0,
+                        row.y + row.h * 0.5,
+                        3.5,
+                        if active { ui_accent() } else { ui_dim() },
+                    );
+                    ui_text(
+                        &app.ui_font,
+                        &ellipsize_width(
+                            &format!("{}{}", if active { "EDITING  ·  " } else { "" }, model.name),
+                            14,
+                            row.w - 124.0,
+                        ),
+                        row.x + 22.0,
+                        row.y + 21.0,
+                        if model.dirty { YELLOW } else { WHITE },
+                    );
+                    if !active {
+                        text_button(
+                            &app.ui_font,
+                            editing_dff_model_move_rect(dff, index),
+                            "Move Here",
+                            false,
+                        );
+                    }
+                }
+            }
         }
         Some(EditingAsset::Col(col)) => {
             ui_text_bold(
@@ -21997,6 +32684,483 @@ fn draw_editing_center_overlay(app: &AppState) {
             );
         }
     }
+}
+
+fn draw_dff_uv_editor(app: &AppState, dff: &EditingDffState) {
+    let center = dff_uv_editor_panel_rect(&dff.uv_editor);
+    let splitter = dff_uv_editor_splitter_rect(&dff.uv_editor);
+    let view = dff_uv_editor_view_rect(&dff.uv_editor);
+    draw_rectangle(
+        splitter.x,
+        splitter.y,
+        splitter.w,
+        splitter.h,
+        if dff.uv_editor.resizing_split {
+            ui_accent()
+        } else {
+            Color::new(0.18, 0.19, 0.22, 1.0)
+        },
+    );
+    draw_line(
+        splitter.center().x - 24.0,
+        splitter.center().y,
+        splitter.center().x + 24.0,
+        splitter.center().y,
+        2.0,
+        Color::new(0.72, 0.74, 0.78, 0.9),
+    );
+    draw_rrect_bordered(
+        center.x,
+        center.y,
+        center.w,
+        center.h,
+        8.0,
+        1.0,
+        Color::new(0.025, 0.030, 0.038, 0.98),
+        ui_border(),
+    );
+    let close = dff_uv_editor_toolbar_rect(&dff.uv_editor, 0);
+    let menu_buttons = [
+        (
+            DffUvMenu::Select,
+            dff_uv_editor_toolbar_rect(&dff.uv_editor, 1),
+            "Select ▾",
+        ),
+        (
+            DffUvMenu::View,
+            dff_uv_editor_toolbar_rect(&dff.uv_editor, 2),
+            "View ▾",
+        ),
+        (
+            DffUvMenu::Snap,
+            dff_uv_editor_toolbar_rect(&dff.uv_editor, 3),
+            "Snap ▾",
+        ),
+        (
+            DffUvMenu::Align,
+            dff_uv_editor_toolbar_rect(&dff.uv_editor, 4),
+            "Transform ▾",
+        ),
+        (
+            DffUvMenu::Display,
+            dff_uv_editor_toolbar_rect(&dff.uv_editor, 5),
+            "Display ▾",
+        ),
+    ];
+    text_button(&app.ui_font, close, "Close", false);
+    for (menu, rect, label) in menu_buttons {
+        text_button(&app.ui_font, rect, label, dff.uv_editor.menu == Some(menu));
+    }
+
+    draw_rectangle(
+        view.x,
+        view.y,
+        view.w,
+        view.h,
+        Color::new(0.055, 0.060, 0.070, 1.0),
+    );
+    let (origin, size) = dff_uv_editor_transform(view, &dff.uv_editor);
+    begin_ui_clip(view);
+    let texture = dff
+        .material_thumbnails
+        .get(dff.selected_material)
+        .and_then(Option::as_ref);
+    let (min_u, max_u, min_v, max_v) = dff_uv_visible_texture_tiles(view, &dff.uv_editor);
+    for tile_v in min_v..=max_v {
+        for tile_u in min_u..=max_u {
+            let tile_origin = origin + vec2(tile_u as f32 * size.x, tile_v as f32 * size.y);
+            let checker = size / 8.0;
+            if checker.x >= 1.0 && checker.y >= 1.0 {
+                for y in 0..8 {
+                    for x in 0..8 {
+                        let shade = if (x + y) % 2 == 0 { 0.30 } else { 0.20 };
+                        draw_rectangle(
+                            tile_origin.x + x as f32 * checker.x,
+                            tile_origin.y + y as f32 * checker.y,
+                            checker.x,
+                            checker.y,
+                            Color::new(shade, shade, shade, 1.0),
+                        );
+                    }
+                }
+            } else {
+                draw_rectangle(
+                    tile_origin.x,
+                    tile_origin.y,
+                    size.x,
+                    size.y,
+                    Color::new(0.24, 0.24, 0.24, 1.0),
+                );
+            }
+            if let Some(texture) = texture {
+                draw_texture_ex(
+                    texture,
+                    tile_origin.x,
+                    tile_origin.y,
+                    WHITE,
+                    DrawTextureParams {
+                        dest_size: Some(size),
+                        ..Default::default()
+                    },
+                );
+            }
+            draw_rectangle_lines(
+                tile_origin.x,
+                tile_origin.y,
+                size.x,
+                size.y,
+                1.0,
+                Color::new(0.62, 0.64, 0.68, 0.42),
+            );
+        }
+    }
+    draw_rectangle_lines(
+        origin.x,
+        origin.y,
+        size.x,
+        size.y,
+        2.0,
+        Color::new(0.75, 0.75, 0.78, 0.8),
+    );
+
+    let step = dff.uv_editor.grid_step.max(0.001);
+    if dff.uv_editor.snap_grid || size.min_element() * step >= 18.0 {
+        let uv_min = dff_uv_from_screen(view, &dff.uv_editor, vec2(view.x, view.y));
+        let uv_max =
+            dff_uv_from_screen(view, &dff.uv_editor, vec2(view.x + view.w, view.y + view.h));
+        let mut u = (uv_min.u / step).floor() * step;
+        while u <= uv_max.u && u.is_finite() {
+            let x = origin.x + u * size.x;
+            draw_line(
+                x,
+                view.y,
+                x,
+                view.y + view.h,
+                1.0,
+                Color::new(0.45, 0.48, 0.52, 0.25),
+            );
+            u += step;
+        }
+        let mut v = (uv_min.v / step).floor() * step;
+        while v <= uv_max.v && v.is_finite() {
+            let y = origin.y + v * size.y;
+            draw_line(
+                view.x,
+                y,
+                view.x + view.w,
+                y,
+                1.0,
+                Color::new(0.45, 0.48, 0.52, 0.25),
+            );
+            v += step;
+        }
+    }
+
+    for face in dff_uv_selected_face_indices(dff) {
+        let Some(triangle) = dff.raw.triangles.get(face) else {
+            continue;
+        };
+        let indices = [
+            triangle.a as usize,
+            triangle.b as usize,
+            triangle.c as usize,
+        ];
+        let Some(points) = indices
+            .iter()
+            .map(|index| dff.raw.uvs.get(*index).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if points
+            .iter()
+            .any(|uv| !uv.u.is_finite() || !uv.v.is_finite())
+        {
+            continue;
+        }
+        let selected = indices
+            .iter()
+            .all(|index| dff.uv_editor.selected.contains(index));
+        if !selected && !dff.uv_editor.show_material_outlines {
+            continue;
+        }
+        let color = if selected {
+            Color::new(1.0, 0.72, 0.10, 0.95)
+        } else {
+            Color::new(0.10, 0.85, 1.0, 0.22)
+        };
+        for edge in [(0, 1), (1, 2), (2, 0)] {
+            let a = dff_uv_to_screen(view, &dff.uv_editor, points[edge.0]);
+            let b = dff_uv_to_screen(view, &dff.uv_editor, points[edge.1]);
+            draw_line(a.x, a.y, b.x, b.y, if selected { 2.2 } else { 1.3 }, color);
+        }
+    }
+    for index in dff_uv_selected_face_vertices(dff) {
+        let Some(uv) = dff.raw.uvs.get(index).copied() else {
+            continue;
+        };
+        if !uv.u.is_finite() || !uv.v.is_finite() {
+            continue;
+        }
+        let point = dff_uv_to_screen(view, &dff.uv_editor, uv);
+        let selected = dff.uv_editor.selected.contains(&index);
+        let hovered = dff.uv_editor.hovered == Some(index);
+        if !selected && !hovered && !dff.uv_editor.show_material_outlines {
+            continue;
+        }
+        draw_circle(
+            point.x,
+            point.y,
+            if hovered {
+                6.5
+            } else if selected {
+                5.0
+            } else {
+                3.8
+            },
+            if selected {
+                YELLOW
+            } else if hovered {
+                WHITE
+            } else {
+                Color::new(0.10, 0.85, 1.0, 0.38)
+            },
+        );
+        draw_circle_lines(
+            point.x,
+            point.y,
+            if selected { 5.0 } else { 3.8 },
+            1.0,
+            Color::new(0.02, 0.03, 0.04, 1.0),
+        );
+    }
+    if let Some(center) = dff_uv_selection_center_screen(dff, view) {
+        let mouse: Vec2 = mouse_position().into();
+        let hovered = dff_uv_gizmo_hit(center, mouse);
+        let active = dff.uv_editor.transform.as_ref();
+        let u_active = hovered == Some(DffUvGizmoHit::MoveU)
+            || active.is_some_and(|transform| {
+                transform.mode == DffUvTransformMode::Grab && transform.axis == DffUvAxis::U
+            });
+        let v_active = hovered == Some(DffUvGizmoHit::MoveV)
+            || active.is_some_and(|transform| {
+                transform.mode == DffUvTransformMode::Grab && transform.axis == DffUvAxis::V
+            });
+        let rotate_active = hovered == Some(DffUvGizmoHit::Rotate)
+            || active.is_some_and(|transform| transform.mode == DffUvTransformMode::Rotate);
+        let free_active = hovered == Some(DffUvGizmoHit::MoveFree)
+            || active.is_some_and(|transform| {
+                transform.mode == DffUvTransformMode::Grab && transform.axis == DffUvAxis::Free
+            });
+        let u_color = if u_active {
+            Color::new(1.0, 0.65, 0.30, 1.0)
+        } else {
+            Color::new(0.95, 0.20, 0.20, 1.0)
+        };
+        let v_color = if v_active {
+            Color::new(0.75, 1.0, 0.35, 1.0)
+        } else {
+            Color::new(0.25, 0.90, 0.35, 1.0)
+        };
+        let ring_color = if rotate_active {
+            Color::new(1.0, 0.72, 0.15, 1.0)
+        } else {
+            Color::new(0.80, 0.82, 0.86, 0.82)
+        };
+        draw_circle_lines(
+            center.x,
+            center.y,
+            42.0,
+            if rotate_active { 3.0 } else { 1.5 },
+            ring_color,
+        );
+        let u_end = center + vec2(64.0, 0.0);
+        draw_line(center.x, center.y, u_end.x, u_end.y, 3.0, u_color);
+        draw_triangle(
+            u_end + vec2(7.0, 0.0),
+            u_end + vec2(-5.0, -6.0),
+            u_end + vec2(-5.0, 6.0),
+            u_color,
+        );
+        let v_end = center + vec2(0.0, 64.0);
+        draw_line(center.x, center.y, v_end.x, v_end.y, 3.0, v_color);
+        draw_triangle(
+            v_end + vec2(0.0, 7.0),
+            v_end + vec2(-6.0, -5.0),
+            v_end + vec2(6.0, -5.0),
+            v_color,
+        );
+        draw_rectangle(
+            center.x - 7.0,
+            center.y - 7.0,
+            14.0,
+            14.0,
+            if free_active {
+                WHITE
+            } else {
+                Color::new(0.92, 0.92, 0.94, 1.0)
+            },
+        );
+        draw_rectangle_lines(
+            center.x - 7.0,
+            center.y - 7.0,
+            14.0,
+            14.0,
+            1.0,
+            Color::new(0.03, 0.035, 0.045, 1.0),
+        );
+        ui_text_size(&app.ui_font, "X", u_end.x + 9.0, u_end.y + 5.0, 13, u_color);
+        ui_text_size(
+            &app.ui_font,
+            "Y",
+            v_end.x - 4.0,
+            v_end.y + 18.0,
+            13,
+            v_color,
+        );
+    }
+    if let Some(start) = dff.uv_editor.box_start {
+        let mouse: Vec2 = mouse_position().into();
+        draw_rectangle_lines(
+            start.x.min(mouse.x),
+            start.y.min(mouse.y),
+            (start.x - mouse.x).abs(),
+            (start.y - mouse.y).abs(),
+            1.5,
+            ui_accent(),
+        );
+    }
+    end_ui_clip();
+    let texture_name = dff
+        .raw
+        .material_textures
+        .get(dff.selected_material)
+        .map(String::as_str)
+        .unwrap_or("<no texture>");
+    let mode = dff
+        .uv_editor
+        .transform
+        .as_ref()
+        .map(|transform| {
+            let axis = match transform.axis {
+                DffUvAxis::Free => "XY",
+                DffUvAxis::U => "X",
+                DffUvAxis::V => "Y",
+            };
+            let numeric = (!transform.numeric_input.is_empty())
+                .then(|| format!(" {}×", transform.numeric_input))
+                .unwrap_or_default();
+            format!(" · {:?} {axis}{numeric}", transform.mode)
+        })
+        .unwrap_or_default();
+    let summary = format!(
+        "{} · {} selected · zoom {:.0}%{}",
+        ellipsize(texture_name, 22),
+        dff.uv_editor.selected.len(),
+        dff.uv_editor.zoom * 100.0,
+        mode
+    );
+    ui_text_size(
+        &app.ui_font,
+        &ellipsize_width(&summary, 14, view.w - 8.0),
+        view.x + 4.0,
+        view.y + view.h + 17.0,
+        14,
+        ui_muted(),
+    );
+    ui_text_size(
+        &app.ui_font,
+        &ellipsize_width(
+            "G move · S scale · R rotate · M merge · Y split · L island · arrows nudge · Home fit",
+            13,
+            view.w - 8.0,
+        ),
+        view.x + 4.0,
+        view.y + view.h + 34.0,
+        13,
+        ui_muted(),
+    );
+    if let Some(menu) = dff.uv_editor.menu {
+        let (button, labels, active): (Rect, &[&str], [bool; 8]) = match menu {
+            DffUvMenu::Select => (
+                dff_uv_editor_toolbar_rect(&dff.uv_editor, 1),
+                &["Select All", "Deselect All", "Split Selected UVs"],
+                [false; 8],
+            ),
+            DffUvMenu::View => (
+                dff_uv_editor_toolbar_rect(&dff.uv_editor, 2),
+                &["Fit View", "Zoom In", "Zoom Out"],
+                [false; 8],
+            ),
+            DffUvMenu::Snap => (
+                dff_uv_editor_toolbar_rect(&dff.uv_editor, 3),
+                &[
+                    "Grid Snap",
+                    "Vertex Snap",
+                    "Finer Increment",
+                    "Coarser Increment",
+                ],
+                [
+                    dff.uv_editor.snap_grid,
+                    dff.uv_editor.snap_vertices,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                ],
+            ),
+            DffUvMenu::Align => (
+                dff_uv_editor_toolbar_rect(&dff.uv_editor, 4),
+                &[
+                    "Snap to Left Edge",
+                    "Snap to Right Edge",
+                    "Snap to Top Edge",
+                    "Snap to Bottom Edge",
+                    "Rotate 90°",
+                    "Mirror X",
+                    "Mirror Y",
+                    "Blend with neighbors",
+                ],
+                [false; 8],
+            ),
+            DffUvMenu::Display => (
+                dff_uv_editor_toolbar_rect(&dff.uv_editor, 5),
+                &["Repeat Texture", "Material Outlines", "Selection Outline"],
+                [
+                    dff.uv_editor.repeat_texture,
+                    dff.uv_editor.show_material_outlines,
+                    dff.uv_editor.show_material_selection_outlines,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                ],
+            ),
+        };
+        let popup = dff_uv_editor_menu_rect(button, labels.len());
+        draw_rrect_bordered(
+            popup.x,
+            popup.y,
+            popup.w,
+            popup.h,
+            5.0,
+            1.0,
+            Color::new(0.055, 0.060, 0.070, 1.0),
+            ui_border(),
+        );
+        for (index, label) in labels.iter().enumerate() {
+            text_button(
+                &app.ui_font,
+                dff_uv_editor_menu_item_rect(popup, index),
+                label,
+                active[index],
+            );
+        }
+    }
+    draw_editor_tooltip(&app.ui_font, close, "dff.uv_close");
 }
 
 fn draw_editing_txd_material_picker(app: &AppState, txd: &EditingTxdState) {
@@ -22435,14 +33599,136 @@ fn draw_active_asset_editor(app: &AppState) {
             );
         }
     }
+    draw_texture_category_menu(app);
+}
+
+fn texture_category_menu_rect(menu: &TextureCategoryMenu) -> Rect {
+    let width = 220.0;
+    let height = 42.0 + (TEXTURE_CATEGORY_PRESETS.len() as f32 + 1.0) * 26.0;
+    Rect::new(
+        menu.position.x.min(screen_width() - width - 8.0).max(8.0),
+        menu.position
+            .y
+            .min(screen_height() - height - STATUS_H - 8.0)
+            .max(TOP_H + 8.0),
+        width,
+        height,
+    )
+}
+
+fn draw_texture_category_menu(app: &AppState) {
+    let Some(menu) = app.editing.texture_category_menu.as_ref() else {
+        return;
+    };
+    clear_pending_ui_tooltip();
+    let rect = texture_category_menu_rect(menu);
+    draw_rrect_bordered(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        8.0,
+        1.0,
+        Color::new(0.045, 0.052, 0.064, 0.99),
+        ui_accent(),
+    );
+    ui_text_bold(
+        &format!("Categorize {}", ellipsize(&menu.texture_name, 18)),
+        rect.x + 12.0,
+        rect.y + 27.0,
+        16,
+        WHITE,
+    );
+    let current = app
+        .material_classes
+        .texture_category(&menu.txd_name, &menu.texture_name);
+    let mouse: Vec2 = mouse_position().into();
+    for row in 0..=TEXTURE_CATEGORY_PRESETS.len() {
+        let label = if row == 0 {
+            "Uncategorized"
+        } else {
+            TEXTURE_CATEGORY_PRESETS[row - 1]
+        };
+        let row_rect = Rect::new(
+            rect.x + 6.0,
+            rect.y + 38.0 + row as f32 * 26.0,
+            rect.w - 12.0,
+            24.0,
+        );
+        let selected = if row == 0 {
+            current.is_none()
+        } else {
+            current.is_some_and(|category| category.eq_ignore_ascii_case(label))
+        };
+        if selected || row_rect.contains(mouse) {
+            draw_rrect(
+                row_rect.x,
+                row_rect.y,
+                row_rect.w,
+                row_rect.h,
+                5.0,
+                if selected {
+                    ui_surface_active()
+                } else {
+                    ui_surface_hover()
+                },
+            );
+        }
+        ui_text(
+            &app.ui_font,
+            label,
+            row_rect.x + 8.0,
+            row_rect.y + 17.0,
+            if selected { ui_accent() } else { WHITE },
+        );
+    }
+}
+
+fn handle_editing_texture_category_menu(app: &mut AppState, mouse: Vec2) -> bool {
+    let Some(menu) = app.editing.texture_category_menu.clone() else {
+        return false;
+    };
+    if is_key_pressed(KeyCode::Escape) || is_mouse_button_pressed(MouseButton::Right) {
+        app.editing.texture_category_menu = None;
+        return true;
+    }
+    if !is_mouse_button_pressed(MouseButton::Left) {
+        return true;
+    }
+    let rect = texture_category_menu_rect(&menu);
+    if rect.contains(mouse) && mouse.y >= rect.y + 38.0 {
+        let row = ((mouse.y - rect.y - 38.0) / 26.0).floor() as usize;
+        if row <= TEXTURE_CATEGORY_PRESETS.len() {
+            let category = (row > 0).then(|| TEXTURE_CATEGORY_PRESETS[row - 1]);
+            if app.material_classes.set_texture_category(
+                &menu.txd_name,
+                &menu.texture_name,
+                category,
+            ) {
+                app.material_classes_dirty = true;
+            }
+            app.status_message = match category {
+                Some(category) => format!(
+                    "Categorized {} as {}. Save to keep this EagleScene change.",
+                    menu.texture_name, category
+                ),
+                None => format!(
+                    "Cleared the category for {}. Save to keep this EagleScene change.",
+                    menu.texture_name
+                ),
+            };
+        }
+    }
+    app.editing.texture_category_menu = None;
+    true
 }
 
 fn draw_txd_asset(app: &AppState, right: Rect, txd: &EditingTxdState) {
     ui_text_bold(&txd.name, right.x + 16.0, right.y + 30.0, 18, WHITE);
-    let filtered = editing_txd_filtered_indices(txd);
+    let filtered = editing_txd_filtered_indices(txd, &app.material_classes);
     ui_text(
         &app.ui_font,
-        &if txd.search.trim().is_empty() {
+        &if txd.search.trim().is_empty() && txd.category_filter.is_empty() {
             format!("{} texture(s)", txd.textures.len())
         } else {
             format!("{} of {} texture(s)", filtered.len(), txd.textures.len())
@@ -22495,6 +33781,12 @@ fn draw_txd_asset(app: &AppState, right: Rect, txd: &EditingTxdState) {
             WHITE,
         );
     }
+    text_button(
+        &app.ui_font,
+        editing_txd_category_rect(),
+        &ellipsize(texture_category_filter_label(&txd.category_filter), 16),
+        !txd.category_filter.is_empty(),
+    );
 
     let list = editing_txd_list_rect();
     let visible = (list.h / 32.0).floor().max(1.0) as usize;
@@ -22553,6 +33845,27 @@ fn draw_txd_asset(app: &AppState, right: Rect, txd: &EditingTxdState) {
             rect.y + 20.0,
             if selected { ui_accent() } else { WHITE },
         );
+        if let Some(category) = app
+            .material_classes
+            .texture_category(&txd.name, &entry.name)
+        {
+            let badge_w = (ui_text_width(category, 12) + 12.0).min(86.0);
+            let badge = Rect::new(
+                rect.x + rect.w - 130.0 - badge_w,
+                rect.y + 5.0,
+                badge_w,
+                18.0,
+            );
+            draw_rrect(badge.x, badge.y, badge.w, badge.h, 7.0, ui_surface_active());
+            ui_text_size(
+                &app.ui_font,
+                &ellipsize(category, 12),
+                badge.x + 6.0,
+                badge.y + 13.0,
+                12,
+                ui_accent(),
+            );
+        }
         ui_text(
             &app.ui_font,
             &format!(
@@ -22598,7 +33911,13 @@ fn draw_txd_asset(app: &AppState, right: Rect, txd: &EditingTxdState) {
             draw_scrollbar(metrics, state);
         }
     }
-    text_button(&app.ui_font, editing_txd_add_rect(), "Add Texture", false);
+    text_button(&app.ui_font, editing_txd_add_rect(), "Add Textures", false);
+    text_button(
+        &app.ui_font,
+        editing_txd_import_folder_rect(),
+        "Import Folder",
+        false,
+    );
     text_button(&app.ui_font, editing_txd_replace_rect(), "Replace", false);
     text_button(&app.ui_font, editing_txd_rename_rect(), "Rename", false);
     text_button(
@@ -22677,6 +33996,510 @@ fn editing_action_button(
         );
         ui_text(font, label, rect.x + 9.0, rect.y - 14.0, LIGHTGRAY);
     }
+}
+
+fn draw_dff_mesh_category(rect: Rect, title: &str) {
+    ui_text_bold(title, rect.x + 2.0, rect.y + 16.0, 13, ui_dim());
+    let title_w = ui_text_width(title, 13);
+    let line_x = rect.x + title_w + 12.0;
+    draw_rrect(
+        line_x,
+        rect.y + 10.0,
+        (rect.x + rect.w - line_x).max(0.0),
+        1.0,
+        0.5,
+        ui_border(),
+    );
+}
+
+fn dff_mesh_tooltip(label: &str) -> &'static str {
+    match label {
+        "Import + Set Texture" => {
+            "Import an image into the paired TXD and assign it to the selected DFF faces."
+        }
+        "Make Face" => {
+            "Fill a selected vertex polygon or closed edge boundary with contextual UVs."
+        }
+        "Add Vertex" => {
+            "Add a vertex at the origin or selection center, select it, and enter Move mode."
+        }
+        "Add Plane" => {
+            "Add a two-face plane at the origin or selection center and enter Move mode."
+        }
+        "Add Cube" => {
+            "Add a flat-shaded cube at the origin or selection center and enter Move mode."
+        }
+        "Delete Face" => "Delete the selected faces and clean up vertices they no longer use.",
+        "Extrude Selection" => {
+            "Extrude the selected vertices or edges, creating connected geometry to move outward."
+        }
+        "Subdivide" => "Split each selected face into smaller faces.",
+        "Duplicate Faces" => "Copy the selected faces and their vertices inside this object.",
+        "Shade Flat" => "Split selected face corners and assign one normal per face.",
+        "Shade Smooth" => "Average selected face normals across matching corner positions.",
+        "Mark Sharp" => {
+            "Split the selected edges into hard normal boundaries that persist in the DFF."
+        }
+        "Area Average" => {
+            "Average selected normals with each face weighted by its surface area, like Blender."
+        }
+        "Flip Selected" => {
+            "Reverse the winding and visible normal direction of the selected faces only."
+        }
+        "Show Normals" => {
+            "Toggle viewport lines that show the currently authored vertex-normal directions."
+        }
+        "Delete Vertex" => "Delete the selected vertices and any faces connected to them.",
+        "Merge Selected" => {
+            "Weld the selected vertices together. You will be asked how to handle UV seams."
+        }
+        "Merge by Distance" => {
+            "Weld vertices that are within the editor's small default distance threshold."
+        }
+        "Knife" => {
+            "Cut selected edges at their midpoints; in face mode, cut the longest edge of each selected face."
+        }
+        "Duplicate Material" => {
+            "Duplicate the selected material, its properties, and all faces that use it."
+        }
+        "Delete Mat Faces" => "Delete every face that uses the currently selected material.",
+        "Separate from Object" => {
+            "Move the selected faces into a new DFF while leaving the remaining faces here."
+        }
+        "Split Material Limit" => {
+            "Split this DFF into co-located elements with at most 152 materials each, preserving collision on the original."
+        }
+        "Pivot to Selection" => {
+            "Move the object's pivot to the selected geometry, transform its paired COL, and update placements."
+        }
+        "Pivot to Bounds" => {
+            "Move the object's pivot to its bounds center, transform its paired COL, and update placements."
+        }
+        "Freeform Pivot" => {
+            "Place and rotate the object's pivot interactively with the viewport gimbal."
+        }
+        "Apply Pivot" => {
+            "Bake the pivot into the DFF and paired COL, then compensate every referencing placement."
+        }
+        "Cancel Pivot" => "Discard the pending freeform pivot without changing the DFF.",
+        _ => "",
+    }
+}
+
+fn draw_dff_mesh_tooltip(font: &Font, rect: Rect, label: &str) {
+    let mouse: Vec2 = mouse_position().into();
+    if !scrollbar_hover_suppressed() && rect.contains(mouse) {
+        draw_text_tooltip(font, rect, dff_mesh_tooltip(label));
+    }
+}
+
+fn editor_tooltip(key: &str) -> &'static str {
+    match key {
+        "select.vertex" => "Select and edit individual vertices in the 3D preview.",
+        "select.edge" => "Select and edit edges between connected vertices in the 3D preview.",
+        "select.face" => "Select and edit complete triangle faces in the 3D preview.",
+        "select.box_mode" => "Cycle whether box selection adds, removes, or toggles items.",
+        "select.box_distance" => "Decrease or increase the box-selection depth tolerance.",
+        "dff.add_2dfx" => "Add a new GTA 2DFX effect entry to this object.",
+        "dff.delete_2dfx" => "Permanently remove the selected 2DFX effect entry.",
+        "dff.2dfx_type" => "Choose the native GTA 2DFX effect type for the selected entry.",
+        "dff.2dfx_payload" => "Inspect and edit the selected effect's native payload properties.",
+        "dff.corona_preset" => "Add a configured GTA-compatible light corona preset.",
+        "dff.regenerate_coronas" => {
+            "Rebuild generated 2DFX coronas from the object's enabled light-emitter groups."
+        }
+        "dff.generate_fractures" => "Automatically build breakable fracture zones for this DFF.",
+        "dff.manual_fracture" => "Create a breakable fracture zone from the selected faces.",
+        "dff.fracture_origin" => {
+            "Choose whether fracture pieces originate from the object or its collision geometry."
+        }
+        "dff.clear_fractures" => "Remove all authored breakable fracture zones from this DFF.",
+        "dff.simulate_fractures" => "Preview or reset the object's break-apart animation.",
+        "dff.texture_preview" => "Open a larger preview of the selected material texture.",
+        "dff.texture_rename" => "Rename the selected texture and update references that use it.",
+        "dff.texture_duplicate" => "Duplicate the selected texture under a new name.",
+        "dff.material_use_txd" => {
+            "Assign an existing texture from the paired TXD to this material."
+        }
+        "dff.material_import" => {
+            "Import an image into the paired TXD and assign it to this material."
+        }
+        "dff.material_select_faces" => {
+            "Select every face that uses the currently selected material."
+        }
+        "dff.material_new_faces" => {
+            "Create a new material for the selected faces by copying their current material."
+        }
+        "dff.material_assign_faces" => "Assign the selected faces to the selected material slot.",
+        "dff.material_remove_unused" => "Remove the selected material if no faces use it.",
+        "dff.material_color" => {
+            "Drag to adjust the selected material's red, green, blue, or alpha value."
+        }
+        "dff.material_color_preset" => "Apply this color preset to the selected material.",
+        "dff.material_alpha_preset" => "Set the selected material's opacity to this percentage.",
+        "dff.material_surface" => {
+            "Adjust how strongly ambient, diffuse, or specular lighting affects this material."
+        }
+        "dff.collision_material" => {
+            "Choose the collision surface class generated for this material's faces."
+        }
+        "dff.shadow_toggle" => {
+            "Include or exclude this material, or the selected faces, from generated collision shadows."
+        }
+        "dff.shadow_scope" => {
+            "Apply the collision-shadow setting to this DFF material or every use of its texture."
+        }
+        "dff.emitter_toggle" => {
+            "Mark this material or the selected faces as a light-emitting surface."
+        }
+        "dff.emitter_source" => {
+            "Choose whether emitted light uses material color, temperature, or a custom color."
+        }
+        "dff.emitter_scope" => {
+            "Apply emitter settings to this material or every use of its texture."
+        }
+        "dff.emitter_cast_mode" => {
+            "Switch between area light emitted by faces and grouped point lights."
+        }
+        "dff.emitter_shadows" => {
+            "Toggle scene shadows for this face emitter. Disabling them reduces GPU shadow passes."
+        }
+        "dff.emitter_grouping" => {
+            "Limit how far apart faces may be when grouped into one point light."
+        }
+        "dff.emitter_direction" => "Set the point light strength emitted in this direction.",
+        "dff.emitter_day" => "Enable this emitter during the daytime lighting cycle.",
+        "dff.emitter_night" => "Enable this emitter during the nighttime lighting cycle.",
+        "dff.emitter_inversed" => "Also emit light from the reverse side of the selected faces.",
+        "dff.emitter_brightness" => "Set the emitted light intensity multiplier.",
+        "dff.emitter_falloff" => "Set the distance over which emitted light fades out.",
+        "dff.emitter_temperature" => {
+            "Drag to choose the emitted light's color temperature in kelvin."
+        }
+        "dff.emitter_color" => "Drag to adjust a custom emitted-light color channel.",
+        "dff.face_texture_txd" => {
+            "Create a new material for selected faces using a texture from the paired TXD."
+        }
+        "dff.face_texture_import" => {
+            "Import an image and create a new textured material for selected faces."
+        }
+        "dff.anim_assign" => "Assign a UV animation from the paired TXD to the selected material.",
+        "dff.anim_clear" => "Remove the UV animation assigned to the selected material.",
+        "dff.anim_continuous" => {
+            "Toggle seamless looping. Continuous mode uses whole wrapped texture tiles; disabling it allows fractional motion that visibly resets each loop."
+        }
+        "dff.anim_speed" => "Change the loop duration to make the UV scroll slower or faster.",
+        "dff.anim_motion" => {
+            "Scroll one whole texture tile per loop along U or V. Whole-tile motion loops continuously without snapping."
+        }
+        "dff.uv_editor" => "Open the detailed UV editor for the selected material.",
+        "dff.uv_close" => "Close the UV editor and return to the 3D preview.",
+        "dff.uv_select_all" => "Select all UV points belonging to the current material.",
+        "dff.uv_grid_snap" => "Toggle snapping moved UV points to the visible grid.",
+        "dff.uv_vertex_snap" => "Toggle snapping moved UV points onto nearby UV vertices.",
+        "dff.uv_snap_less" => "Use a finer grid increment for UV snapping and arrow nudging.",
+        "dff.uv_snap_more" => "Use a coarser grid increment for UV snapping and arrow nudging.",
+        "dff.uv_zoom_out" => {
+            "Zoom out from the center of the UV view. The mouse wheel zooms at the cursor."
+        }
+        "dff.uv_zoom_in" => {
+            "Zoom in toward the center of the UV view. The mouse wheel zooms at the cursor."
+        }
+        "dff.uv_align_left" => {
+            "Flatten selected UV vertices, edges, or faces against their leftmost U coordinate."
+        }
+        "dff.uv_align_right" => {
+            "Flatten selected UV vertices, edges, or faces against their rightmost U coordinate."
+        }
+        "dff.uv_align_top" => {
+            "Flatten selected UV vertices, edges, or faces against their topmost V coordinate."
+        }
+        "dff.uv_align_bottom" => {
+            "Flatten selected UV vertices, edges, or faces against their bottommost V coordinate."
+        }
+        "dff.uv_fit" => {
+            "Fit selected UVs, or the current material when none are selected, into the view."
+        }
+        "dff.uv_repeat" => {
+            "Repeat the texture through visible UV tiles without changing authored UVs."
+        }
+        "dff.uv_nudge" => "Move selected UV coordinates a small step along the U or V axis.",
+        "dff.uv_scale" => "Scale selected UV coordinates inward or outward around their center.",
+        "dff.uv_rotate" => "Rotate selected UV coordinates by 15 degrees.",
+        "dff.uv_blend_neighbors" => {
+            "Blend only the selected face UVs. Shared corners are detached first so neighboring faces keep their existing UVs."
+        }
+        "dff.uv_unwrap_face" => "Planar-unwrap the selected faces into UV space.",
+        "dff.uv_unwrap_material" => "Planar-unwrap every face using the selected material.",
+        "dff.uv_face_aligned" => {
+            "Project selected faces in their own plane, averaging the top and bottom edge angles so rotated geometry stays upright."
+        }
+        "dff.uv_box_face" => {
+            "Box-project UVs for the selected faces using their dominant directions."
+        }
+        "dff.uv_box_material" => "Box-project UVs for every face using the selected material.",
+        "dff.uv_cliff_face" => {
+            "Unroll selected cliff-wall faces around Z. The upper and lower rims pin to the texture edges, and middle rows use surface-distance spacing."
+        }
+        "dff.uv_cliff_material" => {
+            "Cliff-wrap every face using the selected material into a continuous, vertically pinned strip."
+        }
+        "dff.cutter_add" => "Add a movable box cutter without changing the mesh yet.",
+        "dff.cutter_apply" => {
+            "Apply the cutter now, splitting intersected faces at its boundary and removing only the geometry inside."
+        }
+        "dff.cutter_clear" => "Remove the active boolean cutter without changing more geometry.",
+        "dff.cutter_resize" => "Resize the cutter along this axis.",
+        "dff.generate_lod" => "Generate a lower-detail model from this DFF.",
+        "dff.optimize" => {
+            "Open repair and optimization options for the DFF geometry and materials."
+        }
+        "dff.pair_txd" => "Choose the TXD used for texture previews, assignment, and imports.",
+        "dff.generate_collision" => {
+            "Generate collision geometry from this DFF using the current preset."
+        }
+        "dff.flip_normals" => "Reverse all face normals, changing which side faces outward.",
+        "dff.stage" => "Stage this edited DFF so it is written on the next project save.",
+        "col.overlay_toggle" => "Show or hide the paired DFF as a visual alignment overlay.",
+        "col.overlay_pick" => "Choose a DFF to display over this collision model.",
+        "col.overlay_regenerate" => {
+            "Regenerate collision geometry from the paired DFF using the current preset."
+        }
+        "col.overlay_clear" => "Remove the paired DFF overlay from this editor session.",
+        "col.safe" => "Mark whether this collision is trusted for automatic project processing.",
+        "col.generation_mode" => {
+            "Choose the collision-generation strategy used by regeneration tools."
+        }
+        "col.layer" => "Switch editing between regular collision and the shadow mesh layer.",
+        "col.generate_shadow" => "Generate a closed shadow-casting mesh from the paired DFF.",
+        "col.add_sphere" => "Add a collision sphere primitive.",
+        "col.add_box" => "Add an axis-aligned collision box primitive.",
+        "col.fit_box_to_object" => {
+            "Set the selected collision box to the exact bounds of the paired DFF object."
+        }
+        "col.add_capsule" => "Add a capsule made from two spheres and a connecting cylinder.",
+        "col.duplicate_primitive" => "Duplicate the selected collision primitive.",
+        "col.box_pick" => "Choose whether viewport picking can select collision boxes.",
+        "col.capsule_edges" => {
+            "Switch the selected capsule between rounded and flat end transitions."
+        }
+        "col.material" => {
+            "Choose the collision surface material for the selected face or primitive."
+        }
+        "col.light" => "Set the GTA collision lighting value for the selected face or primitive.",
+        "col.select_material" => {
+            "Select every collision face using the same material as the current face."
+        }
+        "col.primitive_size" => "Edit the selected primitive's radius or dimensions.",
+        "col.primitive_rotation" => "Rotate the selected collision box around this axis.",
+        "col.vertex_position" => "Edit the selected collision vertex coordinate on this axis.",
+        "col.delete" => {
+            "Delete the selected vertices, edges, or faces and connected invalid geometry."
+        }
+        "col.make_face" => {
+            "Create a triangle or quad from the selected collision vertices or edges."
+        }
+        "col.flip_face" => {
+            "Reverse the selected collision faces so their normals point the other way."
+        }
+        "col.merge_distance" => {
+            "Weld collision vertices within the editor's small default distance threshold."
+        }
+        "col.optimize" => {
+            "Simplify and optimize collision geometry while preserving its overall shape."
+        }
+        "col.cleanup" => "Remove invalid, degenerate, or unused collision geometry.",
+        "col.validate" => {
+            "Check the collision model for structural and game-compatibility problems."
+        }
+        "col.stage" => "Stage this edited COL so it is written on the next project save.",
+        _ => "",
+    }
+}
+
+fn draw_editor_tooltip(font: &Font, rect: Rect, key: &str) {
+    let mouse: Vec2 = mouse_position().into();
+    if !scrollbar_hover_suppressed() && rect.contains(mouse) {
+        draw_text_tooltip(font, rect, editor_tooltip(key));
+    }
+}
+
+fn draw_optional_editor_tooltip(font: &Font, rect: Option<Rect>, key: &str) {
+    if let Some(rect) = rect {
+        draw_editor_tooltip(font, rect, key);
+    }
+}
+
+fn draw_editor_tooltips_for_rects(font: &Font, rects: Option<&[Rect]>, key: &str) {
+    if let Some(rects) = rects {
+        for rect in rects {
+            draw_editor_tooltip(font, *rect, key);
+        }
+    }
+}
+
+fn draw_selection_mode_tooltips(font: &Font) {
+    draw_editor_tooltip(font, editing_select_vertex_mode_rect(), "select.vertex");
+    draw_editor_tooltip(font, editing_select_edge_mode_rect(), "select.edge");
+    draw_editor_tooltip(font, editing_select_face_mode_rect(), "select.face");
+    draw_editor_tooltip(font, editing_box_select_mode_rect(), "select.box_mode");
+    draw_editor_tooltip(font, editing_box_select_minus_rect(), "select.box_distance");
+    draw_editor_tooltip(font, editing_box_select_plus_rect(), "select.box_distance");
+}
+
+fn draw_dff_editor_tooltips(font: &Font, layout: &DffPanelLayout) {
+    macro_rules! tip {
+        ($field:ident, $key:literal) => {
+            draw_optional_editor_tooltip(font, layout.$field, $key)
+        };
+    }
+    macro_rules! tips {
+        ($field:ident, $key:literal) => {
+            draw_editor_tooltips_for_rects(
+                font,
+                layout.$field.as_ref().map(|rects| rects.as_slice()),
+                $key,
+            )
+        };
+    }
+
+    draw_selection_mode_tooltips(font);
+    tip!(add_2dfx, "dff.add_2dfx");
+    tip!(delete_2dfx, "dff.delete_2dfx");
+    tip!(type_2dfx, "dff.2dfx_type");
+    tip!(payload_2dfx, "dff.2dfx_payload");
+    tip!(add_2dfx_corona_preset, "dff.corona_preset");
+    tip!(regenerate_2dfx_coronas, "dff.regenerate_coronas");
+    tip!(generate_fractures, "dff.generate_fractures");
+    tip!(manual_fracture_zone, "dff.manual_fracture");
+    tip!(fracture_origin, "dff.fracture_origin");
+    tip!(clear_fractures, "dff.clear_fractures");
+    tip!(simulate_fractures, "dff.simulate_fractures");
+    tip!(view_texture, "dff.texture_preview");
+    tip!(rename_texture, "dff.texture_rename");
+    tip!(duplicate_texture, "dff.texture_duplicate");
+    tip!(set_material_texture_from_txd, "dff.material_use_txd");
+    tip!(set_material_texture_browse, "dff.material_import");
+    tip!(select_material_faces, "dff.material_select_faces");
+    tip!(new_material_for_faces, "dff.material_new_faces");
+    tip!(assign_material_to_faces, "dff.material_assign_faces");
+    tip!(delete_unused_material, "dff.material_remove_unused");
+    tips!(material_color, "dff.material_color");
+    tips!(material_color_presets, "dff.material_color_preset");
+    tips!(material_alpha_presets, "dff.material_alpha_preset");
+    tips!(material_surface, "dff.material_surface");
+    tip!(collision_material, "dff.collision_material");
+    tip!(shadow_casting_toggle, "dff.shadow_toggle");
+    tip!(shadow_casting_scope, "dff.shadow_scope");
+    tip!(emitter_toggle, "dff.emitter_toggle");
+    tip!(emitter_source, "dff.emitter_source");
+    tip!(emitter_scope, "dff.emitter_scope");
+    tip!(emitter_cast_mode, "dff.emitter_cast_mode");
+    tip!(emitter_casts_shadow, "dff.emitter_shadows");
+    tip!(emitter_max_grouping_size, "dff.emitter_grouping");
+    tip!(emitter_point_up_strength, "dff.emitter_direction");
+    tip!(emitter_point_down_strength, "dff.emitter_direction");
+    tip!(emitter_point_sides_strength, "dff.emitter_direction");
+    tip!(emitter_day, "dff.emitter_day");
+    tip!(emitter_night, "dff.emitter_night");
+    tip!(emitter_inversed, "dff.emitter_inversed");
+    tip!(emitter_strength, "dff.emitter_brightness");
+    tip!(emitter_falloff, "dff.emitter_falloff");
+    tip!(emitter_temperature, "dff.emitter_temperature");
+    tips!(emitter_color, "dff.emitter_color");
+    tip!(tex_from_txd, "dff.face_texture_txd");
+    tip!(tex_browse, "dff.face_texture_import");
+    tip!(anim_assign, "dff.anim_assign");
+    tip!(anim_clear, "dff.anim_clear");
+    tip!(anim_continuous, "dff.anim_continuous");
+    tips!(anim_speed, "dff.anim_speed");
+    tips!(anim_motion, "dff.anim_motion");
+    tip!(uv_editor_open, "dff.uv_editor");
+    tips!(uv_nudge, "dff.uv_nudge");
+    tips!(uv_scale, "dff.uv_scale");
+    tips!(uv_rotate, "dff.uv_rotate");
+    tip!(uv_blend_neighbors, "dff.uv_blend_neighbors");
+    tip!(uv_unwrap_face, "dff.uv_unwrap_face");
+    tip!(uv_unwrap_material, "dff.uv_unwrap_material");
+    tip!(uv_face_aligned_unwrap, "dff.uv_face_aligned");
+    tip!(uv_box_unwrap_face, "dff.uv_box_face");
+    tip!(uv_box_unwrap_material, "dff.uv_box_material");
+    tip!(uv_cliff_unwrap_face, "dff.uv_cliff_face");
+    tip!(uv_cliff_unwrap_material, "dff.uv_cliff_material");
+    tip!(cutter_add, "dff.cutter_add");
+    tip!(cutter_apply, "dff.cutter_apply");
+    tip!(cutter_clear, "dff.cutter_clear");
+    tips!(cutter_resize, "dff.cutter_resize");
+    tip!(generate_lod, "dff.generate_lod");
+    tip!(optimize_dff, "dff.optimize");
+    tip!(pair_txd, "dff.pair_txd");
+    draw_editor_tooltip(font, layout.generate_collision, "dff.generate_collision");
+    draw_editor_tooltip(font, layout.flip_normals, "dff.flip_normals");
+    draw_editor_tooltip(font, layout.stage, "dff.stage");
+}
+
+fn draw_col_editor_tooltips(font: &Font, layout: &ColPanelLayout) {
+    macro_rules! tip {
+        ($field:ident, $key:literal) => {
+            draw_optional_editor_tooltip(font, layout.$field, $key)
+        };
+    }
+    macro_rules! tips {
+        ($field:ident, $key:literal) => {
+            draw_editor_tooltips_for_rects(
+                font,
+                layout.$field.as_ref().map(|rects| rects.as_slice()),
+                $key,
+            )
+        };
+    }
+
+    draw_selection_mode_tooltips(font);
+    draw_editor_tooltip(
+        font,
+        editing_col_overlay_toggle_rect(),
+        "col.overlay_toggle",
+    );
+    draw_editor_tooltip(font, editing_col_overlay_pick_rect(), "col.overlay_pick");
+    draw_editor_tooltip(
+        font,
+        editing_col_overlay_match_rect(),
+        "col.overlay_regenerate",
+    );
+    draw_editor_tooltip(font, editing_col_overlay_clear_rect(), "col.overlay_clear");
+    draw_editor_tooltip(font, editing_col_safe_rect(), "col.safe");
+    draw_editor_tooltip(
+        font,
+        editing_col_generation_preset_rect(),
+        "col.generation_mode",
+    );
+    draw_editor_tooltip(font, editing_col_shadow_layer_rect(), "col.layer");
+    draw_editor_tooltip(
+        font,
+        editing_col_generate_shadow_rect(),
+        "col.generate_shadow",
+    );
+    tip!(add_sphere, "col.add_sphere");
+    tip!(add_box, "col.add_box");
+    tip!(fit_box_to_object, "col.fit_box_to_object");
+    tip!(add_capsule, "col.add_capsule");
+    tip!(duplicate_primitive, "col.duplicate_primitive");
+    tip!(box_pick_toggle, "col.box_pick");
+    tip!(capsule_edges_toggle, "col.capsule_edges");
+    tip!(material, "col.material");
+    tip!(light, "col.light");
+    tip!(select_same_material, "col.select_material");
+    tips!(prim_size, "col.primitive_size");
+    tips!(prim_rotation, "col.primitive_rotation");
+    tips!(vertex, "col.vertex_position");
+    tip!(delete_face, "col.delete");
+    tip!(make_face, "col.make_face");
+    tip!(flip_face, "col.flip_face");
+    tip!(merge_distance, "col.merge_distance");
+    tip!(optimize, "col.optimize");
+    tip!(cleanup, "col.cleanup");
+    tip!(validate, "col.validate");
+    draw_editor_tooltip(font, layout.stage, "col.stage");
 }
 
 fn draw_editing_select_mode_toggle(app: &AppState, mode: EditingSelectMode) {
@@ -22835,6 +34658,16 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         18,
         if dff.dirty { YELLOW } else { WHITE },
     );
+    if dff.read_only {
+        ui_text_size(
+            &app.ui_font,
+            "READ-ONLY GTA:SA PREVIEW",
+            header_x,
+            right.y + 49.0,
+            12,
+            ORANGE,
+        );
+    }
     let animated_materials = dff
         .raw
         .material_animations
@@ -23399,6 +35232,18 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
                         .collect::<Vec<_>>();
                     (!names.is_empty()).then(|| format!("Anim {}", names.join(", ")))
                 });
+            let category = dff
+                .txd_context
+                .as_deref()
+                .and_then(|txd_name| app.material_classes.texture_category(txd_name, texture));
+            let secondary_label = match (anim_label.as_deref(), category) {
+                (Some(animation), Some(category)) => {
+                    Some(format!("{animation}  ·  Category: {category}"))
+                }
+                (Some(animation), None) => Some(animation.to_string()),
+                (None, Some(category)) => Some(format!("Category: {category}")),
+                (None, None) => None,
+            };
             let thumbnail = dff
                 .material_thumbnails
                 .get(material)
@@ -23459,11 +35304,15 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
                 fingerprint,
                 app.collision_generation_fallback_material,
             );
-            let face_label = if collision_material.no_collision {
+            let emitter_enabled = dff_material_emitter(app, &dff.name, material).enabled;
+            let mut face_label = if collision_material.no_collision {
                 format!("{face_count} face(s) · NO COL")
             } else {
                 format!("{face_count} face(s) · COL {}", collision_material.material)
             };
+            if emitter_enabled {
+                face_label.push_str(" · LIGHT");
+            }
             let face_w = ui_text_width(&face_label, 14);
             ui_text(
                 &app.ui_font,
@@ -23477,7 +35326,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
                     rect.w - 190.0,
                 ),
                 rect.x + 84.0,
-                if anim_label.is_some() {
+                if secondary_label.is_some() {
                     rect.y + 17.0
                 } else {
                     rect.y + 23.0
@@ -23488,14 +35337,18 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
                     WHITE
                 },
             );
-            if let Some(anim_label) = anim_label {
+            if let Some(secondary_label) = secondary_label {
                 ui_text_size(
                     &app.ui_font,
-                    &ellipsize_width(&anim_label, 13, rect.w - 190.0),
+                    &ellipsize_width(&secondary_label, 13, rect.w - 190.0),
                     rect.x + 84.0,
                     rect.y + 31.0,
                     13,
-                    GREEN,
+                    if category.is_some() {
+                        ui_accent()
+                    } else {
+                        GREEN
+                    },
                 );
             }
             ui_text_size(
@@ -23537,6 +35390,16 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             rect,
             &app.icons.select,
             "Preview",
+            false,
+            false,
+        );
+    }
+    if let Some(rect) = layout.select_material_faces {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.face,
+            "Select All Material Faces",
             false,
             false,
         );
@@ -23753,7 +35616,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
 
     let casts_shadow = selected_shadow_casting(app);
     let shadow_scope_global = selected_shadow_casting_is_global(app);
-    let face_shadow_target = selected_dff_faces_are_emitter_target(dff);
+    let face_shadow_target = dff_has_selected_faces(dff);
     let shadow_face_count = if face_shadow_target {
         dff_selected_face_set(dff).len()
     } else {
@@ -23815,6 +35678,18 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
     } else {
         0
     };
+    if let Some(rect) = layout.emitter_target {
+        text_button(
+            &app.ui_font,
+            rect,
+            if face_emitter {
+                "Emitter Target: Selected Faces"
+            } else {
+                "Emitter Target: Material / Texture"
+            },
+            face_emitter,
+        );
+    }
     if let Some(rect) = layout.emitter_toggle {
         text_button(
             &app.ui_font,
@@ -23898,6 +35773,18 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
                 MaterialEmitterCastMode::Point => "Casting Mode: Point",
             },
             emitter.cast_mode == MaterialEmitterCastMode::Point,
+        );
+    }
+    if let Some(rect) = layout.emitter_casts_shadow {
+        text_button(
+            &app.ui_font,
+            rect,
+            if emitter.casts_shadow {
+                "Area Shadows: On"
+            } else {
+                "Area Shadows: Off"
+            },
+            emitter.casts_shadow,
         );
     }
     if layout.emitter_max_grouping_size.is_some() {
@@ -24019,6 +35906,23 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             true,
         );
     }
+    let selected_animation = selected_dff_uv_animation(dff);
+    if let Some(rect) = layout.anim_continuous {
+        let continuous = selected_animation.is_some_and(dff_uv_animation_is_continuous);
+        let duration = selected_animation
+            .map(|animation| animation.duration.max(0.05))
+            .unwrap_or(1.0);
+        text_button(
+            &app.ui_font,
+            rect,
+            &format!("Continuous Loop  •  {duration:.2}s"),
+            continuous,
+        );
+    }
+    if let Some(speed) = layout.anim_speed {
+        text_button(&app.ui_font, speed[0], "Slower", false);
+        text_button(&app.ui_font, speed[1], "Faster", false);
+    }
     if let Some(motion) = layout.anim_motion {
         for (idx, rect) in motion.iter().enumerate() {
             let axis = if idx / 2 == 0 { "U" } else { "V" };
@@ -24028,6 +35932,16 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
     }
 
     // UV tools.
+    if let Some(rect) = layout.uv_editor_open {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.select,
+            "Open UV Editor",
+            dff.uv_editor.open,
+            false,
+        );
+    }
     if let Some(nudge) = layout.uv_nudge {
         for (idx, rect) in nudge.iter().enumerate() {
             let axis = if idx / 2 == 0 { "U" } else { "V" };
@@ -24043,12 +35957,22 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         text_button(&app.ui_font, rotate[0], "Rotate -15", false);
         text_button(&app.ui_font, rotate[1], "Rotate +15", false);
     }
+    if let Some(rect) = layout.uv_blend_neighbors {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.select,
+            "Blend with neighbors",
+            false,
+            false,
+        );
+    }
     if let Some(rect) = layout.uv_unwrap_face {
         editing_action_button(
             &app.ui_font,
             rect,
             &app.icons.face,
-            "Unwrap Face",
+            "Unwrap Faces",
             false,
             false,
         );
@@ -24063,8 +35987,67 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
         );
     }
+    if let Some(rect) = layout.uv_face_aligned_unwrap {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.face,
+            "Face-Aligned Unwrap",
+            false,
+            false,
+        );
+    }
+    if let Some(rect) = layout.uv_box_unwrap_face {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.face,
+            "Box Unwrap Face",
+            false,
+            false,
+        );
+    }
+    if let Some(rect) = layout.uv_box_unwrap_material {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.select,
+            "Box Unwrap Material",
+            false,
+            false,
+        );
+    }
+    if let Some(rect) = layout.uv_cliff_unwrap_face {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.face,
+            "Cliff Wrap Faces",
+            false,
+            false,
+        );
+    }
+    if let Some(rect) = layout.uv_cliff_unwrap_material {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.select,
+            "Cliff Wrap Material",
+            false,
+            false,
+        );
+    }
 
     // Mesh tools.
+    for (rect, title) in layout
+        .mesh_category_headers
+        .iter()
+        .zip(DFF_MESH_CATEGORY_TITLES)
+    {
+        if let Some(rect) = rect {
+            draw_dff_mesh_category(*rect, title);
+        }
+    }
     if let Some(rect) = layout.mesh_import_set {
         editing_action_button(
             &app.ui_font,
@@ -24074,6 +36057,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             false,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Import + Set Texture");
     }
     if let Some(rect) = layout.make_face {
         editing_action_button(
@@ -24084,6 +36068,40 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             false,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Make Face");
+    }
+    if let Some(rect) = layout.add_vertex {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.vertex,
+            "Add Vertex",
+            false,
+            false,
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Add Vertex");
+    }
+    if let Some(rect) = layout.add_plane {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.face,
+            "Add Plane",
+            false,
+            false,
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Add Plane");
+    }
+    if let Some(rect) = layout.add_cube {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.duplicate,
+            "Add Cube",
+            false,
+            false,
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Add Cube");
     }
     if let Some(rect) = layout.delete_face {
         editing_action_button(
@@ -24094,6 +36112,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             true,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Delete Face");
     }
     if let Some(rect) = layout.delete_vertex {
         editing_action_button(
@@ -24104,6 +36123,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             true,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Delete Vertex");
     }
     if let Some(rect) = layout.delete_material_faces {
         editing_action_button(
@@ -24114,6 +36134,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             true,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Delete Mat Faces");
     }
     if let Some(rect) = layout.extrude_selection {
         editing_action_button(
@@ -24124,6 +36145,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             false,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Extrude Selection");
     }
     if let Some(rect) = layout.merge_selected {
         editing_action_button(
@@ -24134,6 +36156,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             false,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Merge Selected");
     }
     if let Some(rect) = layout.merge_distance {
         editing_action_button(
@@ -24144,6 +36167,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             false,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Merge by Distance");
     }
     if let Some(rect) = layout.subdivide {
         editing_action_button(
@@ -24154,6 +36178,11 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             false,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Subdivide");
+    }
+    if let Some(rect) = layout.knife {
+        editing_action_button(&app.ui_font, rect, &app.icons.face, "Knife", false, false);
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Knife");
     }
     if let Some(rect) = layout.duplicate_faces {
         editing_action_button(
@@ -24164,6 +36193,73 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             false,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Duplicate Faces");
+    }
+    if let Some(rect) = layout.shade_flat {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.face,
+            "Shade Flat",
+            false,
+            false,
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Shade Flat");
+    }
+    if let Some(rect) = layout.shade_smooth {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.face,
+            "Shade Smooth",
+            false,
+            false,
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Shade Smooth");
+    }
+    if let Some(rect) = layout.mark_edges_sharp {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.edge,
+            "Mark Sharp",
+            false,
+            false,
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Mark Sharp");
+    }
+    if let Some(rect) = layout.area_weighted_normals {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.face,
+            "Area Average",
+            false,
+            false,
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Area Average");
+    }
+    if let Some(rect) = layout.flip_selected_faces {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.face,
+            "Flip Selected",
+            false,
+            false,
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Flip Selected");
+    }
+    if let Some(rect) = layout.show_normals {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.vertex,
+            "Show Normals",
+            dff.show_normals,
+            false,
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Show Normals");
     }
     if let Some(rect) = layout.duplicate_material {
         editing_action_button(
@@ -24174,6 +36270,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             false,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Duplicate Material");
     }
     if let Some(rect) = layout.separate_faces {
         editing_action_button(
@@ -24184,6 +36281,19 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             false,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Separate from Object");
+    }
+    if let Some(rect) = layout.split_material_limits {
+        let material_count = dff_material_slot_count(&dff.raw);
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.duplicate,
+            &format!("Split Material Limit ({material_count})"),
+            false,
+            material_count <= GTA_DFF_MATERIAL_LIMIT,
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Split Material Limit");
     }
     if let Some(rect) = layout.pivot_to_selection {
         editing_action_button(
@@ -24194,6 +36304,7 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             false,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Pivot to Selection");
     }
     if let Some(rect) = layout.pivot_to_bounds {
         editing_action_button(
@@ -24204,6 +36315,40 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             false,
             false,
         );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Pivot to Bounds");
+    }
+    if let Some(rect) = layout.freeform_pivot {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.move_tool,
+            "Freeform Pivot",
+            false,
+            false,
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Freeform Pivot");
+    }
+    if let Some(rect) = layout.freeform_pivot_apply {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.save,
+            "Apply Pivot",
+            true,
+            app.dff_geometry_job.is_some(),
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Apply Pivot");
+    }
+    if let Some(rect) = layout.freeform_pivot_cancel {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.delete,
+            "Cancel Pivot",
+            false,
+            app.dff_geometry_job.is_some(),
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Cancel Pivot");
     }
 
     // Boolean cutter.
@@ -24226,6 +36371,16 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             let sign = if idx % 2 == 1 { "+" } else { "-" };
             text_button(&app.ui_font, *rect, &format!("{axis}{sign}"), false);
         }
+    }
+    if let Some(rect) = layout.cutter_apply {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.select,
+            "Apply Boolean",
+            false,
+            false,
+        );
     }
     end_ui_clip();
 
@@ -24286,7 +36441,9 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         &app.ui_font,
         layout.stage,
         &app.icons.save,
-        if dff.normalized_warning && !dff.normalized_rewrite_confirmed {
+        if dff.read_only {
+            "Read-only preview"
+        } else if dff.normalized_warning && !dff.normalized_rewrite_confirmed {
             "Confirm"
         } else if dff.dirty {
             "Stage for Project Save *"
@@ -24296,6 +36453,15 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         dff.dirty,
         false,
     );
+    let panel_popup_open = dff.texture_picker_open
+        || dff.uv_anim_picker_open
+        || dff.dff_2dfx_type_picker_open
+        || dff.dff_2dfx_corona_preset_picker_open
+        || dff.dff_2dfx_payload_editor_open
+        || dff.collision_material_picker_open;
+    if !panel_popup_open {
+        draw_dff_editor_tooltips(&app.ui_font, &layout);
+    }
     draw_dff_texture_picker_popup(app, dff);
     draw_dff_uv_anim_picker_popup(app, dff);
     draw_dff_2dfx_type_picker_popup(app, dff);
@@ -24337,7 +36503,7 @@ fn draw_dff_2dfx_corona_preset_popup(app: &AppState, dff: &EditingDffState) {
     );
     ui_text_size(
         &app.ui_font,
-        "Uses stock GTA:SA values, textures, show mode, and flags",
+        "GTA:SA-compatible textures, behavior, flags, and compact glow sizes",
         popup.x + 12.0,
         popup.y + 48.0,
         13,
@@ -24598,6 +36764,17 @@ fn draw_dff_2dfx_payload_editor_popup(app: &AppState, dff: &EditingDffState) {
             break;
         };
         let spec_label = specs.get(idx).map(|spec| spec.label).unwrap_or("Property");
+        let choices = specs
+            .get(idx)
+            .map(|spec| {
+                dff_2dfx_prop_choices(selected_dff_2dfx_effect_id(dff).unwrap_or(u32::MAX), *spec)
+            })
+            .unwrap_or(&[]);
+        let display_value = choices
+            .iter()
+            .find(|(stored, _)| *stored == value)
+            .map(|(_, label)| format!("{label}  v"))
+            .unwrap_or_else(|| value.clone());
         let rect = Rect::new(text.x, text.y + row as f32 * row_h, text.w, row_h - 4.0);
         let active = dff.dff_2dfx_payload_active_field == Some(idx);
         let hovered = rect.contains(mouse_position().into());
@@ -24626,12 +36803,12 @@ fn draw_dff_2dfx_payload_editor_popup(app: &AppState, dff: &EditingDffState) {
         );
         ui_text(
             &app.ui_font,
-            &ellipsize_width(value, 15, rect.w - 158.0),
+            &ellipsize_width(&display_value, 15, rect.w - 158.0),
             rect.x + 146.0,
             rect.y + 20.0,
             if active { WHITE } else { LIGHTGRAY },
         );
-        if active && (get_time() * 2.0) as i32 % 2 == 0 {
+        if active && choices.is_empty() && (get_time() * 2.0) as i32 % 2 == 0 {
             let caret_x = rect.x + 146.0 + ui_text_width(value, 15).min(rect.w - 164.0);
             draw_line(
                 caret_x,
@@ -24658,6 +36835,54 @@ fn draw_dff_2dfx_payload_editor_popup(app: &AppState, dff: &EditingDffState) {
                 ScrollbarVisualState::Idle
             };
             draw_scrollbar(metrics, state);
+        }
+    }
+    if let Some(active) = dff.dff_2dfx_payload_active_field
+        && let Some(spec) = specs.get(active).copied()
+    {
+        ui_text(
+            &app.ui_font,
+            &ellipsize_width(
+                dff_2dfx_prop_help(selected_dff_2dfx_effect_id(dff).unwrap_or(u32::MAX), spec),
+                12,
+                popup.w - 36.0,
+            ),
+            popup.x + 12.0,
+            popup.y + popup.h - 57.0,
+            ui_muted(),
+        );
+    } else {
+        ui_text(
+            &app.ui_font,
+            "Select a property for an explanation; fields marked v have common choices.",
+            popup.x + 12.0,
+            popup.y + popup.h - 57.0,
+            ui_muted(),
+        );
+    }
+    if let Some((_field, choices)) = dff_2dfx_active_choice_info(dff) {
+        let picker = editing_dff_2dfx_choice_picker_rect(choices.len());
+        draw_rrect_bordered(
+            picker.x,
+            picker.y,
+            picker.w,
+            picker.h,
+            6.0,
+            1.0,
+            Color::new(0.030, 0.036, 0.046, 0.99),
+            ui_accent(),
+        );
+        for (row, (_, label)) in choices.iter().enumerate() {
+            let rect = Rect::new(
+                picker.x + 4.0,
+                picker.y + 4.0 + row as f32 * 26.0,
+                picker.w - 8.0,
+                22.0,
+            );
+            if rect.contains(mouse_position().into()) {
+                draw_rrect(rect.x, rect.y, rect.w, rect.h, 4.0, ui_surface_hover());
+            }
+            ui_text(&app.ui_font, label, rect.x + 8.0, rect.y + 16.0, WHITE);
         }
     }
     if dff_2dfx_active_payload_is_particle_name(dff) {
@@ -24906,6 +37131,14 @@ fn draw_dff_texture_picker_popup(app: &AppState, dff: &EditingDffState) {
     if !dff.texture_picker_open {
         return;
     }
+    let panel = editing_asset_rect();
+    draw_rectangle(
+        panel.x,
+        panel.y,
+        panel.w,
+        panel.h,
+        Color::new(0.0, 0.0, 0.0, 0.58),
+    );
     let popup = editing_dff_texture_picker_rect();
     draw_rrect_bordered(
         popup.x,
@@ -24930,6 +37163,42 @@ fn draw_dff_texture_picker_popup(app: &AppState, dff: &EditingDffState) {
     );
     let close = editing_dff_texture_picker_close_rect();
     text_button(&app.ui_font, close, "Close", false);
+
+    let search = editing_dff_texture_picker_search_rect();
+    draw_rrect_bordered(
+        search.x,
+        search.y,
+        search.w,
+        search.h,
+        5.0,
+        1.0,
+        Color::new(0.055, 0.064, 0.078, 1.0),
+        ui_accent(),
+    );
+    ui_text(
+        &app.ui_font,
+        if dff.texture_picker_search.is_empty() {
+            "Search textures..."
+        } else {
+            &dff.texture_picker_search
+        },
+        search.x + 9.0,
+        search.y + 20.0,
+        if dff.texture_picker_search.is_empty() {
+            ui_muted()
+        } else {
+            WHITE
+        },
+    );
+    text_button(
+        &app.ui_font,
+        editing_dff_texture_picker_category_rect(),
+        &ellipsize(
+            texture_category_filter_label(&dff.texture_picker_category),
+            16,
+        ),
+        !dff.texture_picker_category.is_empty(),
+    );
 
     let names = editing_dff_picker_texture_names(app);
     let list = editing_dff_texture_picker_list_rect();
@@ -24979,13 +37248,64 @@ fn draw_dff_texture_picker_popup(app: &AppState, dff: &EditingDffState) {
             },
             ui_border(),
         );
+        let entry = dff
+            .texture_picker_entries
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(name));
+        let thumb_rect = Rect::new(rect.x + 5.0, rect.y + 3.0, 22.0, 22.0);
+        draw_rrect_bordered(
+            thumb_rect.x,
+            thumb_rect.y,
+            thumb_rect.w,
+            thumb_rect.h,
+            4.0,
+            1.0,
+            Color::new(0.035, 0.040, 0.050, 1.0),
+            ui_border(),
+        );
+        if let Some(thumbnail) = entry.and_then(|entry| entry.thumbnail.as_ref()) {
+            draw_texture_ex(
+                thumbnail,
+                thumb_rect.x + 2.0,
+                thumb_rect.y + 2.0,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(thumb_rect.w - 4.0, thumb_rect.h - 4.0)),
+                    ..Default::default()
+                },
+            );
+        }
         ui_text(
             &app.ui_font,
-            &ellipsize_width(name, 16, rect.w - 20.0),
-            rect.x + 10.0,
+            &ellipsize_width(name, 16, rect.w - 190.0),
+            rect.x + 34.0,
             rect.y + 18.0,
             if selected { ui_accent() } else { WHITE },
         );
+        if let Some(category) = dff
+            .txd_context
+            .as_deref()
+            .and_then(|txd| app.material_classes.texture_category(txd, name))
+        {
+            ui_text_size(
+                &app.ui_font,
+                &ellipsize(category, 16),
+                rect.x + rect.w - 132.0,
+                rect.y + 18.0,
+                12,
+                ui_accent(),
+            );
+        }
+        if let Some(entry) = entry {
+            ui_text_size(
+                &app.ui_font,
+                &format!("{}x{}", entry.width, entry.height),
+                rect.x + rect.w - 64.0,
+                rect.y + 18.0,
+                12,
+                ui_muted(),
+            );
+        }
     }
     if names.len() > visible {
         let track = Rect::new(list.x + list.w - 4.0, list.y, 3.0, list.h);
@@ -25442,6 +37762,22 @@ fn draw_col_asset(app: &AppState, right: Rect, col: &EditingColState) {
             false,
         );
     }
+    if let Some(rect) = layout.fit_box_to_object {
+        let box_selected = col.selected_primitive.is_some_and(|selected| {
+            matches!(
+                selected.kind,
+                CollisionPrimitiveKind::Box | CollisionPrimitiveKind::Cuboid
+            )
+        });
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.cube,
+            "Fit to Object",
+            box_selected,
+            false,
+        );
+    }
     if let Some(rect) = layout.duplicate_primitive {
         editing_action_button(
             &app.ui_font,
@@ -25721,6 +38057,9 @@ fn draw_col_asset(app: &AppState, right: Rect, col: &EditingColState) {
         col.dirty,
         false,
     );
+    if !app.col_material_dropdown_open {
+        draw_col_editor_tooltips(&app.ui_font, &layout);
+    }
     // Draw the material dropdown's expanded list last so it overlays the buttons above.
     draw_col_material_dropdown_popup(app);
 }
@@ -25728,6 +38067,1704 @@ fn draw_col_asset(app: &AppState, right: Rect, col: &EditingColState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_edge_bridge_uses_shortest_total_connectors_without_a_bow_tie() {
+        let points = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(6.0, 3.0, 0.0),
+            Vec3::new(7.4, 3.0, 0.0),
+            Vec3::new(10.5, 0.0, 0.0),
+        ];
+
+        let indices = bridge_edge_indices(Vec3::new(5.0, 1.0, 10.0), (0, 1), (2, 3), |index| {
+            points.get(index).copied()
+        })
+        .unwrap();
+        let boundary = (0..4)
+            .map(|index| editing_edge_key(indices[index], indices[(index + 1) % 4]))
+            .collect::<BTreeSet<_>>();
+
+        assert!(boundary.contains(&editing_edge_key(0, 3)));
+        assert!(boundary.contains(&editing_edge_key(1, 2)));
+        assert!(!boundary.contains(&editing_edge_key(0, 2)));
+        assert!(!boundary.contains(&editing_edge_key(1, 3)));
+    }
+
+    #[test]
+    fn make_face_collapses_uv_seam_records_at_the_same_visible_position() {
+        let raw = RawMesh {
+            vertices: vec![
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 1.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+        let selected = BTreeSet::from([0, 1, 2, 3]);
+
+        assert_eq!(
+            unique_raw_vertex_positions(&raw, &selected, Some(2)),
+            BTreeSet::from([0, 2, 3])
+        );
+    }
+
+    #[test]
+    fn make_face_triangulates_a_concave_five_vertex_boundary() {
+        let points = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::new(3.0, 3.0, 0.0),
+            Vec3::new(1.5, 1.0, 0.0),
+            Vec3::new(0.0, 3.0, 0.0),
+        ];
+        let triangles =
+            triangulate_dff_polygon(&[0, 1, 2, 3, 4], |index| points.get(index).copied()).unwrap();
+
+        assert_eq!(triangles.len(), 3);
+        assert_eq!(
+            triangles.iter().flatten().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn created_face_uvs_continue_the_closest_matching_surface() {
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 3.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 3.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 1.5,
+                    y: 0.5,
+                    z: 0.0,
+                },
+            ],
+            uvs: vec![
+                V2 { u: 0.0, v: 0.0 },
+                V2 { u: 1.0, v: 0.0 },
+                V2 { u: 0.0, v: 1.0 },
+                V2::default(),
+                V2::default(),
+                V2::default(),
+                V2::default(),
+                V2::default(),
+            ],
+            triangles: vec![Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 4,
+            }],
+            ..RawMesh::default()
+        };
+
+        let (_, count) = append_dff_polygon_fill(&mut raw, &[3, 4, 5, 6, 7], 4).unwrap();
+
+        assert_eq!(count, 3);
+        for index in 3..8 {
+            assert!((raw.uvs[index].u - raw.vertices[index].x).abs() < 0.0001);
+            assert!((raw.uvs[index].v - raw.vertices[index].y).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn created_face_gets_independent_coherent_uvs_when_reusing_vertices() {
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 3.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 4.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ],
+            uvs: vec![
+                V2 { u: 0.0, v: 0.0 },
+                V2 { u: 1.0, v: 0.0 },
+                V2 { u: 0.0, v: 1.0 },
+                V2 { u: 20.0, v: -8.0 },
+                V2 { u: -12.0, v: 15.0 },
+                V2 { u: 30.0, v: 30.0 },
+                V2 { u: 7.0, v: 7.0 },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 4,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 6,
+                    material: 5,
+                },
+                Tri {
+                    a: 3,
+                    b: 6,
+                    c: 5,
+                    material: 5,
+                },
+            ],
+            ..RawMesh::default()
+        };
+        let old_uvs = raw.uvs.clone();
+        let old_vertex_count = raw.vertices.len();
+
+        let (first, count) = append_dff_polygon_fill(&mut raw, &[3, 4, 5], 4).unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(&raw.uvs[..old_vertex_count], old_uvs.as_slice());
+        let created = raw_triangle_indices(&raw, first).unwrap();
+        assert!(created.iter().all(|index| *index >= old_vertex_count));
+        for index in created {
+            assert!((raw.uvs[index].u - raw.vertices[index].x).abs() < 0.0001);
+            assert!((raw.uvs[index].v - raw.vertices[index].y).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn validation_slicer_defaults_to_200_units() {
+        assert_eq!(default_oversized_chunk_size(), "200");
+    }
+
+    #[test]
+    fn ensuring_a_minimum_material_slot_count_never_discards_later_materials() {
+        let textures = [
+            "trava02", "1skprec3", "1skala4", "1prechod", "1silnice", "betzed1",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let mut raw = RawMesh {
+            material_textures: textures.clone(),
+            materials: vec![RawMaterial::default(); textures.len()],
+            material_animations: vec![DffMaterialAnim::default(); textures.len()],
+            ..RawMesh::default()
+        };
+
+        ensure_dff_material_slots(&mut raw, 1);
+
+        assert_eq!(raw.material_textures, textures);
+        assert_eq!(raw.materials.len(), 6);
+        assert_eq!(raw.material_animations.len(), 6);
+    }
+
+    #[test]
+    fn selected_edge_inherits_the_material_from_its_picked_face() {
+        let raw = RawMesh {
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 2,
+                },
+                Tri {
+                    a: 1,
+                    b: 0,
+                    c: 3,
+                    material: 5,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        assert_eq!(dff_edge_material(&raw, (0, 1), Some(1)), Some(5));
+        assert_eq!(dff_edge_material(&raw, (0, 1), Some(0)), Some(2));
+    }
+
+    fn boolean_test_triangle() -> RawMesh {
+        RawMesh {
+            vertices: vec![
+                V3 {
+                    x: -2.0,
+                    y: -1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: -1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 2.0,
+                    z: 0.0,
+                },
+            ],
+            uvs: vec![
+                V2 { u: 0.0, v: 0.0 },
+                V2 { u: 1.0, v: 0.0 },
+                V2 { u: 0.5, v: 1.0 },
+            ],
+            triangles: vec![Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 7,
+            }],
+            ..RawMesh::default()
+        }
+    }
+
+    #[test]
+    fn boolean_box_clips_faces_and_interpolates_vertex_streams() {
+        let mut raw = boolean_test_triangle();
+        let cutter = DffBooleanBox {
+            center: V3::default(),
+            half_extents: V3 {
+                x: 0.5,
+                y: 0.5,
+                z: 0.5,
+            },
+        };
+
+        assert_eq!(apply_dff_boolean_box(&mut raw, cutter), 1);
+        assert!(raw.triangles.len() > 1);
+        assert!(raw.vertices.len() > 3);
+        assert!(
+            raw.vertices
+                .iter()
+                .skip(3)
+                .any(|vertex| (vertex.x.abs() - 0.5).abs() < 0.0001)
+        );
+        for (vertex, uv) in raw.vertices.iter().zip(&raw.uvs) {
+            assert!((uv.u - (vertex.x + 2.0) / 4.0).abs() < 0.0001);
+        }
+        assert!(raw.triangles.iter().all(|triangle| triangle.material == 7));
+    }
+
+    #[test]
+    fn boolean_box_leaves_non_intersecting_faces_untouched() {
+        let mut raw = boolean_test_triangle();
+        let original = raw.clone();
+        let cutter = DffBooleanBox {
+            center: V3 {
+                x: 10.0,
+                y: 10.0,
+                z: 10.0,
+            },
+            half_extents: V3 {
+                x: 0.5,
+                y: 0.5,
+                z: 0.5,
+            },
+        };
+
+        assert_eq!(apply_dff_boolean_box(&mut raw, cutter), 0);
+        assert!(raw == original);
+    }
+
+    #[test]
+    fn edge_pick_segment_parameter_clamps_to_the_visible_line() {
+        let a = vec2(10.0, 20.0);
+        let b = vec2(30.0, 20.0);
+
+        assert_eq!(closest_segment_parameter(vec2(0.0, 20.0), a, b), 0.0);
+        assert_eq!(closest_segment_parameter(vec2(40.0, 20.0), a, b), 1.0);
+        assert!((closest_segment_parameter(vec2(15.0, 28.0), a, b) - 0.25).abs() < 0.0001);
+        assert_eq!(closest_segment_parameter(vec2(12.0, 22.0), a, a), 0.0);
+    }
+
+    #[test]
+    fn uv_editor_screen_transform_round_trips_with_zoom_and_pan() {
+        let editor = DffUvEditorState {
+            zoom: 2.5,
+            pan: vec2(31.0, -17.0),
+            texture_aspect: 2.0,
+            ..DffUvEditorState::default()
+        };
+        let view = Rect::new(100.0, 50.0, 640.0, 480.0);
+        let source = V2 {
+            u: 0.375,
+            v: 0.8125,
+        };
+
+        let screen = dff_uv_to_screen(view, &editor, source);
+        let restored = dff_uv_from_screen(view, &editor, screen);
+
+        assert!((source.u - restored.u).abs() < 0.00001);
+        assert!((source.v - restored.v).abs() < 0.00001);
+        let size = dff_uv_editor_base_size(view, editor.texture_aspect);
+        assert!((size.x / size.y - 2.0).abs() < 0.00001);
+    }
+
+    #[test]
+    fn uv_editor_scroll_zoom_keeps_uv_under_cursor() {
+        let mut editor = DffUvEditorState::default();
+        let view = Rect::new(100.0, 50.0, 640.0, 480.0);
+        let cursor = vec2(317.0, 221.0);
+        let before = dff_uv_from_screen(view, &editor, cursor);
+
+        zoom_dff_uv_editor(&mut editor, view, cursor, 1.15);
+
+        let after = dff_uv_from_screen(view, &editor, cursor);
+        assert!(editor.zoom > 1.0);
+        let anchored = dff_uv_to_screen(view, &editor, before);
+        assert!(anchored.distance(cursor) <= 1.0);
+        assert!((before.u - after.u).abs() < 0.005);
+        assert!((before.v - after.v).abs() < 0.005);
+    }
+
+    #[test]
+    fn uv_editor_edge_commands_snap_to_material_bounds() {
+        let source = vec![
+            V2 { u: 0.2, v: 0.3 },
+            V2 { u: 0.8, v: 0.9 },
+            V2 { u: 2.0, v: 2.0 },
+        ];
+        let selected = BTreeSet::from([0, 1]);
+        for (edge, expected) in [
+            (DffUvAlignEdge::Left, 0.0),
+            (DffUvAlignEdge::Right, 1.0),
+            (DffUvAlignEdge::Top, 0.0),
+            (DffUvAlignEdge::Bottom, 1.0),
+        ] {
+            let mut raw = RawMesh {
+                uvs: source.clone(),
+                ..RawMesh::default()
+            };
+            assert_eq!(
+                snap_raw_uv_selection_to_material_edge(&mut raw, &selected, edge),
+                2
+            );
+            for index in &selected {
+                let value = match edge {
+                    DffUvAlignEdge::Left | DffUvAlignEdge::Right => raw.uvs[*index].u,
+                    DffUvAlignEdge::Top | DffUvAlignEdge::Bottom => raw.uvs[*index].v,
+                };
+                assert_eq!(value, expected);
+            }
+            assert_eq!(raw.uvs[2], source[2]);
+        }
+    }
+
+    #[test]
+    fn uv_editor_merge_places_every_selected_point_at_average() {
+        let mut raw = RawMesh {
+            uvs: vec![
+                V2 { u: 0.0, v: 0.25 },
+                V2 { u: 1.0, v: 0.75 },
+                V2 { u: 9.0, v: 9.0 },
+            ],
+            ..RawMesh::default()
+        };
+
+        assert_eq!(merge_raw_uv_selection(&mut raw, &BTreeSet::from([0, 1])), 2);
+        assert_eq!(raw.uvs[0], V2 { u: 0.5, v: 0.5 });
+        assert_eq!(raw.uvs[1], V2 { u: 0.5, v: 0.5 });
+        assert_eq!(raw.uvs[2], V2 { u: 9.0, v: 9.0 });
+    }
+
+    #[test]
+    fn uv_editor_blend_averages_connected_neighbors_simultaneously() {
+        let mut raw = RawMesh {
+            uvs: vec![
+                V2 { u: 9.0, v: 9.0 },
+                V2 { u: 1.0, v: 0.0 },
+                V2 { u: 0.0, v: 1.0 },
+                V2 { u: 1.0, v: 1.0 },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 1,
+                    b: 3,
+                    c: 2,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        assert_eq!(
+            blend_raw_uv_selection_with_neighbors(
+                &mut raw,
+                &BTreeSet::from([0]),
+                &BTreeSet::from([0, 1]),
+            ),
+            2
+        );
+        assert_eq!(raw.uvs[0], V2 { u: 0.5, v: 0.5 });
+        // Vertex 1 uses the original UV of selected vertex 0 and never the
+        // just-blended value, making multi-point smoothing deterministic.
+        assert_eq!(raw.uvs[1], V2 { u: 4.5, v: 5.0 });
+        assert_eq!(raw.uvs[2], V2 { u: 0.0, v: 1.0 });
+    }
+
+    #[test]
+    fn uv_editor_blend_ignores_neighbors_on_hidden_faces() {
+        let mut raw = RawMesh {
+            uvs: vec![
+                V2 { u: 4.0, v: 4.0 },
+                V2 { u: 0.0, v: 0.0 },
+                V2 { u: 1.0, v: 0.0 },
+                V2 { u: 100.0, v: 100.0 },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 0,
+                    b: 2,
+                    c: 3,
+                    material: 1,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        assert_eq!(
+            blend_raw_uv_selection_with_neighbors(
+                &mut raw,
+                &BTreeSet::from([0]),
+                &BTreeSet::from([0]),
+            ),
+            1
+        );
+        assert_eq!(raw.uvs[0], V2 { u: 0.5, v: 0.0 });
+    }
+
+    #[test]
+    fn uv_face_blend_detaches_shared_corners_and_preserves_other_faces() {
+        let mut raw = RawMesh {
+            vertices: vec![V3::default(); 4],
+            uvs: vec![
+                V2 { u: 9.0, v: 9.0 },
+                V2 { u: 1.0, v: 0.0 },
+                V2 { u: 0.0, v: 1.0 },
+                V2 { u: 1.0, v: 1.0 },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 1,
+                    b: 3,
+                    c: 2,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+        let untouched_uvs = raw.uvs.clone();
+
+        let (changed, split_count, selected) =
+            blend_raw_uv_faces_with_neighbors(&mut raw, &BTreeSet::from([0]));
+
+        assert_eq!(changed, 3);
+        assert_eq!(split_count, 2);
+        assert_eq!(selected.len(), 3);
+        assert_eq!(
+            [raw.triangles[1].a, raw.triangles[1].b, raw.triangles[1].c],
+            [1, 3, 2]
+        );
+        assert_eq!(raw.uvs[1], untouched_uvs[1]);
+        assert_eq!(raw.uvs[2], untouched_uvs[2]);
+        assert_eq!(raw.uvs[3], untouched_uvs[3]);
+    }
+
+    #[test]
+    fn uv_editor_quick_transforms_use_selection_center() {
+        let source = vec![
+            V2 { u: 0.0, v: 0.0 },
+            V2 { u: 2.0, v: 0.0 },
+            V2 { u: 2.0, v: 1.0 },
+            V2 { u: 0.0, v: 1.0 },
+            V2 { u: 9.0, v: 9.0 },
+        ];
+        let selected = BTreeSet::from([0, 1, 2, 3]);
+
+        let mut rotated = RawMesh {
+            uvs: source.clone(),
+            ..RawMesh::default()
+        };
+        assert_eq!(
+            quick_transform_raw_uv_selection(
+                &mut rotated,
+                &selected,
+                DffUvQuickTransform::Rotate90,
+            ),
+            4
+        );
+        assert_eq!(rotated.uvs[0], V2 { u: 1.5, v: -0.5 });
+        assert_eq!(rotated.uvs[2], V2 { u: 0.5, v: 1.5 });
+
+        let mut mirrored_x = RawMesh {
+            uvs: source.clone(),
+            ..RawMesh::default()
+        };
+        quick_transform_raw_uv_selection(&mut mirrored_x, &selected, DffUvQuickTransform::MirrorX);
+        assert_eq!(mirrored_x.uvs[0], source[1]);
+        assert_eq!(mirrored_x.uvs[2], source[3]);
+
+        let mut mirrored_y = RawMesh {
+            uvs: source.clone(),
+            ..RawMesh::default()
+        };
+        quick_transform_raw_uv_selection(&mut mirrored_y, &selected, DffUvQuickTransform::MirrorY);
+        assert_eq!(mirrored_y.uvs[0], source[3]);
+        assert_eq!(mirrored_y.uvs[2], source[1]);
+        assert_eq!(mirrored_y.uvs[4], source[4]);
+    }
+
+    #[test]
+    fn uv_editor_numeric_scale_accepts_integer_decimal_and_fractional_values() {
+        let mut typed = String::new();
+        assert!(!append_dff_uv_numeric_char(&mut typed, 'y'));
+        assert!(append_dff_uv_numeric_char(&mut typed, '2'));
+        assert!(append_dff_uv_numeric_char(&mut typed, '.'));
+        assert!(append_dff_uv_numeric_char(&mut typed, '5'));
+        assert!(!append_dff_uv_numeric_char(&mut typed, '.'));
+        assert_eq!(typed, "2.5");
+
+        assert_eq!(dff_uv_scale_multiplier("2"), Some(2.0));
+        assert_eq!(dff_uv_scale_multiplier("2.3"), Some(2.3));
+        assert_eq!(dff_uv_scale_multiplier("0.5"), Some(0.5));
+        assert_eq!(dff_uv_scale_multiplier(".5"), Some(0.5));
+        assert_eq!(dff_uv_scale_multiplier("-1"), Some(-1.0));
+        assert_eq!(dff_uv_scale_multiplier(""), None);
+        assert_eq!(dff_uv_scale_multiplier("."), None);
+
+        let start = V2 { u: 0.25, v: 0.25 };
+        let center = V2 { u: 0.5, v: 0.5 };
+        assert_eq!(
+            scale_dff_uv_from_center(start, center, 2.0, DffUvAxis::V),
+            V2 { u: 0.25, v: 0.0 }
+        );
+        assert_eq!(
+            scale_dff_uv_from_center(start, center, 0.5, DffUvAxis::U),
+            V2 { u: 0.375, v: 0.25 }
+        );
+    }
+
+    #[test]
+    fn uv_editor_y_split_shortcut_yields_to_an_active_transform() {
+        assert!(dff_uv_split_shortcut_available(false));
+        assert!(!dff_uv_split_shortcut_available(true));
+    }
+
+    #[test]
+    fn uv_editor_split_duplicates_attributes_and_only_redirects_selected_faces() {
+        let mut raw = RawMesh {
+            vertices: vec![V3::default(); 4],
+            normals: vec![V3::default(); 4],
+            uvs: vec![
+                V2 { u: 0.0, v: 0.0 },
+                V2 { u: 1.0, v: 0.0 },
+                V2 { u: 0.0, v: 1.0 },
+                V2 { u: 1.0, v: 1.0 },
+            ],
+            secondary_uvs: vec![vec![V2::default(); 4]],
+            prelit_colors: vec![V3::default(); 4],
+            prelit_alphas: vec![1.0; 4],
+            night_prelit_colors: vec![V3::default(); 4],
+            night_prelit_alphas: vec![1.0; 4],
+            light_flags: vec![false; 4],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 1,
+                    b: 3,
+                    c: 2,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        let selected =
+            split_raw_uv_selection(&mut raw, &BTreeSet::from([0]), &BTreeSet::from([1, 2]));
+
+        assert_eq!(raw.vertices.len(), 6);
+        assert_eq!(raw.normals.len(), 6);
+        assert_eq!(raw.uvs.len(), 6);
+        assert_eq!(raw.secondary_uvs[0].len(), 6);
+        assert_eq!(raw.triangles[0].a, 0);
+        assert_eq!([raw.triangles[0].b, raw.triangles[0].c], [4, 5]);
+        assert_eq!([raw.triangles[1].a, raw.triangles[1].c], [1, 2]);
+        assert_eq!(selected, BTreeSet::from([4, 5]));
+        assert_eq!(raw.uvs[4], raw.uvs[1]);
+        assert_eq!(raw.uvs[5], raw.uvs[2]);
+    }
+
+    #[test]
+    fn uv_editor_hit_testing_distinguishes_edges_and_faces() {
+        let a = vec2(0.0, 0.0);
+        let b = vec2(100.0, 0.0);
+        let c = vec2(0.0, 100.0);
+
+        assert!(dff_uv_point_segment_distance(vec2(50.0, 4.0), a, b) < 5.0);
+        assert!(dff_uv_point_in_triangle(vec2(25.0, 25.0), a, b, c));
+        assert!(!dff_uv_point_in_triangle(vec2(80.0, 80.0), a, b, c));
+    }
+
+    #[test]
+    fn uv_editor_gizmo_hit_testing_selects_move_axes_and_rotation() {
+        let center = vec2(100.0, 100.0);
+
+        assert_eq!(
+            dff_uv_gizmo_hit(center, center),
+            Some(DffUvGizmoHit::MoveFree)
+        );
+        assert_eq!(
+            dff_uv_gizmo_hit(center, center + vec2(60.0, 2.0)),
+            Some(DffUvGizmoHit::MoveU)
+        );
+        assert_eq!(
+            dff_uv_gizmo_hit(center, center + vec2(2.0, 60.0)),
+            Some(DffUvGizmoHit::MoveV)
+        );
+        assert_eq!(
+            dff_uv_gizmo_hit(center, center + vec2(-42.0, 0.0)),
+            Some(DffUvGizmoHit::Rotate)
+        );
+        assert_eq!(dff_uv_gizmo_hit(center, center + vec2(90.0, 90.0)), None);
+    }
+
+    #[test]
+    fn uv_editor_repeat_preview_covers_visible_integer_tiles() {
+        let view = Rect::new(100.0, 50.0, 640.0, 480.0);
+        let mut editor = DffUvEditorState::default();
+        assert_eq!(dff_uv_visible_texture_tiles(view, &editor), (0, 0, 0, 0));
+
+        editor.repeat_texture = true;
+        assert_eq!(dff_uv_visible_texture_tiles(view, &editor), (-1, 1, 0, 0));
+    }
+
+    #[test]
+    fn uv_editor_material_scope_excludes_other_material_vertices() {
+        let raw = RawMesh {
+            vertices: vec![V3::default(); 6],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 2,
+                    b: 3,
+                    c: 4,
+                    material: 1,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 5,
+                    material: 1,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        assert_eq!(dff_uv_material_vertices(&raw, 0), BTreeSet::from([0, 1, 2]));
+        assert_eq!(
+            dff_uv_material_vertices(&raw, 1),
+            BTreeSet::from([2, 3, 4, 5])
+        );
+    }
+
+    #[test]
+    fn uv_editor_face_scope_excludes_unselected_faces_of_same_material() {
+        let raw = RawMesh {
+            vertices: vec![V3::default(); 6],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 2,
+                    b: 3,
+                    c: 4,
+                    material: 0,
+                },
+                Tri {
+                    a: 1,
+                    b: 4,
+                    c: 5,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        assert_eq!(
+            dff_uv_face_vertices(&raw, &BTreeSet::from([1])),
+            BTreeSet::from([2, 3, 4])
+        );
+        assert_eq!(
+            dff_uv_face_vertices(&raw, &BTreeSet::from([0, 2])),
+            BTreeSet::from([0, 1, 2, 4, 5])
+        );
+    }
+
+    #[test]
+    fn uv_editor_linked_selection_stays_on_seed_island_and_material() {
+        let raw = RawMesh {
+            vertices: vec![V3::default(); 9],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 2,
+                    b: 3,
+                    c: 0,
+                    material: 0,
+                },
+                Tri {
+                    a: 4,
+                    b: 5,
+                    c: 6,
+                    material: 0,
+                },
+                Tri {
+                    a: 3,
+                    b: 7,
+                    c: 8,
+                    material: 1,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        assert_eq!(
+            dff_uv_linked_vertices_in_faces(&raw, &BTreeSet::from([0, 1, 2]), &BTreeSet::from([1])),
+            BTreeSet::from([0, 1, 2, 3])
+        );
+        assert_eq!(
+            dff_uv_linked_vertices_in_faces(&raw, &BTreeSet::from([0, 1, 2]), &BTreeSet::from([5])),
+            BTreeSet::from([4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn dff_mesh_tooltips_cover_every_action() {
+        for label in [
+            "Import + Set Texture",
+            "Add Vertex",
+            "Add Plane",
+            "Add Cube",
+            "Make Face",
+            "Delete Face",
+            "Extrude Selection",
+            "Subdivide",
+            "Knife",
+            "Duplicate Faces",
+            "Shade Flat",
+            "Shade Smooth",
+            "Mark Sharp",
+            "Area Average",
+            "Flip Selected",
+            "Show Normals",
+            "Delete Vertex",
+            "Merge Selected",
+            "Merge by Distance",
+            "Duplicate Material",
+            "Delete Mat Faces",
+            "Separate from Object",
+            "Split Material Limit",
+            "Pivot to Selection",
+            "Pivot to Bounds",
+        ] {
+            assert!(
+                !dff_mesh_tooltip(label).is_empty(),
+                "missing tooltip for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn dff_normal_rebuild_weights_faces_by_surface_area() {
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3::default(),
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 2.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 0,
+                    b: 3,
+                    c: 4,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        recalc_raw_normals(&mut raw);
+
+        let shared = raw.normals[0];
+        assert!(shared.z < -0.9, "large face should dominate: {shared:?}");
+        assert!(
+            shared.x < -0.2,
+            "small face should still contribute: {shared:?}"
+        );
+    }
+
+    fn split_normal_test_mesh(normals: [V3; 2]) -> RawMesh {
+        RawMesh {
+            vertices: vec![
+                V3::default(),
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 2.0,
+                    z: 0.0,
+                },
+                V3::default(),
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+            ],
+            normals: vec![
+                normals[0], normals[0], normals[0], normals[1], normals[1], normals[1],
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 5,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        }
+    }
+
+    fn split_edge_test_mesh(normals: [V3; 2]) -> RawMesh {
+        RawMesh {
+            // The two faces share geometric edge A-B but use independent DFF
+            // vertices, as stock assets do for UV seams and hard normals.
+            vertices: vec![
+                V3::default(),
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3::default(),
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+            ],
+            normals: vec![
+                normals[0], normals[0], normals[0], normals[1], normals[1], normals[1],
+            ],
+            uvs: vec![V2::default(); 6],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 5,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        }
+    }
+
+    #[test]
+    fn inferred_sharp_edges_detect_split_authored_normals() {
+        let raw = split_edge_test_mesh([
+            V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+            V3 {
+                x: -1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+        ]);
+
+        assert_eq!(inferred_dff_sharp_edges(&raw).len(), 1);
+    }
+
+    #[test]
+    fn inferred_sharp_edges_ignore_smooth_uv_seams() {
+        let smooth = V3 {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        };
+        let raw = split_edge_test_mesh([smooth, smooth]);
+
+        assert!(inferred_dff_sharp_edges(&raw).is_empty());
+    }
+
+    #[test]
+    fn standard_dff_sharp_edge_survives_round_trip_and_normal_rebuild() {
+        let raw = split_edge_test_mesh([
+            V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+            V3 {
+                x: -1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+        ]);
+        let bytes = write_normalized_dff(&raw, "stock_split_normals").unwrap();
+        let mut imported = parse_dff_mesh(&bytes);
+
+        assert_eq!(inferred_dff_sharp_edges(&imported).len(), 1);
+        recalc_raw_normals(&mut imported);
+        assert_eq!(inferred_dff_sharp_edges(&imported).len(), 1);
+    }
+
+    #[test]
+    fn normal_rebuild_keeps_matching_split_normals_smooth() {
+        let smooth = V3 {
+            x: 0.0,
+            y: 0.0,
+            z: -1.0,
+        };
+        let mut raw = split_normal_test_mesh([smooth, smooth]);
+
+        recalc_raw_normals(&mut raw);
+
+        assert_eq!(raw.normals[0], raw.normals[3]);
+        assert!(raw.normals[0].z < -0.9);
+        assert!(raw.normals[0].x < -0.2);
+    }
+
+    #[test]
+    fn normal_rebuild_preserves_authored_hard_split() {
+        let mut raw = split_normal_test_mesh([
+            V3 {
+                x: 0.0,
+                y: 0.0,
+                z: -1.0,
+            },
+            V3 {
+                x: -1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+        ]);
+
+        recalc_raw_normals(&mut raw);
+
+        assert!(raw.normals[0].z < -0.99);
+        assert!(raw.normals[0].x.abs() < 0.01);
+        assert!(raw.normals[3].x < -0.99);
+        assert!(raw.normals[3].z.abs() < 0.01);
+    }
+
+    #[test]
+    fn first_authored_vertex_does_not_create_black_prelight_streams() {
+        let mut raw = RawMesh::default();
+
+        let index = raw_append_vertex_average(&mut raw, &[]);
+
+        assert_eq!(index, 0);
+        assert_eq!(raw.vertices.len(), 1);
+        assert_eq!(raw.normals.len(), 1);
+        assert_eq!(raw.uvs.len(), 1);
+        assert!(raw.prelit_colors.is_empty());
+        assert!(raw.prelit_alphas.is_empty());
+        assert!(raw.night_prelit_colors.is_empty());
+        assert!(raw.night_prelit_alphas.is_empty());
+        assert!(raw.light_flags.is_empty());
+    }
+
+    #[test]
+    fn source_less_vertex_in_existing_prelight_streams_is_visible() {
+        let mut raw = RawMesh {
+            vertices: vec![V3::default()],
+            normals: vec![V3::default()],
+            uvs: vec![V2::default()],
+            prelit_colors: vec![V3::default()],
+            prelit_alphas: vec![0.25],
+            night_prelit_colors: vec![V3::default()],
+            night_prelit_alphas: vec![0.5],
+            light_flags: vec![true],
+            ..RawMesh::default()
+        };
+
+        let index = raw_append_vertex_average(&mut raw, &[]);
+
+        assert_eq!(index, 1);
+        assert_eq!(raw.prelit_colors[index], neutral_vertex_color());
+        assert_eq!(raw.prelit_alphas[index], 1.0);
+        assert_eq!(raw.night_prelit_colors[index], neutral_vertex_color());
+        assert_eq!(raw.night_prelit_alphas[index], 1.0);
+        assert!(!raw.light_flags[index]);
+    }
+
+    #[test]
+    fn dff_and_col_editor_tooltips_cover_every_control() {
+        for key in [
+            "select.vertex",
+            "select.edge",
+            "select.face",
+            "select.box_mode",
+            "select.box_distance",
+            "dff.add_2dfx",
+            "dff.delete_2dfx",
+            "dff.2dfx_type",
+            "dff.2dfx_payload",
+            "dff.corona_preset",
+            "dff.regenerate_coronas",
+            "dff.generate_fractures",
+            "dff.manual_fracture",
+            "dff.fracture_origin",
+            "dff.clear_fractures",
+            "dff.simulate_fractures",
+            "dff.texture_preview",
+            "dff.texture_rename",
+            "dff.texture_duplicate",
+            "dff.material_use_txd",
+            "dff.material_import",
+            "dff.material_select_faces",
+            "dff.material_new_faces",
+            "dff.material_assign_faces",
+            "dff.material_remove_unused",
+            "dff.material_color",
+            "dff.material_color_preset",
+            "dff.material_alpha_preset",
+            "dff.material_surface",
+            "dff.collision_material",
+            "dff.shadow_toggle",
+            "dff.shadow_scope",
+            "dff.emitter_toggle",
+            "dff.emitter_source",
+            "dff.emitter_scope",
+            "dff.emitter_cast_mode",
+            "dff.emitter_shadows",
+            "dff.emitter_grouping",
+            "dff.emitter_direction",
+            "dff.emitter_day",
+            "dff.emitter_night",
+            "dff.emitter_inversed",
+            "dff.emitter_brightness",
+            "dff.emitter_falloff",
+            "dff.emitter_temperature",
+            "dff.emitter_color",
+            "dff.face_texture_txd",
+            "dff.face_texture_import",
+            "dff.anim_assign",
+            "dff.anim_clear",
+            "dff.anim_continuous",
+            "dff.anim_speed",
+            "dff.anim_motion",
+            "dff.uv_editor",
+            "dff.uv_close",
+            "dff.uv_select_all",
+            "dff.uv_grid_snap",
+            "dff.uv_vertex_snap",
+            "dff.uv_snap_less",
+            "dff.uv_snap_more",
+            "dff.uv_zoom_out",
+            "dff.uv_zoom_in",
+            "dff.uv_align_left",
+            "dff.uv_align_right",
+            "dff.uv_align_top",
+            "dff.uv_align_bottom",
+            "dff.uv_fit",
+            "dff.uv_repeat",
+            "dff.uv_nudge",
+            "dff.uv_scale",
+            "dff.uv_rotate",
+            "dff.uv_blend_neighbors",
+            "dff.uv_unwrap_face",
+            "dff.uv_unwrap_material",
+            "dff.uv_face_aligned",
+            "dff.uv_box_face",
+            "dff.uv_box_material",
+            "dff.uv_cliff_face",
+            "dff.uv_cliff_material",
+            "dff.cutter_add",
+            "dff.cutter_apply",
+            "dff.cutter_clear",
+            "dff.cutter_resize",
+            "dff.generate_lod",
+            "dff.optimize",
+            "dff.pair_txd",
+            "dff.generate_collision",
+            "dff.flip_normals",
+            "dff.stage",
+            "col.overlay_toggle",
+            "col.overlay_pick",
+            "col.overlay_regenerate",
+            "col.overlay_clear",
+            "col.safe",
+            "col.generation_mode",
+            "col.layer",
+            "col.generate_shadow",
+            "col.add_sphere",
+            "col.add_box",
+            "col.fit_box_to_object",
+            "col.add_capsule",
+            "col.duplicate_primitive",
+            "col.box_pick",
+            "col.capsule_edges",
+            "col.material",
+            "col.light",
+            "col.select_material",
+            "col.primitive_size",
+            "col.primitive_rotation",
+            "col.vertex_position",
+            "col.delete",
+            "col.make_face",
+            "col.flip_face",
+            "col.merge_distance",
+            "col.optimize",
+            "col.cleanup",
+            "col.validate",
+            "col.stage",
+        ] {
+            assert!(!editor_tooltip(key).is_empty(), "missing tooltip for {key}");
+        }
+    }
+
+    #[test]
+    fn face_aligned_unwrap_averages_rotated_top_and_bottom_edges() {
+        let angle = 35.0_f32.to_radians();
+        let along = V3 {
+            x: angle.cos(),
+            y: angle.sin(),
+            z: 0.0,
+        };
+        let point = |across: f32, height: f32| V3 {
+            x: along.x * across,
+            y: along.y * across,
+            z: height,
+        };
+        let mut raw = RawMesh {
+            // The lower and upper edges lean by equal amounts in opposite
+            // directions. Their average direction is the rotated `along` axis.
+            vertices: vec![
+                point(-1.0, 0.0),
+                point(1.0, 0.2),
+                point(1.0, 2.0),
+                point(-1.0, 2.2),
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 0,
+                    b: 2,
+                    c: 3,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+        let vertices = BTreeSet::from([0, 1, 2, 3]);
+        let faces = BTreeSet::from([0, 1]);
+
+        assert_eq!(
+            face_aligned_unwrap_raw_vertices(&mut raw, &vertices, &faces),
+            4
+        );
+        assert!((raw.uvs[0].u - raw.uvs[3].u).abs() < 0.0001);
+        assert!((raw.uvs[1].u - raw.uvs[2].u).abs() < 0.0001);
+
+        let uv_width = raw
+            .uvs
+            .iter()
+            .map(|uv| uv.u)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - raw.uvs.iter().map(|uv| uv.u).fold(f32::INFINITY, f32::min);
+        let uv_height = raw
+            .uvs
+            .iter()
+            .map(|uv| uv.v)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - raw.uvs.iter().map(|uv| uv.v).fold(f32::INFINITY, f32::min);
+        assert!((uv_width / uv_height - 2.0 / 2.2).abs() < 0.0001);
+        assert!(
+            raw.uvs
+                .iter()
+                .all(|uv| (0.0..=1.0).contains(&uv.u) && (0.0..=1.0).contains(&uv.v))
+        );
+    }
+
+    #[test]
+    fn planar_unwrap_selected_faces_rejoins_authored_uv_seam_bounds() {
+        let mut raw = RawMesh {
+            // The triangles form one rectangle, but each side of their shared
+            // diagonal has independently authored vertex records and UV bounds.
+            vertices: vec![
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 4.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 4.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 4.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+            ],
+            uvs: vec![
+                V2 { u: -8.0, v: 0.0 },
+                V2 { u: -4.0, v: 0.0 },
+                V2 { u: -4.0, v: 1.0 },
+                V2 { u: 10.0, v: 0.0 },
+                V2 { u: 14.0, v: 1.0 },
+                V2 { u: 10.0, v: 1.0 },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 5,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+        let faces = BTreeSet::from([0, 1]);
+        let vertices = planar_unwrap_scope_vertices(&raw, &faces, &BTreeSet::new(), 0, false);
+
+        assert_eq!(vertices, BTreeSet::from([0, 1, 2, 3, 4, 5]));
+        assert_eq!(planar_unwrap_raw_vertices(&mut raw, &vertices), 6);
+        assert_eq!(raw.uvs[0], raw.uvs[3]);
+        assert_eq!(raw.uvs[2], raw.uvs[4]);
+        assert_eq!(raw.uvs[0], V2 { u: 0.0, v: 0.0 });
+        assert_eq!(raw.uvs[4], V2 { u: 1.0, v: 1.0 });
+    }
+
+    #[test]
+    fn face_unwrap_auto_splits_shared_boundary_vertices() {
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 1.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+            ],
+            uvs: vec![
+                V2 { u: 0.0, v: 0.0 },
+                V2 { u: 1.0, v: 0.0 },
+                V2 { u: 0.0, v: 1.0 },
+                V2 { u: 1.0, v: 1.0 },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 1,
+                    b: 3,
+                    c: 2,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        assert_eq!(auto_split_unwrap_faces(&mut raw, &BTreeSet::from([0])), 2);
+        assert_eq!(raw.vertices.len(), 6);
+        assert_eq!([raw.triangles[0].b, raw.triangles[0].c], [4, 5]);
+        assert_eq!([raw.triangles[1].a, raw.triangles[1].c], [1, 2]);
+        let surrounding_uvs = [raw.uvs[1], raw.uvs[2]];
+        let selected = dff_uv_face_vertices(&raw, &BTreeSet::from([0]));
+        assert_eq!(planar_unwrap_raw_vertices(&mut raw, &selected), 3);
+        assert_eq!([raw.uvs[1], raw.uvs[2]], surrounding_uvs);
+    }
+
+    #[test]
+    fn box_unwrap_projects_faces_along_their_dominant_axis() {
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 2.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 2.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 2.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 2.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 2.0,
+                    z: 2.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 2.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 2.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 2.0,
+                    z: 2.0,
+                },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 5,
+                    material: 0,
+                },
+                Tri {
+                    a: 6,
+                    b: 7,
+                    c: 8,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+        let vertices = (0..raw.vertices.len()).collect();
+        let faces = (0..raw.triangles.len()).collect();
+
+        assert_eq!(box_unwrap_raw_vertices(&mut raw, &vertices, &faces), 9);
+        assert_eq!(raw.uvs[1], V2 { u: 0.0, v: 1.0 });
+        assert_eq!(raw.uvs[4], V2 { u: 1.0, v: 0.0 });
+        assert_eq!(raw.uvs[7], V2 { u: 1.0, v: 0.0 });
+        assert!(
+            raw.uvs
+                .iter()
+                .all(|uv| (0.0..=1.0).contains(&uv.u) && (0.0..=1.0).contains(&uv.v))
+        );
+    }
+
+    #[test]
+    fn cliff_wrap_pins_rims_and_surface_spaces_middle_ring() {
+        let ring_points = 8usize;
+        let heights = [0.0_f32, 1.0, 3.0];
+        let mut raw = RawMesh::default();
+        for height in heights {
+            for point in 0..ring_points {
+                let angle = std::f32::consts::TAU * point as f32 / ring_points as f32;
+                raw.vertices.push(V3 {
+                    x: angle.cos() * 4.0,
+                    y: angle.sin() * 4.0,
+                    z: height,
+                });
+            }
+        }
+        for ring in 0..heights.len() - 1 {
+            for point in 0..ring_points {
+                let next = (point + 1) % ring_points;
+                let lower = ring * ring_points;
+                let upper = (ring + 1) * ring_points;
+                raw.triangles.extend([
+                    Tri {
+                        a: (lower + point) as u32,
+                        b: (lower + next) as u32,
+                        c: (upper + next) as u32,
+                        material: 0,
+                    },
+                    Tri {
+                        a: (lower + point) as u32,
+                        b: (upper + next) as u32,
+                        c: (upper + point) as u32,
+                        material: 0,
+                    },
+                ]);
+            }
+        }
+        let faces = (0..raw.triangles.len()).collect::<BTreeSet<_>>();
+        let (changed, seam_splits) = cliff_wrap_unwrap_raw_vertices(&mut raw, &faces);
+
+        assert!(changed >= ring_points * heights.len());
+        assert!(seam_splits > 0, "a closed ring needs an automatic UV seam");
+        for point in 0..ring_points {
+            assert!((raw.uvs[point].v - 1.0).abs() < 0.0001);
+            assert!((raw.uvs[ring_points + point].v - 2.0 / 3.0).abs() < 0.0001);
+            assert!(raw.uvs[ring_points * 2 + point].v.abs() < 0.0001);
+        }
+        for face_idx in faces {
+            let indices = raw_triangle_indices(&raw, face_idx).unwrap();
+            let min_u = indices
+                .iter()
+                .map(|index| raw.uvs[*index].u)
+                .fold(f32::INFINITY, f32::min);
+            let max_u = indices
+                .iter()
+                .map(|index| raw.uvs[*index].u)
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(max_u - min_u <= 0.5, "face {face_idx} crosses the UV seam");
+        }
+    }
+
+    #[test]
+    fn dff_material_face_selection_returns_every_matching_face_only() {
+        let raw = RawMesh {
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 3,
+                },
+                Tri {
+                    a: 2,
+                    b: 3,
+                    c: 0,
+                    material: 1,
+                },
+                Tri {
+                    a: 4,
+                    b: 5,
+                    c: 6,
+                    material: 3,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        assert_eq!(
+            dff_face_indices_with_material(&raw, 3),
+            BTreeSet::from([0, 2])
+        );
+        assert!(dff_face_indices_with_material(&raw, 9).is_empty());
+    }
 
     fn unique_test_img_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -25825,6 +39862,39 @@ mod tests {
         let bytes = checked_editing_entry_bytes(&row, (0u8..16).collect()).unwrap();
 
         assert_eq!(bytes, (0u8..9).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn editing_entry_read_refreshes_offsets_after_img_rewrite() {
+        let path = unique_test_img_path("refreshed_entry_offset");
+        write_img_archive(
+            &path,
+            &[
+                ("target.dat".to_string(), vec![1; 33]),
+                ("tail.dat".to_string(), vec![2; 17]),
+            ],
+        )
+        .unwrap();
+        let stale_row = load_editing_img_rows(&path)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.entry.name == "target.dat")
+            .unwrap();
+
+        write_img_archive(
+            &path,
+            &[
+                ("padding.dat".to_string(), vec![9; 4096]),
+                ("target.dat".to_string(), vec![7; 33]),
+                ("tail.dat".to_string(), vec![2; 17]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(read_img_entry(&stale_row.entry)[0], 9);
+        let refreshed = current_editing_entry_bytes(&stale_row).unwrap();
+        assert_eq!(&refreshed[..33], &[7; 33]);
+        fs::remove_file(path).unwrap();
     }
 
     fn test_clockwise_triangle_raw() -> RawMesh {
@@ -26446,6 +40516,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn img_save_collapses_shadowed_duplicate_names_to_the_first_effective_entry() {
+        let missing = PathBuf::from("unused-because-both-entries-are-modified.img");
+        let row = |name: &str, offset| EditingImgRow {
+            entry: ImgEntry {
+                img_path: missing.clone(),
+                name: name.to_string(),
+                offset,
+                size: 2048,
+            },
+            logical_size: 128,
+        };
+        let rows = vec![row("duplicate.dff", 2048), row("DUPLICATE.DFF", 4096)];
+        let modified = BTreeMap::from([("duplicate.dff".to_string(), vec![7, 8, 9])]);
+
+        let entries = editing_img_save_entries(rows, &modified, &BTreeSet::new()).unwrap();
+
+        assert_eq!(entries, vec![("duplicate.dff".to_string(), vec![7, 8, 9])]);
+    }
+
+    #[test]
+    fn img_save_duplicate_confirmation_groups_names_case_insensitively() {
+        let row = |name: &str| EditingImgRow {
+            entry: ImgEntry {
+                img_path: PathBuf::from("unused.img"),
+                name: name.to_string(),
+                offset: 0,
+                size: 2048,
+            },
+            logical_size: 128,
+        };
+        let rows = vec![
+            row("first.dff"),
+            row("FIRST.DFF"),
+            row("first.dff"),
+            row("unique.dff"),
+        ];
+
+        assert_eq!(
+            editing_img_duplicate_names(&rows),
+            vec![("first.dff".to_string(), 3)]
+        );
+    }
+
     fn lod_test_placement(id: &str, dff: &str, lod_parent: Option<&str>) -> Placement {
         let mut attrs = BTreeMap::new();
         if let Some(lod_parent) = lod_parent {
@@ -26460,6 +40574,64 @@ mod tests {
             pos: V3::default(),
             rot: V3::default(),
         }
+    }
+
+    #[test]
+    fn scene_camera_transfer_preserves_view_relative_to_placement() {
+        let placement = Placement {
+            attrs: BTreeMap::from([("scale".to_string(), "2".to_string())]),
+            pos: V3 {
+                x: 120.0,
+                y: -40.0,
+                z: 15.0,
+            },
+            rot: V3 {
+                x: 12.0,
+                y: -18.0,
+                z: 67.0,
+            },
+            ..lod_test_placement("test", "test", None)
+        };
+        let local_pos = vec3(-14.0, 9.0, 22.0);
+        let local_forward = vec3(0.25, 0.83, -0.31).normalize();
+        let model = placement_matrix(&placement);
+        let world_pos = model.transform_point3(local_pos);
+        let world_forward = model.transform_vector3(local_forward).normalize();
+        let camera = CameraState {
+            pos: world_pos,
+            yaw: world_forward.x.atan2(world_forward.y),
+            pitch: world_forward
+                .z
+                .atan2(Vec2::new(world_forward.x, world_forward.y).length()),
+            last_mouse: Vec2::ZERO,
+            looking: true,
+        };
+
+        let transferred = scene_camera_relative_to_placement(camera, &placement).unwrap();
+        let (transferred_forward, _) = camera_vectors(&transferred);
+        assert!(transferred.pos.distance(local_pos) < 0.0001);
+        assert!(transferred_forward.distance(local_forward) < 0.0001);
+        assert!(!transferred.looking);
+    }
+
+    #[test]
+    fn scene_camera_transfer_rejects_non_finite_placement() {
+        let placement = Placement {
+            rot: V3 {
+                x: f32::NAN,
+                ..V3::default()
+            },
+            ..lod_test_placement("test", "test", None)
+        };
+        let camera = CameraState {
+            pos: vec3(10.0, 20.0, 30.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            last_mouse: Vec2::ZERO,
+            looking: false,
+        };
+
+        assert!(scene_camera_relative_to_placement(camera, &placement).is_none());
     }
 
     #[test]
@@ -26620,6 +40792,48 @@ mod tests {
         );
         assert!(editing.added_entries.contains("d3b0890001_fence_a.col"));
         assert!(!editing.deleted_entries.contains("d3b0890001_fence_a.col"));
+    }
+
+    #[test]
+    fn generated_col_uses_project_staging_when_a_col_archive_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "eagle_generated_col_archive_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let imgs = root.join("imgs");
+        fs::create_dir_all(&imgs).unwrap();
+        let dff_archive = imgs.join("dff.img");
+        let col_archive = imgs.join("col.img");
+        write_img_archive(
+            &dff_archive,
+            &[("building.dff".to_string(), vec![1, 2, 3, 4])],
+        )
+        .unwrap();
+        write_img_archive(
+            &col_archive,
+            &[("existing.col".to_string(), vec![5, 6, 7, 8])],
+        )
+        .unwrap();
+        let editing = EditingState {
+            img_path: Some(dff_archive),
+            ..EditingState::default()
+        };
+
+        assert_eq!(
+            existing_col_archive(&root, "generated.col"),
+            Some(col_archive)
+        );
+        assert!(!generated_col_stages_in_open_archive(
+            &root,
+            &editing,
+            "generated.col"
+        ));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -26997,6 +41211,68 @@ mod tests {
                 Some(preset)
             );
         }
+    }
+
+    #[test]
+    fn road_sign_fields_encode_font_blanks_and_attribute_bits() {
+        let mut payload = dff_2dfx_default_payload(7);
+        assert_eq!(payload.len(), 88);
+        assert!(payload[22..86].iter().all(|byte| *byte == b'_'));
+
+        let specs = dff_2dfx_prop_specs(7);
+        let mut position = V3::default();
+        for (label, value) in [
+            ("Text Lines", "2"),
+            ("Characters / Line", "8"),
+            ("Text Color", "3"),
+            ("Text Line 1", "Downtown ^"),
+        ] {
+            let spec = *specs.iter().find(|spec| spec.label == label).unwrap();
+            apply_dff_2dfx_field_value(7, &mut payload, &mut position, spec, value).unwrap();
+        }
+
+        assert_eq!(
+            u16::from_le_bytes([payload[20], payload[21]]) & 0x3f,
+            0b11_11_10
+        );
+        assert_eq!(&payload[22..34], b"Downtown_^__");
+        assert_eq!(road_sign_string(&payload, 22), "Downtown ^");
+    }
+
+    #[test]
+    fn road_sign_rotation_round_trips_through_gizmo_payload_helpers() {
+        let mut effect = Dff2dEffect {
+            position: V3::default(),
+            effect_id: 7,
+            payload: dff_2dfx_default_payload(7),
+        };
+        let rotation = V3 {
+            x: 24.5,
+            y: -90.0,
+            z: 12.25,
+        };
+        assert!(set_dff_2dfx_effect_rotation(&mut effect, rotation));
+        assert_eq!(dff_2dfx_effect_rotation(&effect), Some(rotation));
+
+        let mut light = Dff2dEffect {
+            position: V3::default(),
+            effect_id: 0,
+            payload: dff_2dfx_default_payload(0),
+        };
+        assert!(!set_dff_2dfx_effect_rotation(&mut light, rotation));
+        assert_eq!(dff_2dfx_effect_rotation(&light), None);
+    }
+
+    #[test]
+    fn new_coronas_use_compact_default_sizes() {
+        let default = dff_2dfx_default_light_payload();
+        assert_eq!(f32::from_le_bytes(read_payload(&default, 12)), 0.75);
+        assert!(
+            DFF_CORONA_PRESETS
+                .iter()
+                .all(|preset| preset.corona_size <= 1.25)
+        );
+        assert_eq!(DFF_GENERATED_CORONA_SIZE, 0.40);
     }
 
     #[test]
@@ -28077,6 +42353,17 @@ mod tests {
     }
 
     #[test]
+    fn default_uv_scroll_ends_on_a_seamless_wrapped_tile() {
+        let animation = default_dff_uv_animation("continuous_scroll");
+        let first = animation.frames.first().unwrap();
+        let last = animation.frames.last().unwrap();
+
+        assert_eq!(last.uv[4] - first.uv[4], -1.0);
+        assert_eq!(last.uv[5] - first.uv[5], 0.0);
+        assert_eq!((last.uv[4] - first.uv[4]).fract(), 0.0);
+    }
+
+    #[test]
     fn merge_col_vertices_by_distance_remaps_faces() {
         let vertices = vec![
             V3::default(),
@@ -28458,14 +42745,34 @@ mod tests {
             search_cursor: 4,
             search_anchor: None,
             search_active: true,
+            category_filter: String::new(),
             preview_texture: None,
+            preview_zoom: 1.0,
+            preview_pan: Vec2::ZERO,
+            preview_dragging: false,
+            preview_drag_last: Vec2::ZERO,
             material_picker_open: false,
             material_picker_search: String::new(),
             material_picker_scroll: 0.0,
             material_picker_scope: CollisionMaterialAssignmentScope::ExactTxd,
         };
 
-        assert_eq!(editing_txd_filtered_indices(&txd), vec![1, 2]);
+        assert_eq!(
+            editing_txd_filtered_indices(&txd, &TextureMaterialClasses::default()),
+            vec![1, 2]
+        );
+
+        let mut classes = TextureMaterialClasses::default();
+        classes.set_texture_category("city", "Road_Main", Some("Road"));
+        classes.set_texture_category("city", "road_markings", Some("UI"));
+        let mut categorized = txd.clone();
+        categorized.category_filter = "Road".to_string();
+        assert_eq!(
+            editing_txd_filtered_indices(&categorized, &classes),
+            vec![1]
+        );
+        categorized.category_filter = "__uncategorized".to_string();
+        assert!(editing_txd_filtered_indices(&categorized, &classes).is_empty());
     }
 
     #[test]
@@ -28543,6 +42850,108 @@ mod tests {
     }
 
     #[test]
+    fn imported_dff_material_limit_split_creates_safe_complete_groups() {
+        let material_count = GTA_DFF_MATERIAL_LIMIT * 2 + 1;
+        let raw = RawMesh {
+            vertices: (0..material_count)
+                .flat_map(|material| {
+                    let x = material as f32 * 2.0;
+                    [
+                        V3 { x, y: 0.0, z: 0.0 },
+                        V3 {
+                            x: x + 1.0,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                        V3 { x, y: 1.0, z: 0.0 },
+                    ]
+                })
+                .collect(),
+            triangles: (0..material_count)
+                .map(|material| Tri {
+                    a: (material * 3) as u32,
+                    b: (material * 3 + 1) as u32,
+                    c: (material * 3 + 2) as u32,
+                    material: material as u16,
+                })
+                .collect(),
+            material_textures: (0..material_count)
+                .map(|material| format!("material_{material}"))
+                .collect(),
+            materials: vec![RawMaterial::default(); material_count],
+            material_animations: vec![DffMaterialAnim::default(); material_count],
+            effects_2dfx: vec![Dff2dEffect {
+                position: V3::default(),
+                effect_id: 0,
+                payload: Vec::new(),
+            }],
+            ..RawMesh::default()
+        };
+
+        let groups = split_raw_mesh_by_material_limit(&raw).unwrap();
+        assert_eq!(groups.len(), 3);
+        assert_eq!(
+            groups
+                .iter()
+                .map(dff_material_slot_count)
+                .collect::<Vec<_>>(),
+            [152, 152, 1]
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.triangles.len())
+                .sum::<usize>(),
+            material_count
+        );
+        assert_eq!(groups[0].effects_2dfx.len(), 1);
+        assert!(
+            groups[1..]
+                .iter()
+                .all(|group| group.effects_2dfx.is_empty())
+        );
+        assert_eq!(groups[1].material_textures[0], "material_152");
+        for (index, group) in groups.iter().enumerate() {
+            let bytes = write_normalized_dff(group, &format!("group_{index}")).unwrap();
+            assert!(max_dff_geometry_material_count(&bytes).unwrap() <= GTA_DFF_MATERIAL_LIMIT);
+        }
+    }
+
+    #[test]
+    fn imported_dff_material_repair_compacts_unused_declared_slots() {
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3::default(),
+                V3 {
+                    x: 1.0,
+                    ..V3::default()
+                },
+                V3 {
+                    y: 1.0,
+                    ..V3::default()
+                },
+            ],
+            triangles: vec![Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 152,
+            }],
+            material_textures: vec![String::new(); 153],
+            materials: vec![RawMaterial::default(); 153],
+            material_animations: vec![DffMaterialAnim::default(); 153],
+            ..RawMesh::default()
+        };
+        raw.material_textures[152] = "used".to_string();
+
+        let groups = split_raw_mesh_by_material_limit(&raw).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(dff_material_slot_count(&groups[0]), 1);
+        assert_eq!(groups[0].material_textures, ["used"]);
+        assert_eq!(groups[0].triangles[0].material, 0);
+    }
+
+    #[test]
     fn pivot_shift_and_placement_compensation_preserve_world_position() {
         let pivot = V3 {
             x: 1.0,
@@ -28597,6 +43006,263 @@ mod tests {
                 z: 1.25
             }
         );
+    }
+
+    #[test]
+    fn rotated_freeform_pivot_preserves_mesh_world_transform_and_bakes_geometry() {
+        let pivot = DffFreeformPivot {
+            position: V3 {
+                x: 1.25,
+                y: -0.75,
+                z: 2.0,
+            },
+            rotation: V3 {
+                x: 21.0,
+                y: -34.0,
+                z: 57.0,
+            },
+        };
+        let vertex = V3 {
+            x: 5.0,
+            y: 2.0,
+            z: -1.0,
+        };
+        let normal = V3 {
+            x: 0.2,
+            y: 0.7,
+            z: 0.4,
+        };
+        let frame_pos = V3 {
+            x: -2.0,
+            y: 1.0,
+            z: 3.0,
+        };
+        let mut raw = RawMesh {
+            vertices: vec![vertex],
+            normals: vec![normal],
+            effects_2dfx: vec![Dff2dEffect {
+                position: vertex,
+                ..Dff2dEffect::default()
+            }],
+            frames: vec![RawMeshFrame {
+                right: V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                up: V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                at: V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                pos: frame_pos,
+                ..RawMeshFrame::default()
+            }],
+            ..RawMesh::default()
+        };
+        let placement = Placement {
+            id: "source".to_string(),
+            dff: "source".to_string(),
+            zone: "zone".to_string(),
+            tag: "object".to_string(),
+            attrs: BTreeMap::from([("scale".to_string(), "1.75".to_string())]),
+            pos: V3 {
+                x: 10.0,
+                y: -20.0,
+                z: 30.0,
+            },
+            rot: V3 {
+                x: -11.0,
+                y: 28.0,
+                z: 73.0,
+            },
+        };
+        let original_matrix = placement_matrix(&placement);
+        let original_rotation = placement_rotation_matrix(&placement);
+        let before_vertex = original_matrix.transform_point3(to_mq(vertex));
+        let before_normal = original_rotation.transform_vector3(to_mq(normal).normalize());
+
+        transform_raw_mesh_pivot(&mut raw, pivot);
+        let (position, rotation) = compensated_dff_pivot_placement(&placement, pivot);
+        let mut compensated = placement.clone();
+        compensated.pos = position;
+        compensated.rot = rotation;
+        let compensated_matrix = placement_matrix(&compensated);
+        let compensated_rotation = placement_rotation_matrix(&compensated);
+
+        assert!(
+            before_vertex.distance(compensated_matrix.transform_point3(to_mq(raw.vertices[0])))
+                < 0.0002
+        );
+        assert!(
+            before_vertex
+                .distance(compensated_matrix.transform_point3(to_mq(raw.effects_2dfx[0].position)))
+                < 0.0002
+        );
+        assert_eq!(raw.frames[0].pos, frame_pos);
+        assert!(
+            before_normal.distance(compensated_rotation.transform_vector3(to_mq(raw.normals[0])))
+                < 0.0002
+        );
+    }
+
+    #[test]
+    fn pivot_rewrite_round_trip_keeps_entity_root_centered_and_moves_geometry() {
+        let frame = RawMeshFrame {
+            name: "atomic".to_string(),
+            parent: -1,
+            right: V3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            up: V3 {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            at: V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+            // GTA replaces a clump's root matrix with the entity matrix. DFF
+            // imports therefore normalize this frame to the entity origin.
+            pos: V3::default(),
+        };
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 3.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+            ],
+            triangles: vec![Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 0,
+            }],
+            material_textures: vec![String::new()],
+            materials: vec![RawMaterial::default()],
+            material_animations: vec![DffMaterialAnim::default()],
+            components: vec![RawMeshComponent {
+                name: "atomic".to_string(),
+                frame_index: Some(0),
+                vertex_start: 0,
+                vertex_end: 3,
+                tri_start: 0,
+                tri_end: 1,
+                breakable: None,
+            }],
+            frames: vec![frame.clone()],
+            ..RawMesh::default()
+        };
+        transform_raw_mesh_pivot(
+            &mut raw,
+            DffFreeformPivot {
+                position: V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                rotation: V3::default(),
+            },
+        );
+        let bytes = write_normalized_dff(&raw, "pivoted").unwrap();
+        let reparsed = parse_dff_mesh(&bytes);
+
+        assert_eq!(reparsed.frames[0].pos, frame.pos);
+        assert!((reparsed.vertices[0].x - 1.0).abs() < 0.0001);
+        assert!((reparsed.vertices[1].x - 2.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn freeform_pivot_transforms_col_and_materializes_rotated_native_boxes() {
+        let surface = CollisionSurface {
+            material: 4,
+            flags: 1,
+            brightness: 2,
+            light: 3,
+        };
+        let mut mesh = CollisionMesh {
+            name: "pivot.col".to_string(),
+            spheres: vec![CollisionSphere {
+                center: V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                radius: 0.5,
+                surface: surface.clone(),
+            }],
+            boxes: vec![CollisionBox {
+                min: V3 {
+                    x: 1.0,
+                    y: -1.0,
+                    z: -1.0,
+                },
+                max: V3 {
+                    x: 3.0,
+                    y: 1.0,
+                    z: 1.0,
+                },
+                surface,
+            }],
+            vertices: Vec::new(),
+            faces: Vec::new(),
+            bounds: Bounds {
+                min: Vec3::new(1.0, -1.0, -1.0),
+                max: Vec3::new(3.0, 1.0, 1.0),
+            },
+            shadow_vertices: Vec::new(),
+            shadow_faces: Vec::new(),
+        };
+        transform_collision_mesh_pivot(
+            &mut mesh,
+            DffFreeformPivot {
+                position: V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                rotation: V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 45.0,
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(mesh.boxes.is_empty());
+        assert_eq!(mesh.vertices.len(), COL_CUBOID_VERTEX_COUNT);
+        assert_eq!(mesh.faces.len(), COL_CUBOID_FACE_COUNT);
+        assert!((mesh.spheres[0].center.x - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
+        assert!((mesh.spheres[0].center.y + std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
+
+        let template = col_regeneration_template(&[], "pivot.col");
+        let bytes = write_col_mesh_from_template(&template, &mesh).unwrap();
+        assert!(!col_validation_has_errors(&validate_col_for_game_load(
+            "pivot.col",
+            &bytes
+        )));
     }
 
     #[test]
@@ -28699,6 +43365,102 @@ mod tests {
             panel_scroll: 0.0,
             panel_collapsed: col_default_collapsed(),
         }
+    }
+
+    #[test]
+    fn selected_col_box_fits_exactly_to_object_bounds() {
+        let mut mesh = empty_capsule_test_mesh();
+        mesh.boxes.push(CollisionBox {
+            min: V3 {
+                x: -1.0,
+                y: -1.0,
+                z: -1.0,
+            },
+            max: V3 {
+                x: 1.0,
+                y: 1.0,
+                z: 1.0,
+            },
+            surface: CollisionSurface {
+                material: 4,
+                flags: 0,
+                brightness: 0,
+                light: 255,
+            },
+        });
+        let mut col = test_editing_col_state(mesh, Vec::new(), Vec::new());
+        col.selected_primitive = Some(CollisionPrimitiveSelection {
+            kind: CollisionPrimitiveKind::Box,
+            index: 0,
+        });
+        let object_bounds = Bounds {
+            min: vec3(-7.5, 2.25, -0.125),
+            max: vec3(14.0, 3.75, 9.5),
+        };
+
+        fit_selected_col_box_to_bounds(&mut col, object_bounds).unwrap();
+
+        assert_eq!(col.mesh.boxes[0].min, from_mq(object_bounds.min));
+        assert_eq!(col.mesh.boxes[0].max, from_mq(object_bounds.max));
+        assert!(col.mesh.bounds == object_bounds);
+        assert!(col.dirty);
+    }
+
+    #[test]
+    fn rotated_col_box_fit_resets_rotation_and_matches_object_bounds() {
+        let mut mesh = empty_capsule_test_mesh();
+        let surface = CollisionSurface {
+            material: 4,
+            flags: 0,
+            brightness: 0,
+            light: 255,
+        };
+        let cuboid = append_cuboid_artifacts(
+            &mut mesh,
+            V3::default(),
+            V3 {
+                x: 1.0,
+                y: 1.0,
+                z: 1.0,
+            },
+            V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 35.0,
+            },
+            surface,
+        )
+        .unwrap();
+        let mut col = test_editing_col_state(mesh, Vec::new(), vec![cuboid]);
+        col.selected_primitive = Some(CollisionPrimitiveSelection {
+            kind: CollisionPrimitiveKind::Cuboid,
+            index: 0,
+        });
+        let object_bounds = Bounds {
+            min: vec3(-4.0, -2.0, 1.0),
+            max: vec3(8.0, 6.0, 5.0),
+        };
+
+        fit_selected_col_box_to_bounds(&mut col, object_bounds).unwrap();
+
+        assert_eq!(
+            col.cuboids[0].center,
+            V3 {
+                x: 2.0,
+                y: 2.0,
+                z: 3.0
+            }
+        );
+        assert_eq!(
+            col.cuboids[0].half_extents,
+            V3 {
+                x: 6.0,
+                y: 4.0,
+                z: 2.0
+            }
+        );
+        assert_eq!(col.cuboids[0].rotation, V3::default());
+        assert!(col.mesh.bounds == object_bounds);
     }
 
     #[test]
@@ -28964,13 +43726,7 @@ mod tests {
             lod_only: false,
             definition_ids_to_assign: Vec::new(),
         };
-        let generated = serialize_generated_collision(
-            Path::new("/definitely/not/an/eagle/resource"),
-            &BTreeMap::new(),
-            &source,
-            mesh,
-        )
-        .unwrap();
+        let generated = serialize_generated_collision(&source, mesh, &[]).unwrap();
         assert!(!col_validation_has_errors(&validate_col_for_game_load(
             "capsule_test.col",
             &generated.bytes
@@ -29016,5 +43772,305 @@ mod tests {
             2,
             "wall"
         ));
+    }
+
+    #[test]
+    fn world_scale_uv_uses_transformed_world_distance_and_multiplier() {
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 3.0,
+                    z: 0.0,
+                },
+            ],
+            uvs: vec![V2::default(); 3],
+            triangles: vec![Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 4,
+            }],
+            ..RawMesh::default()
+        };
+        let mut attrs = BTreeMap::new();
+        attrs.insert("scale".to_string(), "2".to_string());
+        let placement = Placement {
+            id: "grass_patch".to_string(),
+            dff: "grass_patch".to_string(),
+            zone: "test".to_string(),
+            tag: "object".to_string(),
+            attrs,
+            pos: V3 {
+                x: 10.0,
+                y: 20.0,
+                z: 0.0,
+            },
+            rot: V3::default(),
+        };
+
+        assert_eq!(
+            world_scale_box_unwrap_material(&mut raw, 4, &placement, 0.5, false),
+            3
+        );
+        assert_eq!(raw.uvs[0], V2 { u: 5.0, v: 10.0 });
+        assert_eq!(raw.uvs[1], V2 { u: 7.0, v: 10.0 });
+        assert_eq!(raw.uvs[2], V2 { u: 5.0, v: 13.0 });
+    }
+
+    #[test]
+    fn world_uv_variation_is_identical_at_shared_world_seams() {
+        let shared = vec3(412.25, -88.5, 17.0);
+        let from_left_dff = varied_world_uv_position(shared);
+        let from_right_dff = varied_world_uv_position(shared);
+        assert_eq!(from_left_dff, from_right_dff);
+
+        let nearby = varied_world_uv_position(shared + vec3(0.001, 0.0, 0.0));
+        assert!(nearby.distance(from_left_dff) < 0.002);
+        assert_ne!(from_left_dff, shared);
+    }
+
+    #[test]
+    fn world_uv_variation_breaks_up_repeating_ground_directions() {
+        let edge_at = |origin: Vec3| {
+            varied_world_uv_position(origin + vec3(8.0, 0.0, 0.0))
+                - varied_world_uv_position(origin)
+        };
+        let first = edge_at(vec3(0.0, 0.0, 0.0));
+        let later = edge_at(vec3(24.0, 0.0, 0.0));
+        assert!(first.distance(later) > 0.5);
+
+        // The old single sine octave repeated every 96 world units. Hashed
+        // noise must not recreate that regularity on a large grass plane.
+        let start = vec3(250.0, -110.0, 4.0);
+        let repeated = start + vec3(96.0, 0.0, 0.0);
+        let start_offset = varied_world_uv_position(start) - start;
+        let repeated_offset = varied_world_uv_position(repeated) - repeated;
+        assert!(start_offset.distance(repeated_offset) > 0.5);
+    }
+
+    fn world_unwrap_placement() -> Placement {
+        Placement {
+            id: "terrain".to_string(),
+            dff: "terrain".to_string(),
+            zone: "test".to_string(),
+            tag: "object".to_string(),
+            attrs: BTreeMap::new(),
+            pos: V3::default(),
+            rot: V3::default(),
+        }
+    }
+
+    fn world_unwrap_v3(x: f32, y: f32, z: f32) -> V3 {
+        V3 { x, y, z }
+    }
+
+    /// Flat ground running into a tall steep wall. The two vertices on the
+    /// crease belong to both, so their averaged normal leans toward the wall
+    /// while the ground faces sharing them stay horizontal.
+    fn world_unwrap_ridge_mesh() -> RawMesh {
+        RawMesh {
+            vertices: vec![
+                world_unwrap_v3(0.0, 0.0, 0.0),
+                world_unwrap_v3(0.0, 5.0, 0.0),
+                world_unwrap_v3(10.0, 0.0, 0.0),
+                world_unwrap_v3(10.0, 5.0, 0.0),
+                world_unwrap_v3(12.0, 0.0, 30.0),
+                world_unwrap_v3(12.0, 5.0, 30.0),
+            ],
+            uvs: vec![V2::default(); 6],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 2,
+                    c: 1,
+                    material: 0,
+                },
+                Tri {
+                    a: 1,
+                    b: 2,
+                    c: 3,
+                    material: 0,
+                },
+                Tri {
+                    a: 2,
+                    b: 4,
+                    c: 3,
+                    material: 1,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 5,
+                    material: 1,
+                },
+            ],
+            material_textures: vec!["grass".to_string(), "rock".to_string()],
+            ..RawMesh::default()
+        }
+    }
+
+    fn world_unwrap_uv_area(raw: &RawMesh, face: usize) -> f32 {
+        let tri = &raw.triangles[face];
+        let uv = |index: u32| {
+            let value = raw.uvs[index as usize];
+            Vec2::new(value.u, value.v)
+        };
+        ((uv(tri.b) - uv(tri.a)).perp_dot(uv(tri.c) - uv(tri.a)) * 0.5).abs()
+    }
+
+    fn world_unwrap_face_area(raw: &RawMesh, face: usize) -> f32 {
+        let tri = &raw.triangles[face];
+        let point = |index: u32| to_mq(raw.vertices[index as usize]);
+        (point(tri.b) - point(tri.a))
+            .cross(point(tri.c) - point(tri.a))
+            .length()
+            * 0.5
+    }
+
+    fn world_unwrap_face_uvs(raw: &RawMesh) -> Vec<[(f32, f32); 3]> {
+        raw.triangles
+            .iter()
+            .map(|tri| {
+                // A bin-mesh round trip may rotate a triangle's corner order,
+                // so compare each face as an unordered corner set.
+                let mut corners = [tri.a, tri.b, tri.c].map(|index| {
+                    let uv = raw.uvs[index as usize];
+                    (uv.u, uv.v)
+                });
+                corners.sort_by(|left, right| left.partial_cmp(right).expect("finite UV"));
+                corners
+            })
+            .collect()
+    }
+
+    /// Mirrors `update_preview_world_uv_job`, which resolves the materials to
+    /// unwrap by texture name and hands those indices to the worker.
+    fn world_unwrap_materials_named(raw: &RawMesh, texture: &str) -> Vec<usize> {
+        raw.material_textures
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| name.eq_ignore_ascii_case(texture))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn world_unwrap_keeps_every_face_on_a_single_projection_plane() {
+        let mut raw = world_unwrap_ridge_mesh();
+        let placement = world_unwrap_placement();
+        assert!(world_scale_box_unwrap_material(&mut raw, 0, &placement, 1.0, false) > 0);
+        assert!(world_scale_box_unwrap_material(&mut raw, 1, &placement, 1.0, false) > 0);
+
+        for face in 0..raw.triangles.len() {
+            let uv_area = world_unwrap_uv_area(&raw, face);
+            let face_area = world_unwrap_face_area(&raw, face);
+            // Box-projecting at 1x shrinks a face by the cosine between its
+            // normal and the projection axis, which stays above 1/sqrt(3) once
+            // the axis is chosen per face. Corners taken from two different
+            // planes collapse the face far below that.
+            assert!(
+                uv_area >= face_area * 0.5,
+                "face {face} projected to {uv_area} UV area for {face_area} world area"
+            );
+        }
+    }
+
+    #[test]
+    fn world_unwrap_repeats_without_changing_the_result() {
+        let placement = world_unwrap_placement();
+        // The editor always works from a parsed DFF, so start from a real
+        // round trip rather than a hand-built RawMesh.
+        let seed = write_normalized_dff(&world_unwrap_ridge_mesh(), "terrain").expect("seed write");
+
+        let mut current = parse_dff_mesh(&seed);
+        let mut passes = Vec::new();
+        for _ in 0..3 {
+            for material in world_unwrap_materials_named(&current, "grass") {
+                world_scale_box_unwrap_material(&mut current, material, &placement, 1.0, false);
+            }
+            current = parse_dff_mesh(&write_normalized_dff(&current, "terrain").expect("write"));
+            passes.push((
+                current.material_textures.clone(),
+                world_unwrap_face_uvs(&current),
+            ));
+        }
+
+        for (index, pass) in passes.iter().enumerate().skip(1) {
+            assert_eq!(
+                *pass,
+                passes[0],
+                "world unwrap pass {} diverged from the first pass",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn multi_atomic_dff_round_trip_keeps_one_material_table() {
+        let mut raw = world_unwrap_ridge_mesh();
+        raw.frames = ["ground", "wall"]
+            .into_iter()
+            .map(|name| RawMeshFrame {
+                name: name.to_string(),
+                parent: -1,
+                right: world_unwrap_v3(1.0, 0.0, 0.0),
+                up: world_unwrap_v3(0.0, 1.0, 0.0),
+                at: world_unwrap_v3(0.0, 0.0, 1.0),
+                pos: V3::default(),
+            })
+            .collect();
+        raw.components = vec![
+            RawMeshComponent {
+                name: "ground".to_string(),
+                frame_index: Some(0),
+                vertex_start: 0,
+                vertex_end: 6,
+                tri_start: 0,
+                tri_end: 2,
+                breakable: None,
+            },
+            RawMeshComponent {
+                name: "wall".to_string(),
+                frame_index: Some(1),
+                vertex_start: 0,
+                vertex_end: 6,
+                tri_start: 2,
+                tri_end: 4,
+                breakable: None,
+            },
+        ];
+
+        // Each atomic carries the whole model's material list, so appending
+        // them unconditionally used to double the table on every rewrite and
+        // move the index that identifies a texture.
+        let mut current = raw;
+        for pass in 1..=3 {
+            current = parse_dff_mesh(&write_normalized_dff(&current, "terrain").expect("write"));
+            assert_eq!(
+                current.material_textures,
+                ["grass".to_string(), "rock".to_string()],
+                "material table grew on rewrite {pass}"
+            );
+            assert_eq!(
+                current
+                    .triangles
+                    .iter()
+                    .map(|tri| tri.material)
+                    .collect::<Vec<_>>(),
+                [0, 0, 1, 1],
+                "triangle material indices moved on rewrite {pass}"
+            );
+        }
     }
 }

@@ -1,5 +1,142 @@
 use super::super::*;
 
+type VisibleCell = (f32, usize);
+type VisibleBlendSegment = (f32, usize, usize, usize, usize);
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ViewportRenderDiagnostics {
+    pub(crate) frame_ms: f64,
+    pub(crate) cull_ms: f64,
+    pub(crate) sort_ms: f64,
+    pub(crate) submit_ms: f64,
+    pub(crate) candidate_cells: usize,
+    pub(crate) visible_cells: usize,
+    pub(crate) submitted_cells: usize,
+    pub(crate) blend_segments: usize,
+    pub(crate) draw_calls: usize,
+    pub(crate) state_changes: usize,
+    pub(crate) resident_cells: usize,
+    pub(crate) resident_bytes: usize,
+    pub(crate) residency_uploads: usize,
+    pub(crate) residency_evictions: usize,
+    pub(crate) residency_misses: usize,
+}
+
+std::thread_local! {
+    static VIEWPORT_DIAGNOSTICS_CURRENT: std::cell::RefCell<Option<ViewportRenderDiagnostics>> =
+        const { std::cell::RefCell::new(None) };
+    static VIEWPORT_DIAGNOSTICS_LATEST: std::cell::Cell<ViewportRenderDiagnostics> =
+        const { std::cell::Cell::new(ViewportRenderDiagnostics {
+            frame_ms: 0.0,
+            cull_ms: 0.0,
+            sort_ms: 0.0,
+            submit_ms: 0.0,
+            candidate_cells: 0,
+            visible_cells: 0,
+            submitted_cells: 0,
+            blend_segments: 0,
+            draw_calls: 0,
+            state_changes: 0,
+            resident_cells: 0,
+            resident_bytes: 0,
+            residency_uploads: 0,
+            residency_evictions: 0,
+            residency_misses: 0,
+        }) };
+}
+
+struct ViewportDiagnosticsFrame {
+    started: Option<Instant>,
+}
+
+impl ViewportDiagnosticsFrame {
+    fn begin(enabled: bool) -> Self {
+        let started = enabled.then(Instant::now);
+        if enabled {
+            VIEWPORT_DIAGNOSTICS_CURRENT.with(|sample| {
+                *sample.borrow_mut() = Some(ViewportRenderDiagnostics::default());
+            });
+        }
+        Self { started }
+    }
+}
+
+impl Drop for ViewportDiagnosticsFrame {
+    fn drop(&mut self) {
+        let Some(started) = self.started else {
+            return;
+        };
+        VIEWPORT_DIAGNOSTICS_CURRENT.with(|current| {
+            if let Some(mut sample) = current.borrow_mut().take() {
+                sample.frame_ms = started.elapsed().as_secs_f64() * 1000.0;
+                VIEWPORT_DIAGNOSTICS_LATEST.with(|latest| latest.set(sample));
+            }
+        });
+    }
+}
+
+fn viewport_diagnostics_enabled() -> bool {
+    VIEWPORT_DIAGNOSTICS_CURRENT.with(|sample| sample.borrow().is_some())
+}
+
+fn update_viewport_diagnostics(update: impl FnOnce(&mut ViewportRenderDiagnostics)) {
+    VIEWPORT_DIAGNOSTICS_CURRENT.with(|sample| {
+        if let Some(sample) = sample.borrow_mut().as_mut() {
+            update(sample);
+        }
+    });
+}
+
+pub(crate) fn viewport_render_diagnostics() -> ViewportRenderDiagnostics {
+    VIEWPORT_DIAGNOSTICS_LATEST.with(std::cell::Cell::get)
+}
+
+std::thread_local! {
+    /// Frame-local scratch storage avoids reallocating the same visibility and
+    /// blend-sort buffers on every render pass. Rendering is confined to the
+    /// window thread, so a thread-local pool also avoids synchronization.
+    static VISIBLE_CELL_SCRATCH: std::cell::RefCell<Vec<VisibleCell>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static VISIBLE_BLEND_SEGMENT_SCRATCH: std::cell::RefCell<Vec<VisibleBlendSegment>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_visible_cell_scratch() -> Vec<VisibleCell> {
+    VISIBLE_CELL_SCRATCH.with(|scratch| std::mem::take(&mut *scratch.borrow_mut()))
+}
+
+fn recycle_visible_cell_scratch(mut scratch: Vec<VisibleCell>) {
+    scratch.clear();
+    VISIBLE_CELL_SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
+}
+
+fn take_visible_blend_segment_scratch() -> Vec<VisibleBlendSegment> {
+    VISIBLE_BLEND_SEGMENT_SCRATCH.with(|scratch| std::mem::take(&mut *scratch.borrow_mut()))
+}
+
+fn recycle_visible_blend_segment_scratch(mut scratch: Vec<VisibleBlendSegment>) {
+    scratch.clear();
+    VISIBLE_BLEND_SEGMENT_SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
+}
+
+fn sort_visible_cells_nearest_first(cells: &mut [VisibleCell]) {
+    cells.sort_unstable_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+}
+
+fn sort_blend_segments_farthest_first(segments: &mut [VisibleBlendSegment]) {
+    segments.sort_unstable_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // Preserve the insertion order formerly supplied by stable sort
+            // when two segments have the same depth.
+            .then_with(|| a.4.cmp(&b.4))
+    });
+}
+
 pub(crate) fn placement_matrix(p: &Placement) -> Mat4 {
     let pos = to_mq(p.pos);
     Mat4::from_translation(pos)
@@ -82,6 +219,361 @@ pub(crate) fn aabb_in_frustum(planes: &[Plane; 6], min: Vec3, max: Vec3) -> bool
     })
 }
 
+const DEFAULT_WORLD_DRAW_DISTANCE: f32 = 200.0;
+
+fn definition_world_draw_distance(definition: Option<&Definition>) -> f32 {
+    definition
+        .into_iter()
+        .flat_map(|definition| ["lodDistance", "drawDistance"].map(|key| definition.attrs.get(key)))
+        .flatten()
+        .find_map(|value| {
+            value
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())
+        })
+        .unwrap_or(DEFAULT_WORLD_DRAW_DISTANCE)
+}
+
+fn quantize_world_draw_distance(distance: f32) -> WorldDrawDistanceTier {
+    if distance <= 128.0 {
+        WorldDrawDistanceTier::D128
+    } else if distance <= 256.0 {
+        WorldDrawDistanceTier::D256
+    } else if distance <= 512.0 {
+        WorldDrawDistanceTier::D512
+    } else if distance <= 1024.0 {
+        WorldDrawDistanceTier::D1024
+    } else if distance <= 2048.0 {
+        WorldDrawDistanceTier::D2048
+    } else if distance <= 4096.0 {
+        WorldDrawDistanceTier::D4096
+    } else if distance <= 8192.0 {
+        WorldDrawDistanceTier::D8192
+    } else {
+        WorldDrawDistanceTier::Infinite
+    }
+}
+
+/// Approximate the engine's high-detail draw-distance rules conservatively.
+/// Base objects, scenery, and buildings all use their authored model distance;
+/// MTA's 5x rule belongs only to elements acting as low-LOD objects. Very small
+/// authored values are promoted to the canonical 700-unit fallback.
+pub(crate) fn placement_world_draw_distance_tier(
+    placement: &Placement,
+    definitions: &HashMap<String, Definition>,
+) -> WorldDrawDistanceTier {
+    let mut distance = definition_world_draw_distance(definitions.get(&placement.id));
+    if distance < 10.0 {
+        distance = 700.0;
+    }
+    quantize_world_draw_distance(distance)
+}
+
+fn placement_has_lod_parent(placement: &Placement) -> bool {
+    placement
+        .attrs
+        .get("lodParent")
+        .is_some_and(|parent| !parent.trim().is_empty())
+}
+
+/// Linked detail/LOD pairs retain the existing global swap band. Applying an
+/// individual authored tier to either half could create a hole before the
+/// globally configured LOD transition.
+pub(crate) fn placement_world_draw_distance_tier_for_render(
+    placement: &Placement,
+    definitions: &HashMap<String, Definition>,
+    want_lod: bool,
+) -> WorldDrawDistanceTier {
+    if want_lod || placement_has_lod_parent(placement) {
+        WorldDrawDistanceTier::Infinite
+    } else {
+        placement_world_draw_distance_tier(placement, definitions)
+    }
+}
+
+fn world_cell_far_distance(
+    global_far: f32,
+    tier: WorldDrawDistanceTier,
+    draw_distance_percent: u16,
+) -> f32 {
+    if draw_distance_percent == 0 {
+        return global_far;
+    }
+    let scaled_tier = tier.distance() * draw_distance_percent as f32 / 100.0;
+    global_far.min(scaled_tier)
+}
+
+fn world_cell_in_distance_band(
+    cell: &WorldCell,
+    distance_squared: f32,
+    near: f32,
+    global_far: f32,
+    draw_distance_percent: u16,
+) -> bool {
+    let far_edge =
+        world_cell_far_distance(global_far, cell.draw_distance_tier, draw_distance_percent)
+            + cell.radius;
+    if distance_squared > far_edge * far_edge {
+        return false;
+    }
+    let near_edge = near - cell.radius;
+    near_edge <= 0.0 || distance_squared >= near_edge * near_edge
+}
+
+const WORLD_CELL_GPU_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+const WORLD_CELL_RESIDENCY_MARGIN: f32 = 512.0;
+const WORLD_CELL_RESIDENCY_GRACE_SECONDS: f64 = 2.0;
+
+#[derive(Clone, Copy)]
+struct WorldCellResidencyPlan {
+    lod: bool,
+    index: usize,
+    distance_squared: f32,
+    preload: bool,
+    visible: bool,
+}
+
+fn world_cell_in_residency_band(
+    cell: &WorldCell,
+    distance_squared: f32,
+    near: f32,
+    global_far: f32,
+    draw_distance_percent: u16,
+) -> bool {
+    let far = world_cell_far_distance(global_far, cell.draw_distance_tier, draw_distance_percent);
+    let far_edge = far + cell.radius + WORLD_CELL_RESIDENCY_MARGIN;
+    if distance_squared > far_edge * far_edge {
+        return false;
+    }
+    let near_edge = near - cell.radius - WORLD_CELL_RESIDENCY_MARGIN;
+    near_edge <= 0.0 || distance_squared >= near_edge * near_edge
+}
+
+fn upload_world_cell_vbo(cell: &mut WorldCell) -> bool {
+    if cell.vbo != 0 {
+        return true;
+    }
+    let vertex_count = cell.batches.iter().map(|batch| batch.data.len()).sum();
+    if vertex_count == 0 {
+        return false;
+    }
+    let mut packed = Vec::<WorldVertex>::with_capacity(vertex_count);
+    for batch in &cell.batches {
+        packed.extend_from_slice(&batch.data);
+    }
+    let mut vbo = 0;
+    unsafe {
+        gl::GenBuffers(1, &mut vbo);
+        if vbo != 0 {
+            gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                std::mem::size_of_val(packed.as_slice()) as isize,
+                packed.as_ptr().cast(),
+                gl::STATIC_DRAW,
+            );
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+        }
+    }
+    if vbo == 0 {
+        return false;
+    }
+    cell.vbo = vbo;
+    true
+}
+
+fn delete_world_cell_vbo(cell: &mut WorldCell) -> bool {
+    if cell.vbo == 0 {
+        return false;
+    }
+    unsafe {
+        gl::DeleteBuffers(1, &cell.vbo);
+    }
+    cell.vbo = 0;
+    true
+}
+
+fn residency_cell<'a>(
+    detail: &'a [WorldCell],
+    lod: &'a [WorldCell],
+    plan: WorldCellResidencyPlan,
+) -> &'a WorldCell {
+    if plan.lod {
+        &lod[plan.index]
+    } else {
+        &detail[plan.index]
+    }
+}
+
+fn residency_cell_mut<'a>(
+    detail: &'a mut [WorldCell],
+    lod: &'a mut [WorldCell],
+    plan: WorldCellResidencyPlan,
+) -> &'a mut WorldCell {
+    if plan.lod {
+        &mut lod[plan.index]
+    } else {
+        &mut detail[plan.index]
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_world_cell_residency(
+    detail: &mut [WorldCell],
+    lod: &mut [WorldCell],
+    cam: Vec3,
+    detail_far: f32,
+    lod_near: f32,
+    lod_far: f32,
+    draw_distance_percent: u16,
+    draw_lod: bool,
+    frustum: &[Plane; 6],
+) {
+    let now = get_time();
+    let mut plans = Vec::with_capacity(detail.len() + lod.len());
+    for (is_lod, cells) in [(false, &mut *detail), (true, &mut *lod)] {
+        let (near, far, enabled) = if is_lod {
+            (lod_near, lod_far, draw_lod)
+        } else {
+            (0.0, detail_far, true)
+        };
+        for (index, cell) in cells.iter_mut().enumerate() {
+            let distance_squared = (cell.center - cam).length_squared();
+            let preload = enabled
+                && world_cell_in_residency_band(
+                    cell,
+                    distance_squared,
+                    near,
+                    far,
+                    draw_distance_percent,
+                );
+            let visible = enabled
+                && world_cell_in_distance_band(
+                    cell,
+                    distance_squared,
+                    near,
+                    far,
+                    draw_distance_percent,
+                )
+                && aabb_in_frustum(frustum, cell.min, cell.max);
+            if preload {
+                cell.resident_last_required_at = now;
+            }
+            plans.push(WorldCellResidencyPlan {
+                lod: is_lod,
+                index,
+                distance_squared,
+                preload,
+                visible,
+            });
+        }
+    }
+
+    let mut resident_bytes = plans
+        .iter()
+        .map(|plan| residency_cell(detail, lod, *plan))
+        .filter(|cell| cell.vbo != 0)
+        .map(|cell| cell.gpu_bytes)
+        .sum::<usize>();
+    let mut uploads = 0usize;
+    let mut evictions = 0usize;
+    let mut misses = 0usize;
+
+    let mut candidates = plans
+        .iter()
+        .copied()
+        .filter(|plan| plan.preload && residency_cell(detail, lod, *plan).vbo == 0)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|left, right| {
+        right.visible.cmp(&left.visible).then_with(|| {
+            left.distance_squared
+                .partial_cmp(&right.distance_squared)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    for candidate in candidates {
+        let bytes = residency_cell(detail, lod, candidate).gpu_bytes;
+        while resident_bytes.saturating_add(bytes) > WORLD_CELL_GPU_BUDGET_BYTES {
+            let victim = plans
+                .iter()
+                .copied()
+                .filter(|plan| {
+                    let cell = residency_cell(detail, lod, *plan);
+                    cell.vbo != 0 && !plan.visible && (!plan.preload || candidate.visible)
+                })
+                .min_by(|left, right| {
+                    let left_cell = residency_cell(detail, lod, *left);
+                    let right_cell = residency_cell(detail, lod, *right);
+                    left.preload
+                        .cmp(&right.preload)
+                        .then_with(|| {
+                            left_cell
+                                .resident_last_required_at
+                                .partial_cmp(&right_cell.resident_last_required_at)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .then_with(|| {
+                            right
+                                .distance_squared
+                                .partial_cmp(&left.distance_squared)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                });
+            let Some(victim) = victim else {
+                break;
+            };
+            let victim_bytes = residency_cell(detail, lod, victim).gpu_bytes;
+            if delete_world_cell_vbo(residency_cell_mut(detail, lod, victim)) {
+                resident_bytes = resident_bytes.saturating_sub(victim_bytes);
+                evictions += 1;
+            } else {
+                break;
+            }
+        }
+        if resident_bytes.saturating_add(bytes) > WORLD_CELL_GPU_BUDGET_BYTES && !candidate.visible
+        {
+            continue;
+        }
+        if upload_world_cell_vbo(residency_cell_mut(detail, lod, candidate)) {
+            resident_bytes = resident_bytes.saturating_add(bytes);
+            uploads += 1;
+        } else if candidate.visible {
+            misses += 1;
+        }
+    }
+
+    // Retain recently departed cells briefly so small camera movements do not
+    // repeatedly allocate and delete the same buffers.
+    for plan in &plans {
+        let cell = residency_cell(detail, lod, *plan);
+        let cold = !plan.preload
+            && cell.vbo != 0
+            && now - cell.resident_last_required_at >= WORLD_CELL_RESIDENCY_GRACE_SECONDS;
+        if cold {
+            let bytes = cell.gpu_bytes;
+            if delete_world_cell_vbo(residency_cell_mut(detail, lod, *plan)) {
+                resident_bytes = resident_bytes.saturating_sub(bytes);
+                evictions += 1;
+            }
+        }
+    }
+
+    let resident_cells = plans
+        .iter()
+        .filter(|plan| residency_cell(detail, lod, **plan).vbo != 0)
+        .count();
+    update_viewport_diagnostics(|sample| {
+        sample.resident_cells = resident_cells;
+        sample.resident_bytes = resident_bytes;
+        sample.residency_uploads = uploads;
+        sample.residency_evictions = evictions;
+        sample.residency_misses = misses;
+    });
+}
+
 /// Draw a set of pre-batched world cells (fast VBO / immediate path) whose
 /// distance from the camera falls in the band `[near, far]`. Cells are visited
 /// nearest-first so a vertex budget drops the farthest geometry. Counters are
@@ -92,44 +584,66 @@ pub(crate) fn draw_world_cell_set(
     cam: Vec3,
     near: f32,
     far: f32,
+    draw_distance_percent: u16,
     frustum: &[Plane; 6],
     immediate: bool,
+    color_mode: WorldVertexColorMode,
     vertex_budget: usize,
     drawn_placements: &mut usize,
     drawn_parts: &mut usize,
     drawn_vertices: &mut usize,
 ) {
-    let mut order: Vec<(f32, usize)> = cells
+    let diagnostics = viewport_diagnostics_enabled();
+    let cull_started = diagnostics.then(Instant::now);
+    let mut order = take_visible_cell_scratch();
+    order.extend(cells.iter().enumerate().filter_map(|(i, cell)| {
+        if !immediate && cell.vbo == 0 {
+            return None;
+        }
+        let distance_squared = (cell.center - cam).length_squared();
+        if !world_cell_in_distance_band(cell, distance_squared, near, far, draw_distance_percent) {
+            return None;
+        }
+        if !aabb_in_frustum(frustum, cell.min, cell.max) {
+            return None;
+        }
+        Some((distance_squared, i))
+    }));
+    if let Some(started) = cull_started {
+        update_viewport_diagnostics(|sample| {
+            sample.cull_ms += started.elapsed().as_secs_f64() * 1000.0;
+            sample.candidate_cells += cells.len();
+            sample.visible_cells += order.len();
+        });
+    }
+    let sort_started = diagnostics.then(Instant::now);
+    let remaining_vertices = vertex_budget.saturating_sub(*drawn_vertices);
+    if order
         .iter()
-        .enumerate()
-        .filter_map(|(i, cell)| {
-            let distance_squared = (cell.center - cam).length_squared();
-            let far_edge = far + cell.radius;
-            if distance_squared > far_edge * far_edge {
-                return None;
-            }
-            let near_edge = near - cell.radius;
-            if near_edge > 0.0 && distance_squared < near_edge * near_edge {
-                return None;
-            }
-            if !aabb_in_frustum(frustum, cell.min, cell.max) {
-                return None;
-            }
-            Some((distance_squared, i))
-        })
-        .collect();
-    order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        .map(|(_, index)| cells[*index].vertices)
+        .sum::<usize>()
+        > remaining_vertices
+    {
+        sort_visible_cells_nearest_first(&mut order);
+    }
+    if let Some(started) = sort_started {
+        update_viewport_diagnostics(|sample| {
+            sample.sort_ms += started.elapsed().as_secs_f64() * 1000.0;
+        });
+    }
     // Populate the depth buffer with all solid/cutout geometry before drawing
     // any translucent surface.  Blended geometry cannot write depth (otherwise
     // its transparent pixels hide geometry behind it), but it must still be
     // depth-tested and drawn back-to-front to preserve the scene's depth order.
-    let mut visible_blend_segments = Vec::new();
-    let mut state = WorldDrawState::new(immediate);
+    let mut visible_blend_segments = take_visible_blend_segment_scratch();
+    let mut state = WorldDrawState::new(immediate, color_mode, diagnostics);
+    let mut submitted_cells = 0usize;
+    let submit_started = diagnostics.then(Instant::now);
     unsafe {
         if !immediate {
             enable_world_client_arrays();
         }
-        for (_, idx) in order {
+        for &(_, idx) in &order {
             let cell = &cells[idx];
             if *drawn_vertices + cell.vertices > vertex_budget {
                 if *drawn_vertices > 0 {
@@ -142,6 +656,9 @@ pub(crate) fn draw_world_cell_set(
             *drawn_placements += cell.placements;
             *drawn_parts += cell.parts;
             *drawn_vertices += cell.vertices;
+            if diagnostics {
+                submitted_cells += 1;
+            }
             for batch in &cell.batches {
                 if batch.transparency != TransparencyMode::Blend {
                     state.set_pass(WorldPassState::Solid(batch.transparency));
@@ -157,26 +674,37 @@ pub(crate) fn draw_world_cell_set(
             }
             for (batch_idx, batch) in cell.batches.iter().enumerate() {
                 if batch.transparency == TransparencyMode::Blend {
-                    visible_blend_segments.extend(batch.blend_segments.iter().enumerate().map(
-                        |(segment_idx, segment)| {
-                            (
-                                (segment.center - cam).length_squared(),
-                                idx,
-                                batch_idx,
-                                segment_idx,
-                            )
-                        },
-                    ));
+                    for (segment_idx, segment) in batch.blend_segments.iter().enumerate() {
+                        let insertion_order = visible_blend_segments.len();
+                        visible_blend_segments.push((
+                            (segment.center - cam).length_squared(),
+                            idx,
+                            batch_idx,
+                            segment_idx,
+                            insertion_order,
+                        ));
+                    }
                 }
             }
         }
 
         // Alpha parts remain separate and are sorted by their own centers,
         // rather than inheriting the order of an entire world cell.
-        visible_blend_segments
-            .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(started) = submit_started {
+            update_viewport_diagnostics(|sample| {
+                sample.submit_ms += started.elapsed().as_secs_f64() * 1000.0;
+            });
+        }
+        let blend_sort_started = diagnostics.then(Instant::now);
+        sort_blend_segments_farthest_first(&mut visible_blend_segments);
+        if let Some(started) = blend_sort_started {
+            update_viewport_diagnostics(|sample| {
+                sample.sort_ms += started.elapsed().as_secs_f64() * 1000.0;
+            });
+        }
+        let blend_submit_started = diagnostics.then(Instant::now);
         state.set_pass(WorldPassState::BlendColor);
-        for (_, cell_idx, batch_idx, segment_idx) in visible_blend_segments {
+        for &(_, cell_idx, batch_idx, segment_idx, _) in &visible_blend_segments {
             let batch = &cells[cell_idx].batches[batch_idx];
             state.draw_batch(
                 batch,
@@ -190,7 +718,155 @@ pub(crate) fn draw_world_cell_set(
         gl::Enable(gl::ALPHA_TEST);
         gl::DepthMask(gl::TRUE);
         gl::DepthFunc(gl::LEQUAL);
+        if let Some(started) = blend_submit_started {
+            update_viewport_diagnostics(|sample| {
+                sample.submit_ms += started.elapsed().as_secs_f64() * 1000.0;
+            });
+        }
     }
+    if diagnostics {
+        update_viewport_diagnostics(|sample| {
+            sample.submitted_cells += submitted_cells;
+            sample.blend_segments += visible_blend_segments.len();
+            sample.draw_calls += state.draw_calls;
+            sample.state_changes += state.state_changes;
+        });
+    }
+    recycle_visible_blend_segment_scratch(visible_blend_segments);
+    recycle_visible_cell_scratch(order);
+}
+
+/// Draw collision-material colors from the same packed world-cell VBO used by
+/// the normal viewport. Classification ranges stay separate because multiple
+/// materials can share one texture/render-state batch.
+#[allow(clippy::too_many_arguments)]
+fn draw_world_cell_classification_set(
+    cells: &[WorldCell],
+    cam: Vec3,
+    near: f32,
+    far: f32,
+    draw_distance_percent: u16,
+    frustum: &[Plane; 6],
+    vertex_budget: usize,
+    classes: &TextureMaterialClasses,
+    fallback_material: u8,
+    drawn_placements: &mut usize,
+    drawn_parts: &mut usize,
+    drawn_vertices: &mut usize,
+) {
+    let diagnostics = viewport_diagnostics_enabled();
+    let cull_started = diagnostics.then(Instant::now);
+    let mut order = take_visible_cell_scratch();
+    order.extend(cells.iter().enumerate().filter_map(|(index, cell)| {
+        if cell.vbo == 0 {
+            return None;
+        }
+        let distance_squared = (cell.center - cam).length_squared();
+        if !world_cell_in_distance_band(cell, distance_squared, near, far, draw_distance_percent) {
+            return None;
+        }
+        aabb_in_frustum(frustum, cell.min, cell.max).then_some((distance_squared, index))
+    }));
+    if let Some(started) = cull_started {
+        update_viewport_diagnostics(|sample| {
+            sample.cull_ms += started.elapsed().as_secs_f64() * 1000.0;
+            sample.candidate_cells += cells.len();
+            sample.visible_cells += order.len();
+        });
+    }
+    let sort_started = diagnostics.then(Instant::now);
+    let remaining_vertices = vertex_budget.saturating_sub(*drawn_vertices);
+    if order
+        .iter()
+        .map(|(_, index)| cells[*index].vertices)
+        .sum::<usize>()
+        > remaining_vertices
+    {
+        sort_visible_cells_nearest_first(&mut order);
+    }
+    if let Some(started) = sort_started {
+        update_viewport_diagnostics(|sample| {
+            sample.sort_ms += started.elapsed().as_secs_f64() * 1000.0;
+        });
+    }
+    let submit_started = diagnostics.then(Instant::now);
+    let mut submitted_cells = 0usize;
+    let mut draw_calls = 0usize;
+    let mut state_changes = 0usize;
+
+    unsafe {
+        gl::EnableClientState(gl::VERTEX_ARRAY);
+        gl::DisableClientState(gl::NORMAL_ARRAY);
+        gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::DisableClientState(gl::COLOR_ARRAY);
+        gl::Disable(gl::TEXTURE_2D);
+        gl::Disable(gl::LIGHTING);
+        gl::Disable(gl::BLEND);
+        gl::Disable(gl::ALPHA_TEST);
+        gl::Enable(gl::DEPTH_TEST);
+        gl::DepthMask(gl::TRUE);
+
+        for &(_, index) in &order {
+            let cell = &cells[index];
+            if *drawn_vertices + cell.vertices > vertex_budget {
+                if *drawn_vertices > 0 {
+                    break;
+                }
+                continue;
+            }
+            bind_world_vbo(cell.vbo, WorldVertexColorMode::Shaded);
+            *drawn_placements += cell.placements;
+            *drawn_parts += cell.parts;
+            *drawn_vertices += cell.vertices;
+            if diagnostics {
+                submitted_cells += 1;
+                state_changes += 1; // VBO binding.
+            }
+            for batch in &cell.batches {
+                if batch.double_sided {
+                    gl::Disable(gl::CULL_FACE);
+                } else {
+                    gl::Enable(gl::CULL_FACE);
+                }
+                if diagnostics {
+                    state_changes += 1;
+                }
+                for segment in &batch.classification_segments {
+                    let color = collision_classification_color(
+                        classes,
+                        segment.txd_name.as_deref(),
+                        &segment.texture_name,
+                        segment.texture_fingerprint,
+                        fallback_material,
+                    );
+                    gl::Color4f(color[0], color[1], color[2], color[3]);
+                    gl::DrawArrays(
+                        gl::TRIANGLES,
+                        batch
+                            .first_vertex
+                            .saturating_add(segment.first_vertex)
+                            .min(i32::MAX as usize) as i32,
+                        segment.vertices.min(i32::MAX as usize) as i32,
+                    );
+                    if diagnostics {
+                        draw_calls += 1;
+                    }
+                }
+            }
+        }
+        gl::Enable(gl::CULL_FACE);
+        gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+        gl::DisableClientState(gl::VERTEX_ARRAY);
+    }
+    if let Some(started) = submit_started {
+        update_viewport_diagnostics(|sample| {
+            sample.submit_ms += started.elapsed().as_secs_f64() * 1000.0;
+            sample.submitted_cells += submitted_cells;
+            sample.draw_calls += draw_calls;
+            sample.state_changes += state_changes;
+        });
+    }
+    recycle_visible_cell_scratch(order);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -202,22 +878,36 @@ enum WorldPassState {
 
 struct WorldDrawState {
     immediate: bool,
+    color_mode: WorldVertexColorMode,
     pass: Option<WorldPassState>,
     double_sided: Option<bool>,
     use_lighting: Option<bool>,
     texture: Option<u32>,
     vbo: u32,
+    diagnostics: bool,
+    draw_calls: usize,
+    state_changes: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorldVertexColorMode {
+    Shaded,
+    Unshaded,
 }
 
 impl WorldDrawState {
-    fn new(immediate: bool) -> Self {
+    fn new(immediate: bool, color_mode: WorldVertexColorMode, diagnostics: bool) -> Self {
         Self {
             immediate,
+            color_mode,
             pass: None,
             double_sided: None,
             use_lighting: None,
             texture: None,
             vbo: 0,
+            diagnostics,
+            draw_calls: 0,
+            state_changes: 0,
         }
     }
 
@@ -231,6 +921,9 @@ impl WorldDrawState {
             WorldPassState::BlendColor => set_blend_color_pass_state(),
         }
         self.pass = Some(pass);
+        if self.diagnostics {
+            self.state_changes += 1;
+        }
     }
 
     fn draw_batch(&mut self, batch: &WorldBatch, vbo: u32, segment: Option<&WorldBlendSegment>) {
@@ -244,14 +937,22 @@ impl WorldDrawState {
                     gl::LightModeli(gl::LIGHT_MODEL_TWO_SIDE, gl::FALSE as i32);
                 }
                 self.double_sided = Some(batch.double_sided);
+                if self.diagnostics {
+                    self.state_changes += 1;
+                }
             }
-            if self.use_lighting != Some(batch.use_lighting) {
-                if batch.use_lighting {
+            let use_lighting =
+                self.color_mode == WorldVertexColorMode::Shaded && batch.use_lighting;
+            if self.use_lighting != Some(use_lighting) {
+                if use_lighting {
                     gl::Enable(gl::LIGHTING);
                 } else {
                     gl::Disable(gl::LIGHTING);
                 }
-                self.use_lighting = Some(batch.use_lighting);
+                self.use_lighting = Some(use_lighting);
+                if self.diagnostics {
+                    self.state_changes += 1;
+                }
             }
             if self.texture != Some(batch.texture) {
                 if batch.texture != 0 {
@@ -263,17 +964,23 @@ impl WorldDrawState {
                     gl::Color4f(0.78, 0.78, 0.74, 1.0);
                 }
                 self.texture = Some(batch.texture);
+                if self.diagnostics {
+                    self.state_changes += 1;
+                }
             }
 
             let (local_first_vertex, vertices) = segment
                 .map(|segment| (segment.first_vertex, segment.vertices))
                 .unwrap_or((0, batch.vertices));
             if self.immediate {
-                draw_world_batch_immediate(batch, local_first_vertex, vertices);
+                draw_world_batch_immediate(batch, local_first_vertex, vertices, self.color_mode);
             } else {
                 if self.vbo != vbo {
-                    bind_world_vbo(vbo);
+                    bind_world_vbo(vbo, self.color_mode);
                     self.vbo = vbo;
+                    if self.diagnostics {
+                        self.state_changes += 1;
+                    }
                 }
                 let first_vertex = batch
                     .first_vertex
@@ -284,6 +991,9 @@ impl WorldDrawState {
                     first_vertex as i32,
                     vertices.min(i32::MAX as usize) as i32,
                 );
+            }
+            if self.diagnostics {
+                self.draw_calls += 1;
             }
         }
     }
@@ -298,43 +1008,80 @@ unsafe fn enable_world_client_arrays() {
     }
 }
 
-unsafe fn bind_world_vbo(vbo: u32) {
-    let stride = (12 * std::mem::size_of::<f32>()) as i32;
+unsafe fn bind_world_vbo(vbo: u32, color_mode: WorldVertexColorMode) {
+    let stride = std::mem::size_of::<WorldVertex>() as i32;
+    let color_offset = match color_mode {
+        WorldVertexColorMode::Shaded => std::mem::offset_of!(WorldVertex, shaded_rgba),
+        WorldVertexColorMode::Unshaded => std::mem::offset_of!(WorldVertex, unshaded_rgba),
+    };
     unsafe {
         gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-        gl::TexCoordPointer(2, gl::FLOAT, stride, std::ptr::null());
+        gl::TexCoordPointer(
+            2,
+            gl::FLOAT,
+            stride,
+            std::mem::offset_of!(WorldVertex, uv) as *const c_void,
+        );
         gl::NormalPointer(
             gl::FLOAT,
             stride,
-            (2 * std::mem::size_of::<f32>()) as *const c_void,
+            std::mem::offset_of!(WorldVertex, normal) as *const c_void,
         );
-        gl::ColorPointer(
-            4,
-            gl::FLOAT,
-            stride,
-            (5 * std::mem::size_of::<f32>()) as *const c_void,
-        );
+        gl::ColorPointer(4, gl::UNSIGNED_BYTE, stride, color_offset as *const c_void);
         gl::VertexPointer(
             3,
             gl::FLOAT,
             stride,
-            (9 * std::mem::size_of::<f32>()) as *const c_void,
+            std::mem::offset_of!(WorldVertex, position) as *const c_void,
         );
     }
 }
 
-unsafe fn draw_world_batch_immediate(batch: &WorldBatch, first_vertex: usize, vertices: usize) {
-    let first = first_vertex.saturating_mul(12);
-    let end = first
-        .saturating_add(vertices.saturating_mul(12))
-        .min(batch.data.len());
+fn pack_world_color(channel: f32) -> u8 {
+    if channel.is_finite() {
+        (channel.clamp(0.0, 1.0) * 255.0).round() as u8
+    } else {
+        0
+    }
+}
+
+fn pack_world_rgba(rgb: V3, alpha: f32) -> [u8; 4] {
+    [
+        pack_world_color(rgb.x),
+        pack_world_color(rgb.y),
+        pack_world_color(rgb.z),
+        pack_world_color(alpha),
+    ]
+}
+
+fn unpack_world_color(channel: u8) -> f32 {
+    f32::from(channel) / 255.0
+}
+
+unsafe fn draw_world_batch_immediate(
+    batch: &WorldBatch,
+    first_vertex: usize,
+    vertices: usize,
+    color_mode: WorldVertexColorMode,
+) {
+    let first = first_vertex.min(batch.data.len());
+    let end = first.saturating_add(vertices).min(batch.data.len());
     unsafe {
         gl::Begin(gl::TRIANGLES);
-        for v in batch.data[first..end].chunks_exact(12) {
-            gl::TexCoord2f(v[0], v[1]);
-            gl::Normal3f(v[2], v[3], v[4]);
-            gl::Color4f(v[5], v[6], v[7], v[8]);
-            gl::Vertex3f(v[9], v[10], v[11]);
+        for v in &batch.data[first..end] {
+            gl::TexCoord2f(v.uv[0], v.uv[1]);
+            gl::Normal3f(v.normal[0], v.normal[1], v.normal[2]);
+            let color = match color_mode {
+                WorldVertexColorMode::Shaded => v.shaded_rgba,
+                WorldVertexColorMode::Unshaded => v.unshaded_rgba,
+            };
+            gl::Color4f(
+                unpack_world_color(color[0]),
+                unpack_world_color(color[1]),
+                unpack_world_color(color[2]),
+                unpack_world_color(color[3]),
+            );
+            gl::Vertex3f(v.position[0], v.position[1], v.position[2]);
         }
         gl::End();
     }
@@ -449,22 +1196,41 @@ pub(crate) fn draw_scene_cell_set(
     drawn_parts: &mut usize,
     drawn_vertices: &mut usize,
 ) {
-    let mut order: Vec<(f32, usize)> = cells
-        .iter()
-        .enumerate()
-        .map(|(i, c)| ((c.center - cam).length(), i))
-        .collect();
-    order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    for (dist, idx) in order {
+    let diagnostics = viewport_diagnostics_enabled();
+    let cull_started = diagnostics.then(Instant::now);
+    let mut order = take_visible_cell_scratch();
+    order.extend(cells.iter().enumerate().filter_map(|(i, cell)| {
+        let distance_squared = (cell.center - cam).length_squared();
+        let far_edge = far + cell.radius;
+        if far_edge < 0.0 || distance_squared > far_edge * far_edge {
+            return None;
+        }
+        let near_edge = near - cell.radius;
+        if near_edge > 0.0 && distance_squared < near_edge * near_edge {
+            return None;
+        }
+        aabb_in_frustum(frustum, cell.min, cell.max).then_some((distance_squared, i))
+    }));
+    if let Some(started) = cull_started {
+        update_viewport_diagnostics(|sample| {
+            sample.cull_ms += started.elapsed().as_secs_f64() * 1000.0;
+            sample.candidate_cells += cells.len();
+            sample.visible_cells += order.len();
+        });
+    }
+    let sort_started = diagnostics.then(Instant::now);
+    sort_visible_cells_nearest_first(&mut order);
+    if let Some(started) = sort_started {
+        update_viewport_diagnostics(|sample| {
+            sample.sort_ms += started.elapsed().as_secs_f64() * 1000.0;
+        });
+    }
+    let submit_started = diagnostics.then(Instant::now);
+    let mut submitted_cells = 0usize;
+    for &(_, idx) in &order {
         let cell = &cells[idx];
         if *drawn_parts >= part_budget || *drawn_vertices >= vertex_budget {
             break;
-        }
-        if dist > far + cell.radius || dist + cell.radius < near {
-            continue;
-        }
-        if !aabb_in_frustum(frustum, cell.min, cell.max) {
-            continue;
         }
         if *drawn_parts + cell.parts > part_budget
             || *drawn_vertices + cell.vertices > vertex_budget
@@ -472,10 +1238,21 @@ pub(crate) fn draw_scene_cell_set(
             continue;
         }
         unsafe { gl::CallList(cell.list) };
+        if diagnostics {
+            submitted_cells += 1;
+        }
         *drawn_placements += cell.placements;
         *drawn_parts += cell.parts;
         *drawn_vertices += cell.vertices;
     }
+    if let Some(started) = submit_started {
+        update_viewport_diagnostics(|sample| {
+            sample.submit_ms += started.elapsed().as_secs_f64() * 1000.0;
+            sample.submitted_cells += submitted_cells;
+            sample.draw_calls += submitted_cells;
+        });
+    }
+    recycle_visible_cell_scratch(order);
 }
 
 pub(crate) fn draw_placement_render_mesh(
@@ -666,11 +1443,30 @@ fn draw_render_part_view_mode(
                     classification[2],
                     classification[3],
                 );
-                gl::Begin(gl::TRIANGLES);
-                for vertex in &part.cpu_vertices {
-                    gl::Vertex3f(vertex.pos.x, vertex.pos.y, vertex.pos.z);
+                if part.vbo != 0 {
+                    let stride = (12 * std::mem::size_of::<f32>()) as i32;
+                    gl::BindBuffer(gl::ARRAY_BUFFER, part.vbo);
+                    gl::EnableClientState(gl::VERTEX_ARRAY);
+                    gl::VertexPointer(
+                        3,
+                        gl::FLOAT,
+                        stride,
+                        (9 * std::mem::size_of::<f32>()) as *const c_void,
+                    );
+                    gl::DrawArrays(
+                        gl::TRIANGLES,
+                        0,
+                        part.vertices.min(i32::MAX as usize) as i32,
+                    );
+                    gl::DisableClientState(gl::VERTEX_ARRAY);
+                    gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+                } else {
+                    gl::Begin(gl::TRIANGLES);
+                    for vertex in &part.cpu_vertices {
+                        gl::Vertex3f(vertex.pos.x, vertex.pos.y, vertex.pos.z);
+                    }
+                    gl::End();
                 }
-                gl::End();
             }
         }
     }
@@ -704,13 +1500,17 @@ fn draw_placement_render_mesh_view_mode(
         });
         for index in order {
             let part = &mesh.parts[index];
-            let classification = collision_classification_color(
-                classes,
-                txd_name,
-                &part.texture_name,
-                part.texture_fingerprint,
-                fallback_material,
-            );
+            let classification = if mode == ViewportRenderMode::CollisionClassification {
+                collision_classification_color(
+                    classes,
+                    txd_name,
+                    &part.texture_name,
+                    part.texture_fingerprint,
+                    fallback_material,
+                )
+            } else {
+                [0.0; 4]
+            };
             draw_render_part_view_mode(part, placement_alpha, mode, classification);
         }
         gl::PopMatrix();
@@ -1159,8 +1959,8 @@ pub(crate) fn draw_selected_local_lod(
     let bounds = transformed_bounds(mesh.bounds, &model_cols);
     let center = (bounds.min + bounds.max) * 0.5;
     let radius = (bounds.max - center).length() + 64.0;
-    let distance = (center - app.camera.pos).length();
-    if distance + radius >= lod_near {
+    let near_center_distance = (lod_near - radius).max(0.0);
+    if (center - app.camera.pos).length_squared() >= near_center_distance * near_center_distance {
         return (0, 0, 0);
     }
     if !aabb_in_frustum(frustum, bounds.min, bounds.max) {
@@ -1287,35 +2087,72 @@ pub(crate) fn build_world_cells(
     placements: &[Placement],
     definitions: &HashMap<String, Definition>,
     meshes: &HashMap<String, RenderMesh>,
-    keep_cpu_data: bool,
+    _keep_cpu_data: bool,
     lod_ids: &std::collections::HashSet<String>,
     want_lod: bool,
     ambient_lift: V3,
 ) -> Vec<WorldCell> {
-    // This is the culling granularity for the fast VBO renderer.  At 512 m a
-    // single visible edge of a dense city block could submit an entire
-    // neighborhood; 256 m keeps batching efficient while letting the frustum
-    // reject substantially more off-screen geometry on lower-end GPUs.
-    const CELL_SIZE: f32 = 256.0;
-    let mut cells = HashMap::<(i32, i32), WorldCellBuild>::new();
-    for p in placements {
+    build_world_cells_for_keys(
+        placements,
+        None,
+        definitions,
+        meshes,
+        _keep_cpu_data,
+        lod_ids,
+        want_lod,
+        ambient_lift,
+        None,
+    )
+}
+
+/// Builds complete cells for the requested spatial keys. Filtering happens on
+/// placement origins, matching the partition used by the normal full builder.
+pub(crate) fn build_world_cells_for_keys(
+    placements: &[Placement],
+    element_states: Option<&[ElementState]>,
+    definitions: &HashMap<String, Definition>,
+    meshes: &HashMap<String, RenderMesh>,
+    _keep_cpu_data: bool,
+    lod_ids: &std::collections::HashSet<String>,
+    want_lod: bool,
+    ambient_lift: V3,
+    selected_keys: Option<&HashSet<WorldCellKey>>,
+) -> Vec<WorldCell> {
+    // Keep only placement indices while discovering buckets. Expanding every
+    // placement into world-space vertices here used to retain the entire map's
+    // upload data until the scan completed. Building one bucket at a time
+    // bounds transient vertex memory to the largest cell/tier bucket instead.
+    let mut bucket_members = HashMap::<(WorldCellKey, WorldDrawDistanceTier), Vec<usize>>::new();
+    for (index, p) in placements.iter().enumerate() {
+        if element_states.is_some_and(|states| {
+            states
+                .get(index)
+                .is_none_or(|state| state.deleted || state.hidden)
+        }) {
+            continue;
+        }
         if placement_is_lod(p, lod_ids) != want_lod {
             continue;
         }
-        let key = placement_mesh_key(p, definitions);
-        let Some(mesh) = meshes.get(&key) else {
+        let cell_key = world_cell_key(p.pos);
+        if !world_cell_key_is_selected(p.pos, selected_keys) {
             continue;
-        };
-        let origin = to_mq(p.pos);
-        let cell_key = (
-            (origin.x / CELL_SIZE).floor() as i32,
-            (origin.y / CELL_SIZE).floor() as i32,
-        );
-        let model = placement_matrix(p);
-        let double_sided = placement_disable_backface_culling(p, definitions);
-        let alpha = placement_alpha(p);
-        let alpha_u8 = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
-        let cell = cells.entry(cell_key).or_insert_with(|| WorldCellBuild {
+        }
+        let mesh_key = placement_mesh_key(p, definitions);
+        if !meshes.contains_key(&mesh_key) {
+            continue;
+        }
+        let draw_distance_tier =
+            placement_world_draw_distance_tier_for_render(p, definitions, want_lod);
+        bucket_members
+            .entry((cell_key, draw_distance_tier))
+            .or_default()
+            .push(index);
+    }
+
+    let mut out = Vec::with_capacity(bucket_members.len());
+    for ((key, draw_distance_tier), members) in bucket_members {
+        let mut cell = WorldCellBuild {
             min: Vec3::splat(f32::MAX),
             max: Vec3::splat(f32::MIN),
             placements: 0,
@@ -1323,100 +2160,142 @@ pub(crate) fn build_world_cells(
             vertices: 0,
             batch_data: HashMap::new(),
             blend_data: Vec::new(),
-        });
-        cell.placements += 1;
-        let model_cols = model.to_cols_array();
-        let bounds = transformed_bounds(mesh.bounds, &model_cols);
-        cell.min = cell.min.min(bounds.min);
-        cell.max = cell.max.max(bounds.max);
-        for part in &mesh.parts {
-            cell.parts += 1;
-            let transparency = if alpha_u8 < 255 {
-                TransparencyMode::Blend
-            } else {
-                part.transparency
+        };
+        for index in members {
+            let p = &placements[index];
+            let mesh_key = placement_mesh_key(p, definitions);
+            let Some(mesh) = meshes.get(&mesh_key) else {
+                // Membership collection already verified this lookup. Retain a
+                // defensive guard so the packing loop stays robust if its
+                // inputs are refactored to a mutable source later.
+                continue;
             };
-            // Blend parts have an opaque-texel depth/color pass plus a sorted
-            // translucent color pass. Count both submissions against the
-            // vertex budget so alpha-heavy maps cannot silently do almost
-            // twice the configured GPU work.
-            let pass_count = if transparency == TransparencyMode::Blend {
-                2
-            } else {
-                1
-            };
-            cell.vertices += part.cpu_vertices.len() * pass_count;
-            let key = (part.texture, part.use_lighting, double_sided, transparency);
-            let mut part_data = Vec::with_capacity(part.cpu_vertices.len() * 12);
-            let mut part_min = Vec3::splat(f32::MAX);
-            let mut part_max = Vec3::splat(f32::MIN);
-            for v in &part.cpu_vertices {
-                let pos = transform_point_gl(&model_cols, v.pos);
-                part_min = part_min.min(pos);
-                part_max = part_max.max(pos);
-                let normal = transform_normal_gl(&model_cols, v.normal);
-                let display_color = display_vertex_color(
-                    v.color,
-                    ambient_lift,
-                    part.material_color,
-                    part.material_ambient,
-                );
-                let vertex_alpha = alpha * part.alpha * v.alpha;
-                part_data.extend_from_slice(&[
-                    v.uv.u,
-                    v.uv.v,
-                    normal.x,
-                    normal.y,
-                    normal.z,
-                    display_color.x,
-                    display_color.y,
-                    display_color.z,
-                    vertex_alpha,
-                    pos.x,
-                    pos.y,
-                    pos.z,
-                ]);
-            }
-            if transparency == TransparencyMode::Blend {
-                // Do not merge alpha parts by texture. Their individual centers
-                // are required for stable back-to-front ordering as the camera
-                // moves around the DFF.
-                let center = if part_data.is_empty() {
-                    origin
+            let origin = to_mq(p.pos);
+            let model = placement_matrix(p);
+            let double_sided = placement_disable_backface_culling(p, definitions);
+            let alpha = placement_alpha(p);
+            let alpha_u8 = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+            cell.placements += 1;
+            // Authored streaming distance is measured from the placement origin.
+            // Include it in the conservative cell volume even when a DFF has an
+            // unusually offset pivot, otherwise bounds-center culling could pop
+            // the placement before its tier distance is reached.
+            cell.min = cell.min.min(origin);
+            cell.max = cell.max.max(origin);
+            let model_cols = model.to_cols_array();
+            let bounds = transformed_bounds(mesh.bounds, &model_cols);
+            cell.min = cell.min.min(bounds.min);
+            cell.max = cell.max.max(bounds.max);
+            for part in &mesh.parts {
+                cell.parts += 1;
+                let transparency = if alpha_u8 < 255 {
+                    TransparencyMode::Blend
                 } else {
-                    (part_min + part_max) * 0.5
+                    part.transparency
                 };
-                cell.blend_data.push((key, part_data, center));
-            } else {
-                cell.batch_data.entry(key).or_default().extend(part_data);
+                // Blend parts have an opaque-texel depth/color pass plus a sorted
+                // translucent color pass. Count both submissions against the
+                // vertex budget so alpha-heavy maps cannot silently do almost
+                // twice the configured GPU work.
+                let pass_count = if transparency == TransparencyMode::Blend {
+                    2
+                } else {
+                    1
+                };
+                cell.vertices += part.cpu_vertices.len() * pass_count;
+                let key = (part.texture, part.use_lighting, double_sided, transparency);
+                let mut part_data = Vec::with_capacity(part.cpu_vertices.len());
+                let mut part_min = Vec3::splat(f32::MAX);
+                let mut part_max = Vec3::splat(f32::MIN);
+                for v in &part.cpu_vertices {
+                    let pos = transform_point_gl(&model_cols, v.pos);
+                    part_min = part_min.min(pos);
+                    part_max = part_max.max(pos);
+                    let normal = transform_normal_gl(&model_cols, v.normal);
+                    let display_color = display_vertex_color(
+                        v.color,
+                        ambient_lift,
+                        part.material_color,
+                        part.material_ambient,
+                    );
+                    let vertex_alpha = alpha * part.alpha * v.alpha;
+                    part_data.push(WorldVertex {
+                        uv: [v.uv.u, v.uv.v],
+                        normal: [normal.x, normal.y, normal.z],
+                        shaded_rgba: pack_world_rgba(display_color, vertex_alpha),
+                        unshaded_rgba: pack_world_rgba(
+                            V3 {
+                                x: 1.0,
+                                y: 1.0,
+                                z: 1.0,
+                            },
+                            vertex_alpha,
+                        ),
+                        position: [pos.x, pos.y, pos.z],
+                    });
+                }
+                let classification = WorldClassificationSegment {
+                    txd_name: definition_txd_name(definitions, &p.id).map(str::to_owned),
+                    texture_name: part.texture_name.clone(),
+                    texture_fingerprint: part.texture_fingerprint,
+                    first_vertex: 0,
+                    vertices: part.cpu_vertices.len(),
+                };
+                if transparency == TransparencyMode::Blend {
+                    // Do not merge alpha parts by texture. Their individual centers
+                    // are required for stable back-to-front ordering as the camera
+                    // moves around the DFF.
+                    let center = if part_data.is_empty() {
+                        origin
+                    } else {
+                        (part_min + part_max) * 0.5
+                    };
+                    cell.blend_data.push(WorldBlendData {
+                        key,
+                        data: part_data,
+                        center,
+                        classification,
+                    });
+                } else {
+                    let group = cell
+                        .batch_data
+                        .entry(key)
+                        .or_insert_with(|| WorldBatchBuild {
+                            data: Vec::new(),
+                            classification_segments: Vec::new(),
+                        });
+                    let mut classification = classification;
+                    classification.first_vertex = group.data.len();
+                    group.data.extend(part_data);
+                    group.classification_segments.push(classification);
+                }
             }
         }
-    }
-
-    let mut out = Vec::with_capacity(cells.len());
-    for (_, cell) in cells {
         let center = (cell.min + cell.max) * 0.5;
         let mut grouped_data = cell
             .batch_data
             .into_iter()
-            .map(|(key, data)| (key, (data, Vec::new())))
+            .map(|(key, build)| (key, (build.data, Vec::new(), build.classification_segments)))
             .collect::<HashMap<_, _>>();
-        for (key, data, segment_center) in cell.blend_data {
-            let (group_data, segments) = grouped_data
-                .entry(key)
-                .or_insert_with(|| (Vec::new(), Vec::new()));
-            let first_vertex = group_data.len() / 12;
-            let vertices = data.len() / 12;
-            group_data.extend(data);
+        for blend in cell.blend_data {
+            let (group_data, segments, classification_segments) = grouped_data
+                .entry(blend.key)
+                .or_insert_with(|| (Vec::new(), Vec::new(), Vec::new()));
+            let first_vertex = group_data.len();
+            let vertices = blend.data.len();
+            group_data.extend(blend.data);
             segments.push(WorldBlendSegment {
-                center: segment_center,
+                center: blend.center,
                 first_vertex,
                 vertices,
             });
+            let mut classification = blend.classification;
+            classification.first_vertex = first_vertex;
+            classification_segments.push(classification);
         }
         let mut groups = grouped_data
             .into_iter()
-            .filter(|(_, (data, _))| !data.is_empty())
+            .filter(|(_, (data, _, _))| !data.is_empty())
             .collect::<Vec<_>>();
         groups.sort_by_key(|(key, _)| {
             let (texture, use_lighting, double_sided, transparency) = *key;
@@ -1427,14 +2306,17 @@ pub(crate) fn build_world_cells(
                 texture,
             )
         });
-        let combined_len = groups.iter().map(|(_, (data, _))| data.len()).sum();
-        let mut combined_data = Vec::with_capacity(combined_len);
+        let combined_len: usize = groups.iter().map(|(_, (data, _, _))| data.len()).sum();
+        let mut next_vertex = 0usize;
         let mut batches = Vec::with_capacity(groups.len());
-        for ((texture, use_lighting, double_sided, transparency), (data, blend_segments)) in groups
+        for (
+            (texture, use_lighting, double_sided, transparency),
+            (data, blend_segments, classification_segments),
+        ) in groups
         {
-            let first_vertex = combined_data.len() / 12;
-            let vertices = data.len() / 12;
-            combined_data.extend_from_slice(&data);
+            let first_vertex = next_vertex;
+            let vertices = data.len();
+            next_vertex = next_vertex.saturating_add(vertices);
             batches.push(WorldBatch {
                 texture,
                 use_lighting,
@@ -1442,29 +2324,17 @@ pub(crate) fn build_world_cells(
                 transparency,
                 first_vertex,
                 vertices,
-                data: if keep_cpu_data { data } else { Vec::new() },
+                // Compact CPU data is the backing store for runtime VBO
+                // residency and the optional immediate-mode diagnostic path.
+                data,
+                classification_segments,
                 blend_segments,
             });
         }
-        let mut vbo = 0u32;
-        unsafe {
-            gl::GenBuffers(1, &mut vbo);
-            if vbo != 0 {
-                gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-                gl::BufferData(
-                    gl::ARRAY_BUFFER,
-                    (combined_data.len() * std::mem::size_of::<f32>()) as isize,
-                    combined_data.as_ptr().cast(),
-                    gl::STATIC_DRAW,
-                );
-                gl::BindBuffer(gl::ARRAY_BUFFER, 0);
-            }
-        }
-        if vbo == 0 {
-            continue;
-        }
         let radius = (cell.max - center).length() + 64.0;
         out.push(WorldCell {
+            key,
+            draw_distance_tier,
             min: cell.min,
             max: cell.max,
             center,
@@ -1472,7 +2342,9 @@ pub(crate) fn build_world_cells(
             placements: cell.placements,
             parts: cell.parts,
             vertices: cell.vertices,
-            vbo,
+            gpu_bytes: combined_len.saturating_mul(std::mem::size_of::<WorldVertex>()),
+            resident_last_required_at: 0.0,
+            vbo: 0,
             batches,
         });
     }
@@ -2185,12 +3057,35 @@ fn collision_render_vertices(mesh: &CollisionMesh) -> usize {
         + mesh.boxes.len().saturating_mul(60)
 }
 
-fn delete_collision_render_lists(cache: &CollisionRenderCache) {
-    unsafe {
-        if cache.list != 0 {
-            gl::DeleteLists(cache.list, 1);
-        }
+#[allow(clippy::too_many_arguments)]
+fn collision_in_distance_band(
+    is_lod: bool,
+    mode: LodMode,
+    detail_tier: WorldDrawDistanceTier,
+    distance_squared: f32,
+    radius: f32,
+    detail_far: f32,
+    lod_near: f32,
+    lod_far: f32,
+    draw_distance_percent: u16,
+) -> bool {
+    if is_lod && mode == LodMode::DetailOnly {
+        return false;
     }
+    let (near, far) = if is_lod {
+        (lod_near, lod_far)
+    } else {
+        (
+            0.0,
+            world_cell_far_distance(detail_far, detail_tier, draw_distance_percent),
+        )
+    };
+    let far_edge = far + radius;
+    if distance_squared > far_edge * far_edge {
+        return false;
+    }
+    let near_edge = near - radius;
+    near_edge <= 0.0 || distance_squared >= near_edge * near_edge
 }
 
 fn collision_world_list(
@@ -2198,20 +3093,14 @@ fn collision_world_list(
     collision_key: &str,
     mesh: &CollisionMesh,
 ) -> u32 {
-    let stale = caches
-        .get(collision_key)
-        .is_some_and(|cache| cache.mesh != *mesh);
-    if stale {
-        if let Some(cache) = caches.remove(collision_key) {
-            delete_collision_render_lists(&cache);
-        }
+    if let Some(cache) = caches.get(collision_key)
+        && cache.list != 0
+    {
+        return cache.list;
     }
     let cache = caches
         .entry(collision_key.to_string())
-        .or_insert_with(|| CollisionRenderCache {
-            mesh: mesh.clone(),
-            list: 0,
-        });
+        .or_insert(CollisionRenderCache { list: 0 });
     if cache.list != 0 {
         return cache.list;
     }
@@ -2247,7 +3136,15 @@ fn collision_world_list(
 
 pub(crate) fn draw_collision_world(app: &mut AppState, frustum: &[Plane; 6]) {
     let far = app.options.draw_radius;
-    let mut visible = Vec::<(f32, String, [f32; 16])>::new();
+    let lod_far = app.options.lod_radius.max(far);
+    let mode = app.options.lod_mode;
+    let lod_near = match mode {
+        LodMode::Swap => (far - 256.0).max(0.0),
+        LodMode::ShowAll => 0.0,
+        LodMode::DetailOnly => f32::MAX,
+    };
+    let mut visible = Vec::<(f32, std::borrow::Cow<'_, str>, [f32; 16], usize)>::new();
+    let mut visible_vertices = 0usize;
     for (idx, placement) in app.placements.iter().enumerate() {
         if app
             .element_states
@@ -2256,31 +3153,60 @@ pub(crate) fn draw_collision_world(app: &mut AppState, frustum: &[Plane; 6]) {
         {
             continue;
         }
-        let collision_key = element_collision_key(app, placement);
-        let Some(mesh) = app.collisions.get(&collision_key) else {
-            continue;
-        };
         if placement_disable_collisions(placement, &app.definitions) {
             continue;
         }
+        let is_lod = placement_is_app_lod(app, placement);
+        if is_lod && mode == LodMode::DetailOnly {
+            continue;
+        }
+        // Most resource keys are already normalized. Borrow them during the
+        // full placement scan and allocate an owned key only for placements
+        // which survive visibility culling.
+        let collision_key = placement_collision_key_cow(&app.definitions, placement);
+        let Some(mesh) = app.collisions.get(collision_key.as_ref()) else {
+            continue;
+        };
         let model_cols = placement_matrix(placement).to_cols_array();
         let bounds = transformed_bounds(mesh.bounds, &model_cols);
         let center = (bounds.min + bounds.max) * 0.5;
         let radius = (bounds.max - center).length();
         let distance_squared = (center - app.camera.pos).length_squared();
-        let far_edge = far + radius;
-        if distance_squared > far_edge * far_edge
-            || !aabb_in_frustum(frustum, bounds.min, bounds.max)
+        let detail_tier = if is_lod {
+            WorldDrawDistanceTier::Infinite
+        } else {
+            placement_world_draw_distance_tier_for_render(placement, &app.definitions, false)
+        };
+        if !collision_in_distance_band(
+            is_lod,
+            mode,
+            detail_tier,
+            distance_squared,
+            radius,
+            far,
+            lod_near,
+            lod_far,
+            app.options.draw_distance_percent,
+        ) || !aabb_in_frustum(frustum, bounds.min, bounds.max)
         {
             continue;
         }
-        visible.push((distance_squared, collision_key, model_cols));
+        let vertices = collision_render_vertices(mesh);
+        visible_vertices = visible_vertices.saturating_add(vertices);
+        visible.push((distance_squared, collision_key, model_cols, vertices));
     }
-    visible.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let vertex_budget = app.options.vertex_budget;
+    let mut vertex_budget = app.options.vertex_budget;
+    if get_time() < app.render_settle_until {
+        vertex_budget = vertex_budget.min(SETTLE_VERTEX_BUDGET);
+    }
+    // Nearest-first ordering only changes which cells survive a tight budget.
+    // Avoid O(V log V) work when every visible collision instance fits.
+    if visible_vertices > vertex_budget {
+        visible.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    }
     let mut submitted_vertices = 0usize;
-    let mut prepared_lists = HashMap::<String, u32>::new();
+    let mut prepared_lists = HashMap::<&str, u32>::new();
     unsafe {
         gl::Disable(gl::TEXTURE_2D);
         gl::Disable(gl::LIGHTING);
@@ -2288,23 +3214,23 @@ pub(crate) fn draw_collision_world(app: &mut AppState, frustum: &[Plane; 6]) {
         gl::Disable(gl::BLEND);
         gl::DepthMask(gl::TRUE);
         gl::Disable(gl::CULL_FACE);
-        for (_, collision_key, model_cols) in visible {
-            let Some(mesh) = app.collisions.get(&collision_key) else {
+        for (_, collision_key, model_cols, vertices) in &visible {
+            let collision_key = collision_key.as_ref();
+            let Some(mesh) = app.collisions.get(collision_key) else {
                 continue;
             };
-            let vertices = collision_render_vertices(mesh);
-            if submitted_vertices.saturating_add(vertices) > vertex_budget {
+            if submitted_vertices.saturating_add(*vertices) > vertex_budget {
                 if submitted_vertices > 0 {
                     break;
                 }
                 continue;
             }
-            let list = if let Some(list) = prepared_lists.get(&collision_key) {
+            let list = if let Some(list) = prepared_lists.get(collision_key) {
                 *list
             } else {
                 let list =
-                    collision_world_list(&mut app.collision_render_cache, &collision_key, mesh);
-                prepared_lists.insert(collision_key.clone(), list);
+                    collision_world_list(&mut app.collision_render_cache, collision_key, mesh);
+                prepared_lists.insert(collision_key, list);
                 list
             };
             gl::PushMatrix();
@@ -2329,10 +3255,10 @@ pub(crate) fn draw_collision_world(app: &mut AppState, frustum: &[Plane; 6]) {
                 );
             }
             gl::PopMatrix();
-            submitted_vertices = submitted_vertices.saturating_add(vertices);
+            submitted_vertices = submitted_vertices.saturating_add(*vertices);
             app.last_drawn_placements += 1;
             app.last_drawn_parts += 1;
-            app.last_drawn_vertices += vertices;
+            app.last_drawn_vertices += *vertices;
         }
         gl::DepthMask(gl::TRUE);
         gl::Disable(gl::BLEND);
@@ -2366,12 +3292,18 @@ fn draw_editing_dff_preview(
     txd_textures: &TxdTextureIndex,
     txd_name: Option<&str>,
     fallback_material: u8,
+    double_sided: bool,
+    show_material_selection_outline: bool,
 ) {
     let has_normals = raw.normals.len() == raw.vertices.len();
     unsafe {
         gl::Disable(gl::TEXTURE_2D);
         gl::Disable(gl::LIGHTING);
-        gl::Disable(gl::CULL_FACE);
+        if double_sided {
+            gl::Disable(gl::CULL_FACE);
+        } else {
+            gl::Enable(gl::CULL_FACE);
+        }
         gl::Begin(gl::TRIANGLES);
         for tri in &raw.triangles {
             let indices = [tri.a as usize, tri.b as usize, tri.c as usize];
@@ -2418,32 +3350,34 @@ fn draw_editing_dff_preview(
             }
         }
         gl::End();
-        gl::LineWidth(2.0);
-        gl::Color4f(1.0, 0.92, 0.20, 1.0);
-        gl::Begin(gl::LINES);
-        for tri in raw
-            .triangles
-            .iter()
-            .filter(|tri| tri.material as usize == selected_material)
-        {
-            let indices = [tri.a as usize, tri.b as usize, tri.c as usize];
-            if indices.iter().any(|idx| *idx >= raw.vertices.len()) {
-                continue;
+        if show_material_selection_outline {
+            gl::LineWidth(2.0);
+            gl::Color4f(1.0, 0.92, 0.20, 1.0);
+            gl::Begin(gl::LINES);
+            for tri in raw
+                .triangles
+                .iter()
+                .filter(|tri| tri.material as usize == selected_material)
+            {
+                let indices = [tri.a as usize, tri.b as usize, tri.c as usize];
+                if indices.iter().any(|idx| *idx >= raw.vertices.len()) {
+                    continue;
+                }
+                let a = raw.vertices[indices[0]];
+                let b = raw.vertices[indices[1]];
+                let c = raw.vertices[indices[2]];
+                for (p, q) in [(a, b), (b, c), (c, a)] {
+                    gl::Vertex3f(p.x, p.y, p.z);
+                    gl::Vertex3f(q.x, q.y, q.z);
+                }
             }
-            let a = raw.vertices[indices[0]];
-            let b = raw.vertices[indices[1]];
-            let c = raw.vertices[indices[2]];
-            for (p, q) in [(a, b), (b, c), (c, a)] {
-                gl::Vertex3f(p.x, p.y, p.z);
-                gl::Vertex3f(q.x, q.y, q.z);
-            }
+            gl::End();
         }
-        gl::End();
         gl::Enable(gl::CULL_FACE);
     }
 }
 
-fn draw_raw_mesh_edges(raw: &RawMesh) {
+fn draw_raw_mesh_edges(raw: &RawMesh, alpha: f32) {
     unsafe {
         gl::Enable(gl::DEPTH_TEST);
         gl::Disable(gl::TEXTURE_2D);
@@ -2452,7 +3386,7 @@ fn draw_raw_mesh_edges(raw: &RawMesh) {
         gl::Enable(gl::BLEND);
         gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
         gl::LineWidth(1.0);
-        gl::Color4f(0.02, 0.03, 0.04, 0.62);
+        gl::Color4f(0.02, 0.03, 0.04, alpha);
         gl::Begin(gl::LINES);
         for tri in &raw.triangles {
             let indices = [tri.a as usize, tri.b as usize, tri.c as usize];
@@ -2472,6 +3406,28 @@ fn draw_raw_mesh_edges(raw: &RawMesh) {
         }
         gl::End();
         gl::Disable(gl::BLEND);
+        gl::Enable(gl::CULL_FACE);
+    }
+}
+
+fn draw_dff_sharp_edge_overlay(raw: &RawMesh) {
+    let sharp_edges = inferred_dff_sharp_edges(raw);
+    if sharp_edges.is_empty() {
+        return;
+    }
+    unsafe {
+        gl::Enable(gl::DEPTH_TEST);
+        gl::Disable(gl::TEXTURE_2D);
+        gl::Disable(gl::LIGHTING);
+        gl::Disable(gl::CULL_FACE);
+        gl::LineWidth(3.0);
+        gl::Color4f(1.0, 0.18, 0.72, 1.0);
+        gl::Begin(gl::LINES);
+        for (a, b) in sharp_edges {
+            gl::Vertex3f(a.x, a.y, a.z);
+            gl::Vertex3f(b.x, b.y, b.z);
+        }
+        gl::End();
         gl::Enable(gl::CULL_FACE);
     }
 }
@@ -2540,11 +3496,19 @@ fn draw_dff_face_vertex_overlay(
     selected_vertex: Option<usize>,
     selected_vertices: &BTreeSet<usize>,
     hovered_vertex: Option<usize>,
+    hovered_edge: Option<(usize, usize)>,
     camera_pos: Vec3,
     show_vertices: bool,
     show_faces: bool,
+    show_sharp_edges: bool,
+    mesh_outline_alpha: f32,
 ) {
-    draw_raw_mesh_edges(raw);
+    if mesh_outline_alpha > 0.0 {
+        draw_raw_mesh_edges(raw, mesh_outline_alpha);
+    }
+    if show_sharp_edges {
+        draw_dff_sharp_edge_overlay(raw);
+    }
     if show_vertices {
         draw_nearby_raw_vertices(raw, camera_pos);
         draw_dff_vertex_incident_edges(raw, selected_vertex, selected_vertices);
@@ -2596,6 +3560,18 @@ fn draw_dff_face_vertex_overlay(
             }
             gl::End();
         }
+        if let Some((a, b)) = hovered_edge
+            && !selected_edges.contains(&(a, b))
+            && let (Some(a), Some(b)) = (raw.vertices.get(a), raw.vertices.get(b))
+        {
+            gl::Enable(gl::DEPTH_TEST);
+            gl::LineWidth(5.0);
+            gl::Color4f(0.15, 0.95, 1.0, 0.95);
+            gl::Begin(gl::LINES);
+            gl::Vertex3f(a.x, a.y, a.z);
+            gl::Vertex3f(b.x, b.y, b.z);
+            gl::End();
+        }
         if show_vertices {
             if let Some(vertex_idx) = selected_vertex {
                 if let Some(p) = raw.vertices.get(vertex_idx) {
@@ -2645,6 +3621,42 @@ fn draw_dff_face_vertex_overlay(
             }
         }
         gl::Enable(gl::CULL_FACE);
+    }
+}
+
+fn draw_dff_normal_overlay(raw: &RawMesh) {
+    if raw.normals.len() != raw.vertices.len() || raw.vertices.is_empty() {
+        return;
+    }
+    let bounds = bounds_from_vertices(&raw.vertices);
+    let length = (bounds.max - bounds.min)
+        .length()
+        .mul_add(0.035, 0.0)
+        .clamp(0.03, 8.0);
+    // Keep the diagnostic usable on unusually dense assets without turning a
+    // viewport toggle into millions of immediate-mode line vertices.
+    let stride = raw.vertices.len().div_ceil(20_000).max(1);
+    unsafe {
+        gl::PushAttrib(gl::ENABLE_BIT | gl::LINE_BIT | gl::CURRENT_BIT);
+        gl::Enable(gl::DEPTH_TEST);
+        gl::Disable(gl::TEXTURE_2D);
+        gl::Disable(gl::LIGHTING);
+        gl::Disable(gl::CULL_FACE);
+        gl::LineWidth(1.5);
+        gl::Color4f(0.18, 0.95, 0.82, 0.92);
+        gl::Begin(gl::LINES);
+        for index in (0..raw.vertices.len()).step_by(stride) {
+            let position = to_mq(raw.vertices[index]);
+            let normal = to_mq(raw.normals[index]).normalize_or_zero();
+            if normal.length_squared() <= 0.0001 {
+                continue;
+            }
+            let end = position + normal * length;
+            gl::Vertex3f(position.x, position.y, position.z);
+            gl::Vertex3f(end.x, end.y, end.z);
+        }
+        gl::End();
+        gl::PopAttrib();
     }
 }
 
@@ -3035,7 +4047,7 @@ fn draw_breakable_fracture_preview(
     (triangle_count, vertex_count)
 }
 
-fn draw_render_mesh_edges(mesh: &RenderMesh) {
+fn draw_render_mesh_edges(mesh: &RenderMesh, alpha: f32) {
     unsafe {
         gl::Enable(gl::DEPTH_TEST);
         gl::Disable(gl::TEXTURE_2D);
@@ -3044,7 +4056,7 @@ fn draw_render_mesh_edges(mesh: &RenderMesh) {
         gl::Enable(gl::BLEND);
         gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
         gl::LineWidth(1.0);
-        gl::Color4f(0.02, 0.03, 0.04, 0.62);
+        gl::Color4f(0.02, 0.03, 0.04, alpha);
         gl::Begin(gl::LINES);
         for part in &mesh.parts {
             for tri in part.cpu_vertices.chunks_exact(3) {
@@ -3058,6 +4070,42 @@ fn draw_render_mesh_edges(mesh: &RenderMesh) {
         }
         gl::End();
         gl::Disable(gl::BLEND);
+        gl::Enable(gl::CULL_FACE);
+    }
+}
+
+fn draw_raw_mesh_model_hover(raw: &RawMesh) {
+    unsafe {
+        gl::Enable(gl::DEPTH_TEST);
+        gl::DepthFunc(gl::LEQUAL);
+        gl::Disable(gl::TEXTURE_2D);
+        gl::Disable(gl::LIGHTING);
+        gl::Disable(gl::CULL_FACE);
+        gl::Enable(gl::BLEND);
+        gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+        gl::LineWidth(3.0);
+        gl::Color4f(0.12, 0.88, 1.0, 0.96);
+        gl::Begin(gl::LINES);
+        for triangle in &raw.triangles {
+            let indices = [
+                triangle.a as usize,
+                triangle.b as usize,
+                triangle.c as usize,
+            ];
+            if indices.iter().any(|index| *index >= raw.vertices.len()) {
+                continue;
+            }
+            for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+                let p = raw.vertices[indices[a]];
+                let q = raw.vertices[indices[b]];
+                gl::Vertex3f(p.x, p.y, p.z);
+                gl::Vertex3f(q.x, q.y, q.z);
+            }
+        }
+        gl::End();
+        gl::LineWidth(1.0);
+        gl::Disable(gl::BLEND);
+        gl::DepthFunc(gl::LESS);
         gl::Enable(gl::CULL_FACE);
     }
 }
@@ -3291,6 +4339,25 @@ fn sphere_intersects_aabb(center: Vec3, radius: f32, min: Vec3, max: Vec3) -> bo
     (nearest - center).length_squared() <= radius * radius
 }
 
+/// Copies the lights which can affect an AABB into `output`, preserving the
+/// global point-light selection order. The renderer uses a fixed-size output
+/// buffer so filtering each world cell does not allocate.
+fn dff_point_lights_intersecting_aabb(
+    lights: &[DffPointLight],
+    min: Vec3,
+    max: Vec3,
+    output: &mut [DffPointLight; MAX_DFF_POINT_LIGHTS],
+) -> usize {
+    let mut count = 0;
+    for &light in lights.iter().take(MAX_DFF_POINT_LIGHTS) {
+        if sphere_intersects_aabb(light.position, light.radius, min, max) {
+            output[count] = light;
+            count += 1;
+        }
+    }
+    count
+}
+
 fn select_dff_point_lights(
     effects: &[Dff2dEffect],
     camera_pos: Vec3,
@@ -3457,7 +4524,55 @@ fn ensure_dff_pointlight_preview_program(app: &mut AppState) -> u32 {
     }
 }
 
-unsafe fn upload_dff_pointlight_uniforms(program: u32, lights: &[DffPointLight]) {
+#[derive(Clone, Copy)]
+struct DffPointlightUniforms {
+    light_count: i32,
+    light_position_radius: i32,
+    light_color: i32,
+    diffuse_texture: i32,
+    has_texture: i32,
+    base_color: i32,
+    alpha_cutoff: i32,
+    fog_enabled: i32,
+    fog_start: i32,
+    fog_end: i32,
+    model_to_world: i32,
+}
+
+std::thread_local! {
+    static DFF_POINTLIGHT_UNIFORM_CACHE: std::cell::Cell<Option<(u32, DffPointlightUniforms)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn dff_pointlight_uniforms(program: u32) -> DffPointlightUniforms {
+    DFF_POINTLIGHT_UNIFORM_CACHE.with(|cache| {
+        if let Some((cached_program, uniforms)) = cache.get()
+            && cached_program == program
+        {
+            return uniforms;
+        }
+        let uniforms = DffPointlightUniforms {
+            light_count: uniform_location(program, "light_count"),
+            light_position_radius: uniform_location(program, "light_position_radius"),
+            light_color: uniform_location(program, "light_color"),
+            diffuse_texture: uniform_location(program, "diffuse_texture"),
+            has_texture: uniform_location(program, "has_texture"),
+            base_color: uniform_location(program, "base_color"),
+            alpha_cutoff: uniform_location(program, "alpha_cutoff"),
+            fog_enabled: uniform_location(program, "fog_enabled"),
+            fog_start: uniform_location(program, "fog_start"),
+            fog_end: uniform_location(program, "fog_end"),
+            model_to_world: uniform_location(program, "model_to_world"),
+        };
+        cache.set(Some((program, uniforms)));
+        uniforms
+    })
+}
+
+unsafe fn upload_dff_pointlight_uniforms(
+    uniforms: &DffPointlightUniforms,
+    lights: &[DffPointLight],
+) {
     let mut position_radius = [[0.0_f32; 4]; MAX_DFF_POINT_LIGHTS];
     let mut colors = [[0.0_f32; 4]; MAX_DFF_POINT_LIGHTS];
     for (index, light) in lights.iter().enumerate() {
@@ -3470,40 +4585,42 @@ unsafe fn upload_dff_pointlight_uniforms(program: u32, lights: &[DffPointLight])
         colors[index] = [light.color.x, light.color.y, light.color.z, 1.0];
     }
     unsafe {
-        gl::Uniform1i(
-            uniform_location(program, "light_count"),
-            lights.len() as i32,
-        );
+        gl::Uniform1i(uniforms.light_count, lights.len() as i32);
         gl::Uniform4fv(
-            uniform_location(program, "light_position_radius"),
-            MAX_DFF_POINT_LIGHTS as i32,
+            uniforms.light_position_radius,
+            lights.len() as i32,
             position_radius.as_ptr().cast(),
         );
         gl::Uniform4fv(
-            uniform_location(program, "light_color"),
-            MAX_DFF_POINT_LIGHTS as i32,
+            uniforms.light_color,
+            lights.len() as i32,
             colors.as_ptr().cast(),
         );
-        gl::Uniform1i(uniform_location(program, "diffuse_texture"), 0);
+    }
+}
+
+unsafe fn upload_dff_pointlight_frame_uniforms(uniforms: &DffPointlightUniforms) {
+    unsafe {
+        gl::Uniform1i(uniforms.diffuse_texture, 0);
         let mut fog_start = 0.0;
         let mut fog_end = 1.0;
         gl::GetFloatv(gl::FOG_START, &mut fog_start);
         gl::GetFloatv(gl::FOG_END, &mut fog_end);
         gl::Uniform1i(
-            uniform_location(program, "fog_enabled"),
+            uniforms.fog_enabled,
             if gl::IsEnabled(gl::FOG) == gl::TRUE {
                 1
             } else {
                 0
             },
         );
-        gl::Uniform1f(uniform_location(program, "fog_start"), fog_start);
-        gl::Uniform1f(uniform_location(program, "fog_end"), fog_end);
+        gl::Uniform1f(uniforms.fog_start, fog_start);
+        gl::Uniform1f(uniforms.fog_end, fog_end);
     }
 }
 
 unsafe fn set_dff_pointlight_material_uniforms(
-    program: u32,
+    uniforms: &DffPointlightUniforms,
     texture: u32,
     color: Vec3,
     alpha: f32,
@@ -3512,23 +4629,14 @@ unsafe fn set_dff_pointlight_material_uniforms(
     unsafe {
         gl::ActiveTexture(gl::TEXTURE0);
         gl::BindTexture(gl::TEXTURE_2D, texture);
-        gl::Uniform1i(
-            uniform_location(program, "has_texture"),
-            if texture != 0 { 1 } else { 0 },
-        );
-        gl::Uniform4f(
-            uniform_location(program, "base_color"),
-            color.x,
-            color.y,
-            color.z,
-            alpha,
-        );
+        gl::Uniform1i(uniforms.has_texture, if texture != 0 { 1 } else { 0 });
+        gl::Uniform4f(uniforms.base_color, color.x, color.y, color.z, alpha);
         let cutoff = match transparency {
             TransparencyMode::Blend => 0.98,
             TransparencyMode::Cutout => 0.08,
             TransparencyMode::Opaque => 0.0,
         };
-        gl::Uniform1f(uniform_location(program, "alpha_cutoff"), cutoff);
+        gl::Uniform1f(uniforms.alpha_cutoff, cutoff);
     }
 }
 
@@ -3538,33 +4646,55 @@ unsafe fn draw_world_dff_pointlight_pass(
     cam: Vec3,
     near: f32,
     far: f32,
+    draw_distance_percent: u16,
     frustum: &[Plane; 6],
-    program: u32,
+    uniforms: &DffPointlightUniforms,
     lights: &[DffPointLight],
+    vertex_budget: usize,
+    budgeted_vertices: &mut usize,
 ) {
     let identity = Mat4::IDENTITY.to_cols_array();
+    let mut order = take_visible_cell_scratch();
+    order.extend(cells.iter().enumerate().filter_map(|(index, cell)| {
+        if cell.vbo == 0 {
+            return None;
+        }
+        let distance_squared = (cell.center - cam).length_squared();
+        (world_cell_in_distance_band(cell, distance_squared, near, far, draw_distance_percent)
+            && aabb_in_frustum(frustum, cell.min, cell.max))
+        .then_some((distance_squared, index))
+    }));
+    sort_visible_cells_nearest_first(&mut order);
+    let mut cell_lights = [DffPointLight {
+        position: Vec3::ZERO,
+        radius: 0.0,
+        color: Vec3::ZERO,
+    }; MAX_DFF_POINT_LIGHTS];
     unsafe {
-        gl::UniformMatrix4fv(
-            uniform_location(program, "model_to_world"),
-            1,
-            gl::FALSE,
-            identity.as_ptr(),
-        );
+        gl::UniformMatrix4fv(uniforms.model_to_world, 1, gl::FALSE, identity.as_ptr());
         enable_world_client_arrays();
-        for cell in cells {
-            let distance_squared = (cell.center - cam).length_squared();
-            let far_edge = far + cell.radius;
-            let near_edge = near - cell.radius;
-            if distance_squared > far_edge * far_edge
-                || (near_edge > 0.0 && distance_squared < near_edge * near_edge)
-                || !aabb_in_frustum(frustum, cell.min, cell.max)
-                || !lights.iter().any(|light| {
-                    sphere_intersects_aabb(light.position, light.radius, cell.min, cell.max)
-                })
-            {
+        for &(_, index) in &order {
+            let cell = &cells[index];
+            // Replay the base VBO pass's ordering and accounting. In
+            // particular, cells without a local light still consume budget:
+            // otherwise this additive pass could reach geometry which the
+            // base pass did not submit.
+            if budgeted_vertices.saturating_add(cell.vertices) > vertex_budget {
+                if *budgeted_vertices > 0 {
+                    break;
+                }
+                if cell.vertices > vertex_budget {
+                    continue;
+                }
+            }
+            *budgeted_vertices += cell.vertices;
+            let light_count =
+                dff_point_lights_intersecting_aabb(lights, cell.min, cell.max, &mut cell_lights);
+            if light_count == 0 {
                 continue;
             }
-            bind_world_vbo(cell.vbo);
+            upload_dff_pointlight_uniforms(uniforms, &cell_lights[..light_count]);
+            bind_world_vbo(cell.vbo, WorldVertexColorMode::Shaded);
             for batch in &cell.batches {
                 if batch.double_sided {
                     gl::Disable(gl::CULL_FACE);
@@ -3577,7 +4707,7 @@ unsafe fn draw_world_dff_pointlight_pass(
                     Vec3::ONE
                 };
                 set_dff_pointlight_material_uniforms(
-                    program,
+                    uniforms,
                     batch.texture,
                     color,
                     1.0,
@@ -3596,9 +4726,14 @@ unsafe fn draw_world_dff_pointlight_pass(
         gl::DisableClientState(gl::VERTEX_ARRAY);
         gl::BindBuffer(gl::ARRAY_BUFFER, 0);
     }
+    recycle_visible_cell_scratch(order);
 }
 
-unsafe fn draw_simulation_dff_pointlight_pass(app: &AppState, frustum: &[Plane; 6], program: u32) {
+unsafe fn draw_simulation_dff_pointlight_pass(
+    app: &AppState,
+    frustum: &[Plane; 6],
+    uniforms: &DffPointlightUniforms,
+) {
     for object in &app.sim.objects {
         let Some(mesh) = sim_object_mesh(app, object.kind) else {
             continue;
@@ -3626,7 +4761,7 @@ unsafe fn draw_simulation_dff_pointlight_pass(app: &AppState, frustum: &[Plane; 
             * Mat4::from_scale(Vec3::splat(visual_scale));
         unsafe {
             gl::UniformMatrix4fv(
-                uniform_location(program, "model_to_world"),
+                uniforms.model_to_world,
                 1,
                 gl::FALSE,
                 model.to_cols_array().as_ptr(),
@@ -3635,7 +4770,7 @@ unsafe fn draw_simulation_dff_pointlight_pass(app: &AppState, frustum: &[Plane; 
             gl::MultMatrixf(model.to_cols_array().as_ptr());
             for part in &mesh.parts {
                 set_dff_pointlight_material_uniforms(
-                    program,
+                    uniforms,
                     part.texture,
                     to_mq(part.material_color),
                     part.alpha,
@@ -3657,6 +4792,7 @@ fn draw_dff_pointlight_preview(
     lod_near: f32,
     lod_far: f32,
     draw_lod: bool,
+    vertex_budget: usize,
 ) {
     // SA stores sprite brightness in timecyc as a decimal, quantizes it to
     // tenths internally, then applies the reconstructed decimal to 2DFX RGB.
@@ -3673,6 +4809,7 @@ fn draw_dff_pointlight_preview(
     if program == 0 {
         return;
     }
+    let uniforms = dff_pointlight_uniforms(program);
     unsafe {
         gl::PushAttrib(gl::ALL_ATTRIB_BITS);
         gl::UseProgram(program);
@@ -3692,20 +4829,38 @@ fn draw_dff_pointlight_preview(
         gl::Disable(gl::ALPHA_TEST);
         gl::Disable(gl::LIGHTING);
         gl::Enable(gl::CULL_FACE);
-        upload_dff_pointlight_uniforms(program, &lights);
-        draw_world_dff_pointlight_pass(&app.world_cells, cam, 0.0, far, frustum, program, &lights);
+        upload_dff_pointlight_frame_uniforms(&uniforms);
+        let mut budgeted_vertices = 0;
+        draw_world_dff_pointlight_pass(
+            &app.world_cells,
+            cam,
+            0.0,
+            far,
+            app.options.draw_distance_percent,
+            frustum,
+            &uniforms,
+            &lights,
+            vertex_budget,
+            &mut budgeted_vertices,
+        );
         if draw_lod {
             draw_world_dff_pointlight_pass(
                 &app.lod_world_cells,
                 cam,
                 lod_near,
                 lod_far,
+                app.options.draw_distance_percent,
                 frustum,
-                program,
+                &uniforms,
                 &lights,
+                vertex_budget,
+                &mut budgeted_vertices,
             );
         }
-        draw_simulation_dff_pointlight_pass(app, frustum, program);
+        // World cells upload local subsets. Restore the selected global set
+        // for independently positioned simulation meshes.
+        upload_dff_pointlight_uniforms(&uniforms, &lights);
+        draw_simulation_dff_pointlight_pass(app, frustum, &uniforms);
         gl::UseProgram(0);
         gl::BindTexture(gl::TEXTURE_2D, 0);
         gl::BindBuffer(gl::ARRAY_BUFFER, 0);
@@ -3753,8 +4908,20 @@ fn draw_textured_billboard(
     texture: u32,
     color: Color,
 ) {
-    let right = right * size;
-    let up = up * size;
+    draw_textured_billboard_sized(center, right, up, size, size, texture, color);
+}
+
+fn draw_textured_billboard_sized(
+    center: Vec3,
+    right: Vec3,
+    up: Vec3,
+    half_width: f32,
+    half_height: f32,
+    texture: u32,
+    color: Color,
+) {
+    let right = right * half_width;
+    let up = up * half_height;
     unsafe {
         if texture != 0 {
             gl::Enable(gl::TEXTURE_2D);
@@ -3898,10 +5065,258 @@ fn draw_dff_corona_effect(
                 payload_u8(&effect.payload, 2, 190) as f32 / 255.0,
                 preview_alpha,
             ),
-            payload_f32(&effect.payload, 12, 1.5).max(0.1) * 12.0,
+            dff_corona_preview_half_extent(effect),
         )
     };
     draw_textured_billboard(to_mq(effect.position), right, up, size, texture, color);
+}
+
+fn dff_corona_preview_half_extent(effect: &Dff2dEffect) -> f32 {
+    // CEntity::PreRender passes the authored CoronaSize straight to
+    // CCoronas::RegisterCorona. CSprite treats that value as the billboard's
+    // half-extent; there is no editor/world conversion.
+    payload_f32(&effect.payload, 12, 1.5).max(0.01)
+}
+
+fn sample_particle_size_keys(keys: &[(f32, f32)], phase: f32) -> Option<f32> {
+    let first = *keys.first()?;
+    let phase = phase.clamp(0.0, 1.0);
+    if phase <= first.0 {
+        return Some(first.1);
+    }
+    for pair in keys.windows(2) {
+        let [(t0, v0), (t1, v1)] = pair else {
+            continue;
+        };
+        if phase <= *t1 {
+            let span = (*t1 - *t0).max(f32::EPSILON);
+            return Some(*v0 + (*v1 - *v0) * ((phase - *t0) / span).clamp(0.0, 1.0));
+        }
+    }
+    keys.last().map(|(_, value)| *value)
+}
+
+fn dff_particle_preview_half_size(
+    def: &ParticleEffectDef,
+    primitive_index: usize,
+    phase: f32,
+) -> (f32, f32) {
+    let curve = def
+        .size_curves
+        .get(primitive_index % def.size_curves.len().max(1));
+    let width = curve
+        .and_then(|curve| sample_particle_size_keys(&curve.size_x, phase))
+        .unwrap_or(0.1)
+        .abs();
+    let height = curve
+        .and_then(|curve| sample_particle_size_keys(&curve.size_y, phase))
+        .unwrap_or(width)
+        .abs();
+    // RpPTank sizes are full sprite dimensions while draw_textured_billboard
+    // takes the distance from the center to an edge.
+    ((width * 0.5).max(0.01), (height * 0.5).max(0.01))
+}
+
+fn dff_particle_preview_radius(def: &ParticleEffectDef) -> f32 {
+    def.size_curves
+        .iter()
+        .flat_map(|curve| curve.size_x.iter().chain(&curve.size_y))
+        .map(|(_, value)| value.abs() * 0.5)
+        .filter(|value| value.is_finite())
+        .fold(0.05_f32, f32::max)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DffRoadSignPreview {
+    width: f32,
+    height: f32,
+    rotation: Vec3,
+    line_count: usize,
+    characters_per_line: usize,
+    palette: usize,
+    lines: [String; 4],
+}
+
+fn dff_road_sign_preview(effect: &Dff2dEffect) -> Option<DffRoadSignPreview> {
+    if effect.effect_id != 7 || effect.payload.len() < 86 {
+        return None;
+    }
+    let width = payload_f32(&effect.payload, 0, 1.0).abs();
+    let height = payload_f32(&effect.payload, 4, 1.0).abs();
+    if !width.is_finite() || !height.is_finite() || width <= 0.0001 || height <= 0.0001 {
+        return None;
+    }
+    let flags = u16::from_le_bytes([effect.payload[20], effect.payload[21]]);
+    let encoded_lines = (flags & 0x3) as usize;
+    let line_count = if encoded_lines == 0 { 4 } else { encoded_lines };
+    let characters_per_line = match (flags >> 2) & 0x3 {
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => 16,
+    };
+    let lines = std::array::from_fn(|line| {
+        effect.payload[22 + line * 16..22 + (line + 1) * 16]
+            .iter()
+            .copied()
+            .take(characters_per_line)
+            .take_while(|byte| *byte != 0)
+            .map(|byte| if byte == b'_' { ' ' } else { char::from(byte) })
+            .collect::<String>()
+    });
+    Some(DffRoadSignPreview {
+        width,
+        height,
+        rotation: vec3(
+            payload_f32(&effect.payload, 8, 0.0),
+            payload_f32(&effect.payload, 12, 0.0),
+            payload_f32(&effect.payload, 16, 0.0),
+        ),
+        line_count,
+        characters_per_line,
+        palette: ((flags >> 4) & 0x3) as usize,
+        lines,
+    })
+}
+
+fn dff_road_sign_palette(index: usize) -> Color {
+    match index {
+        1 => Color::new(0.035, 0.035, 0.035, 0.98),
+        2 => Color::new(0.12, 0.82, 0.25, 0.98),
+        3 => Color::new(0.94, 0.12, 0.10, 0.98),
+        _ => Color::new(0.96, 0.96, 0.92, 0.98),
+    }
+}
+
+fn dff_road_sign_point(origin: Vec3, right: Vec3, up: Vec3, x: f32, y: f32) -> Vec3 {
+    origin + right * x + up * y
+}
+
+unsafe fn dff_road_sign_quad(origin: Vec3, right: Vec3, up: Vec3, rect: [f32; 4]) {
+    let [left, bottom, right_edge, top] = rect;
+    let a = dff_road_sign_point(origin, right, up, left, bottom);
+    let b = dff_road_sign_point(origin, right, up, right_edge, bottom);
+    let c = dff_road_sign_point(origin, right, up, right_edge, top);
+    let d = dff_road_sign_point(origin, right, up, left, top);
+    unsafe {
+        gl::Vertex3f(a.x, a.y, a.z);
+        gl::Vertex3f(b.x, b.y, b.z);
+        gl::Vertex3f(c.x, c.y, c.z);
+        gl::Vertex3f(d.x, d.y, d.z);
+    }
+}
+
+fn draw_dff_road_sign_effect(effect: &Dff2dEffect, selected: bool) {
+    let Some(sign) = dff_road_sign_preview(effect) else {
+        return;
+    };
+    let Some(font) = FONT_REGULAR.get() else {
+        return;
+    };
+    let texture_id = font.atlas.raw_miniquad_id();
+    let raw_texture = {
+        let internal = unsafe { get_internal_gl() };
+        let raw = unsafe { internal.quad_context.texture_raw_id(texture_id) };
+        drop(internal);
+        let macroquad::miniquad::RawId::OpenGl(id) = raw;
+        id
+    };
+
+    // SA applies roadsign rotations in Y, X, Z order. With column vectors the
+    // corresponding matrix product is Z * X * Y. An unrotated sign lies in
+    // the local X/Z plane, matching the game's Z-up world.
+    let rotation = dff_2dfx_rotation_matrix(from_mq(sign.rotation));
+    let right = rotation.transform_vector3(Vec3::X).normalize_or_zero();
+    let up = rotation.transform_vector3(Vec3::Z).normalize_or_zero();
+    let normal = rotation.transform_vector3(Vec3::Y).normalize_or_zero();
+    let origin = to_mq(effect.position) + normal * 0.012;
+    let line_height = sign.height / sign.line_count.max(1) as f32;
+    let cell_width = sign.width / sign.characters_per_line.max(1) as f32;
+    let scale = (cell_width * 0.86 / (font.raster_px.max(1.0) * 0.62))
+        .min(line_height * 0.78 / font.raster_px.max(1.0));
+    let color = dff_road_sign_palette(sign.palette);
+    let atlas_w = font.atlas.width().max(1.0);
+    let atlas_h = font.atlas.height().max(1.0);
+
+    unsafe {
+        gl::PushAttrib(gl::ALL_ATTRIB_BITS);
+        gl::Disable(gl::LIGHTING);
+        gl::Disable(gl::CULL_FACE);
+        gl::Enable(gl::DEPTH_TEST);
+        gl::DepthMask(gl::FALSE);
+        gl::Enable(gl::BLEND);
+        gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+
+        if selected {
+            gl::Disable(gl::TEXTURE_2D);
+            gl::Color4f(0.02, 0.05, 0.07, 0.34);
+            gl::Begin(gl::QUADS);
+            dff_road_sign_quad(
+                origin - normal * 0.006,
+                right,
+                up,
+                [
+                    -sign.width * 0.5,
+                    -sign.height * 0.5,
+                    sign.width * 0.5,
+                    sign.height * 0.5,
+                ],
+            );
+            gl::End();
+        }
+
+        gl::Enable(gl::TEXTURE_2D);
+        gl::BindTexture(gl::TEXTURE_2D, raw_texture);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+        gl::Color4f(color.r, color.g, color.b, color.a);
+        gl::Begin(gl::QUADS);
+        for line_index in 0..sign.line_count {
+            let baseline = sign.height * 0.5 - line_index as f32 * line_height - line_height * 0.74;
+            for (column, ch) in sign.lines[line_index]
+                .chars()
+                .take(sign.characters_per_line)
+                .enumerate()
+            {
+                if ch == ' ' || ch == '_' {
+                    continue;
+                }
+                let rendered = if ch == '^' { '↑' } else { ch };
+                let Some(glyph) = font.glyphs.get(&rendered).or_else(|| font.glyphs.get(&'?'))
+                else {
+                    continue;
+                };
+                let Some(source) = glyph.source else {
+                    continue;
+                };
+                let cell_left = -sign.width * 0.5 + column as f32 * cell_width;
+                let advance = glyph.advance * scale;
+                let left = cell_left + (cell_width - advance) * 0.5 + glyph.bearing_x * scale;
+                let right_edge = left + glyph.w * scale;
+                let top = baseline + glyph.top * scale;
+                let bottom = top - glyph.h * scale;
+                let u0 = source.x / atlas_w;
+                let u1 = (source.x + source.w) / atlas_w;
+                let v0 = (source.y + source.h) / atlas_h;
+                let v1 = source.y / atlas_h;
+                let a = dff_road_sign_point(origin, right, up, left, bottom);
+                let b = dff_road_sign_point(origin, right, up, right_edge, bottom);
+                let c = dff_road_sign_point(origin, right, up, right_edge, top);
+                let d = dff_road_sign_point(origin, right, up, left, top);
+                gl::TexCoord2f(u0, v0);
+                gl::Vertex3f(a.x, a.y, a.z);
+                gl::TexCoord2f(u1, v0);
+                gl::Vertex3f(b.x, b.y, b.z);
+                gl::TexCoord2f(u1, v1);
+                gl::Vertex3f(c.x, c.y, c.z);
+                gl::TexCoord2f(u0, v1);
+                gl::Vertex3f(d.x, d.y, d.z);
+            }
+        }
+        gl::End();
+        gl::BindTexture(gl::TEXTURE_2D, 0);
+        gl::PopAttrib();
+    }
 }
 
 fn draw_dff_2dfx_effects(
@@ -3926,7 +5341,7 @@ fn draw_dff_2dfx_effects(
         gl::BlendFunc(gl::SRC_ALPHA, gl::ONE);
         gl::DepthMask(gl::FALSE);
     }
-    for effect in effects {
+    for (effect_index, effect) in effects.iter().enumerate() {
         if traffic_state.is_some_and(|state| !dff_2dfx_active_for_traffic_preview(effect, state)) {
             continue;
         }
@@ -3942,7 +5357,7 @@ fn draw_dff_2dfx_effects(
                     .find(|def| def.name.eq_ignore_ascii_case(&particle_name))
                 {
                     let puff_count = if def.primitive_count > 1 { 6 } else { 4 };
-                    let base_size = (def.cull_distance * 0.045).clamp(6.0, 28.0);
+                    let preview_radius = dff_particle_preview_radius(def);
                     for puff in 0..puff_count {
                         let phase =
                             (get_time() as f32 * 0.45 + puff as f32 / puff_count as f32).fract();
@@ -3960,24 +5375,27 @@ fn draw_dff_2dfx_effects(
                             .or_else(|| textures.get(&format!("particle.txd|{key}")).copied())
                             .unwrap_or(0);
                         let angle = puff as f32 * 2.3999631 + phase * 0.8;
-                        let spread = base_size * (0.35 + phase * 0.85);
-                        let lift = up * (phase * base_size * 1.2);
+                        let spread = preview_radius * (0.12 + phase * 0.3);
+                        let lift = up * (phase * preview_radius * 1.2);
                         let drift =
                             right * angle.cos() * spread + forward * angle.sin() * spread * 0.35;
                         let center = p + drift + lift;
-                        let size = base_size * (0.65 + phase * 1.15);
+                        let (half_width, half_height) =
+                            dff_particle_preview_half_size(def, puff, phase);
                         let alpha = (1.0 - phase).clamp(0.0, 1.0) * 0.62;
-                        draw_textured_billboard(
+                        draw_textured_billboard_sized(
                             center,
                             right,
                             up,
-                            size,
+                            half_width,
+                            half_height,
                             texture,
                             Color::new(0.82, 0.88, 0.96, alpha),
                         );
                     }
                 }
             }
+            7 => draw_dff_road_sign_effect(effect, selected == Some(effect_index)),
             _ => {}
         }
     }
@@ -3989,16 +5407,16 @@ fn draw_dff_2dfx_effects(
         gl::Begin(gl::LINES);
         for (idx, effect) in effects.iter().enumerate() {
             let p = to_mq(effect.position);
-            let mut size: f32 = if Some(idx) == selected { 12.0 } else { 7.0 };
+            // Keep the editing handle distinct from the authored visual size.
+            // These are world-space metres, not screen pixels.
+            let mut size: f32 = if Some(idx) == selected { 0.35 } else { 0.18 };
             if effect.effect_id == 1 {
                 let particle_name = particle_name_from_payload(&effect.payload);
-                if let Some(def) = particle_effects
+                if !particle_effects
                     .iter()
-                    .find(|def| def.name.eq_ignore_ascii_case(&particle_name))
+                    .any(|def| def.name.eq_ignore_ascii_case(&particle_name))
                 {
-                    size = size.max((def.cull_distance * 0.08).clamp(8.0, 30.0));
-                } else {
-                    size = size.max(12.0);
+                    size = size.max(0.25);
                 }
             }
             if Some(idx) == selected {
@@ -4024,7 +5442,7 @@ fn draw_dff_2dfx_effects(
             let size = particle_effects
                 .iter()
                 .find(|def| def.name.eq_ignore_ascii_case(&particle_name))
-                .map(|def| (def.cull_distance * 0.08).clamp(8.0, 30.0))
+                .map(dff_particle_preview_radius)
                 .unwrap_or(12.0);
             gl::Color4f(0.55, 0.72, 0.92, 0.45);
             gl::Begin(gl::LINE_LOOP);
@@ -4125,10 +5543,36 @@ fn collect_placement_2dfx_effects(
     lod_near: f32,
     lod_far: f32,
 ) -> Vec<Dff2dEffect> {
+    if app.placement_2dfx_indices.is_empty()
+        && app.placement_2dfx_index_placement_count == app.placements.len()
+    {
+        return Vec::new();
+    }
+
     let far = app.options.draw_radius;
+    let lod_near_squared = lod_near.max(0.0) * lod_near.max(0.0);
     let mode = app.options.lod_mode;
     let mut visible_effects = Vec::<Dff2dEffect>::new();
-    for (idx, placement) in app.placements.iter().enumerate() {
+    // Structural edit paths rebuild this index with the render cells. Retain a
+    // full-scan fallback if a caller changes the placement vector without a
+    // rebuild, so an optimization cannot make newly added effects disappear.
+    let index_is_current = app.placement_2dfx_index_placement_count == app.placements.len()
+        && app
+            .placement_2dfx_indices
+            .iter()
+            .all(|&index| index < app.placements.len());
+    let cached_count = if index_is_current { usize::MAX } else { 0 };
+    let fallback_count = if index_is_current { 0 } else { usize::MAX };
+    let placement_indices = app
+        .placement_2dfx_indices
+        .iter()
+        .copied()
+        .take(cached_count)
+        .chain((0..app.placements.len()).take(fallback_count));
+    for idx in placement_indices {
+        let Some(placement) = app.placements.get(idx) else {
+            continue;
+        };
         if app
             .element_states
             .get(idx)
@@ -4137,12 +5581,21 @@ fn collect_placement_2dfx_effects(
             continue;
         }
         let is_lod = placement_is_app_lod(app, placement);
+        let origin = to_mq(placement.pos);
+        let camera_distance_squared = (origin - app.camera.pos).length_squared();
+        let authored_far = world_cell_far_distance(
+            if is_lod { lod_far } else { far },
+            placement_world_draw_distance_tier_for_render(placement, &app.definitions, is_lod),
+            app.options.draw_distance_percent,
+        );
+        let authored_far_squared = authored_far * authored_far;
         let draw_this = if is_lod {
             mode != LodMode::DetailOnly
-                && (to_mq(placement.pos) - app.camera.pos).length() >= lod_near
-                && (to_mq(placement.pos) - app.camera.pos).length() <= lod_far
+                && authored_far >= 0.0
+                && camera_distance_squared >= lod_near_squared
+                && camera_distance_squared <= authored_far_squared
         } else {
-            (to_mq(placement.pos) - app.camera.pos).length() <= far
+            authored_far >= 0.0 && camera_distance_squared <= authored_far_squared
         };
         if !draw_this {
             continue;
@@ -4153,7 +5606,6 @@ fn collect_placement_2dfx_effects(
         if mesh.effects_2dfx.is_empty() {
             continue;
         }
-        let origin = to_mq(placement.pos);
         let radius = (mesh.bounds.max - mesh.bounds.min).length().max(32.0);
         if !sphere_in_frustum(frustum, origin, radius + 256.0) {
             continue;
@@ -4283,17 +5735,21 @@ fn transform_uv(uv: V2, matrix: [f32; 6]) -> V2 {
     }
 }
 
-fn draw_editing_part_dynamic(part: &RenderPart, matrix: [f32; 6]) {
+fn draw_editing_part_dynamic(part: &RenderPart, matrix: Option<[f32; 6]>, ambient_lift: V3) {
     unsafe {
         gl::Begin(gl::TRIANGLES);
         for vertex in &part.cpu_vertices {
-            let uv = transform_uv(vertex.uv, matrix);
+            let uv = matrix.map_or(vertex.uv, |matrix| transform_uv(vertex.uv, matrix));
             let alpha = part.alpha * vertex.alpha;
-            if part.texture != 0 {
-                gl::Color4f(vertex.color.x, vertex.color.y, vertex.color.z, alpha);
-            } else {
-                gl::Color4f(0.78, 0.78, 0.74, alpha);
-            }
+            // This is the same prelight + timecycle ambient equation packed
+            // into the game-world VBOs by rebuild_render_part_list_with_lift.
+            let color = display_vertex_color(
+                vertex.color,
+                ambient_lift,
+                part.material_color,
+                part.material_ambient,
+            );
+            gl::Color4f(color.x, color.y, color.z, alpha);
             gl::Normal3f(vertex.normal.x, vertex.normal.y, vertex.normal.z);
             gl::TexCoord2f(uv.u, uv.v);
             gl::Vertex3f(vertex.pos.x, vertex.pos.y, vertex.pos.z);
@@ -4302,59 +5758,31 @@ fn draw_editing_part_dynamic(part: &RenderPart, matrix: [f32; 6]) {
     }
 }
 
-fn draw_editing_material_specular_preview(mesh: &RenderMesh, raw: &RawMesh, camera_pos: Vec3) {
-    let key_dir = Vec3::new(-0.28, -0.36, 0.89).normalize_or_zero();
-    unsafe {
-        gl::PushAttrib(
-            gl::ENABLE_BIT | gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::CURRENT_BIT,
-        );
-        gl::Enable(gl::DEPTH_TEST);
-        gl::Enable(gl::BLEND);
-        gl::BlendFunc(gl::SRC_ALPHA, gl::ONE);
-        gl::DepthFunc(gl::LEQUAL);
-        gl::DepthMask(gl::FALSE);
-        gl::Disable(gl::TEXTURE_2D);
-        gl::Disable(gl::LIGHTING);
-        for part in &mesh.parts {
-            let material = raw
-                .materials
-                .get(part.material_index)
-                .copied()
-                .unwrap_or_else(default_dff_material);
-            let strength = material.specular.clamp(0.0, 4.0) * material.alpha.clamp(0.0, 1.0);
-            if strength <= 0.0001 {
-                continue;
-            }
-            gl::Begin(gl::TRIANGLES);
-            for vertex in &part.cpu_vertices {
-                let position = to_mq(vertex.pos);
-                let normal = to_mq(vertex.normal).normalize_or_zero();
-                let view = (camera_pos - position).normalize_or_zero();
-                let half_vector = (view + key_dir).normalize_or_zero();
-                let highlight = normal.dot(half_vector).max(0.0).powf(24.0) * strength * 0.45;
-                gl::Color4f(1.0, 1.0, 1.0, highlight.clamp(0.0, 1.0));
-                gl::Normal3f(vertex.normal.x, vertex.normal.y, vertex.normal.z);
-                gl::Vertex3f(vertex.pos.x, vertex.pos.y, vertex.pos.z);
-            }
-            gl::End();
-        }
-        gl::PopAttrib();
-    }
-}
-
 fn draw_editing_render_mesh_preview(
     mesh: &RenderMesh,
-    raw: &RawMesh,
-    camera_pos: Vec3,
+    ambient_lift: V3,
     selected_material: usize,
     mode: ViewportRenderMode,
     classes: &TextureMaterialClasses,
     txd_name: Option<&str>,
     fallback_material: u8,
+    double_sided: bool,
+    show_material_selection_outline: bool,
 ) {
     unsafe {
-        gl::Enable(gl::CULL_FACE);
-        gl::LightModeli(gl::LIGHT_MODEL_TWO_SIDE, gl::FALSE as i32);
+        if double_sided {
+            gl::Disable(gl::CULL_FACE);
+        } else {
+            gl::Enable(gl::CULL_FACE);
+        }
+        gl::LightModeli(
+            gl::LIGHT_MODEL_TWO_SIDE,
+            if double_sided {
+                gl::TRUE as i32
+            } else {
+                gl::FALSE as i32
+            },
+        );
         // Render DFF batches exactly in their stored order. This matches San
         // Andreas: alpha faces write depth, so bad ordering remains visible.
         let mut sequence: Vec<usize> = (0..mesh.parts.len()).collect();
@@ -4410,16 +5838,9 @@ fn draw_editing_render_mesh_preview(
                 gl::Disable(gl::TEXTURE_2D);
                 gl::Color3f(0.78, 0.78, 0.74);
             }
-            if let Some(matrix) = editing_part_uv_anim(mesh, part.material_index)
-                .and_then(sample_uv_animation_transform)
-            {
-                draw_editing_part_dynamic(part, matrix);
-            } else {
-                draw_render_part_buffer(part);
-            }
-        }
-        if mode == ViewportRenderMode::ShadedTextured {
-            draw_editing_material_specular_preview(mesh, raw, camera_pos);
+            let matrix = editing_part_uv_anim(mesh, part.material_index)
+                .and_then(sample_uv_animation_transform);
+            draw_editing_part_dynamic(part, matrix, ambient_lift);
         }
         gl::Disable(gl::BLEND);
         gl::Enable(gl::ALPHA_TEST);
@@ -4427,26 +5848,39 @@ fn draw_editing_render_mesh_preview(
         gl::Disable(gl::TEXTURE_2D);
         gl::Disable(gl::LIGHTING);
         gl::Disable(gl::CULL_FACE);
-        gl::LineWidth(2.0);
-        gl::Color4f(1.0, 0.92, 0.20, 1.0);
-        gl::Begin(gl::LINES);
-        for part in mesh
-            .parts
-            .iter()
-            .filter(|part| part.material_index == selected_material)
-        {
-            for tri in part.cpu_vertices.chunks_exact(3) {
-                for (a, b) in [(0, 1), (1, 2), (2, 0)] {
-                    let p = tri[a].pos;
-                    let q = tri[b].pos;
-                    gl::Vertex3f(p.x, p.y, p.z);
-                    gl::Vertex3f(q.x, q.y, q.z);
+        if show_material_selection_outline {
+            gl::LineWidth(2.0);
+            gl::Color4f(1.0, 0.92, 0.20, 1.0);
+            gl::Begin(gl::LINES);
+            for part in mesh
+                .parts
+                .iter()
+                .filter(|part| part.material_index == selected_material)
+            {
+                for tri in part.cpu_vertices.chunks_exact(3) {
+                    for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+                        let p = tri[a].pos;
+                        let q = tri[b].pos;
+                        gl::Vertex3f(p.x, p.y, p.z);
+                        gl::Vertex3f(q.x, q.y, q.z);
+                    }
                 }
             }
+            gl::End();
         }
-        gl::End();
         gl::Enable(gl::CULL_FACE);
+        gl::LightModeli(gl::LIGHT_MODEL_TWO_SIDE, gl::FALSE as i32);
     }
+}
+
+fn editing_scene_model_double_sided(
+    placement_index: usize,
+    placements: &[Placement],
+    definitions: &HashMap<String, Definition>,
+) -> bool {
+    placements
+        .get(placement_index)
+        .is_some_and(|placement| placement_disable_backface_culling(placement, definitions))
 }
 
 fn draw_editing_dff_overlay(mesh: &RenderMesh) {
@@ -4636,6 +6070,7 @@ pub(crate) fn draw_editing_preview(app: &mut AppState, _viewport: Rect) -> bool 
             );
         }
     }
+    let hovered_open_model = editing_dff_hovered_open_model(app);
     let Some(asset) = app.editing.asset.as_ref() else {
         return false;
     };
@@ -4667,20 +6102,118 @@ pub(crate) fn draw_editing_preview(app: &mut AppState, _viewport: Rect) -> bool 
                 return true;
             }
 
-            let show_edit_vertices = dff.select_mode == EditingSelectMode::Vertex;
-            let show_face_selection = dff.select_mode == EditingSelectMode::Face;
+            let show_edit_vertices =
+                dff.select_mode == EditingSelectMode::Vertex || dff.uv_editor.open;
+            let show_face_selection = if dff.uv_editor.open {
+                dff.uv_editor.show_material_selection_outlines
+            } else {
+                dff.select_mode == EditingSelectMode::Face
+            };
+            let overlay_vertices = if dff.uv_editor.open {
+                &dff.uv_editor.selected
+            } else {
+                &dff.selected_vertices
+            };
+            let overlay_active_vertex = if dff.uv_editor.open {
+                dff.uv_editor.hovered
+            } else {
+                dff.selected_vertex
+            };
+            let mesh_outline_alpha = if dff.uv_editor.open {
+                if dff.uv_editor.show_material_outlines {
+                    0.14
+                } else {
+                    0.0
+                }
+            } else {
+                0.62
+            };
+            // In a scene-launched multi-model workspace, inactive models are
+            // contextual geometry. Their RawMesh coordinates were converted
+            // into the common anchor space at open time, so the regular editor
+            // renderer can draw them directly while selection remains scoped
+            // to the active model below.
+            for (index, model) in dff.open_models.iter().enumerate() {
+                if index == dff.active_open_model {
+                    continue;
+                }
+                if let Some(mesh) = model.preview_mesh.as_ref() {
+                    draw_editing_render_mesh_preview(
+                        mesh,
+                        scene_ambient_lift_from_timecyc(&app.timecyc),
+                        usize::MAX,
+                        app.viewport_render_mode,
+                        &app.material_classes,
+                        model.txd_context.as_deref(),
+                        app.collision_generation_fallback_material,
+                        editing_scene_model_double_sided(
+                            model.placement_index,
+                            &app.placements,
+                            &app.definitions,
+                        ),
+                        false,
+                    );
+                    draw_render_mesh_edges(mesh, 0.24);
+                } else {
+                    draw_editing_dff_preview(
+                        &model.raw,
+                        usize::MAX,
+                        app.viewport_render_mode,
+                        &app.material_classes,
+                        &app.txd_textures,
+                        model.txd_context.as_deref(),
+                        app.collision_generation_fallback_material,
+                        editing_scene_model_double_sided(
+                            model.placement_index,
+                            &app.placements,
+                            &app.definitions,
+                        ),
+                        false,
+                    );
+                }
+                if dff.multi_select {
+                    draw_dff_face_vertex_overlay(
+                        &model.raw,
+                        model.selected_face,
+                        &model.selected_faces,
+                        &model.selected_edges,
+                        model.selected_vertex,
+                        &model.selected_vertices,
+                        None,
+                        None,
+                        app.camera.pos,
+                        dff.select_mode == EditingSelectMode::Vertex,
+                        dff.select_mode == EditingSelectMode::Face,
+                        false,
+                        0.0,
+                    );
+                }
+            }
+            let active_double_sided =
+                dff.open_models
+                    .get(dff.active_open_model)
+                    .is_some_and(|model| {
+                        editing_scene_model_double_sided(
+                            model.placement_index,
+                            &app.placements,
+                            &app.definitions,
+                        )
+                    });
             if let Some(mesh) = dff.preview_mesh.as_ref() {
                 draw_editing_render_mesh_preview(
                     mesh,
-                    &dff.raw,
-                    app.camera.pos,
+                    scene_ambient_lift_from_timecyc(&app.timecyc),
                     dff.selected_material,
                     app.viewport_render_mode,
                     &app.material_classes,
                     dff.txd_context.as_deref(),
                     app.collision_generation_fallback_material,
+                    active_double_sided,
+                    !dff.uv_editor.open || dff.uv_editor.show_material_selection_outlines,
                 );
-                draw_render_mesh_edges(mesh);
+                if mesh_outline_alpha > 0.0 {
+                    draw_render_mesh_edges(mesh, mesh_outline_alpha);
+                }
             } else {
                 draw_editing_dff_preview(
                     &dff.raw,
@@ -4690,6 +6223,8 @@ pub(crate) fn draw_editing_preview(app: &mut AppState, _viewport: Rect) -> bool 
                     &app.txd_textures,
                     dff.txd_context.as_deref(),
                     app.collision_generation_fallback_material,
+                    active_double_sided,
+                    !dff.uv_editor.open || dff.uv_editor.show_material_selection_outlines,
                 );
             }
             if !dff.panel_collapsed[DffSection::Fractures as usize] {
@@ -4700,22 +6235,44 @@ pub(crate) fn draw_editing_preview(app: &mut AppState, _viewport: Rect) -> bool 
                 dff.selected_face,
                 &dff.selected_faces,
                 &dff.selected_edges,
-                dff.selected_vertex,
-                &dff.selected_vertices,
+                overlay_active_vertex,
+                overlay_vertices,
                 dff.hovered_vertex,
+                dff.hovered_edge,
                 app.camera.pos,
                 show_edit_vertices,
                 show_face_selection,
+                dff.select_mode == EditingSelectMode::Edge || dff.show_normals,
+                mesh_outline_alpha,
             );
+            if dff.show_normals {
+                draw_dff_normal_overlay(&dff.raw);
+            }
             draw_editing_point_emitter_markers(app, dff);
             if let Some(cutter) = dff.boolean_box {
                 draw_dff_boolean_box(cutter);
             }
+            if let Some(raw) = hovered_open_model
+                .and_then(|index| dff.open_models.get(index))
+                .map(|model| &model.raw)
+            {
+                draw_raw_mesh_model_hover(raw);
+            }
             let sample = active_timecyc_sample(&app.timecyc);
             let sprite_size = sample.values.get(22).copied().unwrap_or(1.0);
             let sprite_brightness = sample.values.get(23).copied().unwrap_or(1.0);
+            let preview_effects = editing_dff_2dfx_draft_effect(dff).map(|(index, effect)| {
+                let mut effects = dff.raw.effects_2dfx.clone();
+                if let Some(target) = effects.get_mut(index) {
+                    *target = effect;
+                }
+                effects
+            });
+            let effects = preview_effects
+                .as_deref()
+                .unwrap_or(dff.raw.effects_2dfx.as_slice());
             draw_dff_2dfx_effects(
-                &dff.raw.effects_2dfx,
+                effects,
                 dff.selected_2dfx,
                 &app.particle_effects,
                 &app.textures,
@@ -4893,14 +6450,52 @@ pub(crate) unsafe fn configure_viewport_light(app: &AppState, timecyc_sample: &T
     }
 }
 
-/// Reproduces SA PC's two additive timecycle colour-filter passes. Both passes
-/// sample the same saved, unfiltered framebuffer rather than feeding the first
-/// result into the second pass.
+fn sa_timecyc_color_filter_active(first: [f32; 4], second: [f32; 4]) -> bool {
+    first[3] > 0.0 || second[3] > 0.0
+}
+
+/// Combines two additive filters when one fixed-function pass can reproduce
+/// both their RGB and alpha contributions without current-color clamping.
+fn combined_sa_timecyc_color_filter(first: [f32; 4], second: [f32; 4]) -> Option<[f32; 4]> {
+    // glColor clamps each authored pass independently. Combining out-of-range
+    // inputs before that clamp would therefore change their contribution.
+    for pass in [first, second] {
+        if pass[3] > 0.0 && !pass.iter().all(|value| (0.0..=1.0).contains(value)) {
+            return None;
+        }
+    }
+    let first_alpha = first[3].max(0.0);
+    let second_alpha = second[3].max(0.0);
+    let alpha = first_alpha.hypot(second_alpha);
+    if alpha <= 0.0 || alpha > 1.0 {
+        return None;
+    }
+
+    let mut combined = [0.0; 4];
+    for channel in 0..3 {
+        combined[channel] = (first[channel] * first_alpha + second[channel] * second_alpha) / alpha;
+        if !(0.0..=1.0).contains(&combined[channel]) {
+            return None;
+        }
+    }
+    combined[3] = alpha;
+    Some(combined)
+}
+
+/// Reproduces SA PC's additive timecycle colour-filter passes. Both authored
+/// passes sample the same saved, unfiltered framebuffer; compatible pairs are
+/// collapsed to one mathematically equivalent fixed-function draw.
 pub(crate) unsafe fn apply_sa_timecyc_color_filter(
     app: &mut AppState,
     viewport: Rect,
     sample: &TimecycSample,
 ) {
+    // Avoid allocating/resizing a texture and copying the framebuffer when the
+    // timecycle has no active post-processing contribution.
+    if !sa_timecyc_color_filter_active(sample.postfx1, sample.postfx2) {
+        return;
+    }
+
     unsafe {
         let width = viewport.w.max(1.0) as i32;
         let height = viewport.h.max(1.0) as i32;
@@ -4959,7 +6554,9 @@ pub(crate) unsafe fn apply_sa_timecyc_color_filter(
         gl::PushMatrix();
         gl::LoadIdentity();
 
-        for pass in [sample.postfx1, sample.postfx2] {
+        let passes = combined_sa_timecyc_color_filter(sample.postfx1, sample.postfx2)
+            .map_or([sample.postfx1, sample.postfx2], |pass| [pass, [0.0; 4]]);
+        for pass in &passes {
             if pass[3] <= 0.0 {
                 continue;
             }
@@ -4985,8 +6582,13 @@ pub(crate) unsafe fn apply_sa_timecyc_color_filter(
 }
 
 pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
+    // Detailed timings are sampled only on the frame that will emit the
+    // existing once-per-second diagnostics log. Normal frames pay only this
+    // cadence check and an inactive guard.
+    let _diagnostics_frame =
+        ViewportDiagnosticsFrame::begin(app.last_log.elapsed() >= Duration::from_secs(1));
     let viewport = if app.active_tab == AppTab::Editing {
-        editing_center_rect()
+        editing_preview_rect(app)
     } else if app.active_tab == AppTab::Vehicles {
         vehicle_preview_viewport_rect(app)
     } else {
@@ -5032,7 +6634,7 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
         70.0_f32.to_radians(),
         viewport.w / viewport.h.max(1.0),
         near_clip,
-        16000.0,
+        VIEWPORT_FAR_CLIP,
     );
     let view = Mat4::look_at_rh(app.camera.pos, app.camera.pos + forward, Vec3::Z);
     let preview_transform = if app.active_tab == AppTab::Preview
@@ -5045,7 +6647,6 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
     };
     let scene_view = view * preview_transform;
     let frustum = frustum_planes(projection * scene_view);
-    let mut max_attribs = 0;
     unsafe {
         gl::Enable(gl::DEPTH_TEST);
         gl::DepthFunc(gl::LEQUAL);
@@ -5106,9 +6707,11 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
         );
         gl::Materialfv(gl::FRONT_AND_BACK, gl::SPECULAR, PREVIEW_SPECULAR.as_ptr());
         gl::Materialfv(gl::FRONT_AND_BACK, gl::EMISSION, emission.as_ptr());
-        gl::GetIntegerv(gl::MAX_VERTEX_ATTRIBS, &mut max_attribs);
-        for index in 0..max_attribs.max(0).min(32) {
-            gl::DisableVertexAttribArray(index as u32);
+        // Miniquad's UI pipeline uses only the low generic attribute slots.
+        // Avoid a synchronous driver query here on every frame; the UI reset
+        // path uses the same bounded sweep before returning control.
+        for index in 0..16 {
+            gl::DisableVertexAttribArray(index);
         }
         gl::DisableClientState(gl::COLOR_ARRAY);
         gl::DisableClientState(gl::VERTEX_ARRAY);
@@ -5118,8 +6721,9 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
 
     if app.active_tab == AppTab::Collisions {
         draw_collision_world(app, &frustum);
-        draw_transform_gizmo(app);
-        draw_water_planes(app);
+        draw_viewport_water_planes(app, &frustum, app.camera.pos, app.options.draw_radius);
+        // draw_editor_outlines owns the transform gizmo as well as selection
+        // overlays; drawing it separately here submitted the gizmo twice.
         draw_editor_outlines(app);
         reset_gl_for_ui();
         return;
@@ -5127,6 +6731,7 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
 
     if app.active_tab == AppTab::Editing {
         draw_editing_preview(app, viewport);
+        unsafe { apply_sa_timecyc_color_filter(app, viewport, &timecyc_sample) };
         draw_transform_gizmo(app);
         reset_gl_for_ui();
         return;
@@ -5169,25 +6774,123 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
     let draw_lod = mode != LodMode::DetailOnly && !app.lod_world_cells.is_empty()
         || mode != LodMode::DetailOnly && !app.lod_scene_cells.is_empty();
 
+    if app.options.fast_vbo && !app.options.vbo_immediate && !part_budgeted {
+        update_world_cell_residency(
+            &mut app.world_cells,
+            &mut app.lod_world_cells,
+            cam,
+            far,
+            lod_near,
+            lod_far,
+            app.options.draw_distance_percent,
+            draw_lod,
+            &frustum,
+        );
+    }
+
     if app.active_tab == AppTab::Preview
         && app.viewport_render_mode != ViewportRenderMode::ShadedTextured
     {
         unsafe {
             gl::Disable(gl::FOG);
         }
-        let (placements, parts, vertices) = draw_preview_view_mode_scene(
-            app,
-            &frustum,
-            cam,
-            far,
-            lod_near,
-            lod_far,
-            app.options.part_budget,
-            vertex_budget,
-        );
-        app.last_drawn_placements = placements;
-        app.last_drawn_parts = parts;
-        app.last_drawn_vertices = vertices;
+        if app.options.fast_vbo && !part_budgeted && !app.world_cells.is_empty() {
+            let mut placements = 0;
+            let mut parts = 0;
+            let mut vertices = 0;
+            match app.viewport_render_mode {
+                ViewportRenderMode::UnshadedTextured => {
+                    draw_world_cell_set(
+                        &app.world_cells,
+                        cam,
+                        0.0,
+                        far,
+                        app.options.draw_distance_percent,
+                        &frustum,
+                        app.options.vbo_immediate,
+                        WorldVertexColorMode::Unshaded,
+                        vertex_budget,
+                        &mut placements,
+                        &mut parts,
+                        &mut vertices,
+                    );
+                    if draw_lod {
+                        draw_world_cell_set(
+                            &app.lod_world_cells,
+                            cam,
+                            lod_near,
+                            lod_far,
+                            app.options.draw_distance_percent,
+                            &frustum,
+                            app.options.vbo_immediate,
+                            WorldVertexColorMode::Unshaded,
+                            vertex_budget,
+                            &mut placements,
+                            &mut parts,
+                            &mut vertices,
+                        );
+                    }
+                }
+                ViewportRenderMode::CollisionClassification => {
+                    draw_world_cell_classification_set(
+                        &app.world_cells,
+                        cam,
+                        0.0,
+                        far,
+                        app.options.draw_distance_percent,
+                        &frustum,
+                        vertex_budget,
+                        &app.material_classes,
+                        app.collision_generation_fallback_material,
+                        &mut placements,
+                        &mut parts,
+                        &mut vertices,
+                    );
+                    if draw_lod {
+                        draw_world_cell_classification_set(
+                            &app.lod_world_cells,
+                            cam,
+                            lod_near,
+                            lod_far,
+                            app.options.draw_distance_percent,
+                            &frustum,
+                            vertex_budget,
+                            &app.material_classes,
+                            app.collision_generation_fallback_material,
+                            &mut placements,
+                            &mut parts,
+                            &mut vertices,
+                        );
+                    }
+                }
+                ViewportRenderMode::ShadedTextured => unreachable!(),
+            }
+            app.last_drawn_placements = placements;
+            app.last_drawn_parts = parts;
+            app.last_drawn_vertices = vertices;
+            unsafe {
+                gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+                gl::BindTexture(gl::TEXTURE_2D, 0);
+                gl::DisableClientState(gl::COLOR_ARRAY);
+                gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+                gl::DisableClientState(gl::NORMAL_ARRAY);
+                gl::DisableClientState(gl::VERTEX_ARRAY);
+            }
+        } else {
+            let (placements, parts, vertices) = draw_preview_view_mode_scene(
+                app,
+                &frustum,
+                cam,
+                far,
+                lod_near,
+                lod_far,
+                app.options.part_budget,
+                vertex_budget,
+            );
+            app.last_drawn_placements = placements;
+            app.last_drawn_parts = parts;
+            app.last_drawn_vertices = vertices;
+        }
         draw_global_transform_bounds(app);
         draw_editor_outlines(app);
         reset_gl_for_ui();
@@ -5205,8 +6908,10 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
             cam,
             0.0,
             far,
+            app.options.draw_distance_percent,
             &frustum,
             immediate,
+            WorldVertexColorMode::Shaded,
             vbud,
             &mut dp,
             &mut dpa,
@@ -5218,8 +6923,10 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
                 cam,
                 lod_near,
                 lod_far,
+                app.options.draw_distance_percent,
                 &frustum,
                 immediate,
+                WorldVertexColorMode::Shaded,
                 vbud,
                 &mut dp,
                 &mut dpa,
@@ -5252,8 +6959,9 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
                 lod_near,
                 lod_far,
                 draw_lod,
+                vertex_budget,
             );
-            draw_water_planes(app);
+            draw_viewport_water_planes(app, &frustum, cam, far);
             draw_placement_2dfx_overlay(app, &visible_2dfx);
             draw_global_transform_bounds(app);
             apply_sa_timecyc_color_filter(app, viewport, &timecyc_sample);
@@ -5261,8 +6969,8 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
             draw_missing_texture_review_overlays(app);
             draw_editor_outlines(app);
             draw_vertex_paint_marker(app, viewport);
-            for index in 0..max_attribs.max(0).min(4) {
-                gl::EnableVertexAttribArray(index as u32);
+            for index in 0..4 {
+                gl::EnableVertexAttribArray(index);
             }
         }
         reset_gl_for_ui();
@@ -5317,8 +7025,9 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
         lod_near,
         lod_far,
         draw_lod,
+        vertex_budget,
     );
-    draw_water_planes(app);
+    draw_viewport_water_planes(app, &frustum, cam, far);
     draw_placement_2dfx_overlay(app, &visible_2dfx);
     draw_global_transform_bounds(app);
     unsafe { apply_sa_timecyc_color_filter(app, viewport, &timecyc_sample) };
@@ -5534,26 +7243,46 @@ fn draw_race_track_gl(track: &RaceTrack, is_sel: bool, mode: RacePlaceMode, sel:
     }
 }
 
+fn draw_viewport_water_planes(
+    app: &AppState,
+    _frustum: &[Plane; 6],
+    _camera: Vec3,
+    _draw_radius: f32,
+) {
+    // Water is an infinite-distance world layer and remains visible regardless
+    // of the element draw radius or camera frustum.
+    draw_water_planes_impl(app);
+    draw_cull_zones(app);
+}
+
 pub(crate) fn draw_water_planes(app: &AppState) {
+    draw_water_planes_impl(app);
+}
+
+fn draw_water_planes_impl(app: &AppState) {
     if app.water_planes.is_empty() {
         return;
     }
+    let adjustment = if app.active_tab == AppTab::Preview && app.global_transform.preview {
+        let transform = global_transform_matrix(app.global_transform);
+        let current = if app.global_transform.transform_elements {
+            transform
+        } else {
+            Mat4::IDENTITY
+        };
+        let desired = if app.global_transform.transform_water {
+            transform
+        } else {
+            Mat4::IDENTITY
+        };
+        current.inverse() * desired
+    } else {
+        Mat4::IDENTITY
+    };
     unsafe {
         gl::MatrixMode(gl::MODELVIEW);
         gl::PushMatrix();
-        if app.active_tab == AppTab::Preview && app.global_transform.preview {
-            let transform = global_transform_matrix(app.global_transform);
-            let current = if app.global_transform.transform_elements {
-                transform
-            } else {
-                Mat4::IDENTITY
-            };
-            let desired = if app.global_transform.transform_water {
-                transform
-            } else {
-                Mat4::IDENTITY
-            };
-            let adjustment = current.inverse() * desired;
+        if adjustment != Mat4::IDENTITY {
             gl::MultMatrixf(adjustment.to_cols_array().as_ptr());
         }
         gl::PushAttrib(gl::ENABLE_BIT | gl::CURRENT_BIT | gl::LINE_BIT | gl::DEPTH_BUFFER_BIT);
@@ -5695,6 +7424,447 @@ fn draw_global_transform_bounds(app: &AppState) {
 mod tests {
     use super::*;
 
+    fn test_placement(id: &str) -> Placement {
+        Placement {
+            id: id.to_string(),
+            dff: format!("{id}.dff"),
+            zone: "test".to_string(),
+            tag: "object".to_string(),
+            attrs: BTreeMap::new(),
+            pos: V3::default(),
+            rot: V3::default(),
+        }
+    }
+
+    #[test]
+    fn editing_scene_model_inherits_definition_double_sided_flag() {
+        let placements = vec![test_placement("fence"), test_placement("wall")];
+        let definitions = HashMap::from([
+            (
+                "fence".to_string(),
+                Definition {
+                    id: "fence".to_string(),
+                    zone: "test".to_string(),
+                    attrs: BTreeMap::from([(
+                        "flags".to_string(),
+                        "disable_backface_culling".to_string(),
+                    )]),
+                },
+            ),
+            (
+                "wall".to_string(),
+                Definition {
+                    id: "wall".to_string(),
+                    zone: "test".to_string(),
+                    attrs: BTreeMap::new(),
+                },
+            ),
+        ]);
+
+        assert!(editing_scene_model_double_sided(
+            0,
+            &placements,
+            &definitions
+        ));
+        assert!(!editing_scene_model_double_sided(
+            1,
+            &placements,
+            &definitions
+        ));
+        assert!(!editing_scene_model_double_sided(
+            2,
+            &placements,
+            &definitions
+        ));
+    }
+
+    #[test]
+    fn packed_world_vertex_layout_matches_client_array_offsets() {
+        assert_eq!(std::mem::size_of::<WorldVertex>(), 40);
+        assert_eq!(std::mem::align_of::<WorldVertex>(), 4);
+        assert_eq!(std::mem::offset_of!(WorldVertex, uv), 0);
+        assert_eq!(std::mem::offset_of!(WorldVertex, normal), 8);
+        assert_eq!(std::mem::offset_of!(WorldVertex, shaded_rgba), 20);
+        assert_eq!(std::mem::offset_of!(WorldVertex, unshaded_rgba), 24);
+        assert_eq!(std::mem::offset_of!(WorldVertex, position), 28);
+    }
+
+    #[test]
+    fn packed_world_color_clamps_rounds_and_decodes() {
+        assert_eq!(pack_world_color(-1.0), 0);
+        assert_eq!(pack_world_color(0.0), 0);
+        assert_eq!(pack_world_color(0.5), 128);
+        assert_eq!(pack_world_color(1.0), 255);
+        assert_eq!(pack_world_color(2.0), 255);
+        assert_eq!(pack_world_color(f32::NAN), 0);
+        assert_eq!(pack_world_color(f32::INFINITY), 0);
+
+        for channel in [0.0, 0.01, 0.08, 0.5, 0.98, 1.0] {
+            let decoded = unpack_world_color(pack_world_color(channel));
+            assert!((decoded - channel).abs() <= 0.5 / 255.0 + f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn packed_world_rgba_preserves_independent_alpha() {
+        let packed = pack_world_rgba(
+            V3 {
+                x: 0.25,
+                y: 0.5,
+                z: 0.75,
+            },
+            0.125,
+        );
+        assert_eq!(packed, [64, 128, 191, 32]);
+    }
+
+    #[test]
+    fn sa_timecyc_filter_skips_non_positive_alpha_passes() {
+        assert!(!sa_timecyc_color_filter_active(
+            [1.0, 0.5, 0.25, 0.0],
+            [0.2, 0.3, 0.4, -0.1],
+        ));
+        assert!(sa_timecyc_color_filter_active(
+            [0.0; 4],
+            [0.2, 0.3, 0.4, 0.1],
+        ));
+    }
+
+    #[test]
+    fn combined_sa_timecyc_filter_preserves_additive_rgba_contribution() {
+        let first = [0.25, 0.4, 0.1, 0.3];
+        let second = [0.2, 0.1, 0.3, 0.4];
+        let combined = combined_sa_timecyc_color_filter(first, second).unwrap();
+
+        for channel in 0..3 {
+            let original = first[channel] * first[3] + second[channel] * second[3];
+            let collapsed = combined[channel] * combined[3];
+            assert!((original - collapsed).abs() < 0.000_001);
+        }
+        let original_alpha = first[3] * first[3] + second[3] * second[3];
+        assert!((original_alpha - combined[3] * combined[3]).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn combined_sa_timecyc_filter_rejects_values_that_would_clamp() {
+        assert!(
+            combined_sa_timecyc_color_filter([1.0, 1.0, 1.0, 0.7], [1.0, 1.0, 1.0, 0.7],).is_none()
+        );
+        assert!(
+            combined_sa_timecyc_color_filter([-0.2, 0.3, 0.4, 0.2], [0.2, 0.3, 0.4, 0.2],)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn world_cell_keys_floor_across_negative_boundaries() {
+        assert_eq!(
+            world_cell_key(V3 {
+                x: -0.01,
+                y: -256.0,
+                z: 900.0,
+            }),
+            WorldCellKey { x: -1, y: -1 }
+        );
+        assert_eq!(
+            world_cell_key(V3 {
+                x: -256.01,
+                y: 255.99,
+                z: -900.0,
+            }),
+            WorldCellKey { x: -2, y: 0 }
+        );
+    }
+
+    #[test]
+    fn world_cell_key_filter_accepts_only_selected_origin_cells() {
+        let selected = HashSet::from([WorldCellKey { x: -1, y: 2 }]);
+        assert!(world_cell_key_is_selected(
+            V3 {
+                x: -1.0,
+                y: 700.0,
+                z: 0.0,
+            },
+            Some(&selected),
+        ));
+        assert!(!world_cell_key_is_selected(
+            V3 {
+                x: 0.0,
+                y: 700.0,
+                z: 0.0,
+            },
+            Some(&selected),
+        ));
+        assert!(world_cell_key_is_selected(V3::default(), None));
+    }
+
+    fn draw_distance_test_placement(tag: &str) -> Placement {
+        Placement {
+            id: "test".to_string(),
+            dff: "test".to_string(),
+            zone: String::new(),
+            tag: tag.to_string(),
+            attrs: BTreeMap::new(),
+            pos: V3::default(),
+            rot: V3::default(),
+        }
+    }
+
+    fn draw_distance_test_definition(attrs: &[(&str, &str)]) -> Definition {
+        Definition {
+            id: "test".to_string(),
+            zone: String::new(),
+            attrs: attrs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn world_draw_distance_parses_preferred_value_and_defaults_safely() {
+        let preferred =
+            draw_distance_test_definition(&[("lodDistance", "300"), ("drawDistance", "900")]);
+        assert_eq!(definition_world_draw_distance(Some(&preferred)), 300.0);
+
+        let fallback = draw_distance_test_definition(&[
+            ("lodDistance", "not-a-number"),
+            ("drawDistance", "450"),
+        ]);
+        assert_eq!(definition_world_draw_distance(Some(&fallback)), 450.0);
+        assert_eq!(definition_world_draw_distance(None), 200.0);
+    }
+
+    #[test]
+    fn world_draw_distance_promotes_tiny_authored_values() {
+        let definitions = HashMap::from([(
+            "test".to_string(),
+            draw_distance_test_definition(&[("lodDistance", "9")]),
+        )]);
+        assert_eq!(
+            placement_world_draw_distance_tier(
+                &draw_distance_test_placement("building"),
+                &definitions,
+            ),
+            WorldDrawDistanceTier::D1024,
+        );
+    }
+
+    #[test]
+    fn base_objects_and_buildings_use_the_same_authored_distance() {
+        let definitions = HashMap::from([(
+            "test".to_string(),
+            draw_distance_test_definition(&[("drawDistance", "100")]),
+        )]);
+        assert_eq!(
+            placement_world_draw_distance_tier(
+                &draw_distance_test_placement("building"),
+                &definitions,
+            ),
+            WorldDrawDistanceTier::D128,
+        );
+        assert_eq!(
+            placement_world_draw_distance_tier(
+                &draw_distance_test_placement("object"),
+                &definitions,
+            ),
+            WorldDrawDistanceTier::D128,
+        );
+    }
+
+    #[test]
+    fn linked_detail_and_lod_cells_keep_the_global_swap_band() {
+        let definitions = HashMap::from([(
+            "test".to_string(),
+            draw_distance_test_definition(&[("drawDistance", "100")]),
+        )]);
+        let mut paired_detail = draw_distance_test_placement("building");
+        paired_detail
+            .attrs
+            .insert("lodParent".to_string(), "self".to_string());
+        assert_eq!(
+            placement_world_draw_distance_tier_for_render(&paired_detail, &definitions, false,),
+            WorldDrawDistanceTier::Infinite,
+        );
+
+        let lod = draw_distance_test_placement("object");
+        assert_eq!(
+            placement_world_draw_distance_tier_for_render(&lod, &definitions, true),
+            WorldDrawDistanceTier::Infinite,
+        );
+    }
+
+    #[test]
+    fn world_draw_distance_quantization_always_rounds_up() {
+        assert_eq!(
+            quantize_world_draw_distance(128.01),
+            WorldDrawDistanceTier::D256,
+        );
+        assert_eq!(
+            quantize_world_draw_distance(4096.01),
+            WorldDrawDistanceTier::D8192,
+        );
+        assert_eq!(
+            quantize_world_draw_distance(8192.01),
+            WorldDrawDistanceTier::Infinite,
+        );
+    }
+
+    #[test]
+    fn world_cell_far_distance_respects_tier_scale_and_global_cap() {
+        assert_eq!(
+            world_cell_far_distance(2500.0, WorldDrawDistanceTier::D1024, 50),
+            512.0,
+        );
+        assert_eq!(
+            world_cell_far_distance(400.0, WorldDrawDistanceTier::D1024, 100),
+            400.0,
+        );
+        assert_eq!(
+            world_cell_far_distance(2500.0, WorldDrawDistanceTier::Infinite, 200),
+            2500.0,
+        );
+        assert_eq!(
+            world_cell_far_distance(2500.0, WorldDrawDistanceTier::D128, 0),
+            2500.0,
+        );
+
+        let cell = WorldCell {
+            key: WorldCellKey { x: 0, y: 0 },
+            draw_distance_tier: WorldDrawDistanceTier::D256,
+            min: Vec3::ZERO,
+            max: Vec3::ZERO,
+            center: Vec3::ZERO,
+            radius: 0.0,
+            placements: 0,
+            parts: 0,
+            vertices: 0,
+            gpu_bytes: 0,
+            resident_last_required_at: 0.0,
+            vbo: 0,
+            batches: Vec::new(),
+        };
+        assert!(world_cell_in_distance_band(
+            &cell,
+            255.0 * 255.0,
+            0.0,
+            2500.0,
+            100,
+        ));
+        assert!(!world_cell_in_distance_band(
+            &cell,
+            257.0 * 257.0,
+            0.0,
+            2500.0,
+            100,
+        ));
+        assert!(world_cell_in_residency_band(
+            &cell,
+            700.0 * 700.0,
+            0.0,
+            2500.0,
+            100,
+        ));
+        assert!(!world_cell_in_residency_band(
+            &cell,
+            769.0 * 769.0,
+            0.0,
+            2500.0,
+            100,
+        ));
+    }
+
+    #[test]
+    fn collision_detail_band_respects_authored_tier_and_radius() {
+        assert!(collision_in_distance_band(
+            false,
+            LodMode::Swap,
+            WorldDrawDistanceTier::D256,
+            260.0 * 260.0,
+            8.0,
+            2500.0,
+            2244.0,
+            9000.0,
+            100,
+        ));
+        assert!(!collision_in_distance_band(
+            false,
+            LodMode::Swap,
+            WorldDrawDistanceTier::D256,
+            265.0 * 265.0,
+            8.0,
+            2500.0,
+            2244.0,
+            9000.0,
+            100,
+        ));
+    }
+
+    #[test]
+    fn collision_lod_band_matches_viewport_modes() {
+        assert!(!collision_in_distance_band(
+            true,
+            LodMode::Swap,
+            WorldDrawDistanceTier::Infinite,
+            2100.0 * 2100.0,
+            32.0,
+            2500.0,
+            2244.0,
+            9000.0,
+            100,
+        ));
+        assert!(collision_in_distance_band(
+            true,
+            LodMode::Swap,
+            WorldDrawDistanceTier::Infinite,
+            2300.0 * 2300.0,
+            32.0,
+            2500.0,
+            2244.0,
+            9000.0,
+            100,
+        ));
+        assert!(!collision_in_distance_band(
+            true,
+            LodMode::DetailOnly,
+            WorldDrawDistanceTier::Infinite,
+            2300.0 * 2300.0,
+            32.0,
+            2500.0,
+            f32::MAX,
+            9000.0,
+            100,
+        ));
+        assert!(collision_in_distance_band(
+            true,
+            LodMode::ShowAll,
+            WorldDrawDistanceTier::Infinite,
+            100.0 * 100.0,
+            0.0,
+            2500.0,
+            0.0,
+            9000.0,
+            100,
+        ));
+    }
+
+    #[test]
+    fn visible_cell_sort_is_nearest_first_with_stable_index_ties() {
+        let mut cells = vec![(9.0, 3), (1.0, 2), (9.0, 1)];
+        sort_visible_cells_nearest_first(&mut cells);
+        assert_eq!(cells, vec![(1.0, 2), (9.0, 1), (9.0, 3)]);
+    }
+
+    #[test]
+    fn blend_segment_sort_is_farthest_first_with_stable_depth_ties() {
+        let mut segments = vec![(4.0, 0, 0, 0, 0), (9.0, 1, 0, 0, 1), (4.0, 2, 0, 0, 2)];
+        sort_blend_segments_farthest_first(&mut segments);
+        assert_eq!(
+            segments,
+            vec![(9.0, 1, 0, 0, 1), (4.0, 0, 0, 0, 0), (4.0, 2, 0, 0, 2)]
+        );
+    }
+
     #[test]
     fn detail_viewports_use_a_close_camera_near_plane() {
         assert_eq!(camera_near_clip_for_tab(AppTab::Editing), 0.05);
@@ -5709,6 +7879,37 @@ mod tests {
         assert_eq!(vehicle_preview_corona_alpha(255), 166);
         assert_eq!(vehicle_preview_corona_alpha(192), 125);
         assert_eq!(vehicle_preview_corona_alpha(0), 83);
+    }
+
+    #[test]
+    fn particle_preview_interpolates_authored_sa_size_curve() {
+        let def = ParticleEffectDef {
+            size_curves: vec![ParticleSizeCurve {
+                size_x: vec![(0.0, 0.35), (0.2, 4.0), (1.0, 9.0)],
+                size_y: vec![(0.0, 0.5), (1.0, 8.0)],
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(dff_particle_preview_half_size(&def, 0, 0.0), (0.175, 0.25));
+        assert_eq!(dff_particle_preview_half_size(&def, 0, 0.2), (2.0, 1.0));
+        assert_eq!(dff_particle_preview_half_size(&def, 0, 1.0), (4.5, 4.0));
+        assert_eq!(dff_particle_preview_radius(&def), 4.5);
+    }
+
+    #[test]
+    fn particle_preview_uses_renderware_default_without_size_info() {
+        let def = ParticleEffectDef::default();
+        assert_eq!(dff_particle_preview_half_size(&def, 0, 0.5), (0.05, 0.05));
+        assert_eq!(dff_particle_preview_radius(&def), 0.05);
+    }
+
+    #[test]
+    fn corona_preview_uses_authored_sa_size_without_editor_multiplier() {
+        let mut effect = point_light_effect(V3::default(), 18.0, [255, 255, 255]);
+        effect.payload.resize(16, 0);
+        effect.payload[12..16].copy_from_slice(&1.5f32.to_le_bytes());
+        assert_eq!(dff_corona_preview_half_extent(&effect), 1.5);
     }
 
     fn point_light_effect(position: V3, radius: f32, color: [u8; 3]) -> Dff2dEffect {
@@ -5729,6 +7930,30 @@ mod tests {
             .resize(DFF_2DFX_CORONA_SHOW_MODE_OFFSET + 1, 0);
         effect.payload[DFF_2DFX_CORONA_SHOW_MODE_OFFSET] = DFF_2DFX_TRAFFIC_LIGHT_SHOW_MODE;
         effect
+    }
+
+    #[test]
+    fn road_sign_preview_decodes_sa_grid_palette_and_blank_glyphs() {
+        let mut payload = vec![0u8; 88];
+        payload[0..4].copy_from_slice(&5.0f32.to_le_bytes());
+        payload[4..8].copy_from_slice(&2.5f32.to_le_bytes());
+        // Two lines, eight characters per line, green palette.
+        payload[20..22].copy_from_slice(&(2u16 | (3 << 2) | (2 << 4)).to_le_bytes());
+        payload[22..30].copy_from_slice(b"NORTH_^_");
+        payload[38..46].copy_from_slice(b"DOWNTOWN");
+        let effect = Dff2dEffect {
+            position: V3::default(),
+            effect_id: 7,
+            payload,
+        };
+
+        let sign = dff_road_sign_preview(&effect).unwrap();
+        assert_eq!((sign.width, sign.height), (5.0, 2.5));
+        assert_eq!(sign.line_count, 2);
+        assert_eq!(sign.characters_per_line, 8);
+        assert_eq!(sign.palette, 2);
+        assert_eq!(sign.lines[0], "NORTH ^ ");
+        assert_eq!(sign.lines[1], "DOWNTOWN");
     }
 
     #[test]
@@ -5848,6 +8073,74 @@ mod tests {
         assert!(sphere_intersects_aabb(Vec3::ZERO, 0.1, min, max));
         assert!(sphere_intersects_aabb(vec3(2.0, 0.0, 0.0), 1.0, min, max));
         assert!(!sphere_intersects_aabb(vec3(2.1, 0.0, 0.0), 1.0, min, max));
+    }
+
+    #[test]
+    fn cell_pointlight_filter_excludes_non_intersecting_lights() {
+        let lights = [
+            DffPointLight {
+                position: vec3(20.0, 0.0, 0.0),
+                radius: 2.0,
+                color: Vec3::X,
+            },
+            DffPointLight {
+                position: vec3(2.0, 0.0, 0.0),
+                radius: 1.0,
+                color: Vec3::Y,
+            },
+        ];
+        let mut output = [DffPointLight {
+            position: Vec3::ZERO,
+            radius: 0.0,
+            color: Vec3::ZERO,
+        }; MAX_DFF_POINT_LIGHTS];
+
+        let count = dff_point_lights_intersecting_aabb(
+            &lights,
+            vec3(-1.0, -1.0, -1.0),
+            vec3(1.0, 1.0, 1.0),
+            &mut output,
+        );
+
+        assert_eq!(count, 1);
+        assert_eq!(output[0].position, lights[1].position);
+    }
+
+    #[test]
+    fn cell_pointlight_filter_preserves_global_selection_order() {
+        let lights = [
+            DffPointLight {
+                position: vec3(0.0, 0.0, 0.0),
+                radius: 2.0,
+                color: Vec3::X,
+            },
+            DffPointLight {
+                position: vec3(50.0, 0.0, 0.0),
+                radius: 1.0,
+                color: Vec3::Y,
+            },
+            DffPointLight {
+                position: vec3(1.0, 0.0, 0.0),
+                radius: 2.0,
+                color: Vec3::Z,
+            },
+        ];
+        let mut output = [DffPointLight {
+            position: Vec3::ZERO,
+            radius: 0.0,
+            color: Vec3::ZERO,
+        }; MAX_DFF_POINT_LIGHTS];
+
+        let count = dff_point_lights_intersecting_aabb(
+            &lights,
+            vec3(-1.0, -1.0, -1.0),
+            vec3(1.0, 1.0, 1.0),
+            &mut output,
+        );
+
+        assert_eq!(count, 2);
+        assert_eq!(output[0].color, Vec3::X);
+        assert_eq!(output[1].color, Vec3::Z);
     }
 
     #[test]

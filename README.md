@@ -2,7 +2,7 @@
 
 **A native 3D world and asset editor for Multi Theft Auto: San Andreas.**
 
-[![Release](https://img.shields.io/badge/release-v0.1.5-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.6-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-4b5563)](#download)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green)](LICENSE)
 
@@ -11,25 +11,25 @@ the complete map, inspect and edit RenderWare assets, build LODs, repair common
 asset problems, configure lighting and physics, and save the result back to the
 resource without moving between several separate tools.
 
-## What’s new in 0.1.5
+## What’s new in 0.1.6
 
-- **Safer asset replacement and export:** imported DFF payloads retain their
-  original hierarchy, plugins, BinMesh data, and face order, and staged IMG
-  replacements are used consistently when exporting or saving.
-- **Better camera behavior:** Preview, Editing, and Vehicles retain independent
-  cameras and speeds, detail views use a close near plane, and free-look input
-  no longer leaks into editor controls.
-- **Improved lighting tools:** lights can be placed directly on scene geometry,
-  attached lights follow every live model instance, and color-temperature and
-  popup controls are easier to use reliably.
-- **More accurate vehicle previews:** the default camera faces the model's
-  front, damaged-part visibility is controllable, transparent parts render in
-  a stable order, and coronas no longer wash out nearby geometry.
-- **More resilient project workflows:** completed saves invalidate stale
-  autosave recovery markers, the project picker supports filtering and long
-  paths, and external IMG archives can be selected from the asset editor.
-- **Responsive editor UI:** workspace navigation, toolbars, scrolling, Race and
-  validation panels, tooltips, and compact-window layouts have been refined.
+- **Native Blender map builder:** import evaluated Blender scenes without
+  DragonFF, then let Eagle slice geometry and build DFF, TXD, IMG, definition,
+  and placement output with per-definition texture settings.
+- **Water cull authoring:** create, duplicate, move, resize, and save water-hide
+  volumes from the new CULL workspace, including the generated client runtime.
+- **Expanded mesh editing:** author and reshape DFF/COL geometry with primitives,
+  boolean cutters, pivots, UV tools, material assignment, and stronger
+  validation while preserving multi-geometry assets.
+- **Safer large-map output:** classify objects and buildings by size, rebalance
+  archives, generate more reliable LODs and collisions, and detect material or
+  texture limits before game load.
+- **Broader texture workflows:** import JPEG, BMP, and TGA sources in addition
+  to PNG/GIF, improve TXD repair and optimization, and keep staged archive
+  indexes synchronized after writes.
+- **Improved editing and preview controls:** refined selection, transforms,
+  undo/redo, rendering, lighting, validation navigation, and asset workflows
+  across dense projects.
 
 > [!IMPORTANT]
 > Eagle Editor is an early public release. Keep a backup or use version control for
@@ -82,8 +82,8 @@ code-signed. Verify the archive checksum below before choosing **Run anyway**.
 The Linux build requires an x86-64 desktop with X11 and OpenGL drivers.
 
 ```bash
-tar -xzf EagleEditor-v0.1.5-linux-x86_64.tar.gz
-cd EagleEditor-v0.1.5-linux-x86_64
+tar -xzf EagleEditor-v0.1.6-linux-x86_64.tar.gz
+cd EagleEditor-v0.1.6-linux-x86_64
 chmod +x EagleEditor
 ./EagleEditor
 ```
@@ -138,11 +138,19 @@ resource/
 ├── meta.xml
 ├── EagleScene.eaglescne
 ├── eagleZones.txt
+├── cull.map
+├── eagle_cull.lua
 ├── imgs/*.img
 └── zones/
     ├── **/*.map
     └── **/*.definition
 ```
+
+The **CULL** workspace authors axis-aligned water hiding volumes. Eagle stores
+them as `<cull type="water" ... />` entries in `cull.map` and installs the
+client runtime reference in `meta.xml` on save. While the local player is
+inside any volume, all map water elements are moved to dimension `65535`; on
+exit, every water element is restored to its original dimension.
 
 `EagleScene.eaglescne` stores editor-only, versioned project metadata such as
 lights, material emitters, shadow overrides, and editable collision shapes. It
@@ -164,22 +172,26 @@ the resource and removes that snapshot.
 | `.` | Focus the selected item |
 | Right-click an object row | Move the camera to that object |
 
-## Optional Blender integration
+## Native Blender map builder
 
-Importing a `.blend` scene requires **Blender 4.2 or newer** and these add-ons
-enabled in the same Blender installation/profile used by Eagle:
-
-- [BlueEagle12/MTA-Tool-Kit](https://github.com/BlueEagle12/MTA-Tool-Kit)
-  (`eagle_mta_toolkit`) — required for resource generation and Eagle scene
-  metadata.
-- [DragonFF](https://github.com/Parik27/DragonFF) — required for DFF and COL
-  export.
-- RRW Material Tools — optional advanced-material authoring tools.
+Importing a `.blend` scene requires **Blender 4.2 or newer**. DragonFF and the
+standalone MTA Tool Kit are no longer required: the Tool Kit workflow is built
+into Eagle Editor, and Eagle's shared RenderWare code owns mesh slicing, DFF
+serialization, TXD generation, IMG packing, definitions, and map placements.
+RRW Material Tools remains optional for advanced material authoring.
 
 Eagle checks the `BLENDER_PATH` environment variable first, then `blender` on
 `PATH`, followed by common installation locations. If more than one Blender
-version is installed, set `BLENDER_PATH` to the exact executable whose profile
-has the required add-ons enabled.
+version is installed, set `BLENDER_PATH` to the exact executable to use.
+
+After creating or opening an Eagle map, drag a saved `.blend` file onto the
+editor window (or use **Import Blender**). A setup prompt lets you choose visual
+chunk size, oversized-mesh splitting, and origin centering. Blender evaluates
+modifiers, armatures, shape keys, normals, UV sets, and vertex colors once;
+Eagle performs the expensive spatial clipping and asset build natively. Each
+Blender definition's TXD setting is preserved (`texture` by default). Collision
+generation is handled in Eagle after import. The full output is saved as
+`logs/blender-import.log` inside the project.
 
 ## Documentation
 

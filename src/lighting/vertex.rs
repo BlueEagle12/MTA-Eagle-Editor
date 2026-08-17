@@ -3270,7 +3270,8 @@ mod tests {
             ),
         ]);
 
-        let output = run_light_lod(context).expect("Light LOD should succeed");
+        let output =
+            run_light_lod(&context, context.selected_index).expect("Light LOD should succeed");
         let written = parse_dff_mesh(&output.bytes);
 
         assert_eq!(output.target_name, "lodmain.dff");
@@ -3291,6 +3292,28 @@ mod tests {
         assert_ne!(written.prelit_colors, written.night_prelit_colors);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validation_light_lods_process_each_target_dff_once() {
+        let mut detail_a = variant_test_placement("detail_a", V3::default());
+        detail_a
+            .attrs
+            .insert("lodParent".to_string(), "lod_a".to_string());
+        let mut detail_b = variant_test_placement("detail_b", V3::default());
+        detail_b
+            .attrs
+            .insert("lodParent".to_string(), "lod_b".to_string());
+        let lod_a = variant_test_placement("lod_a", V3::default());
+        let mut lod_b = variant_test_placement("lod_b", V3::default());
+        lod_b.dff = lod_a.dff.clone();
+        let placements = vec![detail_a, lod_a, detail_b, lod_b];
+        let states = vec![ElementState::default(); placements.len()];
+
+        let (details, issues) = validation_light_lod_details(&placements, &states);
+
+        assert_eq!(details, vec![0]);
+        assert!(issues.is_empty());
     }
 
     #[test]
@@ -8117,6 +8140,7 @@ fn day_night_asset_writer_running(app: &AppState) -> bool {
         || app.lod_generation_job.is_some()
         || app.instance_lod_removal_job.is_some()
         || app.water_texture_conversion_job.is_some()
+        || app.preview_world_uv_job.is_some()
         || app.vehicle_build_rx.is_some()
         || app.vehicle_browser.texture_replace_rx.is_some()
         || app.vehicle_browser.collision_copy_rx.is_some()
@@ -8211,117 +8235,251 @@ struct LightLodResult {
     note: String,
 }
 
+enum LightLodWorkerMessage {
+    Item(Result<LightLodResult, String>),
+    Finished,
+}
+
 pub(crate) struct LightLodJob {
-    rx: mpsc::Receiver<Result<LightLodResult, String>>,
+    rx: mpsc::Receiver<LightLodWorkerMessage>,
     started_at: Instant,
+    total: usize,
+    processed: usize,
+    succeeded: usize,
+    batch: bool,
+    render_changed: bool,
+    errors: Vec<String>,
+    log: Vec<String>,
+    last_pair: Option<(String, String)>,
 }
 
 impl LightLodJob {
     fn new(context: DayNightMergeContext) -> Self {
+        let selected_index = context.selected_index;
+        Self::with_indices(context, vec![selected_index], false, Vec::new())
+    }
+
+    fn batch(
+        context: DayNightMergeContext,
+        detail_indices: Vec<usize>,
+        preflight_errors: Vec<String>,
+    ) -> Self {
+        Self::with_indices(context, detail_indices, true, preflight_errors)
+    }
+
+    fn with_indices(
+        context: DayNightMergeContext,
+        detail_indices: Vec<usize>,
+        batch: bool,
+        preflight_errors: Vec<String>,
+    ) -> Self {
+        let total = detail_indices.len();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| run_light_lod(context))
-                .map_err(|panic| {
-                    panic
-                        .downcast_ref::<&str>()
-                        .map(|message| (*message).to_string())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown Light LOD worker panic".to_string())
-                })
-                .and_then(|result| result);
-            let _ = tx.send(result);
+            for detail_index in detail_indices {
+                let detail_label = context
+                    .placements
+                    .get(detail_index)
+                    .map(|placement| placement.id.clone())
+                    .unwrap_or_else(|| format!("placement {detail_index}"));
+                let result = std::panic::catch_unwind(|| run_light_lod(&context, detail_index))
+                    .map_err(|panic| {
+                        panic
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown Light LOD worker panic".to_string())
+                    })
+                    .and_then(|result| result)
+                    .map_err(|error| format!("{detail_label}: {error}"));
+                if tx.send(LightLodWorkerMessage::Item(result)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(LightLodWorkerMessage::Finished);
         });
         Self {
             rx,
             started_at: Instant::now(),
+            total,
+            processed: 0,
+            succeeded: 0,
+            batch,
+            render_changed: false,
+            errors: preflight_errors,
+            log: Vec::new(),
+            last_pair: None,
+        }
+    }
+
+    pub(crate) fn progress_label(&self) -> String {
+        if self.batch {
+            format!("Light LODs ({}/{})", self.processed, self.total)
+        } else {
+            "Lighting LOD".to_string()
         }
     }
 
     fn step(&mut self, app: &mut AppState) -> bool {
-        let result = match self.rx.try_recv() {
-            Ok(result) => result,
-            Err(mpsc::TryRecvError::Empty) => return false,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                app.status_message = "Light LOD worker disconnected".to_string();
-                set_save_log(app, "Light LOD", vec![app.status_message.clone()], true);
-                return true;
+        // Bound main-thread commits per frame. Geometry matching, parsing, and
+        // serialization remain on the worker while completed LODs are staged
+        // incrementally without freezing Validation.
+        for _ in 0..8 {
+            let message = match self.rx.try_recv() {
+                Ok(message) => message,
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.errors
+                        .push("Light LOD worker disconnected before completion".to_string());
+                    return self.finish(app);
+                }
+            };
+            match message {
+                LightLodWorkerMessage::Item(result) => {
+                    self.processed += 1;
+                    match result {
+                        Ok(output) => match apply_light_lod_result(app, output) {
+                            Ok(applied) => {
+                                self.succeeded += 1;
+                                self.render_changed |= applied.render_changed;
+                                self.last_pair = Some((applied.lod_id, applied.detail_id));
+                                self.log.push(applied.log);
+                            }
+                            Err(error) => self.errors.push(error),
+                        },
+                        Err(error) => self.errors.push(error),
+                    }
+                    if self.batch {
+                        app.status_message = format!(
+                            "Lighting LODs asynchronously: {}/{} processed, {} updated, {} issue(s)...",
+                            self.processed,
+                            self.total,
+                            self.succeeded,
+                            self.errors.len()
+                        );
+                    }
+                }
+                LightLodWorkerMessage::Finished => return self.finish(app),
             }
-        };
-        let output = match result {
-            Ok(output) => output,
-            Err(error) => {
-                app.status_message = format!("Light LOD failed: {error}");
-                set_save_log(app, "Light LOD", vec![app.status_message.clone()], true);
-                return true;
-            }
-        };
-        let stale = [&output.expected_detail, &output.expected_lod]
-            .into_iter()
-            .any(|(index, expected)| {
-                app.placements.get(*index) != Some(expected)
-                    || app
-                        .element_states
-                        .get(*index)
-                        .is_some_and(|state| state.deleted)
-            });
-        if stale {
-            app.status_message =
-                "Light LOD cancelled because the detail object or assigned LOD changed".to_string();
-            set_save_log(app, "Light LOD", vec![app.status_message.clone()], true);
-            return true;
         }
+        false
+    }
 
-        let key = asset_key(&output.target_name, ".dff");
-        let open_dirty = matches!(
-            app.editing.asset.as_ref(),
-            Some(EditingAsset::Dff(dff))
-                if asset_key(&dff.name, ".dff") == key && dff.dirty
-        );
-        if open_dirty || app.editing.modified_entries.contains_key(&key) {
-            app.editing
-                .modified_entries
-                .insert(key.clone(), output.bytes.clone());
-        } else {
-            app.pending_replacement_assets.insert(
-                key.clone(),
-                (output.target_name.clone(), output.bytes.clone()),
-            );
-        }
-        if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
-            && asset_key(&dff.name, ".dff") == key
-        {
-            dff.raw = output.raw.clone();
-            dff.dirty = false;
-        }
-        for mesh_key in &output.preserved_vertex_mesh_keys {
-            app.pending_vertex_light_meshes.remove(mesh_key);
-            app.vertex_paint_dirty_meshes.remove(mesh_key);
-        }
-        if refresh_live_dff_from_raw(app, &output.target_name, &output.raw, &output.texture_files) {
+    fn finish(&mut self, app: &mut AppState) -> bool {
+        if self.render_changed {
             rebuild_render_cells(app);
         }
-        clear_history_for_external_change(app);
-        app.loaded_wip = true;
+        if self.succeeded > 0 {
+            clear_history_for_external_change(app);
+            app.loaded_wip = true;
+        }
         let elapsed = self.started_at.elapsed().as_secs_f32();
-        app.status_message = format!(
-            "Lit assigned LOD {} from {} with approximate day/night prelight in {elapsed:.1}s. Save to apply. Undo history cleared.",
-            output.expected_lod.1.id, output.expected_detail.1.id
-        );
-        set_save_log(
-            app,
-            "Light LOD",
-            vec![format!(
-                "Lit {} from detail {}: {}. The LOD geometry and materials were preserved.",
-                output.target_name, output.expected_detail.1.dff, output.note
-            )],
-            false,
-        );
+        if self.batch {
+            app.status_message = format!(
+                "Light LODs updated {} of {} unique assigned LOD model(s) in {elapsed:.1}s with {} issue(s). Save to apply.{}",
+                self.succeeded,
+                self.total,
+                self.errors.len(),
+                if self.succeeded > 0 {
+                    " Undo history cleared."
+                } else {
+                    ""
+                }
+            );
+            self.log
+                .extend(self.errors.iter().map(|error| format!("Skipped: {error}")));
+            set_save_log(app, "Light LODs", self.log.clone(), !self.errors.is_empty());
+        } else {
+            if let Some((lod_id, detail_id)) = self.last_pair.as_ref() {
+                app.status_message = format!(
+                    "Lit assigned LOD {lod_id} from {detail_id} with approximate day/night prelight in {elapsed:.1}s. Save to apply. Undo history cleared."
+                );
+            } else {
+                app.status_message = format!(
+                    "Light LOD failed: {}",
+                    self.errors
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("no result was produced")
+                );
+            }
+            self.log.extend(self.errors.iter().cloned());
+            set_save_log(app, "Light LOD", self.log.clone(), !self.errors.is_empty());
+        }
         true
     }
 }
 
-fn run_light_lod(context: DayNightMergeContext) -> Result<LightLodResult, String> {
-    let detail_index = context.selected_index;
+struct AppliedLightLod {
+    detail_id: String,
+    lod_id: String,
+    render_changed: bool,
+    log: String,
+}
+
+fn apply_light_lod_result(
+    app: &mut AppState,
+    output: LightLodResult,
+) -> Result<AppliedLightLod, String> {
+    let stale = [&output.expected_detail, &output.expected_lod]
+        .into_iter()
+        .any(|(index, expected)| {
+            app.placements.get(*index) != Some(expected)
+                || app
+                    .element_states
+                    .get(*index)
+                    .is_some_and(|state| state.deleted)
+        });
+    if stale {
+        return Err(format!(
+            "{} was not applied because its detail object or assigned LOD changed",
+            output.target_name
+        ));
+    }
+
+    let key = asset_key(&output.target_name, ".dff");
+    let open_dirty = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff))
+            if asset_key(&dff.name, ".dff") == key && dff.dirty
+    );
+    if open_dirty || app.editing.modified_entries.contains_key(&key) {
+        app.editing
+            .modified_entries
+            .insert(key.clone(), output.bytes.clone());
+    } else {
+        app.pending_replacement_assets.insert(
+            key.clone(),
+            (output.target_name.clone(), output.bytes.clone()),
+        );
+    }
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+        && asset_key(&dff.name, ".dff") == key
+    {
+        dff.raw = output.raw.clone();
+        dff.dirty = false;
+    }
+    for mesh_key in &output.preserved_vertex_mesh_keys {
+        app.pending_vertex_light_meshes.remove(mesh_key);
+        app.vertex_paint_dirty_meshes.remove(mesh_key);
+    }
+    let render_changed =
+        refresh_live_dff_from_raw(app, &output.target_name, &output.raw, &output.texture_files);
+    Ok(AppliedLightLod {
+        detail_id: output.expected_detail.1.id.clone(),
+        lod_id: output.expected_lod.1.id.clone(),
+        render_changed,
+        log: format!(
+            "Lit {} from detail {}: {}. The LOD geometry and materials were preserved.",
+            output.target_name, output.expected_detail.1.dff, output.note
+        ),
+    })
+}
+
+fn run_light_lod(
+    context: &DayNightMergeContext,
+    detail_index: usize,
+) -> Result<LightLodResult, String> {
     let lod_index = resolve_assigned_lod(&context.placements, &context.states, detail_index)?
         .ok_or_else(|| {
             format!(
@@ -8462,6 +8620,70 @@ pub(crate) fn request_light_lod(app: &mut AppState) -> bool {
     let context = snapshot_lighting_asset_context(app, selected[0], None, false);
     app.light_lod_job = Some(LightLodJob::new(context));
     app.status_message = "Light LOD started in background...".to_string();
+    true
+}
+
+fn validation_light_lod_details(
+    placements: &[Placement],
+    states: &[ElementState],
+) -> (Vec<usize>, Vec<String>) {
+    let mut detail_indices = Vec::new();
+    let mut target_dffs = BTreeSet::new();
+    let mut issues = Vec::new();
+    for detail_index in 0..placements.len() {
+        if !day_night_merge_live(states, detail_index) {
+            continue;
+        }
+        match resolve_assigned_lod(placements, states, detail_index) {
+            Ok(Some(lod_index)) => {
+                let detail = &placements[detail_index];
+                let lod = &placements[lod_index];
+                if detail.dff.eq_ignore_ascii_case(&lod.dff) {
+                    issues.push(format!(
+                        "{} uses the same DFF as its assigned LOD {}",
+                        detail.id, lod.id
+                    ));
+                    continue;
+                }
+                if target_dffs.insert(asset_key(&lod.dff, ".dff")) {
+                    detail_indices.push(detail_index);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => issues.push(error),
+        }
+    }
+    (detail_indices, issues)
+}
+
+pub(crate) fn request_validation_light_lods(app: &mut AppState) -> bool {
+    if app.light_lod_job.is_some() {
+        app.status_message = "Light LODs is already running".to_string();
+        return false;
+    }
+    if day_night_asset_writer_running(app) {
+        app.status_message =
+            "Light LODs cannot start while another asset writer is running".to_string();
+        return false;
+    }
+    let (detail_indices, issues) =
+        validation_light_lod_details(&app.placements, &app.element_states);
+    if detail_indices.is_empty() {
+        app.status_message = if issues.is_empty() {
+            "No assigned LOD models were found to light".to_string()
+        } else {
+            format!(
+                "No valid assigned LOD models were found ({} issue(s))",
+                issues.len()
+            )
+        };
+        return false;
+    }
+    let total = detail_indices.len();
+    let context = snapshot_lighting_asset_context(app, detail_indices[0], None, false);
+    app.light_lod_job = Some(LightLodJob::batch(context, detail_indices, issues));
+    app.status_message =
+        format!("Light LODs started asynchronously for {total} unique assigned LOD model(s)...");
     true
 }
 

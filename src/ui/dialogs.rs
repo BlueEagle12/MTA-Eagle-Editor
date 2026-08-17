@@ -4,6 +4,10 @@ pub(crate) fn draw_context_menu(app: &AppState) {
     let Some(rect) = context_menu_rect(app) else {
         return;
     };
+    // Controls underneath the floating menu were drawn first and may already
+    // have queued a tooltip for the same pointer position. A context menu owns
+    // the pointer while open, so discard that underlying hover UI.
+    clear_pending_ui_tooltip();
     let mouse: Vec2 = mouse_position().into();
     draw_rrect_bordered(
         rect.x,
@@ -223,6 +227,724 @@ pub(crate) fn draw_save_log_dialog(app: &AppState) {
     draw_dialog_button(&app.ui_font, save_log_close_rect(), "Close", false);
 }
 
+pub(crate) fn draw_blender_import_dialog(app: &AppState) {
+    if !app.blender_import_dialog_open {
+        return;
+    }
+    draw_modal_backdrop();
+    let rect = blender_import_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Import Blender Map"));
+    ui_text(
+        &app.ui_font,
+        &ellipsize_width(&app.blender_import_phase, 16, rect.w - 170.0),
+        rect.x + 24.0,
+        rect.y + 62.0,
+        WHITE,
+    );
+    ui_text(
+        &app.ui_font,
+        &format!(
+            "{:>3.0}%",
+            app.blender_import_progress.clamp(0.0, 1.0) * 100.0
+        ),
+        rect.x + rect.w - 70.0,
+        rect.y + 62.0,
+        LIGHTGRAY,
+    );
+
+    let progress = Rect::new(rect.x + 24.0, rect.y + 78.0, rect.w - 48.0, 18.0);
+    draw_rrect_bordered(
+        progress.x,
+        progress.y,
+        progress.w,
+        progress.h,
+        6.0,
+        1.0,
+        ui_input_bg(),
+        ui_border(),
+    );
+    let fill = (progress.w - 4.0) * app.blender_import_progress.clamp(0.0, 1.0);
+    if fill > 0.5 {
+        draw_rrect(
+            progress.x + 2.0,
+            progress.y + 2.0,
+            fill,
+            progress.h - 4.0,
+            4.0,
+            ui_accent(),
+        );
+    }
+    ui_text(
+        &app.ui_font,
+        "Live Blender / RRW:MTA output   Mouse wheel scrolls   Home/End jumps",
+        rect.x + 24.0,
+        rect.y + 126.0,
+        ui_muted(),
+    );
+
+    let list = Rect::new(rect.x + 24.0, rect.y + 142.0, rect.w - 48.0, rect.h - 206.0);
+    draw_rrect_bordered(
+        list.x,
+        list.y,
+        list.w,
+        list.h,
+        7.0,
+        1.0,
+        ui_input_bg(),
+        ui_border(),
+    );
+    let rows = blender_import_display_rows(app, list.w);
+    let visible_rows = (list.h / 20.0).max(1.0) as usize;
+    let max_scroll = rows.len().saturating_sub(visible_rows) as f32;
+    let scroll = if app.blender_import_log_follow_tail {
+        max_scroll
+    } else {
+        app.blender_import_log_scroll.clamp(0.0, max_scroll)
+    };
+    let start = scroll.floor() as usize;
+    for row in 0..visible_rows {
+        let Some(line) = rows.get(start + row) else {
+            break;
+        };
+        let color = if line.contains("ERROR") || line.contains("Traceback") {
+            Color::new(1.0, 0.48, 0.48, 1.0)
+        } else if line.contains("WARN") || line.contains("warning") {
+            Color::new(1.0, 0.78, 0.36, 1.0)
+        } else {
+            LIGHTGRAY
+        };
+        ui_text(
+            &app.ui_font,
+            line,
+            list.x + 12.0,
+            list.y + 21.0 + row as f32 * 20.0,
+            color,
+        );
+    }
+    if rows.len() > visible_rows {
+        let track = Rect::new(list.x + list.w - 10.0, list.y + 8.0, 4.0, list.h - 16.0);
+        if let Some(metrics) =
+            scrollbar_metrics(track, visible_rows as f32, rows.len() as f32, 24.0, scroll)
+        {
+            draw_scrollbar(metrics, scrollbar_visual_state(track, false));
+        }
+    }
+
+    if app.blender_import_finished {
+        ui_text(
+            &app.ui_font,
+            "The saved log remains in the project's logs folder.",
+            rect.x + 24.0,
+            rect.y + rect.h - 27.0,
+            ui_muted(),
+        );
+        draw_dialog_button(&app.ui_font, blender_import_close_rect(), "Close", false);
+    } else {
+        ui_text(
+            &app.ui_font,
+            "Import is running. Keep Eagle Editor open.",
+            rect.x + 24.0,
+            rect.y + rect.h - 27.0,
+            ui_muted(),
+        );
+    }
+}
+
+pub(crate) fn draw_blender_import_setup_dialog(app: &AppState) {
+    let Some(setup) = app.blender_import_setup.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = blender_import_setup_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Blender Import Setup"));
+    ui_text(
+        &app.ui_font,
+        "Source",
+        rect.x + 24.0,
+        rect.y + 62.0,
+        ui_dim(),
+    );
+    ui_text(
+        &app.ui_font,
+        &ellipsize_width(&setup.source.to_string_lossy(), 16, rect.w - 116.0),
+        rect.x + 88.0,
+        rect.y + 62.0,
+        LIGHTGRAY,
+    );
+    ui_text(&app.ui_font, "TXDs", rect.x + 24.0, rect.y + 96.0, ui_dim());
+    ui_text(
+        &app.ui_font,
+        "Follow Blender definition settings; default is texture.txd",
+        rect.x + 104.0,
+        rect.y + 96.0,
+        LIGHTGRAY,
+    );
+    ui_text(
+        &app.ui_font,
+        "Chunk size",
+        rect.x + 24.0,
+        rect.y + 146.0,
+        WHITE,
+    );
+    ui_text_size(
+        &app.ui_font,
+        "Maximum world-space size for generated visual mesh chunks",
+        rect.x + 24.0,
+        rect.y + 166.0,
+        13,
+        ui_muted(),
+    );
+    let input = blender_import_setup_chunk_rect();
+    draw_rrect_bordered(
+        input.x,
+        input.y,
+        input.w,
+        input.h,
+        7.0,
+        1.0,
+        ui_input_bg(),
+        if setup.error.is_some() {
+            RED
+        } else {
+            ui_accent()
+        },
+    );
+    ui_text(
+        &app.ui_font,
+        &setup.chunk_size,
+        input.x + 10.0,
+        input.y + 21.0,
+        WHITE,
+    );
+    if (get_time() * 2.0) as i32 % 2 == 0 {
+        let cursor = clamp_char_boundary(&setup.chunk_size, setup.chunk_size_cursor);
+        let prefix = &setup.chunk_size[..cursor];
+        let caret_x = input.x + 10.0 + ui_text_width(prefix, 16);
+        draw_line(caret_x, input.y + 7.0, caret_x, input.y + 25.0, 1.0, WHITE);
+    }
+
+    let chunk_row = blender_import_setup_toggle_rect(0);
+    draw_checkbox(
+        &app.ui_font,
+        chunk_row,
+        "Split oversized visual meshes into chunks",
+        setup.options.chunk_meshes,
+    );
+    ui_text_size(
+        &app.ui_font,
+        "Disable only when the Blender scene is already partitioned for streaming",
+        chunk_row.x + 28.0,
+        chunk_row.y + 35.0,
+        13,
+        ui_muted(),
+    );
+    let origins_row = blender_import_setup_toggle_rect(1);
+    draw_checkbox(
+        &app.ui_font,
+        origins_row,
+        "Center generated model origins",
+        setup.options.center_origins,
+    );
+    ui_text_size(
+        &app.ui_font,
+        "Keeps model pivots compact while preserving placement in the generated map",
+        origins_row.x + 28.0,
+        origins_row.y + 35.0,
+        13,
+        ui_muted(),
+    );
+
+    if let Some(error) = setup.error.as_deref() {
+        ui_text_size(
+            &app.ui_font,
+            error,
+            rect.x + 24.0,
+            rect.y + rect.h - 26.0,
+            13,
+            Color::new(1.0, 0.48, 0.48, 1.0),
+        );
+    } else {
+        ui_text_size(
+            &app.ui_font,
+            "Collision generation is handled after import by Eagle Editor.",
+            rect.x + 24.0,
+            rect.y + rect.h - 26.0,
+            13,
+            ui_muted(),
+        );
+    }
+    draw_dialog_button(
+        &app.ui_font,
+        blender_import_setup_start_rect(),
+        "Start Import",
+        true,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        blender_import_setup_cancel_rect(),
+        "Cancel",
+        false,
+    );
+}
+
+pub(crate) fn oversized_chunk_dialog_rect() -> Rect {
+    let w = 780.0_f32.min(screen_width() - 64.0);
+    let h = 610.0_f32.min(screen_height() - 64.0);
+    Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - h) * 0.5,
+        w,
+        h,
+    )
+}
+
+pub(crate) fn oversized_chunk_size_rect() -> Rect {
+    let rect = oversized_chunk_dialog_rect();
+    Rect::new(rect.x + 164.0, rect.y + 72.0, 130.0, 32.0)
+}
+
+pub(crate) fn oversized_chunk_rescan_rect() -> Rect {
+    let rect = oversized_chunk_dialog_rect();
+    Rect::new(rect.x + 306.0, rect.y + 72.0, 92.0, 32.0)
+}
+
+pub(crate) fn oversized_chunk_list_rect() -> Rect {
+    let rect = oversized_chunk_dialog_rect();
+    Rect::new(rect.x + 24.0, rect.y + 128.0, rect.w - 48.0, rect.h - 210.0)
+}
+
+pub(crate) fn oversized_chunk_candidate_rect(app: &AppState, index: usize) -> Rect {
+    let list = oversized_chunk_list_rect();
+    Rect::new(
+        list.x + 6.0,
+        list.y + 6.0 + index as f32 * 58.0
+            - app
+                .oversized_chunk_dialog
+                .as_ref()
+                .map_or(0.0, |dialog| dialog.scroll),
+        list.w - 12.0,
+        52.0,
+    )
+}
+
+pub(crate) fn oversized_chunk_apply_rect() -> Rect {
+    let rect = oversized_chunk_dialog_rect();
+    Rect::new(rect.x + rect.w - 246.0, rect.y + rect.h - 52.0, 132.0, 32.0)
+}
+
+pub(crate) fn oversized_chunk_cancel_rect() -> Rect {
+    let rect = oversized_chunk_dialog_rect();
+    Rect::new(rect.x + rect.w - 102.0, rect.y + rect.h - 52.0, 78.0, 32.0)
+}
+
+pub(crate) fn draw_oversized_chunk_dialog(app: &AppState) {
+    let Some(dialog) = app.oversized_chunk_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = oversized_chunk_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Chunk Oversized Elements"));
+    ui_text(
+        &app.ui_font,
+        "Cell size (X/Y/Z)",
+        rect.x + 24.0,
+        rect.y + 94.0,
+        WHITE,
+    );
+    let input = oversized_chunk_size_rect();
+    draw_rrect_bordered(
+        input.x,
+        input.y,
+        input.w,
+        input.h,
+        7.0,
+        1.0,
+        ui_input_bg(),
+        if dialog.error.is_some() {
+            RED
+        } else {
+            ui_accent()
+        },
+    );
+    ui_text(
+        &app.ui_font,
+        &dialog.chunk_size,
+        input.x + 10.0,
+        input.y + 21.0,
+        WHITE,
+    );
+    if (get_time() * 2.0) as i32 % 2 == 0 {
+        let cursor = clamp_char_boundary(&dialog.chunk_size, dialog.chunk_size_cursor);
+        let prefix = &dialog.chunk_size[..cursor];
+        let caret_x = input.x + 10.0 + ui_text_width(prefix, 16);
+        draw_line(caret_x, input.y + 7.0, caret_x, input.y + 25.0, 1.0, WHITE);
+    }
+    draw_dialog_button(&app.ui_font, oversized_chunk_rescan_rect(), "Review", false);
+    let supported = dialog
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.blocked_reason.is_none())
+        .count();
+    let selected = dialog
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.selected)
+        .count();
+    ui_text_size(
+        &app.ui_font,
+        &format!(
+            "{} oversized DFF(s), {} safe to cut, {} selected",
+            dialog.candidates.len(),
+            supported,
+            selected
+        ),
+        rect.x + 418.0,
+        rect.y + 93.0,
+        13,
+        ui_muted(),
+    );
+
+    let list = oversized_chunk_list_rect();
+    draw_rrect_bordered(
+        list.x,
+        list.y,
+        list.w,
+        list.h,
+        8.0,
+        1.0,
+        ui_input_bg(),
+        ui_border(),
+    );
+    begin_ui_clip(list);
+    for (index, candidate) in dialog.candidates.iter().enumerate() {
+        let row = oversized_chunk_candidate_rect(app, index);
+        if row.y + row.h < list.y || row.y > list.y + list.h {
+            continue;
+        }
+        draw_rrect(
+            row.x,
+            row.y,
+            row.w,
+            row.h,
+            6.0,
+            Color::new(0.085, 0.09, 0.10, 1.0),
+        );
+        let checkbox = Rect::new(row.x + 10.0, row.y + 8.0, 24.0, 24.0);
+        draw_checkbox(
+            &app.ui_font,
+            checkbox,
+            "",
+            candidate.selected && candidate.blocked_reason.is_none(),
+        );
+        ui_text(
+            &app.ui_font,
+            &candidate.dff_name,
+            row.x + 44.0,
+            row.y + 22.0,
+            WHITE,
+        );
+        let detail = if let Some(reason) = candidate.blocked_reason.as_deref() {
+            format!(
+                "{:.1} x {:.1} x {:.1} | {} placement(s) | skipped: {reason}",
+                candidate.extents.x,
+                candidate.extents.y,
+                candidate.extents.z,
+                candidate.placement_count
+            )
+        } else {
+            format!(
+                "{:.1} x {:.1} x {:.1} | {} placement(s)",
+                candidate.extents.x,
+                candidate.extents.y,
+                candidate.extents.z,
+                candidate.placement_count
+            )
+        };
+        ui_text_size(
+            &app.ui_font,
+            &detail,
+            row.x + 44.0,
+            row.y + 42.0,
+            13,
+            if candidate.blocked_reason.is_some() {
+                Color::new(1.0, 0.55, 0.4, 1.0)
+            } else {
+                ui_muted()
+            },
+        );
+    }
+    if dialog.candidates.is_empty() {
+        ui_text(
+            &app.ui_font,
+            "No loaded elements exceed this cell size.",
+            list.x + 18.0,
+            list.y + 34.0,
+            ui_muted(),
+        );
+    }
+    end_ui_clip();
+    if let Some(error) = dialog.error.as_deref() {
+        ui_text_size(
+            &app.ui_font,
+            error,
+            rect.x + 24.0,
+            rect.y + rect.h - 28.0,
+            13,
+            Color::new(1.0, 0.48, 0.48, 1.0),
+        );
+    } else {
+        ui_text_size(
+            &app.ui_font,
+            "Visual DFFs are clipped at cell boundaries; the source keeps its original collision and siblings are render-only.",
+            rect.x + 24.0,
+            rect.y + rect.h - 28.0,
+            13,
+            ui_muted(),
+        );
+    }
+    draw_dialog_button(
+        &app.ui_font,
+        oversized_chunk_apply_rect(),
+        "Cut Selected",
+        true,
+    );
+    draw_dialog_button(&app.ui_font, oversized_chunk_cancel_rect(), "Cancel", false);
+}
+
+pub(crate) fn classify_dialog_rect() -> Rect {
+    let w = 780.0_f32.min(screen_width() - 64.0);
+    let h = 610.0_f32.min(screen_height() - 64.0);
+    Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - h) * 0.5,
+        w,
+        h,
+    )
+}
+
+pub(crate) fn classify_size_rect() -> Rect {
+    let rect = classify_dialog_rect();
+    Rect::new(rect.x + 214.0, rect.y + 72.0, 130.0, 32.0)
+}
+
+pub(crate) fn classify_review_rect() -> Rect {
+    let rect = classify_dialog_rect();
+    Rect::new(rect.x + 356.0, rect.y + 72.0, 92.0, 32.0)
+}
+
+pub(crate) fn classify_list_rect() -> Rect {
+    let rect = classify_dialog_rect();
+    Rect::new(rect.x + 24.0, rect.y + 128.0, rect.w - 48.0, rect.h - 210.0)
+}
+
+pub(crate) fn classify_candidate_rect(app: &AppState, index: usize) -> Rect {
+    let list = classify_list_rect();
+    Rect::new(
+        list.x + 6.0,
+        list.y + 6.0 + index as f32 * 58.0
+            - app
+                .classify_dialog
+                .as_ref()
+                .map_or(0.0, |dialog| dialog.scroll),
+        list.w - 12.0,
+        52.0,
+    )
+}
+
+pub(crate) fn classify_apply_rect() -> Rect {
+    let rect = classify_dialog_rect();
+    Rect::new(rect.x + rect.w - 262.0, rect.y + rect.h - 52.0, 148.0, 32.0)
+}
+
+pub(crate) fn classify_cancel_rect() -> Rect {
+    let rect = classify_dialog_rect();
+    Rect::new(rect.x + rect.w - 102.0, rect.y + rect.h - 52.0, 78.0, 32.0)
+}
+
+pub(crate) fn draw_classify_dialog(app: &AppState) {
+    let Some(dialog) = app.classify_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let rect = classify_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Classify Elements"));
+    ui_text(
+        &app.ui_font,
+        "Max object size (units)",
+        rect.x + 24.0,
+        rect.y + 94.0,
+        WHITE,
+    );
+    let input = classify_size_rect();
+    draw_rrect_bordered(
+        input.x,
+        input.y,
+        input.w,
+        input.h,
+        7.0,
+        1.0,
+        ui_input_bg(),
+        if dialog.error.is_some() {
+            RED
+        } else {
+            ui_accent()
+        },
+    );
+    ui_text(
+        &app.ui_font,
+        &dialog.size,
+        input.x + 10.0,
+        input.y + 21.0,
+        WHITE,
+    );
+    if (get_time() * 2.0) as i32 % 2 == 0 {
+        let cursor = clamp_char_boundary(&dialog.size, dialog.size_cursor);
+        let prefix = &dialog.size[..cursor];
+        let caret_x = input.x + 10.0 + ui_text_width(prefix, 16);
+        draw_line(caret_x, input.y + 7.0, caret_x, input.y + 25.0, 1.0, WHITE);
+    }
+    draw_dialog_button(
+        &app.ui_font,
+        classify_review_rect(),
+        if dialog.scanning {
+            "Reviewing..."
+        } else {
+            "Review"
+        },
+        false,
+    );
+    let blocked = dialog
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.blocked_reason.is_some())
+        .count();
+    let selected = dialog
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.selected && candidate.blocked_reason.is_none())
+        .count();
+    ui_text_size(
+        &app.ui_font,
+        &format!(
+            "{}{} element(s) scanned, {} to retag, {} skipped, {} selected",
+            if dialog.scanning { "Scanning: " } else { "" },
+            dialog.scanned,
+            dialog.candidates.len(),
+            blocked,
+            selected
+        ),
+        rect.x + 468.0,
+        rect.y + 93.0,
+        13,
+        ui_muted(),
+    );
+
+    let list = classify_list_rect();
+    draw_rrect_bordered(
+        list.x,
+        list.y,
+        list.w,
+        list.h,
+        8.0,
+        1.0,
+        ui_input_bg(),
+        ui_border(),
+    );
+    begin_ui_clip(list);
+    for (index, candidate) in dialog.candidates.iter().enumerate() {
+        let row = classify_candidate_rect(app, index);
+        if row.y + row.h < list.y || row.y > list.y + list.h {
+            continue;
+        }
+        draw_rrect(
+            row.x,
+            row.y,
+            row.w,
+            row.h,
+            6.0,
+            Color::new(0.085, 0.09, 0.10, 1.0),
+        );
+        let checkbox = Rect::new(row.x + 10.0, row.y + 8.0, 24.0, 24.0);
+        draw_checkbox(
+            &app.ui_font,
+            checkbox,
+            "",
+            candidate.selected && candidate.blocked_reason.is_none(),
+        );
+        ui_text(
+            &app.ui_font,
+            &format!(
+                "{}  {} -> {}",
+                candidate.id, candidate.current_tag, candidate.target_tag
+            ),
+            row.x + 44.0,
+            row.y + 22.0,
+            WHITE,
+        );
+        let size = candidate.size.map_or_else(
+            || "model not loaded".to_string(),
+            |size| format!("{size:.1} units"),
+        );
+        let detail = if let Some(reason) = candidate.blocked_reason.as_deref() {
+            format!("{size} | {} | skipped: {reason}", candidate.reason.label())
+        } else {
+            format!("{size} | {}", candidate.reason.label())
+        };
+        ui_text_size(
+            &app.ui_font,
+            &detail,
+            row.x + 44.0,
+            row.y + 42.0,
+            13,
+            if candidate.blocked_reason.is_some() {
+                Color::new(1.0, 0.55, 0.4, 1.0)
+            } else {
+                ui_muted()
+            },
+        );
+    }
+    if dialog.candidates.is_empty() && !dialog.scanning {
+        ui_text(
+            &app.ui_font,
+            "Every element already matches this classification.",
+            list.x + 18.0,
+            list.y + 34.0,
+            ui_muted(),
+        );
+    }
+    end_ui_clip();
+    if let Some(error) = dialog.error.as_deref() {
+        ui_text_size(
+            &app.ui_font,
+            error,
+            rect.x + 24.0,
+            rect.y + rect.h - 28.0,
+            13,
+            Color::new(1.0, 0.48, 0.48, 1.0),
+        );
+    } else {
+        ui_text_size(
+            &app.ui_font,
+            "Physics elements always stay objects; everything else larger than the size becomes a building. Scenery and LOD elements keep their type.",
+            rect.x + 24.0,
+            rect.y + rect.h - 28.0,
+            13,
+            ui_muted(),
+        );
+    }
+    draw_dialog_button(
+        &app.ui_font,
+        classify_apply_rect(),
+        if dialog.scanning {
+            "Scanning..."
+        } else {
+            "Classify Selected"
+        },
+        true,
+    );
+    draw_dialog_button(&app.ui_font, classify_cancel_rect(), "Cancel", false);
+}
+
 fn wrap_save_log_line(line: &str, max_chars: usize) -> Vec<String> {
     let mut rows = Vec::new();
     for source in line.split('\n') {
@@ -246,6 +968,15 @@ fn wrap_save_log_line(line: &str, max_chars: usize) -> Vec<String> {
         if !current.is_empty() {
             rows.push(current);
         }
+    }
+    rows
+}
+
+pub(crate) fn blender_import_display_rows(app: &AppState, list_width: f32) -> Vec<String> {
+    let max_chars = ((list_width - 28.0) / 8.0).max(16.0) as usize;
+    let mut rows = Vec::new();
+    for entry in &app.blender_import_log {
+        rows.extend(wrap_save_log_line(entry, max_chars));
     }
     rows
 }
@@ -341,6 +1072,95 @@ pub(crate) fn draw_load_dialog(app: &AppState) {
         "Cancel",
         false,
     );
+}
+
+pub(crate) struct ImportAssetDialogLayout {
+    pub(crate) rect: Rect,
+    pub(crate) id: Rect,
+    pub(crate) browse: Rect,
+    pub(crate) import: Rect,
+    pub(crate) cancel: Rect,
+}
+
+pub(crate) fn import_asset_dialog_layout() -> ImportAssetDialogLayout {
+    let w = 680.0_f32.min(screen_width() - 48.0);
+    let rect = Rect::new(
+        (screen_width() - w) * 0.5,
+        screen_height() * 0.5 - 150.0,
+        w,
+        300.0,
+    );
+    ImportAssetDialogLayout {
+        id: Rect::new(rect.x + 24.0, rect.y + 100.0, rect.w - 48.0, 34.0),
+        browse: Rect::new(rect.x + rect.w - 144.0, rect.y + 184.0, 120.0, 32.0),
+        import: Rect::new(rect.x + rect.w - 224.0, rect.y + rect.h - 50.0, 96.0, 32.0),
+        cancel: Rect::new(rect.x + rect.w - 116.0, rect.y + rect.h - 50.0, 92.0, 32.0),
+        rect,
+    }
+}
+
+pub(crate) fn draw_import_asset_dialog(app: &AppState) {
+    let Some(dialog) = app.import_asset_dialog.as_ref() else {
+        return;
+    };
+    draw_modal_backdrop();
+    let layout = import_asset_dialog_layout();
+    draw_panel_rect(&app.ui_font, layout.rect, Some("Import new asset"));
+    ui_text(
+        &app.ui_font,
+        "DFF",
+        layout.rect.x + 24.0,
+        layout.rect.y + 58.0,
+        ui_dim(),
+    );
+    ui_text(
+        &app.ui_font,
+        &ellipsize(dialog.dff_path.to_string_lossy().as_ref(), 74),
+        layout.rect.x + 74.0,
+        layout.rect.y + 58.0,
+        LIGHTGRAY,
+    );
+    ui_text(
+        &app.ui_font,
+        "Asset ID",
+        layout.id.x,
+        layout.id.y - 10.0,
+        ui_dim(),
+    );
+    draw_rrect_bordered(
+        layout.id.x,
+        layout.id.y,
+        layout.id.w,
+        layout.id.h,
+        7.0,
+        1.0,
+        Color::new(0.055, 0.064, 0.078, 1.0),
+        ui_accent(),
+    );
+    ui_text(
+        &app.ui_font,
+        &ellipsize_width(&dialog.id, 16, layout.id.w - 20.0),
+        layout.id.x + 10.0,
+        layout.id.y + 23.0,
+        WHITE,
+    );
+    ui_text(
+        &app.ui_font,
+        "Texture folder",
+        layout.rect.x + 24.0,
+        layout.rect.y + 166.0,
+        ui_dim(),
+    );
+    ui_text(
+        &app.ui_font,
+        &ellipsize(dialog.texture_dir.to_string_lossy().as_ref(), 62),
+        layout.rect.x + 24.0,
+        layout.rect.y + 205.0,
+        LIGHTGRAY,
+    );
+    draw_dialog_button(&app.ui_font, layout.browse, "Choose folder", false);
+    draw_dialog_button(&app.ui_font, layout.import, "Import", true);
+    draw_dialog_button(&app.ui_font, layout.cancel, "Cancel", false);
 }
 
 pub(crate) fn draw_preferences_dialog(app: &AppState) {
@@ -562,9 +1382,13 @@ fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog,
         app,
         PREFERENCES_DRAW_DISTANCE_ROW,
         "Draw Distance",
-        &format!("{}%", dialog.draw_distance_percent),
-        dialog.draw_distance_percent > 25,
-        dialog.draw_distance_percent < 200,
+        &if dialog.draw_distance_percent == 0 {
+            "Disabled".to_string()
+        } else {
+            format!("{}%", dialog.draw_distance_percent)
+        },
+        dialog.draw_distance_percent > 0,
+        dialog.draw_distance_percent < MAX_DRAW_DISTANCE_PERCENT,
     );
 }
 
@@ -674,6 +1498,138 @@ pub(crate) fn draw_element_id_rename_dialog(app: &AppState) {
     draw_dialog_button(
         &app.ui_font,
         Rect::new(rect.x + rect.w - 88.0, rect.y + rect.h - 50.0, 64.0, 32.0),
+        "Cancel",
+        false,
+    );
+}
+
+pub(crate) fn draw_element_replace_with_dialog(app: &AppState) {
+    let Some(dialog) = app.element_replace_with_dialog.as_ref() else {
+        return;
+    };
+    if dialog.picking_scene {
+        let banner = Rect::new((screen_width() - 520.0) * 0.5, TOP_H + 14.0, 520.0, 48.0);
+        draw_rrect_bordered(
+            banner.x,
+            banner.y,
+            banner.w,
+            banner.h,
+            10.0,
+            1.0,
+            ui_surface(),
+            ui_accent(),
+        );
+        ui_text(
+            &app.ui_font,
+            "Click the replacement element in the scene  |  Esc to return",
+            banner.x + 18.0,
+            banner.y + 29.0,
+            WHITE,
+        );
+        return;
+    }
+    draw_modal_backdrop();
+    let rect = element_replace_with_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Replace with Model"));
+    ui_text(
+        &app.ui_font,
+        &format!(
+            "Replace {} selected element(s) with an existing model ID.",
+            dialog.source_indices.len()
+        ),
+        rect.x + 24.0,
+        rect.y + 60.0,
+        LIGHTGRAY,
+    );
+    let search = element_replace_with_search_rect();
+    draw_rrect_bordered(
+        search.x,
+        search.y,
+        search.w,
+        search.h,
+        8.0,
+        1.0,
+        ui_input_bg(),
+        ui_accent(),
+    );
+    let search_text = if dialog.search.is_empty() {
+        "Search by ID..."
+    } else {
+        dialog.search.as_str()
+    };
+    ui_text(
+        &app.ui_font,
+        &ellipsize_width(search_text, 16, search.w - 20.0),
+        search.x + 10.0,
+        search.y + 23.0,
+        if dialog.search.is_empty() {
+            ui_muted()
+        } else {
+            WHITE
+        },
+    );
+    let options = element_replace_target_ids(app, &dialog.search);
+    let start = (dialog.scroll.floor() as usize).min(options.len().saturating_sub(1));
+    for row in 0..8 {
+        let Some(id) = options.get(start + row) else {
+            break;
+        };
+        let row_rect = element_replace_with_row_rect(row);
+        let selected = dialog.selected_target.as_deref() == Some(id.as_str());
+        if selected || row_rect.contains(mouse_position().into()) {
+            draw_rrect(
+                row_rect.x,
+                row_rect.y,
+                row_rect.w,
+                row_rect.h,
+                7.0,
+                if selected {
+                    ui_accent_soft()
+                } else {
+                    ui_surface_hover()
+                },
+            );
+        }
+        let instances = app
+            .placements
+            .iter()
+            .filter(|placement| placement.id.eq_ignore_ascii_case(id))
+            .count();
+        ui_text(
+            &app.ui_font,
+            id,
+            row_rect.x + 10.0,
+            row_rect.y + 20.0,
+            WHITE,
+        );
+        let count = format!(
+            "{instances} instance{}",
+            if instances == 1 { "" } else { "s" }
+        );
+        let count_w = ui_text_width(&count, 16);
+        ui_text(
+            &app.ui_font,
+            &count,
+            row_rect.x + row_rect.w - count_w - 10.0,
+            row_rect.y + 20.0,
+            ui_muted(),
+        );
+    }
+    draw_dialog_button(
+        &app.ui_font,
+        element_replace_with_pick_rect(),
+        "Pick in scene",
+        false,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        element_replace_with_apply_rect(),
+        "Replace",
+        true,
+    );
+    draw_dialog_button(
+        &app.ui_font,
+        element_replace_with_cancel_rect(),
         "Cancel",
         false,
     );
@@ -1158,14 +2114,30 @@ pub(crate) fn draw_lod_batch_dialog(app: &AppState) {
     let Some(dialog) = app.lod_batch_dialog.as_ref() else {
         return;
     };
-    draw_modal_backdrop();
+    if dialog.mode == LodBatchMode::GenerateSelection {
+        draw_modal_backdrop();
+    } else {
+        // Keep the scene legible while the blue generation preview is active.
+        draw_rectangle(
+            0.0,
+            0.0,
+            screen_width(),
+            screen_height(),
+            Color::new(0.0, 0.0, 0.0, 0.24),
+        );
+    }
     let rect = lod_batch_dialog_rect();
     draw_panel_rect(&app.ui_font, rect, Some("Generate LODs"));
     ui_text(
         &app.ui_font,
         &format!(
-            "{} selected elements. Elements smaller than the minimum are filtered out.",
-            dialog.candidates.len()
+            "{} {} elements. Elements smaller than the minimum are filtered out.",
+            dialog.candidates.len(),
+            if dialog.mode != LodBatchMode::GenerateSelection {
+                "scene"
+            } else {
+                "selected"
+            }
         ),
         rect.x + 24.0,
         rect.y + 56.0,
@@ -1178,6 +2150,21 @@ pub(crate) fn draw_lod_batch_dialog(app: &AppState) {
         rect.y + 99.0,
         WHITE,
     );
+    if dialog.mode != LodBatchMode::GenerateSelection {
+        ui_text(&app.ui_font, "Mode", rect.x + 24.0, rect.y + 143.0, WHITE);
+        text_button(
+            &app.ui_font,
+            lod_batch_missing_only_rect(),
+            "Missing only",
+            dialog.mode == LodBatchMode::GenerateSceneMissing,
+        );
+        text_button(
+            &app.ui_font,
+            lod_batch_regenerate_all_rect(),
+            "Regenerate all",
+            dialog.mode == LodBatchMode::RegenerateScene,
+        );
+    }
     let input = lod_batch_minimum_size_rect();
     let valid_minimum = lod_batch_minimum_size(dialog);
     draw_rrect_bordered(
@@ -1268,13 +2255,26 @@ pub(crate) fn draw_lod_batch_dialog(app: &AppState) {
                 Color::new(0.065, 0.074, 0.088, 1.0),
             );
         }
-        let (state, color) = if let Some(parent) = candidate.existing_lod.as_deref() {
+        let included = lod_batch_candidate_included(candidate, minimum_size, dialog.mode);
+        let (state, color) = if candidate.size < minimum_size {
+            ("FILTERED".to_string(), ui_muted())
+        } else if included && candidate.existing_lod.is_some() {
+            ("REGENERATE".to_string(), Color::new(0.30, 0.72, 1.0, 1.0))
+        } else if let Some(parent) = candidate.existing_lod.as_deref() {
             (
                 format!("SKIP · LOD {parent}"),
                 Color::new(0.95, 0.68, 0.22, 1.0),
             )
-        } else if lod_batch_candidate_included(candidate, minimum_size) {
-            ("INCLUDE".to_string(), Color::new(0.30, 0.85, 0.55, 1.0))
+        } else if included {
+            (
+                if dialog.mode != LodBatchMode::GenerateSelection {
+                    "GENERATE"
+                } else {
+                    "INCLUDE"
+                }
+                .to_string(),
+                Color::new(0.30, 0.85, 0.55, 1.0),
+            )
         } else {
             ("FILTERED".to_string(), ui_muted())
         };
@@ -1308,12 +2308,25 @@ pub(crate) fn draw_lod_batch_dialog(app: &AppState) {
     }
     ui_text(
         &app.ui_font,
-        "Size is the longest rendered bounds dimension after element scale. Existing LODs are always skipped.",
+        if dialog.mode != LodBatchMode::GenerateSelection {
+            "Size is the longest rendered bounds dimension after element scale. Blue outlines preview elements included by the selected mode."
+        } else {
+            "Size is the longest rendered bounds dimension after element scale. Existing LODs are always skipped."
+        },
         rect.x + 24.0,
         rect.y + rect.h - 58.0,
         ui_muted(),
     );
-    draw_dialog_button(&app.ui_font, lod_batch_continue_rect(), "Continue", true);
+    draw_dialog_button(
+        &app.ui_font,
+        lod_batch_continue_rect(),
+        if dialog.mode != LodBatchMode::GenerateSelection {
+            "Generate"
+        } else {
+            "Continue"
+        },
+        true,
+    );
     draw_dialog_button(&app.ui_font, lod_batch_cancel_rect(), "Cancel", false);
 }
 
@@ -1924,6 +2937,7 @@ pub(crate) struct DffTextureViewDialogLayout {
     pub(crate) rect: Rect,
     pub(crate) image: Rect,
     pub(crate) close: Rect,
+    pub(crate) export: Rect,
 }
 
 pub(crate) fn dff_texture_view_dialog_layout(
@@ -1944,6 +2958,7 @@ pub(crate) fn dff_texture_view_dialog_layout(
     DffTextureViewDialogLayout {
         image: Rect::new(rect.x + 24.0, rect.y + 70.0, rect.w - 48.0, rect.h - 126.0),
         close: Rect::new(rect.x + rect.w - 108.0, rect.y + rect.h - 44.0, 84.0, 30.0),
+        export: Rect::new(rect.x + 24.0, rect.y + rect.h - 44.0, 84.0, 30.0),
         rect,
     }
 }
@@ -2011,6 +3026,7 @@ pub(crate) fn draw_dff_texture_view_dialog(app: &AppState) {
         );
     }
     draw_dialog_button(&app.ui_font, layout.close, "Close", true);
+    draw_dialog_button(&app.ui_font, layout.export, "Export", dialog.rgba.is_some());
 }
 
 pub(crate) fn draw_loading_resource(root: &Path, status: &str) {

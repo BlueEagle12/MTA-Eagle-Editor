@@ -483,17 +483,16 @@ pub(crate) fn new_project_cancel_rect() -> Rect {
 
 pub(crate) fn project_picker_open_new_dialog(picker: &mut ProjectPicker) {
     drain_text_input();
-    let root = if Path::new(BROWSE_ROOT).is_dir() {
-        BROWSE_ROOT.to_string()
-    } else {
-        env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .to_string_lossy()
-            .to_string()
-    };
+    let root = load_last_new_project_root().unwrap_or_else(|| {
+        if Path::new(BROWSE_ROOT).is_dir() {
+            PathBuf::from(BROWSE_ROOT)
+        } else {
+            env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        }
+    });
     let name = "New Project".to_string();
     picker.new_project_dialog = Some(NewProjectDialog {
-        root,
+        root: root.to_string_lossy().to_string(),
         cursor: name.len(),
         selection_anchor: Some(0),
         name,
@@ -972,6 +971,7 @@ pub(crate) fn update_project_picker(picker: &mut ProjectPicker) -> Option<LoadJo
         match rx.try_recv() {
             Ok(Ok(Some(path))) => {
                 picker.new_root_picker_rx = None;
+                save_last_new_project_root(&path);
                 if let Some(dialog) = picker.new_project_dialog.as_mut() {
                     dialog.root = path.to_string_lossy().to_string();
                 }
@@ -1150,6 +1150,7 @@ fn create_new_project_from_dialog(picker: &mut ProjectPicker) -> Option<LoadJob>
     };
     match create_eagle_project(Path::new(dialog.root.trim()), &dialog.name) {
         Ok(path) => {
+            save_last_new_project_root(Path::new(dialog.root.trim()));
             picker.status = format!("Created {}", path.display());
             project_picker_start_load(picker, path)
         }

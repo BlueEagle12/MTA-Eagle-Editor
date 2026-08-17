@@ -6,7 +6,7 @@ use std::{
     ffi::{CString, c_void},
     fs,
     hash::{Hash, Hasher},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, Ordering},
@@ -60,6 +60,7 @@ const EDITOR_GROUP_ATTR: &str = "editorGroup";
 const DEFAULT_BOX_SELECT_DISTANCE: f32 = 6000.0;
 const FAR_DRAW: f32 = 9000.0;
 const DEFAULT_DRAW: f32 = 2500.0;
+const VIEWPORT_FAR_CLIP: f32 = 16000.0;
 const DEFAULT_VERTEX_BUDGET: usize = 6_000_000;
 const NO_SELECTION: usize = usize::MAX;
 const SETTLE_SECONDS: f64 = 0.35;
@@ -122,6 +123,9 @@ const REPLACEMENT_IMG: &str = "light_mapper_replacements.img";
 // VER2 reserves 24 bytes for an entry name, but MTA's IMG enumeration expects
 // a trailing NUL. Editor-authored names therefore use at most 23 bytes.
 const IMG_RUNTIME_SAFE_ENTRY_NAME_BYTES: usize = 23;
+// GTA:SA's atomic render path stores one alpha byte per geometry material in a
+// fixed 152-byte stack buffer. A 153rd material corrupts the caller's stack.
+const GTA_DFF_MATERIAL_LIMIT: usize = 152;
 const EAGLE_ELEMENT_TYPES: [&str; 3] = ["building", "object", "scenery"];
 static PHYSICS_ROOT_SPECS: [PhysicsRootSpec; 18] = [
     PhysicsRootSpec::new(
@@ -209,7 +213,7 @@ static PHYSICS_ROOT_SPECS: [PhysicsRootSpec; 18] = [
         PhysicsRootProperties::new(50.0, 50.0, 0.99, 0.05, 50.0),
     ),
     PhysicsRootSpec::new(
-        "Gas Pump (Explosive)",
+        "Fuel Pump (Explosive)",
         1676,
         "washgaspump",
         PhysicsRootProperties::new(99999.0, 500.0, 0.99, 0.05, 50.0).with_damage_behavior(
@@ -352,6 +356,7 @@ mod app_icon {
 mod app;
 mod assets;
 mod blender_import;
+mod blender_native;
 mod col;
 mod dff;
 mod editor;
@@ -371,8 +376,9 @@ use lighting::bake::*;
 use lighting::vertex::*;
 use render::{radar::*, runtime::*, scene::*};
 use resource::{
-    archive_rebalance::*, collision_safety::*, files::*, loading::*, lod_audit::*,
-    material_classes::*, missing_texture_review::*, race::*, save::*, validation::*, water::*,
+    archive_rebalance::*, classify::*, collision_safety::*, cull::*, files::*, loading::*,
+    lod_audit::*, material_classes::*, missing_texture_review::*, race::*, save::*, validation::*,
+    water::*,
 };
 use ui::*;
 
@@ -651,6 +657,8 @@ struct MaterialEmitter {
     enabled: bool,
     emit_inversed: bool,
     cast_mode: MaterialEmitterCastMode,
+    /// Whether Face-mode area samples test scene visibility while baking.
+    casts_shadow: bool,
     max_grouping_size: f32,
     point_up_strength: f32,
     point_down_strength: f32,
@@ -671,6 +679,7 @@ impl Default for MaterialEmitter {
             enabled: false,
             emit_inversed: false,
             cast_mode: MaterialEmitterCastMode::Face,
+            casts_shadow: true,
             max_grouping_size: 2.0,
             point_up_strength: 1.0,
             point_down_strength: 1.0,
@@ -1013,6 +1022,7 @@ struct GpuBakeChannel {
 struct GpuBakeState {
     input: Vec<f32>,
     positions: Vec<Vec3>,
+    triangles: Vec<[Vec3; 3]>,
     mapping: Vec<(String, usize, usize)>,
     channels: Vec<GpuBakeChannel>,
     current_channel: usize,
@@ -1342,6 +1352,9 @@ fn create_gpu_lightmap_program() -> Result<u32, String> {
     const SOURCE: &str = r#"#version 130
 attribute vec3 in_pos;
 attribute vec3 in_normal;
+attribute vec3 in_tri_a;
+attribute vec3 in_tri_b;
+attribute vec3 in_tri_c;
 uniform int light_count;
 uniform int light_kind[32];
 uniform int light_point_lobe[32];
@@ -1369,6 +1382,52 @@ uniform float shadow_occluder_range;
 uniform float shadow_occluder_min;
 uniform float shadow_occluder_max;
 varying vec3 baked_color;
+
+vec3 closest_point_on_triangle(vec3 p, vec3 a, vec3 b, vec3 c) {
+    vec3 ab = b - a;
+    vec3 ac = c - a;
+    vec3 ap = p - a;
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return a;
+    vec3 bp = p - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) return b;
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) return a + ab * (d1 / (d1 - d3));
+    vec3 cp = p - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) return c;
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) return a + ac * (d2 / (d2 - d6));
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0) {
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+    float denom = 1.0 / (va + vb + vc);
+    return a + ab * (vb * denom) + ac * (vc * denom);
+}
+
+bool local_light_has_geometric_influence(int i, vec3 p) {
+    vec3 from_light = p - light_pos_radius[i].xyz;
+    float dist = length(from_light);
+    if (dist > max(light_pos_radius[i].w, 0.001)) return false;
+    if (light_kind[i] == 3) {
+        if (dist <= 0.001) return false;
+        vec3 forward = normalize(light_dir_intensity[i].xyz);
+        return dot(forward, from_light / dist) > cos(radians(36.0));
+    }
+    if (light_kind[i] == 2 && light_point_lobe[i] != 0) {
+        if (dist <= 0.001) return false;
+        vec3 direction = from_light / dist;
+        if (light_point_lobe[i] == 1) return direction.z > 0.0;
+        if (light_point_lobe[i] == 2) return direction.z < 0.0;
+        return length(direction.xy) > 0.0;
+    }
+    return true;
+}
 
 float point_shadow_depth(float dist) {
     float near_plane = max(point_shadow_near, 0.001);
@@ -1466,7 +1525,17 @@ void main() {
         if (i >= light_count) {
             break;
         }
-        float visibility = (i == shadow_light_index) ? shadow_visibility(in_pos, n) : 1.0;
+        vec3 receiver_pos = in_pos;
+        if (light_kind[i] >= 2 && light_kind[i] <= 4) {
+            if (!local_light_has_geometric_influence(i, receiver_pos)) {
+                vec3 surface_pos = closest_point_on_triangle(
+                    light_pos_radius[i].xyz, in_tri_a, in_tri_b, in_tri_c);
+                if (local_light_has_geometric_influence(i, surface_pos)) {
+                    receiver_pos = surface_pos;
+                }
+            }
+        }
+        float visibility = (i == shadow_light_index) ? shadow_visibility(receiver_pos, n) : 1.0;
         vec3 color = light_color[i].rgb * light_dir_intensity[i].w;
         if (light_kind[i] == 0) {
             accum += color;
@@ -1484,7 +1553,7 @@ void main() {
             // radiance times the patch area it represents, so applying both
             // cosine terms and inverse-square distance integrates the actual
             // emitting surface instead of approximating it with a spotlight.
-            vec3 to_light = light_pos_radius[i].xyz - in_pos;
+            vec3 to_light = light_pos_radius[i].xyz - receiver_pos;
             float dist = length(to_light);
             float radius = max(light_pos_radius[i].w, 0.001);
             if (dist > 0.001 && dist <= radius) {
@@ -1501,7 +1570,7 @@ void main() {
                 }
             }
         } else {
-            vec3 to_light = light_pos_radius[i].xyz - in_pos;
+            vec3 to_light = light_pos_radius[i].xyz - receiver_pos;
             float dist = length(to_light);
             float radius = max(light_pos_radius[i].w, 0.001);
             if (dist <= radius) {
@@ -1560,8 +1629,14 @@ void main() {
         gl::AttachShader(program, shader);
         let in_pos = CString::new("in_pos").unwrap();
         let in_normal = CString::new("in_normal").unwrap();
+        let in_tri_a = CString::new("in_tri_a").unwrap();
+        let in_tri_b = CString::new("in_tri_b").unwrap();
+        let in_tri_c = CString::new("in_tri_c").unwrap();
         gl::BindAttribLocation(program, 0, in_pos.as_ptr());
         gl::BindAttribLocation(program, 1, in_normal.as_ptr());
+        gl::BindAttribLocation(program, 2, in_tri_a.as_ptr());
+        gl::BindAttribLocation(program, 3, in_tri_b.as_ptr());
+        gl::BindAttribLocation(program, 4, in_tri_c.as_ptr());
         let varying = CString::new("baked_color").unwrap();
         let varyings = [varying.as_ptr()];
         gl::TransformFeedbackVaryings(program, 1, varyings.as_ptr(), gl::INTERLEAVED_ATTRIBS);
@@ -1770,6 +1845,27 @@ struct SceneCell {
     vertices: usize,
 }
 
+/// Fixed-function-compatible vertex used by the pre-batched world-cell VBOs.
+/// Colors use normalized bytes to reduce resident memory and vertex bandwidth
+/// without sacrificing geometric precision.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WorldVertex {
+    uv: [f32; 2],
+    normal: [f32; 3],
+    shaded_rgba: [u8; 4],
+    unshaded_rgba: [u8; 4],
+    position: [f32; 3],
+}
+
+const _: () = assert!(std::mem::size_of::<WorldVertex>() == 40);
+const _: () = assert!(std::mem::align_of::<WorldVertex>() == 4);
+const _: () = assert!(std::mem::offset_of!(WorldVertex, uv) == 0);
+const _: () = assert!(std::mem::offset_of!(WorldVertex, normal) == 8);
+const _: () = assert!(std::mem::offset_of!(WorldVertex, shaded_rgba) == 20);
+const _: () = assert!(std::mem::offset_of!(WorldVertex, unshaded_rgba) == 24);
+const _: () = assert!(std::mem::offset_of!(WorldVertex, position) == 28);
+
 struct WorldBatch {
     texture: u32,
     use_lighting: bool,
@@ -1777,11 +1873,24 @@ struct WorldBatch {
     transparency: TransparencyMode,
     first_vertex: usize,
     vertices: usize,
-    data: Vec<f32>,
+    data: Vec<WorldVertex>,
+    /// Per-part ranges retain the material lookup identity used by the
+    /// collision-classification viewport. The normal renderer can still batch
+    /// those parts by render state, while the classification renderer assigns
+    /// the correct color without walking the original placements.
+    classification_segments: Vec<WorldClassificationSegment>,
     /// Translucent geometry is packed by render state into one VBO. The
     /// opaque-texel pass can therefore draw the whole batch at once, while the
     /// color pass retains exact per-part ranges for back-to-front sorting.
     blend_segments: Vec<WorldBlendSegment>,
+}
+
+struct WorldClassificationSegment {
+    txd_name: Option<String>,
+    texture_name: String,
+    texture_fingerprint: Option<TextureContentFingerprint>,
+    first_vertex: usize,
+    vertices: usize,
 }
 
 struct WorldBlendSegment {
@@ -1790,7 +1899,62 @@ struct WorldBlendSegment {
     vertices: usize,
 }
 
+const WORLD_CELL_SIZE: f32 = 256.0;
+const DEFAULT_SLICER_CHUNK_SIZE: f32 = 200.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct WorldCellKey {
+    x: i32,
+    y: i32,
+}
+
+/// Conservative upper-bound buckets for authored element draw distances.
+///
+/// Geometry is split by tier inside each spatial cell so short-range objects do
+/// not keep an entire 256 m cell resident out to the viewport's global cap.
+/// Every finite tier rounds upward, so bucketing can only draw an element later
+/// than its authored distance, never make it disappear early.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum WorldDrawDistanceTier {
+    D128,
+    D256,
+    D512,
+    D1024,
+    D2048,
+    D4096,
+    D8192,
+    Infinite,
+}
+
+impl WorldDrawDistanceTier {
+    fn distance(self) -> f32 {
+        match self {
+            Self::D128 => 128.0,
+            Self::D256 => 256.0,
+            Self::D512 => 512.0,
+            Self::D1024 => 1024.0,
+            Self::D2048 => 2048.0,
+            Self::D4096 => 4096.0,
+            Self::D8192 => 8192.0,
+            Self::Infinite => f32::INFINITY,
+        }
+    }
+}
+
+fn world_cell_key(position: V3) -> WorldCellKey {
+    WorldCellKey {
+        x: (position.x / WORLD_CELL_SIZE).floor() as i32,
+        y: (position.y / WORLD_CELL_SIZE).floor() as i32,
+    }
+}
+
+fn world_cell_key_is_selected(position: V3, selected_keys: Option<&HashSet<WorldCellKey>>) -> bool {
+    selected_keys.is_none_or(|keys| keys.contains(&world_cell_key(position)))
+}
+
 struct WorldCell {
+    key: WorldCellKey,
+    draw_distance_tier: WorldDrawDistanceTier,
     min: Vec3,
     max: Vec3,
     center: Vec3,
@@ -1798,12 +1962,27 @@ struct WorldCell {
     placements: usize,
     parts: usize,
     vertices: usize,
+    /// Bytes occupied by the packed vertex payload when this cell is uploaded.
+    gpu_bytes: usize,
+    /// Last time this cell fell inside the residency preload band.
+    resident_last_required_at: f64,
     vbo: u32,
     batches: Vec<WorldBatch>,
 }
 
 type WorldBatchKey = (u32, bool, bool, TransparencyMode);
-type WorldBlendData = (WorldBatchKey, Vec<f32>, Vec3);
+
+struct WorldBatchBuild {
+    data: Vec<WorldVertex>,
+    classification_segments: Vec<WorldClassificationSegment>,
+}
+
+struct WorldBlendData {
+    key: WorldBatchKey,
+    data: Vec<WorldVertex>,
+    center: Vec3,
+    classification: WorldClassificationSegment,
+}
 
 struct WorldCellBuild {
     min: Vec3,
@@ -1811,12 +1990,11 @@ struct WorldCellBuild {
     placements: usize,
     parts: usize,
     vertices: usize,
-    batch_data: HashMap<WorldBatchKey, Vec<f32>>,
+    batch_data: HashMap<WorldBatchKey, WorldBatchBuild>,
     blend_data: Vec<WorldBlendData>,
 }
 
 struct CollisionRenderCache {
-    mesh: CollisionMesh,
     list: u32,
 }
 
@@ -1840,6 +2018,7 @@ enum TransformMode {
     Select,
     Move,
     Rotate,
+    Scale,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1861,6 +2040,7 @@ enum AppTab {
     Lights,
     Bake,
     Water,
+    Cull,
     Race,
     Simulate,
 }
@@ -2056,15 +2236,30 @@ enum GizmoAxis {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum GizmoPlane {
+    XY,
+    XZ,
+    YZ,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum GizmoTarget {
     Element,
+    CullZone,
     Light,
     CollisionVertex,
     CollisionPrimitive,
     DffVertex,
+    DffPivot,
     DffBooleanBox,
     Dff2dEffect,
     RacePoint,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct DffFreeformPivot {
+    position: V3,
+    rotation: V3,
 }
 
 struct GizmoDrag {
@@ -2075,8 +2270,18 @@ struct GizmoDrag {
     start_rot: V3,
     element_start_positions: Vec<(usize, V3)>,
     element_start_rots: Vec<(usize, V3)>,
+    scale_plane: Option<GizmoPlane>,
+    dff_start_vertices: Vec<(usize, V3)>,
     before: ScopedHistorySnapshot,
     label: String,
+}
+
+struct DffScaleInput {
+    axis: Option<GizmoAxis>,
+    numeric_input: String,
+    pivot: V3,
+    start_vertices: Vec<(usize, V3)>,
+    before: EditingHistorySnapshot,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2098,6 +2303,36 @@ struct WaterEdgeDrag {
     edge: WaterEdge,
     start_value: f32,
     before: WaterHistorySnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CullZone {
+    id: String,
+    center: V3,
+    size: V3,
+}
+
+// Drag-resize one face of the selected axis-aligned Cull zone while keeping
+// the opposite face fixed.
+struct CullFacePick {
+    axis: usize,
+    side_is_max: bool,
+    center: Vec3,
+    half_extents: Vec3,
+    axis_dir: Vec3,
+    face_origin: Vec3,
+}
+
+struct CullFaceDrag {
+    zone: usize,
+    axis: usize,
+    side_is_max: bool,
+    center: Vec3,
+    half_extents: Vec3,
+    axis_dir: Vec3,
+    face_origin: Vec3,
+    start_mouse: Vec2,
+    before: CullHistorySnapshot,
 }
 
 // Drag-resize a single face of a selected collision box (Editing tab).
@@ -2147,6 +2382,7 @@ struct SavedContentSnapshot {
     element_states: Vec<ElementState>,
     lights: Vec<EditorLight>,
     water_planes: Vec<WaterPlane>,
+    cull_zones: Vec<CullZone>,
     race_tracks: Vec<RaceTrack>,
     race_radar_path: String,
     race_world_size: f32,
@@ -2181,6 +2417,12 @@ struct WaterHistorySnapshot {
 }
 
 #[derive(Clone, PartialEq)]
+struct CullHistorySnapshot {
+    zones: Vec<CullZone>,
+    selected: usize,
+}
+
+#[derive(Clone, PartialEq)]
 struct LightHistorySnapshot {
     lights: Vec<EditorLight>,
     selected: usize,
@@ -2211,6 +2453,16 @@ struct WorldHistorySnapshot {
     selected_element_order: Vec<usize>,
     selected_col_face: Option<SelectedCollisionFace>,
     selected_col_vertex: usize,
+}
+
+/// The placement subset touched by an in-place world transform.
+///
+/// Unlike `WorldHistorySnapshot`, this deliberately excludes definitions and
+/// unrelated placements so frequent nudges and gizmo drags have history cost
+/// proportional to the selection size.
+#[derive(Clone, PartialEq)]
+struct PlacementTransformHistorySnapshot {
+    placements: Vec<(usize, Placement)>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -2263,7 +2515,6 @@ struct WorldRaceHistorySnapshot {
 #[derive(Clone)]
 struct LodGenerationHistoryArtifact {
     assets: Vec<(String, String, Vec<u8>)>,
-    txd_name: Option<String>,
     mesh_key: String,
     mesh: Option<RenderMesh>,
     collision_key: String,
@@ -2275,13 +2526,19 @@ struct LodGenerationHistorySnapshot {
     world: WorldHistorySnapshot,
     artifacts: Arc<Vec<LodGenerationHistoryArtifact>>,
     generated_present: bool,
+    /// Shared LOD dictionaries the batch wrote to, keyed by asset key, holding
+    /// the bytes for this side of the edit. `None` means the dictionary did not
+    /// exist yet.
+    txd_assets: BTreeMap<String, (String, Option<Vec<u8>>)>,
 }
 
 enum UndoState {
     Water(WaterHistorySnapshot),
+    Cull(CullHistorySnapshot),
     Lights(LightHistorySnapshot),
     Race(RaceHistorySnapshot),
     World(WorldHistorySnapshot),
+    PlacementTransforms(PlacementTransformHistorySnapshot),
     Selection(SelectionHistorySnapshot),
     Collision(CollisionHistorySnapshot),
     Editing(EditingHistorySnapshot),
@@ -2295,9 +2552,11 @@ enum UndoState {
 enum ScopedHistorySnapshot {
     None,
     Water(WaterHistorySnapshot),
+    Cull(CullHistorySnapshot),
     Lights(LightHistorySnapshot),
     Race(RaceHistorySnapshot),
     World(WorldHistorySnapshot),
+    PlacementTransforms(PlacementTransformHistorySnapshot),
     Collision(CollisionHistorySnapshot),
     Editing(EditingHistorySnapshot),
     WorldEditing(WorldEditingHistorySnapshot),
@@ -2477,6 +2736,12 @@ enum InspectorField {
     WaterMaxY,
     WaterHeight,
     WaterType,
+    CullPosX,
+    CullPosY,
+    CullPosZ,
+    CullSizeX,
+    CullSizeY,
+    CullSizeZ,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2587,6 +2852,8 @@ struct EditorLight {
     point_lobe: PointLightLobe,
 }
 
+const DEFAULT_EDITOR_LIGHT_RADIUS: f32 = 50.0;
+
 #[derive(Clone, Copy, PartialEq)]
 struct WaterCorner {
     pos: V3,
@@ -2686,6 +2953,7 @@ impl BoxSelectMode {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ContextAction {
+    ViewAssetPreview,
     AddLight,
     AddLightToInstance,
     CopyId,
@@ -2710,6 +2978,14 @@ enum ContextAction {
     AddTextureToWater,
     LodAuditGenerate,
     LodAuditToggleIgnore,
+    ViewDffMaterialTexture,
+    ExportDffMaterialTexture,
+    ReplaceDffMaterialTexture,
+    SelectAllDffMaterialFaces,
+    MarkDffTextureElementsDoubleSided,
+    ToggleDffMaterialEmitter,
+    ClearDffFaceLighting,
+    CategorizeTexture,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2726,12 +3002,32 @@ struct ContextMenu {
     target: ContextMenuTarget,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ContextMenuTarget {
     Selection,
-    Scene { position: V3 },
+    Scene {
+        position: V3,
+    },
     LodAuditIssue(usize),
-    PreviewTexture { placement: usize, material: usize },
+    PreviewTexture {
+        placement: usize,
+        material: usize,
+    },
+    EditingDffMaterial {
+        dff_name: String,
+        material: usize,
+    },
+    EditingDffFaceLighting {
+        dff_name: String,
+        emitter_key: String,
+    },
+    EditingTexture {
+        txd_name: String,
+        texture_name: String,
+    },
+    AssetBrowser {
+        entry_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2759,14 +3055,64 @@ struct TextureMatchSelectionJob {
     selection_before: Option<SelectionHistorySnapshot>,
 }
 
+#[derive(Clone)]
 enum WaterTextureDffSource {
     Raw(Box<RawMesh>),
     Bytes(Vec<u8>),
+    Entry(ImgEntry),
     Archive {
         root: PathBuf,
         gta_sa_dir: PathBuf,
         dff_name: String,
     },
+}
+
+#[derive(Clone)]
+struct PreviewWorldUvWorkerTarget {
+    dff_name: String,
+    placement: Placement,
+    materials: BTreeSet<usize>,
+    source: WaterTextureDffSource,
+    write_options: DffWriteOptions,
+}
+
+struct PreviewWorldUvRewrite {
+    dff_name: String,
+    dff_key: String,
+    raw: RawMesh,
+    bytes: Vec<u8>,
+    materials: usize,
+    uvs: usize,
+}
+
+struct PreviewWorldUvWorkerResult {
+    rewrites: VecDeque<PreviewWorldUvRewrite>,
+    skipped_assets: usize,
+}
+
+struct PreviewWorldUvJob {
+    texture_name: String,
+    multiplier: f32,
+    variation: bool,
+    all_dffs: bool,
+    snapshot_index: usize,
+    targets_by_dff: BTreeMap<String, (Placement, BTreeSet<usize>)>,
+    targets: Vec<(String, Placement, BTreeSet<usize>)>,
+    source_index: usize,
+    worker_targets: Vec<PreviewWorldUvWorkerTarget>,
+    skipped_readonly: usize,
+    rx: Option<mpsc::Receiver<Result<PreviewWorldUvWorkerResult, String>>>,
+    result: Option<PreviewWorldUvWorkerResult>,
+    staged_dffs: usize,
+    staged_materials: usize,
+    staged_uvs: usize,
+}
+
+struct PreviewWorldUvVisual {
+    dff_name: String,
+    placement_index: usize,
+    material: usize,
+    original_raw: RawMesh,
 }
 
 struct WaterTextureConversionResult {
@@ -2809,6 +3155,13 @@ struct LoadDialog {
     selection_anchor: Option<usize>,
 }
 
+struct ImportAssetDialog {
+    dff_path: PathBuf,
+    texture_dir: PathBuf,
+    id: String,
+    cursor: usize,
+}
+
 struct PreferencesDialog {
     gta_sa_dir: String,
     /// Pending viewport values. They are staged here rather than applied live so
@@ -2829,6 +3182,8 @@ struct PreferencesDialog {
 
 #[derive(Clone, PartialEq, Eq)]
 enum DffPickerKind {
+    ImportNewAssetDff,
+    ImportNewAssetTextures,
     ImportBlender,
     GenerateTxdFolder,
     GenerateTxdBuild {
@@ -2852,6 +3207,9 @@ enum DffPickerKind {
         height: u32,
         rgba: Vec<u8>,
     },
+    ExportTexturePngs {
+        textures: Vec<(String, u32, u32, Vec<u8>)>,
+    },
     VehicleTextureReplace(VehicleTextureReplaceRequest),
     Replace,
     ReplaceCol,
@@ -2867,6 +3225,7 @@ enum DffPickerKind {
     },
     EditingOpenFile,
     EditingOpenImg,
+    EditingCreateDff,
     /// Pick a loose `.txd` to pair with the DFF open in the editor.
     EditingPairTxd,
     EditingMergeImg,
@@ -2875,9 +3234,6 @@ enum DffPickerKind {
         entry_name: String,
     },
     EditingExtractEntry {
-        entry_name: String,
-    },
-    EditingTextureAdd {
         entry_name: String,
     },
     EditingTextureReplace {
@@ -2894,6 +3250,12 @@ enum DffPickerKind {
         txd_name: String,
         dff_name: String,
         material: usize,
+    },
+    EditingMaterialTextureReplace {
+        txd_name: String,
+        dff_name: String,
+        material: usize,
+        texture_name: String,
     },
     EditingGifAnimImport {
         txd_name: String,
@@ -2940,6 +3302,44 @@ struct DffOptimizeDialog {
     options: DffOptimizeOptions,
 }
 
+#[derive(Clone)]
+struct OversizedChunkCandidate {
+    dff_name: String,
+    extents: V3,
+    placement_count: usize,
+    selected: bool,
+    blocked_reason: Option<String>,
+}
+
+struct OversizedChunkDialog {
+    chunk_size: String,
+    chunk_size_cursor: usize,
+    chunk_size_selection_anchor: Option<usize>,
+    candidates: Vec<OversizedChunkCandidate>,
+    scroll: f32,
+    error: Option<String>,
+}
+
+struct OversizedChunkResult {
+    scanned: usize,
+    requested: usize,
+    chunked: usize,
+    assets: Vec<(String, Vec<u8>)>,
+    definitions: Vec<(String, Definition)>,
+    added_placements: Vec<(Placement, ElementState)>,
+    errors: Vec<String>,
+}
+
+pub(crate) struct OversizedChunkJob {
+    rx: mpsc::Receiver<OversizedChunkResult>,
+    result: Option<OversizedChunkResult>,
+    definitions_applied: bool,
+    added_placement_index: usize,
+    asset_index: usize,
+    scene_rebuilt: bool,
+    started_at: Instant,
+}
+
 /// Prompt shown when an opened DFF references textures that no loaded TXD
 /// provides, offering to pair an external `.txd` with it.
 struct DffTxdPairDialog {
@@ -2975,6 +3375,7 @@ struct DffTextureViewDialog {
     height: u16,
     texture: Option<Texture2D>,
     raw_texture: u32,
+    rgba: Option<Vec<u8>>,
 }
 
 struct ElementIdRenameDialog {
@@ -2983,6 +3384,16 @@ struct ElementIdRenameDialog {
     old_id: String,
     new_id: String,
     before: ScopedHistorySnapshot,
+}
+
+struct ElementReplaceWithDialog {
+    source_indices: Vec<usize>,
+    search: String,
+    cursor: usize,
+    selection_anchor: Option<usize>,
+    scroll: f32,
+    selected_target: Option<String>,
+    picking_scene: bool,
 }
 
 #[derive(Clone)]
@@ -3064,13 +3475,36 @@ struct EditingImgMergeApplyJob {
 }
 
 #[derive(Clone)]
+struct EditingDffOpenModel {
+    name: String,
+    placement_index: usize,
+    /// Converts this DFF's local coordinates into the first opened placement's
+    /// local coordinate system. Keeping every open model in that common space
+    /// makes viewport selection and cross-model chunk moves deterministic.
+    to_workspace: Mat4,
+    raw: RawMesh,
+    preview_mesh: Option<RenderMesh>,
+    txd_context: Option<String>,
+    txd_source_label: String,
+    dirty: bool,
+    selected_face: Option<usize>,
+    selected_faces: BTreeSet<usize>,
+    selected_edges: BTreeSet<(usize, usize)>,
+    selected_vertex: Option<usize>,
+    selected_vertices: BTreeSet<usize>,
+}
+
+#[derive(Clone)]
 struct EditingDffState {
     name: String,
+    /// Preview-only GTA:SA assets can be inspected but never staged or saved.
+    read_only: bool,
     raw: RawMesh,
     preview_mesh: Option<RenderMesh>,
     txd_context: Option<String>,
     txd_source_label: String,
     material_thumbnails: Vec<Option<Texture2D>>,
+    uv_editor: DffUvEditorState,
     selected_material: usize,
     selected_breakable_group: usize,
     /// Main-thread-only timestamp for the visual fracture simulation. The
@@ -3078,6 +3512,9 @@ struct EditingDffState {
     fracture_preview_started_at: Option<f64>,
     selected_face: Option<usize>,
     selected_faces: BTreeSet<usize>,
+    /// When faces are selected, chooses whether the Material-tab emitter
+    /// controls edit those faces or the selected material/texture.
+    emitter_targets_faces: bool,
     selected_edges: BTreeSet<(usize, usize)>,
     select_mode: EditingSelectMode,
     selected_vertex: Option<usize>,
@@ -3085,7 +3522,12 @@ struct EditingDffState {
     selected_2dfx: Option<usize>,
     hovered_face: Option<usize>,
     hovered_vertex: Option<usize>,
+    hovered_edge: Option<(usize, usize)>,
+    show_normals: bool,
     boolean_box: Option<DffBooleanBox>,
+    /// Interactive, preview-only pivot transform. Applying it rewrites the DFF
+    /// coordinate system and compensates every referencing placement.
+    freeform_pivot: Option<DffFreeformPivot>,
     dirty: bool,
     normalized_warning: bool,
     normalized_rewrite_confirmed: bool,
@@ -3097,6 +3539,9 @@ struct EditingDffState {
     texture_picker_open: bool,
     texture_picker_edits_material: bool,
     texture_picker_scroll: f32,
+    texture_picker_search: String,
+    texture_picker_category: String,
+    texture_picker_entries: Vec<TextureArchiveEntry>,
     uv_anim_picker_open: bool,
     uv_anim_picker_search: String,
     uv_anim_picker_scroll: f32,
@@ -3116,6 +3561,104 @@ struct EditingDffState {
     panel_tab: usize,
     panel_scroll: f32,
     panel_collapsed: [bool; DFF_SECTION_COUNT],
+    /// Scene-launched DFFs that share this editing workspace. `raw` mirrors
+    /// `open_models[active_open_model].raw`; the other entries are contextual
+    /// models rendered at their placement-relative offsets.
+    open_models: Vec<EditingDffOpenModel>,
+    active_open_model: usize,
+    multi_select: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DffUvTransformMode {
+    Grab,
+    Scale,
+    Rotate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DffUvAxis {
+    Free,
+    U,
+    V,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DffUvMenu {
+    Select,
+    View,
+    Snap,
+    Align,
+    Display,
+}
+
+#[derive(Clone)]
+struct DffUvTransform {
+    mode: DffUvTransformMode,
+    axis: DffUvAxis,
+    start_mouse: Vec2,
+    start_uvs: Vec<(usize, V2)>,
+    /// Typed scale multiplier while a Scale transform is active.
+    numeric_input: String,
+}
+
+#[derive(Clone)]
+struct DffUvEditorState {
+    open: bool,
+    /// Which half of the split workspace owns WASDEQ keyboard input.
+    viewport_keyboard_focus: bool,
+    selected: BTreeSet<usize>,
+    hovered: Option<usize>,
+    zoom: f32,
+    pan: Vec2,
+    panning: bool,
+    pan_last: Vec2,
+    /// Height of the UV split as a fraction of the center editing viewport.
+    split_fraction: f32,
+    resizing_split: bool,
+    box_start: Option<Vec2>,
+    transform: Option<DffUvTransform>,
+    menu: Option<DffUvMenu>,
+    snap_grid: bool,
+    snap_vertices: bool,
+    repeat_texture: bool,
+    /// Show non-selected material/mesh edges while working in the UV editor.
+    show_material_outlines: bool,
+    /// Show the yellow outline around the active material in the 3D preview.
+    show_material_selection_outlines: bool,
+    texture_aspect: f32,
+    grid_step: f32,
+    before_uvs: Option<Vec<V2>>,
+    before_dirty: bool,
+}
+
+impl Default for DffUvEditorState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            viewport_keyboard_focus: false,
+            selected: BTreeSet::new(),
+            hovered: None,
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+            panning: false,
+            pan_last: Vec2::ZERO,
+            split_fraction: 0.58,
+            resizing_split: false,
+            box_start: None,
+            transform: None,
+            menu: None,
+            snap_grid: false,
+            snap_vertices: false,
+            repeat_texture: false,
+            show_material_outlines: true,
+            show_material_selection_outlines: true,
+            texture_aspect: 1.0,
+            grid_step: 0.125,
+            before_uvs: None,
+            before_dirty: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -3134,11 +3677,23 @@ struct EditingTxdState {
     search_cursor: usize,
     search_anchor: Option<usize>,
     search_active: bool,
+    category_filter: String,
     preview_texture: Option<Texture2D>,
+    preview_zoom: f32,
+    preview_pan: Vec2,
+    preview_dragging: bool,
+    preview_drag_last: Vec2,
     material_picker_open: bool,
     material_picker_search: String,
     material_picker_scroll: f32,
     material_picker_scope: CollisionMaterialAssignmentScope,
+}
+
+#[derive(Clone)]
+struct TextureCategoryMenu {
+    txd_name: String,
+    texture_name: String,
+    position: Vec2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3299,6 +3854,8 @@ struct EditingState {
     merge_rx: Option<mpsc::Receiver<Result<EditingImgMergePlan, String>>>,
     merge_apply_job: Option<EditingImgMergeApplyJob>,
     txd_import_rx: Option<mpsc::Receiver<EditingTxdImportResult>>,
+    dff_texture_replace_rx: Option<mpsc::Receiver<EditingDffTextureReplaceResult>>,
+    txd_source_picker_rx: Option<mpsc::Receiver<EditingTxdSourcePickerResult>>,
     txd_refresh_job: Option<EditingTxdRefreshJob>,
     linked_selection_job: Option<EditingLinkedSelectionJob>,
     /// Child lists must be clicked before their wheel input takes precedence
@@ -3306,13 +3863,42 @@ struct EditingState {
     nested_scroll_focus: Option<EditingNestedScrollFocus>,
     scrollbar_drag: Option<EditingScrollbarDrag>,
     scrollbar_drag_grab_offset_y: f32,
+    texture_category_menu: Option<TextureCategoryMenu>,
 }
 
 struct EditingTxdImportResult {
     entry_name: String,
     target_texture: String,
+    imported_count: usize,
     linked_definition_ids: Vec<String>,
     result: Result<EditingTxdImportOutput, String>,
+}
+
+struct EditingDffTextureReplaceResult {
+    txd_name: String,
+    dff_name: String,
+    material: usize,
+    texture_name: String,
+    source_path: PathBuf,
+    linked_definition_ids: Vec<String>,
+    result: Result<EditingDffTextureReplaceOutput, String>,
+}
+
+struct EditingDffTextureReplaceOutput {
+    indexed_textures: Vec<(String, Vec<TxdTexture>)>,
+    replacement_txd_names: HashSet<String>,
+}
+
+#[derive(Clone, Copy)]
+enum EditingTxdSourcePickerKind {
+    Files,
+    Folder,
+}
+
+struct EditingTxdSourcePickerResult {
+    entry_name: String,
+    kind: EditingTxdSourcePickerKind,
+    result: Result<Option<Vec<PathBuf>>, String>,
 }
 
 struct EditingTxdImportOutput {
@@ -3335,6 +3921,9 @@ struct EditingImgSaveOutcome {
     path: PathBuf,
     backup: PathBuf,
     rows: Vec<EditingImgRow>,
+    /// Fresh TXD offsets for the rewritten IMG. IMG members can move after any
+    /// entry changes size, so the previous global index is no longer valid.
+    txd_index: TxdTextureIndex,
     camera: CameraState,
     selected_row: usize,
     selected_name: Option<String>,
@@ -3370,11 +3959,14 @@ impl Default for EditingState {
             merge_rx: None,
             merge_apply_job: None,
             txd_import_rx: None,
+            dff_texture_replace_rx: None,
+            txd_source_picker_rx: None,
             txd_refresh_job: None,
             linked_selection_job: None,
             nested_scroll_focus: None,
             scrollbar_drag: None,
             scrollbar_drag_grab_offset_y: 0.0,
+            texture_category_menu: None,
         }
     }
 }
@@ -3382,6 +3974,7 @@ impl Default for EditingState {
 struct AssetBrowserState {
     expanded: bool,
     height: f32,
+    grid_scale: f32,
     resizing: bool,
     show_sa_assets: bool,
     sort_by_zone: bool,
@@ -3389,12 +3982,27 @@ struct AssetBrowserState {
     show_buildings: bool,
     show_objects: bool,
     show_scenery: bool,
+    category_dropdown_open: bool,
+    hidden_categories: HashSet<String>,
     search: String,
     cursor: usize,
     selection_anchor: Option<usize>,
     search_active: bool,
     scroll: f32,
     thumbnails: HashMap<String, Texture2D>,
+    thumbnail_placeholder: Option<Texture2D>,
+    thumbnail_generation_available: bool,
+    entries_cache: std::sync::Arc<Vec<AssetBrowserEntry>>,
+    entries_cache_fingerprint: Option<u64>,
+    dff_sources: Option<HashMap<String, ImgEntry>>,
+    drag: Option<AssetBrowserDrag>,
+}
+
+struct AssetBrowserDrag {
+    entry_id: String,
+    start_mouse: Vec2,
+    position: Option<V3>,
+    dragging: bool,
 }
 
 impl Default for AssetBrowserState {
@@ -3402,6 +4010,7 @@ impl Default for AssetBrowserState {
         Self {
             expanded: false,
             height: 244.0,
+            grid_scale: 1.0,
             resizing: false,
             show_sa_assets: false,
             sort_by_zone: true,
@@ -3409,12 +4018,20 @@ impl Default for AssetBrowserState {
             show_buildings: true,
             show_objects: true,
             show_scenery: true,
+            category_dropdown_open: false,
+            hidden_categories: HashSet::new(),
             search: String::new(),
             cursor: 0,
             selection_anchor: None,
             search_active: false,
             scroll: 0.0,
             thumbnails: HashMap::new(),
+            thumbnail_placeholder: None,
+            thumbnail_generation_available: false,
+            entries_cache: std::sync::Arc::new(Vec::new()),
+            entries_cache_fingerprint: None,
+            dff_sources: None,
+            drag: None,
         }
     }
 }
@@ -3803,7 +4420,15 @@ struct LodBatchCandidate {
     existing_lod: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LodBatchMode {
+    GenerateSelection,
+    GenerateSceneMissing,
+    RegenerateScene,
+}
+
 struct LodBatchDialog {
+    mode: LodBatchMode,
     candidates: Vec<LodBatchCandidate>,
     minimum_size: String,
     cursor: usize,
@@ -3907,6 +4532,10 @@ enum TxdCleanupPhase {
 struct TxdCleanupDefinition {
     dff_name: String,
     txd_name: String,
+    /// The live in-memory DFF, when it has not been promoted to the project
+    /// archive yet. Generated LODs land here before Save, so cleanup must scan
+    /// these bytes instead of an older (or not-yet-existing) archive entry.
+    dff_bytes: Option<Arc<Vec<u8>>>,
 }
 
 struct TxdCleanupJob {
@@ -3945,6 +4574,8 @@ struct DffRepairResult {
     sanitized_texture_names: usize,
     sanitized_texture_references: usize,
     normalized: usize,
+    bin_mesh_batches_removed: usize,
+    lighting_flags_fixed: usize,
     bounds_fixed: usize,
     uv_anim_reordered: usize,
     uv_anim_pipeline_fixed: usize,
@@ -3968,11 +4599,16 @@ enum ConfirmAction {
     OpenEditingAsset(EditingImgRow),
     OpenEditingFile(PathBuf),
     OpenEditingImgEntry(ImgEntry),
+    OpenSceneDffsInEditing {
+        models: Vec<(usize, Placement, ImgEntry)>,
+        camera: Option<CameraState>,
+    },
     OpenEditingStagedAsset(String),
     ApplyEditingImgMerge {
         plan: Arc<EditingImgMergePlan>,
         overwrite_matching: bool,
     },
+    SaveEditingImgWithDuplicateCleanup,
     OpenSelectedVehicleCollision,
     RestoreAutosave(PathBuf),
     DismissAutosave,
@@ -3986,11 +4622,15 @@ enum ConfirmAction {
         delete_lods: bool,
     },
     StartInstanceLodRemoval(String),
+    ReviewPurgeUnused,
     PurgeUnused,
     RebalanceImgArchives,
     FixLods,
     RegenerateLods(Vec<usize>),
+    ClearAllLods,
     TxdCleanup(TxdCleanupPlan),
+    RequestTxdCleanup,
+    ChooseAssetOptimizationProfile,
     StartAssetOptimization(TxdOptimizationProfile),
     StartBake(BakeScope),
     ClearBake,
@@ -4010,6 +4650,20 @@ enum ConfirmAction {
         target_enabled: bool,
         before: ScopedHistorySnapshot,
     },
+    MarkTextureElementsDoubleSided {
+        indices: Vec<usize>,
+        texture_name: String,
+    },
+    ApplyPhysicsEdit {
+        edit: InspectorEdit,
+        conversion_indices: Vec<usize>,
+        writable_definition_ids: Vec<String>,
+    },
+    SetPhysicsRoot {
+        model_id: u16,
+        conversion_indices: Vec<usize>,
+        before: WorldHistorySnapshot,
+    },
 }
 
 struct ConfirmDialog {
@@ -4027,6 +4681,7 @@ struct IconSet {
     select: Texture2D,
     move_tool: Texture2D,
     rotate: Texture2D,
+    scale: Texture2D,
     duplicate: Texture2D,
     delete: Texture2D,
     face: Texture2D,
@@ -4042,6 +4697,12 @@ struct IconSet {
 }
 
 #[derive(Clone, Debug, Default)]
+struct ParticleSizeCurve {
+    size_x: Vec<(f32, f32)>,
+    size_y: Vec<(f32, f32)>,
+}
+
+#[derive(Clone, Debug, Default)]
 struct ParticleEffectDef {
     name: String,
     textures: Vec<String>,
@@ -4049,6 +4710,7 @@ struct ParticleEffectDef {
     play_mode: i32,
     cull_distance: f32,
     primitive_count: usize,
+    size_curves: Vec<ParticleSizeCurve>,
 }
 
 struct AppState {
@@ -4067,6 +4729,9 @@ struct AppState {
     world_cells: Vec<WorldCell>,
     lod_scene_cells: Vec<SceneCell>,
     lod_world_cells: Vec<WorldCell>,
+    /// Placements whose currently resolved mesh contains 2DFX data.
+    placement_2dfx_indices: Vec<usize>,
+    placement_2dfx_index_placement_count: usize,
     textures: HashMap<String, u32>,
     // Retained post-load so textures can be re-decoded at runtime (e.g. toggling
     // the texture option) without a full reload. Not read on the current paths.
@@ -4133,13 +4798,29 @@ struct AppState {
     validation_list_scroll: [f32; 3],
     validation_list_scroll_drag: Option<usize>,
     validation_list_scroll_grab_offset_y: f32,
+    validation_collision_material_dropdown_open: bool,
+    validation_collision_material_search: String,
+    validation_collision_material_scroll: f32,
     element_panel_collapsed: [bool; ELEM_SECTION_COUNT],
     preview_selected_material: Option<(usize, usize)>,
+    preview_texture_advanced: bool,
+    preview_world_uv_all_dffs: bool,
+    preview_world_uv_scale: f32,
+    preview_world_uv_variation: bool,
+    preview_world_uv_job: Option<PreviewWorldUvJob>,
+    preview_world_uv_visual: Option<PreviewWorldUvVisual>,
     texture_match_selection_job: Option<TextureMatchSelectionJob>,
     water_texture_conversion_job: Option<WaterTextureConversionJob>,
     physics_scope: PhysicsScope,
     physics_root_properties: HashMap<u16, PhysicsRootProperties>,
     physics_root_dropdown_open: bool,
+    native_model_dropdown_open: bool,
+    native_model_dropdown_search: String,
+    native_model_dropdown_scroll: f32,
+    txd_dropdown_open: bool,
+    txd_dropdown_search: String,
+    txd_dropdown_scroll: f32,
+    txd_dropdown_create_mode: bool,
     settings_panel_collapsed: [bool; SETTINGS_SECTION_COUNT],
     global_transform: GlobalTransformState,
     collision_edit_mode: bool,
@@ -4151,7 +4832,11 @@ struct AppState {
     col_material_dropdown_scroll: f32,
     pending_col_writes: HashMap<(PathBuf, u64), u8>,
     hovered_gizmo: Option<GizmoAxis>,
+    hovered_gizmo_plane: Option<GizmoPlane>,
     gizmo_drag: Option<GizmoDrag>,
+    dff_scale_input: Option<DffScaleInput>,
+    cull_face_drag: Option<CullFaceDrag>,
+    cull_hovered_face: Option<(usize, bool)>,
     col_box_face_drag: Option<ColBoxFaceDrag>,
     col_box_hovered_face: Option<(CollisionPrimitiveSelection, usize, bool)>,
     inspector_edit: Option<InspectorEdit>,
@@ -4173,10 +4858,24 @@ struct AppState {
     expanded_groups: BTreeSet<String>,
     context_menu: Option<ContextMenu>,
     load_dialog: Option<LoadDialog>,
+    import_asset_dialog: Option<ImportAssetDialog>,
     preferences_dialog: Option<PreferencesDialog>,
     load_picker_rx: Option<mpsc::Receiver<Result<Option<PathBuf>, String>>>,
     dff_picker_rx: Option<mpsc::Receiver<(DffPickerKind, Result<Option<PathBuf>, String>)>>,
-    blender_import_rx: Option<mpsc::Receiver<Result<BlenderImportSummary, String>>>,
+    blender_import_setup: Option<BlenderImportSetup>,
+    oversized_chunk_dialog: Option<OversizedChunkDialog>,
+    oversized_chunk_job: Option<OversizedChunkJob>,
+    classify_dialog: Option<ClassifyElementsDialog>,
+    /// Largest world-axis extent still classified as an `object` element.
+    classify_object_max_size: f32,
+    blender_import_rx: Option<mpsc::Receiver<BlenderImportUpdate>>,
+    blender_import_dialog_open: bool,
+    blender_import_progress: f32,
+    blender_import_phase: String,
+    blender_import_log: Vec<String>,
+    blender_import_log_scroll: f32,
+    blender_import_log_follow_tail: bool,
+    blender_import_finished: bool,
     dff_repair_rx: Option<mpsc::Receiver<DffRepairResult>>,
     dff_repair_refresh: Option<DffRepairRefresh>,
     dff_repair_scope: DffRepairScope,
@@ -4195,6 +4894,7 @@ struct AppState {
     dff_texture_duplicate_dialog: Option<DffTextureDuplicateDialog>,
     dff_texture_view_dialog: Option<DffTextureViewDialog>,
     element_id_rename_dialog: Option<ElementIdRenameDialog>,
+    element_replace_with_dialog: Option<ElementReplaceWithDialog>,
     missing_texture_dialog: Option<MissingTextureDialog>,
     texture_archive_dialog: Option<TextureArchiveDialog>,
     missing_col_dialog: Option<MissingColDialog>,
@@ -4215,6 +4915,7 @@ struct AppState {
     light_lod_job: Option<LightLodJob>,
     fracture_generation_job: Option<FractureGenerationJob>,
     dff_geometry_job: Option<DffGeometryJob>,
+    dff_material_limit_repair_job: Option<DffMaterialLimitRepairJob>,
     collision_generation_job: Option<CollisionGenerationJob>,
     shadow_mesh_generation_job: Option<ShadowMeshGenerationJob>,
     collision_cuboid_audit_job: Option<CollisionCuboidAuditJob>,
@@ -4283,6 +4984,9 @@ struct AppState {
     water_edge_drag: Option<WaterEdgeDrag>,
     water_edge_snap_enabled: bool,
     water_scroll: f32,
+    cull_zones: Vec<CullZone>,
+    selected_cull: usize,
+    cull_scroll: f32,
     race: RaceEditorState,
     timecyc: TimecycState,
     fog_strength: f32,
@@ -4575,6 +5279,7 @@ impl Default for RaceEditorState {
 }
 
 fn parse_options() -> Options {
+    let draw_distance_percent = load_draw_distance_percent_preference();
     let mut options = Options {
         root: PathBuf::new(),
         root_from_cli: false,
@@ -4589,8 +5294,8 @@ fn parse_options() -> Options {
         vbo_immediate: false,
         monitor: None,
         msaa_samples: requested_msaa_samples(),
-        draw_distance_percent: load_draw_distance_percent_preference(),
-        draw_radius: DEFAULT_DRAW * load_draw_distance_percent_preference() as f32 / 100.0,
+        draw_distance_percent,
+        draw_radius: draw_radius_for_percent(draw_distance_percent),
         part_budget: usize::MAX,
         vertex_budget: DEFAULT_VERTEX_BUDGET,
         lod_mode: LodMode::Swap,
@@ -4854,6 +5559,7 @@ async fn main() {
                 poll_vehicle_collision_copy(app);
                 poll_blender_import(app);
                 update_editing_txd_import(app);
+                update_editing_dff_texture_replace(app);
                 poll_editing_img_save(app);
                 update_editing_img_merge(app);
                 poll_manual_save(app);
@@ -4886,6 +5592,9 @@ async fn main() {
                 update_light_lod_job(app);
                 update_fracture_generation_job(app);
                 update_dff_geometry_job(app);
+                update_dff_material_limit_repair_job(app);
+                update_oversized_chunk_job(app);
+                update_classify_scan(app);
                 update_collision_generation_job(app);
                 update_shadow_mesh_generation_job(app);
                 update_collision_cuboid_audit_job(app);
@@ -4895,11 +5604,16 @@ async fn main() {
                 poll_duplicate_placement_scan(app);
                 update_texture_match_selection_job(app);
                 update_water_texture_conversion_job(app);
+                update_preview_world_uv_job(app);
                 update_editing_linked_selection_job(app);
                 poll_lod_audit(app);
                 poll_missing_texture_review(app);
                 update_autosave(app);
                 record_activity_status(app);
+                // Native file drops are consumed and cleared once per frame.
+                // Poll them outside the regular input gate so background jobs
+                // and modal UI can never make the OS payload disappear.
+                let handled_file_drop = update_dropped_resource_files(app);
                 let background_blocks_editor_input = app.blender_import_rx.is_some()
                     || app.manual_save_job.is_some()
                     || app.autosave_cleanup_rx.is_some()
@@ -4914,25 +5628,30 @@ async fn main() {
                     || app.light_lod_job.is_some()
                     || app.fracture_generation_job.is_some()
                     || app.dff_geometry_job.is_some()
+                    || app.dff_material_limit_repair_job.is_some()
+                    || app.oversized_chunk_job.is_some()
                     || app.collision_generation_job.is_some()
                     || app.shadow_mesh_generation_job.is_some()
                     || app.lod_generation_job.is_some()
                     || app.instance_lod_removal_job.is_some()
                     || app.water_texture_conversion_job.is_some()
                     || app.editing.txd_import_rx.is_some()
+                    || app.editing.dff_texture_replace_rx.is_some()
                     || app.editing.txd_refresh_job.is_some()
                     || app.editing.save_rx.is_some()
                     || app.editing.merge_rx.is_some()
                     || app.editing.merge_apply_job.is_some()
                     || app.vehicle_browser.collision_copy_rx.is_some()
                     || app.editing.linked_selection_job.is_some();
-                if !background_blocks_editor_input {
+                if !background_blocks_editor_input && !handled_file_drop {
                     update_editor_input(app, viewport);
                 } else {
                     // Background asset work blocks scene mutations, but the
                     // status strip and activity console must remain interactive.
                     let mouse: Vec2 = mouse_position().into();
-                    let _ = update_save_log_input(app, mouse);
+                    if !update_blender_import_dialog_input(app, mouse) {
+                        let _ = update_save_log_input(app, mouse);
+                    }
                 }
                 update_simulation(app);
                 if let Some(root) = app.pending_load_root.take() {
@@ -4955,12 +5674,17 @@ async fn main() {
                 }
                 update_bake_job(app);
                 record_activity_status(app);
-                if app.inspector_edit.is_none()
+                if !editor_text_input_active(app)
                     && app.load_dialog.is_none()
+                    && app.import_asset_dialog.is_none()
                     && app.preferences_dialog.is_none()
                     && app.save_as_dialog.is_none()
                     && app.dff_picker_rx.is_none()
+                    && app.blender_import_setup.is_none()
+                    && app.oversized_chunk_dialog.is_none()
+                    && app.classify_dialog.is_none()
                     && app.blender_import_rx.is_none()
+                    && !app.blender_import_dialog_open
                     && app.dff_replace_choice_dialog.is_none()
                     && app.dff_merge_choice_dialog.is_none()
                     && app.dff_optimize_dialog.is_none()
@@ -4968,6 +5692,7 @@ async fn main() {
                     && app.dff_texture_duplicate_dialog.is_none()
                     && app.dff_texture_view_dialog.is_none()
                     && app.element_id_rename_dialog.is_none()
+                    && app.element_replace_with_dialog.is_none()
                     && app.missing_texture_dialog.is_none()
                     && app.texture_archive_dialog.is_none()
                     && app.dff_prelight_import_dialog.is_none()
@@ -5000,6 +5725,7 @@ async fn main() {
                 if app.options.ui {
                     draw_panel(app, viewport);
                     draw_load_dialog(app);
+                    draw_import_asset_dialog(app);
                     draw_preferences_dialog(app);
                     draw_save_as_dialog(app);
                     draw_dff_replace_choice_dialog(app);
@@ -5009,6 +5735,7 @@ async fn main() {
                     draw_dff_texture_duplicate_dialog(app);
                     draw_dff_texture_view_dialog(app);
                     draw_element_id_rename_dialog(app);
+                    draw_element_replace_with_dialog(app);
                     draw_missing_texture_dialog(app);
                     draw_texture_archive_dialog(app);
                     draw_dff_prelight_import_dialog(app);
@@ -5016,6 +5743,10 @@ async fn main() {
                     draw_lod_batch_dialog(app);
                     draw_confirm_dialog(app);
                     draw_save_log_dialog(app);
+                    draw_blender_import_dialog(app);
+                    draw_blender_import_setup_dialog(app);
+                    draw_oversized_chunk_dialog(app);
+                    draw_classify_dialog(app);
                     draw_pending_ui_tooltip(&app.ui_font);
                 }
                 let ui_ms = t_ui.elapsed().as_secs_f32() * 1000.0;

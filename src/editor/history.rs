@@ -20,7 +20,7 @@ fn transform_direction(matrix: Mat4, value: V3) -> V3 {
     }
 }
 
-fn matrix_rotation_degrees(matrix: Mat4) -> V3 {
+pub(crate) fn matrix_rotation_degrees(matrix: Mat4) -> V3 {
     // Decompose the editor's Rz * Ry * Rx convention.
     let y = (-matrix.x_axis.z).clamp(-1.0, 1.0).asin();
     let cy = y.cos();
@@ -141,15 +141,32 @@ pub(crate) fn delete_render_cells(scene_cells: &[SceneCell], world_cells: &[Worl
     }
 }
 
-pub(crate) fn delete_app_gl_resources(app: &AppState) {
-    delete_render_cells(&app.scene_cells, &app.world_cells);
-    delete_render_cells(&app.lod_scene_cells, &app.lod_world_cells);
-    unsafe {
-        for cache in app.collision_render_cache.values() {
+pub(crate) fn invalidate_collision_render_cache(app: &mut AppState, collision_key: &str) {
+    if let Some(cache) = app.collision_render_cache.remove(collision_key) {
+        unsafe {
             if cache.list != 0 {
                 gl::DeleteLists(cache.list, 1);
             }
         }
+    }
+}
+
+pub(crate) fn clear_collision_render_cache(app: &mut AppState) {
+    let caches = std::mem::take(&mut app.collision_render_cache);
+    unsafe {
+        for cache in caches.into_values() {
+            if cache.list != 0 {
+                gl::DeleteLists(cache.list, 1);
+            }
+        }
+    }
+}
+
+pub(crate) fn delete_app_gl_resources(app: &mut AppState) {
+    delete_render_cells(&app.scene_cells, &app.world_cells);
+    delete_render_cells(&app.lod_scene_cells, &app.lod_world_cells);
+    clear_collision_render_cache(app);
+    unsafe {
         for mesh in app.meshes.values() {
             for part in &mesh.parts {
                 if part.list != 0 {
@@ -295,6 +312,166 @@ pub(crate) fn rebuild_render_cells(app: &mut AppState) {
     rebuild_render_cells_with_mesh_lift(app, false);
 }
 
+pub(crate) fn build_placement_2dfx_indices(
+    placements: &[Placement],
+    definitions: &HashMap<String, Definition>,
+    meshes: &HashMap<String, RenderMesh>,
+) -> Vec<usize> {
+    placements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, placement)| {
+            meshes
+                .get(&placement_mesh_key(placement, definitions))
+                .is_some_and(|mesh| !mesh.effects_2dfx.is_empty())
+                .then_some(index)
+        })
+        .collect()
+}
+
+pub(crate) fn rebuild_placement_2dfx_index(app: &mut AppState) {
+    app.placement_2dfx_indices =
+        build_placement_2dfx_indices(&app.placements, &app.definitions, &app.meshes);
+    app.placement_2dfx_index_placement_count = app.placements.len();
+}
+
+/// Rebuilds only the complete fast-VBO cells touched by an in-place placement
+/// transform. Both the old and current origin keys are included so crossing a
+/// cell boundary removes the placement from its former cell and inserts it in
+/// its new one without disturbing unrelated GPU buffers.
+pub(crate) fn rebuild_render_cells_for_placement_transforms(
+    app: &mut AppState,
+    before: &PlacementTransformHistorySnapshot,
+) {
+    if !app.options.fast_vbo || app.options.vbo_selected_only {
+        rebuild_render_cells(app);
+        return;
+    }
+
+    let mut dirty_keys = HashSet::with_capacity(before.placements.len() * 2);
+    for (index, old_placement) in &before.placements {
+        dirty_keys.insert(world_cell_key(old_placement.pos));
+        if let Some(current) = app.placements.get(*index) {
+            dirty_keys.insert(world_cell_key(current.pos));
+        }
+    }
+    if dirty_keys.is_empty() {
+        return;
+    }
+
+    invalidate_lod_audit(app);
+    invalidate_missing_texture_review(app);
+    let mut lod_ids = HashSet::new();
+    for (placement, state) in app.placements.iter().zip(&app.element_states) {
+        if state.deleted || state.hidden {
+            continue;
+        }
+        if let Some(parent) = placement.attrs.get("lodParent") {
+            let parent = parent.trim();
+            if !parent.is_empty() && !parent.eq_ignore_ascii_case("self") {
+                lod_ids.insert(parent.to_ascii_lowercase());
+            }
+        }
+    }
+    app.lod_ids = collect_lod_ids(&app.placements);
+    let ambient_lift = scene_ambient_lift_from_timecyc(&app.timecyc);
+
+    // Build replacements before releasing currently drawable cells. Runtime
+    // residency uploads them on demand from their compact CPU payload.
+    let replacement_world_cells = build_world_cells_for_keys(
+        &app.placements,
+        Some(&app.element_states),
+        &app.definitions,
+        &app.meshes,
+        app.options.vbo_immediate,
+        &lod_ids,
+        false,
+        ambient_lift,
+        Some(&dirty_keys),
+    );
+    let replacement_lod_world_cells = build_world_cells_for_keys(
+        &app.placements,
+        Some(&app.element_states),
+        &app.definitions,
+        &app.meshes,
+        app.options.vbo_immediate,
+        &lod_ids,
+        true,
+        ambient_lift,
+        Some(&dirty_keys),
+    );
+    let expected_buckets = |want_lod| {
+        app.placements
+            .iter()
+            .zip(&app.element_states)
+            .filter(|(_, state)| !state.deleted && !state.hidden)
+            .map(|(placement, _)| placement)
+            .filter(|placement| {
+                dirty_keys.contains(&world_cell_key(placement.pos))
+                    && placement_is_lod(placement, &lod_ids) == want_lod
+                    && app
+                        .meshes
+                        .contains_key(&placement_mesh_key(placement, &app.definitions))
+            })
+            .map(|placement| {
+                (
+                    world_cell_key(placement.pos),
+                    placement_world_draw_distance_tier_for_render(
+                        placement,
+                        &app.definitions,
+                        want_lod,
+                    ),
+                )
+            })
+            .collect::<HashSet<_>>()
+    };
+    let replacement_buckets_complete =
+        |expected: HashSet<(WorldCellKey, WorldDrawDistanceTier)>, cells: &[WorldCell]| {
+            expected.iter().all(|(key, tier)| {
+                cells
+                    .iter()
+                    .any(|cell| cell.key == *key && cell.draw_distance_tier == *tier)
+            })
+        };
+    if !replacement_buckets_complete(expected_buckets(false), &replacement_world_cells)
+        || !replacement_buckets_complete(expected_buckets(true), &replacement_lod_world_cells)
+    {
+        // A requested bucket with renderable placements but no replacement is
+        // a build failure, not an empty (vacated) cell.
+        delete_render_cells(&[], &replacement_world_cells);
+        delete_render_cells(&[], &replacement_lod_world_cells);
+        return;
+    }
+
+    let mut displaced_vbos = HashSet::new();
+    app.world_cells.retain(|cell| {
+        let keep = !dirty_keys.contains(&cell.key);
+        if !keep && cell.vbo != 0 {
+            displaced_vbos.insert(cell.vbo);
+        }
+        keep
+    });
+    app.lod_world_cells.retain(|cell| {
+        let keep = !dirty_keys.contains(&cell.key);
+        if !keep && cell.vbo != 0 {
+            displaced_vbos.insert(cell.vbo);
+        }
+        keep
+    });
+    unsafe {
+        for vbo in displaced_vbos {
+            gl::DeleteBuffers(1, &vbo);
+        }
+    }
+
+    app.world_cells.extend(replacement_world_cells);
+    app.lod_world_cells.extend(replacement_lod_world_cells);
+    app.world_cells
+        .sort_unstable_by(|a, b| b.vertices.cmp(&a.vertices));
+    app.lod_world_cells
+        .sort_unstable_by(|a, b| b.vertices.cmp(&a.vertices));
+}
+
 pub(crate) fn rebuild_render_cells_with_mesh_lift(app: &mut AppState, refresh_mesh_lift: bool) {
     invalidate_lod_audit(app);
     invalidate_missing_texture_review(app);
@@ -312,6 +489,7 @@ pub(crate) fn rebuild_render_cells_with_mesh_lift(app: &mut AppState, refresh_me
     if refresh_mesh_lift {
         rebuild_mesh_part_lists_with_lift(&mut app.meshes, ambient_lift);
     }
+    rebuild_placement_2dfx_index(app);
     // Only build the cell set the active render path will draw (see finish()).
     if app.options.fast_vbo {
         app.scene_cells = Vec::new();
@@ -381,6 +559,7 @@ pub(crate) fn saved_content_snapshot(app: &AppState) -> SavedContentSnapshot {
         element_states: app.element_states.clone(),
         lights: app.lights.clone(),
         water_planes: app.water_planes.clone(),
+        cull_zones: app.cull_zones.clone(),
         race_tracks: app.race.tracks.clone(),
         race_radar_path: app.race.radar_path.clone(),
         race_world_size: app.race.world_size,
@@ -399,6 +578,13 @@ pub(crate) fn water_history_snapshot(app: &AppState) -> WaterHistorySnapshot {
         planes: app.water_planes.clone(),
         selected: app.selected_water,
         selected_planes: app.selected_water_planes.clone(),
+    }
+}
+
+pub(crate) fn cull_history_snapshot(app: &AppState) -> CullHistorySnapshot {
+    CullHistorySnapshot {
+        zones: app.cull_zones.clone(),
+        selected: app.selected_cull,
     }
 }
 
@@ -435,6 +621,26 @@ pub(crate) fn world_history_snapshot(app: &AppState) -> WorldHistorySnapshot {
         selected_element_order: app.selected_element_order.clone(),
         selected_col_face: app.selected_col_face,
         selected_col_vertex: app.selected_col_vertex,
+    }
+}
+
+pub(crate) fn placement_transform_history_snapshot<I>(
+    app: &AppState,
+    indices: I,
+) -> PlacementTransformHistorySnapshot
+where
+    I: IntoIterator<Item = usize>,
+{
+    PlacementTransformHistorySnapshot {
+        placements: indices
+            .into_iter()
+            .filter_map(|index| {
+                app.placements
+                    .get(index)
+                    .cloned()
+                    .map(|placement| (index, placement))
+            })
+            .collect(),
     }
 }
 
@@ -569,6 +775,26 @@ fn editing_txd_assets_equal(a: &EditingTxdState, b: &EditingTxdState) -> bool {
                 .map(|texture| (&texture.name, texture.width, texture.height, texture.format)))
 }
 
+fn editing_dff_open_models_equal(a: &EditingDffState, b: &EditingDffState) -> bool {
+    a.active_open_model == b.active_open_model
+        && a.multi_select == b.multi_select
+        && a.open_models.len() == b.open_models.len()
+        && a.open_models.iter().zip(&b.open_models).all(|(a, b)| {
+            a.name == b.name
+                && a.placement_index == b.placement_index
+                && a.to_workspace == b.to_workspace
+                && a.raw == b.raw
+                && a.txd_context == b.txd_context
+                && a.txd_source_label == b.txd_source_label
+                && a.dirty == b.dirty
+                && a.selected_face == b.selected_face
+                && a.selected_faces == b.selected_faces
+                && a.selected_edges == b.selected_edges
+                && a.selected_vertex == b.selected_vertex
+                && a.selected_vertices == b.selected_vertices
+        })
+}
+
 fn editing_assets_equal(a: &Option<EditingAsset>, b: &Option<EditingAsset>) -> bool {
     match (a, b) {
         (None, None) => true,
@@ -589,6 +815,7 @@ fn editing_assets_equal(a: &Option<EditingAsset>, b: &Option<EditingAsset>) -> b
                 && a.dirty == b.dirty
                 && a.normalized_warning == b.normalized_warning
                 && a.normalized_rewrite_confirmed == b.normalized_rewrite_confirmed
+                && editing_dff_open_models_equal(a, b)
         }
         (Some(EditingAsset::Col(a)), Some(EditingAsset::Col(b))) => {
             a.name == b.name
@@ -626,6 +853,15 @@ fn editing_asset_content_equal(a: &Option<EditingAsset>, b: &Option<EditingAsset
                 && a.raw == b.raw
                 && a.txd_context == b.txd_context
                 && a.txd_source_label == b.txd_source_label
+                && a.open_models.len() == b.open_models.len()
+                && a.open_models.iter().zip(&b.open_models).all(|(a, b)| {
+                    a.name == b.name
+                        && a.placement_index == b.placement_index
+                        && a.to_workspace == b.to_workspace
+                        && a.raw == b.raw
+                        && a.txd_context == b.txd_context
+                        && a.txd_source_label == b.txd_source_label
+                })
         }
         (Some(EditingAsset::Col(a)), Some(EditingAsset::Col(b))) => {
             a.name == b.name && a.mesh == b.mesh && a.bytes == b.bytes
@@ -641,6 +877,7 @@ fn app_has_content_changes_from_snapshot(app: &AppState, snapshot: &SavedContent
         || snapshot.element_states != app.element_states
         || snapshot.lights != app.lights
         || snapshot.water_planes != app.water_planes
+        || snapshot.cull_zones != app.cull_zones
         || snapshot.race_tracks != app.race.tracks
         || snapshot.race_radar_path != app.race.radar_path
         || (snapshot.race_world_size - app.race.world_size).abs() > f32::EPSILON
@@ -838,6 +1075,16 @@ fn apply_water_history_snapshot(app: &mut AppState, snapshot: WaterHistorySnapsh
     invalidate_validation_cache(app);
 }
 
+fn apply_cull_history_snapshot(app: &mut AppState, snapshot: CullHistorySnapshot) {
+    app.cull_zones = snapshot.zones;
+    app.selected_cull = snapshot
+        .selected
+        .min(app.cull_zones.len().saturating_sub(1));
+    clamp_cull_scroll(app);
+    app.cull_face_drag = None;
+    app.cull_hovered_face = None;
+}
+
 fn apply_light_history_snapshot(app: &mut AppState, snapshot: LightHistorySnapshot) {
     app.lights = snapshot.lights;
     app.selected_light = snapshot.selected.min(app.lights.len().saturating_sub(1));
@@ -886,6 +1133,25 @@ fn apply_world_history_snapshot(app: &mut AppState, snapshot: WorldHistorySnapsh
     invalidate_validation_cache(app);
 }
 
+fn apply_placement_transform_history_snapshot(
+    app: &mut AppState,
+    snapshot: PlacementTransformHistorySnapshot,
+) {
+    let before = placement_transform_history_snapshot(
+        app,
+        snapshot.placements.iter().map(|(index, _)| *index),
+    );
+    for (index, placement) in snapshot.placements {
+        if let Some(current) = app.placements.get_mut(index) {
+            *current = placement;
+        }
+    }
+    invalidate_outliner_labels(app);
+    rebuild_outliner_filter(app);
+    rebuild_render_cells_for_placement_transforms(app, &before);
+    invalidate_validation_cache(app);
+}
+
 pub(crate) fn apply_selection_history_snapshot(
     app: &mut AppState,
     snapshot: SelectionHistorySnapshot,
@@ -898,6 +1164,7 @@ pub(crate) fn apply_selection_history_snapshot(
 }
 
 fn apply_collision_history_snapshot(app: &mut AppState, snapshot: CollisionHistorySnapshot) {
+    clear_collision_render_cache(app);
     app.collisions = snapshot.collisions;
     app.selected_col_face = snapshot.selected_col_face;
     app.selected_col_vertex = snapshot.selected_col_vertex;
@@ -949,20 +1216,29 @@ fn apply_lod_generation_history_snapshot(
     snapshot: LodGenerationHistorySnapshot,
 ) {
     apply_world_history_snapshot(app, snapshot.world);
-    for artifact in snapshot.artifacts.iter() {
+    let artifacts: Box<dyn Iterator<Item = &LodGenerationHistoryArtifact>> =
+        if snapshot.generated_present {
+            Box::new(snapshot.artifacts.iter())
+        } else {
+            Box::new(snapshot.artifacts.iter().rev())
+        };
+    for artifact in artifacts {
         if snapshot.generated_present {
             for (key, name, bytes) in &artifact.assets {
                 app.pending_replacement_assets
                     .insert(key.clone(), (name.clone(), bytes.clone()));
                 app.pending_asset_deletes.remove(key);
             }
-            if let Some(txd_name) = artifact.txd_name.as_deref() {
-                app.pending_txd_writes.insert(asset_key(txd_name, ".txd"));
-                reindex_staged_txd(app, txd_name);
-            }
+            let replacements = artifact
+                .assets
+                .iter()
+                .map(|(_, name, bytes)| (name.clone(), bytes.clone()))
+                .collect::<Vec<_>>();
+            let _ = upsert_replacement_assets(&wip_root_path(&app.root), &replacements);
             if let Some(mesh) = artifact.mesh.as_ref() {
                 app.meshes.insert(artifact.mesh_key.clone(), mesh.clone());
             }
+            invalidate_collision_render_cache(app, &artifact.collision_key);
             app.collisions
                 .insert(artifact.collision_key.clone(), artifact.collision.clone());
         } else {
@@ -973,15 +1249,29 @@ fn apply_lod_generation_history_snapshot(
                 // the next Save cannot accidentally promote orphan LOD assets.
                 app.pending_asset_deletes.insert(key.clone());
             }
-            if let Some(txd_name) = artifact.txd_name.as_deref() {
-                app.pending_txd_writes.remove(&asset_key(txd_name, ".txd"));
-                remove_txd_from_texture_index(app, txd_name);
-            }
-            // Keep the GPU display lists owned by the history artifact alive
-            // for Redo; removing the map entry makes the mesh unavailable to
-            // the scene without forcing a synchronous recompile.
             app.meshes.remove(&artifact.mesh_key);
+            invalidate_collision_render_cache(app, &artifact.collision_key);
             app.collisions.remove(&artifact.collision_key);
+        }
+    }
+    for (key, (name, bytes)) in &snapshot.txd_assets {
+        if let Some(bytes) = bytes {
+            app.pending_replacement_assets
+                .insert(key.clone(), (name.clone(), bytes.clone()));
+            app.pending_asset_deletes.remove(key);
+            let _ = upsert_replacement_assets(
+                &wip_root_path(&app.root),
+                &[(name.clone(), bytes.clone())],
+            );
+            app.pending_txd_writes.insert(key.clone());
+            reindex_staged_txd(app, name);
+        } else {
+            app.pending_replacement_assets.remove(key);
+            app.pending_txd_writes.remove(key);
+            remove_txd_from_texture_index(app, name);
+            if !snapshot.generated_present {
+                app.pending_asset_deletes.insert(key.clone());
+            }
         }
     }
     app.loaded_wip = true;
@@ -992,9 +1282,13 @@ fn apply_lod_generation_history_snapshot(
 fn apply_undo_state(app: &mut AppState, state: &UndoState) {
     match state {
         UndoState::Water(snapshot) => apply_water_history_snapshot(app, snapshot.clone()),
+        UndoState::Cull(snapshot) => apply_cull_history_snapshot(app, snapshot.clone()),
         UndoState::Lights(snapshot) => apply_light_history_snapshot(app, snapshot.clone()),
         UndoState::Race(snapshot) => apply_race_history_snapshot(app, snapshot.clone()),
         UndoState::World(snapshot) => apply_world_history_snapshot(app, snapshot.clone()),
+        UndoState::PlacementTransforms(snapshot) => {
+            apply_placement_transform_history_snapshot(app, snapshot.clone());
+        }
         UndoState::Selection(snapshot) => apply_selection_history_snapshot(app, snapshot.clone()),
         UndoState::Collision(snapshot) => apply_collision_history_snapshot(app, snapshot.clone()),
         UndoState::Editing(snapshot) => apply_editing_history_snapshot(app, snapshot.clone()),
@@ -1035,6 +1329,17 @@ pub(crate) fn commit_water_history(
         app.undo_stack.remove(0);
     }
     app.redo_stack.clear();
+}
+
+pub(crate) fn commit_cull_history(
+    app: &mut AppState,
+    label: impl Into<String>,
+    before: CullHistorySnapshot,
+) {
+    let after = cull_history_snapshot(app);
+    if before != after {
+        push_scoped_history(app, label, UndoState::Cull(before), UndoState::Cull(after));
+    }
 }
 
 fn push_scoped_history(
@@ -1080,12 +1385,23 @@ pub(crate) fn commit_lod_generation_history(
     app: &mut AppState,
     before_world: WorldHistorySnapshot,
     artifacts: Vec<LodGenerationHistoryArtifact>,
+    txd_before: BTreeMap<String, (String, Option<Vec<u8>>)>,
 ) {
     if artifacts.is_empty() {
         return;
     }
     let artifacts = Arc::new(artifacts);
     let after_world = world_history_snapshot(app);
+    let txd_after = txd_before
+        .iter()
+        .map(|(key, (name, _))| {
+            let bytes = app
+                .pending_replacement_assets
+                .get(key)
+                .map(|(_, bytes)| bytes.clone());
+            (key.clone(), (name.clone(), bytes))
+        })
+        .collect();
     let count = artifacts.len();
     push_scoped_history(
         app,
@@ -1098,11 +1414,13 @@ pub(crate) fn commit_lod_generation_history(
             world: before_world,
             artifacts: Arc::clone(&artifacts),
             generated_present: false,
+            txd_assets: txd_before,
         }),
         UndoState::LodGeneration(LodGenerationHistorySnapshot {
             world: after_world,
             artifacts,
             generated_present: true,
+            txd_assets: txd_after,
         }),
     );
 }
@@ -1146,6 +1464,25 @@ pub(crate) fn commit_world_history(
             label,
             UndoState::World(before),
             UndoState::World(after),
+        );
+    }
+}
+
+pub(crate) fn commit_placement_transform_history(
+    app: &mut AppState,
+    label: impl Into<String>,
+    before: PlacementTransformHistorySnapshot,
+) {
+    let after = placement_transform_history_snapshot(
+        app,
+        before.placements.iter().map(|(index, _)| *index),
+    );
+    if before != after {
+        push_scoped_history(
+            app,
+            label,
+            UndoState::PlacementTransforms(before),
+            UndoState::PlacementTransforms(after),
         );
     }
 }
@@ -1311,9 +1648,13 @@ pub(crate) fn commit_scoped_history(
     match before {
         ScopedHistorySnapshot::None => {}
         ScopedHistorySnapshot::Water(snapshot) => commit_water_history(app, label, snapshot),
+        ScopedHistorySnapshot::Cull(snapshot) => commit_cull_history(app, label, snapshot),
         ScopedHistorySnapshot::Lights(snapshot) => commit_light_history(app, label, snapshot),
         ScopedHistorySnapshot::Race(snapshot) => commit_race_history(app, label, snapshot),
         ScopedHistorySnapshot::World(snapshot) => commit_world_history(app, label, snapshot),
+        ScopedHistorySnapshot::PlacementTransforms(snapshot) => {
+            commit_placement_transform_history(app, label, snapshot);
+        }
         ScopedHistorySnapshot::Collision(snapshot) => {
             commit_collision_history(app, label, snapshot);
         }
@@ -1407,6 +1748,61 @@ pub(crate) fn redo(app: &mut AppState) {
 #[cfg(test)]
 mod selection_history_tests {
     use super::*;
+
+    fn test_placement(dff: &str) -> Placement {
+        Placement {
+            id: String::new(),
+            dff: dff.to_string(),
+            zone: String::new(),
+            tag: String::new(),
+            attrs: BTreeMap::new(),
+            pos: V3::default(),
+            rot: V3::default(),
+        }
+    }
+
+    fn test_render_mesh(has_2dfx: bool) -> RenderMesh {
+        RenderMesh {
+            parts: Vec::new(),
+            bounds: Bounds {
+                min: Vec3::ZERO,
+                max: Vec3::ZERO,
+            },
+            material_animations: Vec::new(),
+            uv_animations: Vec::new(),
+            effects_2dfx: has_2dfx
+                .then(|| Dff2dEffect::default())
+                .into_iter()
+                .collect(),
+            components: Vec::new(),
+            component_pivots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn placement_2dfx_index_contains_only_resolved_effect_meshes() {
+        let placements = vec![
+            test_placement("lamp"),
+            test_placement("road"),
+            test_placement("missing"),
+            test_placement("lamp"),
+        ];
+        let definitions = HashMap::new();
+        let mut meshes = HashMap::new();
+        meshes.insert(
+            placement_mesh_key(&placements[0], &definitions),
+            test_render_mesh(true),
+        );
+        meshes.insert(
+            placement_mesh_key(&placements[1], &definitions),
+            test_render_mesh(false),
+        );
+
+        assert_eq!(
+            build_placement_2dfx_indices(&placements, &definitions, &meshes),
+            vec![0, 3]
+        );
+    }
 
     #[test]
     fn matching_texture_selection_preserves_exact_undo_and_redo_states() {

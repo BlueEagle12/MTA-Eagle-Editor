@@ -1183,6 +1183,7 @@ pub(crate) fn replace_selected_col(app: &mut AppState, path: PathBuf, make_uniqu
     );
 
     let mesh_key = lower(with_ext(&col_name, ".col"));
+    invalidate_collision_render_cache(app, &mesh_key);
     app.collisions.insert(mesh_key, mesh);
     app.selected_col_face = None;
     if make_unique {
@@ -1607,22 +1608,91 @@ fn lod_name_is_repeated(placements: &[Placement], id: &str) -> bool {
         > 1
 }
 
-fn has_two_dimensions_at_least_80(bounds: Bounds) -> bool {
-    let size = bounds.max - bounds.min;
-    [size.x.abs(), size.y.abs(), size.z.abs()]
-        .into_iter()
-        .filter(|dimension| *dimension >= 80.0)
-        .count()
-        >= 2
+const LOW_LOD_EFFECTIVE_DISTANCE: u16 = 1500;
+const MINIMUM_LOW_LOD_EFFECTIVE_DISTANCE: u16 = 300;
+const OBJECT_LOW_LOD_DISTANCE_MULTIPLIER: u16 = 5;
+const OBJECT_DETAIL_WITH_LOD_DISTANCE: u16 = 200;
+const DETAIL_MINIMUM_LOD_DISTANCE: u16 = 80;
+const DETAIL_MAXIMUM_LOD_DISTANCE: u16 = 299;
+const DETAIL_BASE_LOD_DISTANCE: f32 = 100.0;
+const LOD_REFERENCE_VIEWPORT_HEIGHT: f32 = 1080.0;
+const LOD_REFERENCE_VERTICAL_FOV_DEGREES: f32 = 70.0;
+const LOD_CULL_TARGET_PIXELS: f32 = 48.0;
+// Used when a building's mesh bounds are unavailable (including during LOD
+// generation, before the generated definition is installed into the scene).
+const BUILDING_DETAIL_WITH_LOD_DISTANCE: u16 = DETAIL_MAXIMUM_LOD_DISTANCE;
+
+pub(crate) fn generated_lod_distance(is_building: bool) -> u16 {
+    if is_building {
+        LOW_LOD_EFFECTIVE_DISTANCE
+    } else {
+        LOW_LOD_EFFECTIVE_DISTANCE.div_ceil(OBJECT_LOW_LOD_DISTANCE_MULTIPLIER)
+    }
 }
 
-fn default_lod_distance(is_lod: bool, has_lod: bool, is_large: bool) -> u16 {
+pub(crate) fn detail_with_lod_distance(is_building: bool) -> u16 {
+    if is_building {
+        BUILDING_DETAIL_WITH_LOD_DISTANCE
+    } else {
+        OBJECT_DETAIL_WITH_LOD_DISTANCE
+    }
+}
+
+pub(crate) fn sa_detail_lod_distance(bounds: Bounds) -> u16 {
+    let size = bounds.max - bounds.min;
+    let radius = size.length() * 0.5;
+    let distance = (DETAIL_BASE_LOD_DISTANCE + radius).ceil();
+    if !distance.is_finite() || distance <= 0.0 {
+        return OBJECT_DETAIL_WITH_LOD_DISTANCE;
+    }
+    distance.clamp(
+        f32::from(DETAIL_MINIMUM_LOD_DISTANCE),
+        f32::from(DETAIL_MAXIMUM_LOD_DISTANCE),
+    ) as u16
+}
+
+fn sa_effective_low_lod_distance(bounds: Bounds) -> u16 {
+    let size = bounds.max - bounds.min;
+    let max_dimension = size.x.abs().max(size.y.abs()).max(size.z.abs());
+    let half_fov = (LOD_REFERENCE_VERTICAL_FOV_DEGREES * 0.5).to_radians();
+    let distance = (max_dimension * LOD_REFERENCE_VIEWPORT_HEIGHT
+        / (2.0 * half_fov.tan() * LOD_CULL_TARGET_PIXELS))
+        .ceil();
+    if !distance.is_finite() || distance <= 0.0 {
+        return LOW_LOD_EFFECTIVE_DISTANCE;
+    }
+    distance.clamp(
+        f32::from(MINIMUM_LOW_LOD_EFFECTIVE_DISTANCE),
+        f32::from(LOW_LOD_EFFECTIVE_DISTANCE),
+    ) as u16
+}
+
+pub(crate) fn sa_lod_model_distance(is_building: bool, bounds: Bounds) -> u16 {
+    let effective_distance = sa_effective_low_lod_distance(bounds);
+    if is_building {
+        effective_distance
+    } else {
+        effective_distance.div_ceil(OBJECT_LOW_LOD_DISTANCE_MULTIPLIER)
+    }
+}
+
+/// Calculate the definition distance used by Repair LODs for a model's scene
+/// role. LOD generation also calls this helper so newly-created pairs use the
+/// exact same rules without requiring a later repair pass.
+pub(crate) fn repaired_lod_distance(
+    is_lod: bool,
+    is_building: bool,
+    has_lod: bool,
+    mesh_bounds: Option<Bounds>,
+) -> u16 {
     if is_lod {
-        700
+        mesh_bounds
+            .map(|bounds| sa_lod_model_distance(is_building, bounds))
+            .unwrap_or_else(|| generated_lod_distance(is_building))
+    } else if let Some(bounds) = mesh_bounds {
+        sa_detail_lod_distance(bounds)
     } else if has_lod {
-        200
-    } else if is_large {
-        300
+        detail_with_lod_distance(is_building)
     } else {
         170
     }
@@ -1637,11 +1707,15 @@ fn lod_distance_matches(value: Option<&str>, expected: u16) -> bool {
 /// Recalculate definition draw distances using the scene role and dimensions
 /// of each model.
 ///
-/// LOD stand-ins use 700, detail models with an assigned LOD use 200, and
-/// unpaired detail models use 300 when at least two mesh dimensions are 80
-/// units or larger (170 otherwise). `lodParent` does not make the detail model
-/// itself an LOD. Definitions already set to their calculated distance are left
-/// unchanged. Returns `(lod_definitions, detail_definitions)` updated.
+/// Stock SA detail distances correlate most strongly with a 100-unit base plus
+/// the model bounds radius, capped at 299. Low-LOD distance uses a 1080p/70-degree
+/// reference projection and remains loaded until its largest dimension occupies
+/// about 48 vertical pixels, with an effective range clamped to 300..1500.
+/// Building LODs store that actual distance; object LODs store one fifth because
+/// MTA applies its 5-times low-LOD rule. Missing bounds retain the maximum-range
+/// fallback. `lodParent` does not make the detail model itself an LOD.
+/// Definitions already set to their calculated distance are left unchanged.
+/// Returns `(lod_definitions, detail_definitions)` updated.
 pub(crate) fn fix_lod_distances(app: &mut AppState) -> (usize, usize) {
     use std::collections::{HashMap, HashSet};
 
@@ -1666,9 +1740,13 @@ pub(crate) fn fix_lod_distances(app: &mut AppState) -> (usize, usize) {
                 parent.eq_ignore_ascii_case("self")
                     || placement_ids.contains(&parent.to_ascii_lowercase())
             });
-        let is_large = element_mesh(app, placement)
-            .is_some_and(|mesh| has_two_dimensions_at_least_80(mesh.bounds));
-        let distance = default_lod_distance(is_lod, has_lod, is_large);
+        let mesh_bounds = element_mesh(app, placement).map(|mesh| mesh.bounds);
+        let distance = repaired_lod_distance(
+            is_lod,
+            placement.tag.eq_ignore_ascii_case("building"),
+            has_lod,
+            mesh_bounds,
+        );
         targets
             .entry(placement.id.clone())
             .and_modify(|(_, target_is_lod, target_distance)| {
@@ -1749,6 +1827,159 @@ fn resolve_lod_child_target(
     })
 }
 
+/// Make each live LOD placement use the same MTA world element type as the
+/// live detail placement it represents. Repeated LOD ids use the same
+/// uniqueID/nearest-instance resolution as the orphan repair pass.
+///
+/// A single LOD placement can be shared by several detail placements. When
+/// those details disagree between `building` and `object`, there is no type
+/// that can match them all, so the ambiguous LOD is left unchanged.
+fn fix_lod_types_in(placements: &mut [Placement], states: &[ElementState]) -> usize {
+    use std::collections::{HashMap, HashSet};
+
+    let mut target_candidates = HashMap::<String, Vec<usize>>::new();
+    for (index, placement) in placements.iter().enumerate() {
+        if live_in_snapshot(states, index) {
+            target_candidates
+                .entry(placement.id.trim().to_ascii_lowercase())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    let mut target_types = HashMap::<usize, &'static str>::new();
+    let mut conflicts = HashSet::<usize>::new();
+    for (child_index, child) in placements.iter().enumerate() {
+        if !live_in_snapshot(states, child_index) {
+            continue;
+        }
+        let desired_type = if child.tag.eq_ignore_ascii_case("building") {
+            "building"
+        } else if child.tag.eq_ignore_ascii_case("object") {
+            "object"
+        } else {
+            continue;
+        };
+        let Some(parent) = child
+            .attrs
+            .get("lodParent")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("self"))
+        else {
+            continue;
+        };
+        let Some(candidates) = target_candidates.get(&parent.to_ascii_lowercase()) else {
+            continue;
+        };
+        let Some(target) = resolve_lod_child_target(placements, child_index, candidates) else {
+            continue;
+        };
+        match target_types.get(&target) {
+            Some(existing) if *existing != desired_type => {
+                conflicts.insert(target);
+            }
+            None => {
+                target_types.insert(target, desired_type);
+            }
+            _ => {}
+        }
+    }
+
+    let mut changed = 0usize;
+    for (index, desired_type) in target_types {
+        if conflicts.contains(&index) {
+            continue;
+        }
+        let Some(lod) = placements.get_mut(index) else {
+            continue;
+        };
+        if !lod.tag.eq_ignore_ascii_case(desired_type) {
+            lod.tag = desired_type.to_string();
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Repair LOD placement types. The caller owns history and render/outliner
+/// refreshes. Returns the number of LOD placements changed.
+pub(crate) fn fix_lod_types(app: &mut AppState) -> usize {
+    fix_lod_types_in(&mut app.placements, &app.element_states)
+}
+
+#[cfg(test)]
+mod lod_type_tests {
+    use super::*;
+
+    fn placement(
+        id: &str,
+        tag: &str,
+        lod_parent: Option<&str>,
+        unique_id: Option<&str>,
+        x: f32,
+    ) -> Placement {
+        let mut attrs = BTreeMap::new();
+        if let Some(lod_parent) = lod_parent {
+            attrs.insert("lodParent".to_string(), lod_parent.to_string());
+        }
+        if let Some(unique_id) = unique_id {
+            attrs.insert("uniqueID".to_string(), unique_id.to_string());
+        }
+        Placement {
+            id: id.to_string(),
+            dff: id.to_string(),
+            zone: "test".to_string(),
+            tag: tag.to_string(),
+            attrs,
+            pos: V3 { x, y: 0.0, z: 0.0 },
+            rot: V3::default(),
+        }
+    }
+
+    #[test]
+    fn matches_lod_types_to_building_and_object_bases() {
+        let mut placements = vec![
+            placement("tower", "building", Some("lod_tower"), None, 0.0),
+            placement("lod_tower", "object", None, None, 0.0),
+            placement("prop", "object", Some("lod_prop"), None, 100.0),
+            placement("lod_prop", "building", None, None, 100.0),
+        ];
+        let states = vec![ElementState::default(); placements.len()];
+
+        assert_eq!(fix_lod_types_in(&mut placements, &states), 2);
+        assert_eq!(placements[1].tag, "building");
+        assert_eq!(placements[3].tag, "object");
+    }
+
+    #[test]
+    fn repeated_lods_use_unique_ids_when_matching_types() {
+        let mut placements = vec![
+            placement("tower", "building", Some("shared_lod"), Some("1"), 0.0),
+            placement("prop", "object", Some("shared_lod"), Some("2"), 100.0),
+            placement("shared_lod", "object", None, Some("1"), 100.0),
+            placement("shared_lod", "building", None, Some("2"), 0.0),
+        ];
+        let states = vec![ElementState::default(); placements.len()];
+
+        assert_eq!(fix_lod_types_in(&mut placements, &states), 2);
+        assert_eq!(placements[2].tag, "building");
+        assert_eq!(placements[3].tag, "object");
+    }
+
+    #[test]
+    fn shared_lod_with_conflicting_base_types_is_left_unchanged() {
+        let mut placements = vec![
+            placement("tower", "building", Some("shared_lod"), None, 0.0),
+            placement("prop", "object", Some("shared_lod"), None, 10.0),
+            placement("shared_lod", "object", None, None, 5.0),
+        ];
+        let states = vec![ElementState::default(); placements.len()];
+
+        assert_eq!(fix_lod_types_in(&mut placements, &states), 0);
+        assert_eq!(placements[2].tag, "object");
+    }
+}
+
 /// Find live LOD placements that no live detail placement resolves to.
 ///
 /// Repeated LOD names are resolved the same way as the LOD Audit: an exact
@@ -1827,6 +2058,305 @@ pub(crate) fn remove_orphan_lods(app: &mut AppState) -> usize {
     removed
 }
 
+pub(crate) fn request_clear_all_lods(app: &mut AppState) {
+    if writer_is_busy(app) {
+        app.status_message =
+            "LOD removal cannot start while another asset writer is running.".to_string();
+        return;
+    }
+    let assignment_count = app
+        .placements
+        .iter()
+        .enumerate()
+        .filter(|(index, placement)| {
+            !app.element_states
+                .get(*index)
+                .is_some_and(|state| state.deleted)
+                && placement
+                    .attrs
+                    .get("lodParent")
+                    .is_some_and(|parent| !parent.trim().is_empty())
+        })
+        .count();
+    let lod_ids = collect_lod_ids(&app.placements);
+    let lod_count = app
+        .placements
+        .iter()
+        .enumerate()
+        .filter(|(index, placement)| {
+            !app.element_states
+                .get(*index)
+                .is_some_and(|state| state.deleted)
+                && placement_is_lod(placement, &lod_ids)
+        })
+        .count();
+    if assignment_count == 0 && lod_count == 0 {
+        app.status_message = "The scene has no LOD assignments or LOD elements.".to_string();
+        return;
+    }
+    app.confirm_dialog = Some(ConfirmDialog {
+        action: ConfirmAction::ClearAllLods,
+        title: "Clear All LODs?".to_string(),
+        body: format!(
+            "Clear {assignment_count} LOD assignment(s) and remove {lod_count} LOD element(s) from the scene?"
+        ),
+        detail: "This clears both lodParent=\"self\" and links to separate LOD elements, stages their unused DFF/COL/TXD assets for deletion, and removes their unused textures from shared TXDs. Asset cleanup clears Undo and Redo history."
+            .to_string(),
+        primary_label: "Clear All LODs".to_string(),
+        secondary_label: None,
+        secondary_action: None,
+    });
+}
+
+#[derive(Default)]
+struct LodAssetCandidates {
+    definitions: HashSet<String>,
+    dffs: HashSet<String>,
+    cols: HashSet<String>,
+    txds: HashSet<String>,
+}
+
+fn collect_lod_asset_candidates(
+    placements: &[Placement],
+    states: &[ElementState],
+    definitions: &HashMap<String, Definition>,
+) -> LodAssetCandidates {
+    let lod_ids = collect_lod_ids(placements);
+    let mut candidates = LodAssetCandidates::default();
+    for (index, placement) in placements.iter().enumerate() {
+        if states.get(index).is_some_and(|state| state.deleted)
+            || !placement_is_lod(placement, &lod_ids)
+        {
+            continue;
+        }
+        let Some(definition) = definitions.get(&placement.id) else {
+            candidates.dffs.insert(asset_key(&placement.dff, ".dff"));
+            candidates.cols.insert(asset_key(&placement.dff, ".col"));
+            continue;
+        };
+        candidates.definitions.insert(definition.id.clone());
+        let dff = asset_key_opt(definition.attrs.get("dff"), &definition.id, ".dff");
+        let col_fallback = dff.strip_suffix(".dff").unwrap_or(&dff);
+        let col = asset_key_opt(definition.attrs.get("col"), col_fallback, ".col");
+        candidates.dffs.insert(dff);
+        candidates.cols.insert(col);
+        if let Some(txd) = definition_txd_name_from_attrs(definition) {
+            candidates.txds.insert(asset_key(txd, ".txd"));
+        }
+    }
+    candidates
+}
+
+fn active_texture_references_for_txd(
+    app: &AppState,
+    txd_key: &str,
+) -> Result<HashSet<String>, String> {
+    let mut dffs = HashSet::new();
+    for (index, placement) in app.placements.iter().enumerate() {
+        if app
+            .element_states
+            .get(index)
+            .is_some_and(|state| state.deleted)
+        {
+            continue;
+        }
+        let Some(definition) = app.definitions.get(&placement.id) else {
+            continue;
+        };
+        if !definition_txd_name_from_attrs(definition)
+            .is_some_and(|txd| asset_key(txd, ".txd") == txd_key)
+        {
+            continue;
+        }
+        dffs.insert(asset_key_opt(
+            definition.attrs.get("dff"),
+            &definition.id,
+            ".dff",
+        ));
+    }
+
+    let mut textures = HashSet::new();
+    for dff in dffs {
+        let entry = find_dff_entry_for_app(app, &dff).ok_or_else(|| {
+            format!("Could not read {dff}; shared TXD texture cleanup was skipped")
+        })?;
+        let bytes = read_img_entry(&entry);
+        let raw = parse_dff_mesh(&bytes[..dff_chunk_len(&bytes).min(bytes.len())]);
+        textures.extend(
+            raw.material_textures
+                .into_iter()
+                .map(|name| lower(name.trim()))
+                .filter(|name| !name.is_empty()),
+        );
+    }
+    Ok(textures)
+}
+
+fn stage_lod_asset_cleanup(
+    app: &mut AppState,
+    candidates: &LodAssetCandidates,
+) -> (usize, usize, Vec<String>) {
+    let summary = validation_summary(app);
+    let unused_dffs = summary.unused_dffs.into_iter().collect::<HashSet<_>>();
+    let unused_cols = summary.unused_cols.into_iter().collect::<HashSet<_>>();
+    let unused_txds = summary.unused_txds.into_iter().collect::<HashSet<_>>();
+    let mut deletes = candidates
+        .dffs
+        .intersection(&unused_dffs)
+        .chain(candidates.cols.intersection(&unused_cols))
+        .chain(candidates.txds.intersection(&unused_txds))
+        .cloned()
+        .collect::<HashSet<_>>();
+    let deleted = deletes.len();
+    let mut removed_textures = 0usize;
+    let mut warnings = Vec::new();
+
+    for txd_key in candidates.txds.difference(&deletes) {
+        let used = match active_texture_references_for_txd(app, txd_key) {
+            Ok(used) if !used.is_empty() => used,
+            Ok(_) => continue,
+            Err(err) => {
+                warnings.push(err);
+                continue;
+            }
+        };
+        let Some(entry) = find_txd_entry_for_app(app, txd_key) else {
+            warnings.push(format!(
+                "Could not find {txd_key}; shared TXD texture cleanup was skipped"
+            ));
+            continue;
+        };
+        match purge_unused_texture_natives_from_txd(read_txd_entry_bytes(&entry), &used) {
+            Ok((bytes, removed, _)) if removed > 0 => {
+                let name = with_ext(txd_key, ".txd");
+                if let Err(err) = upsert_replacement_asset(&wip_root_path(&app.root), &name, &bytes)
+                {
+                    warnings.push(format!("Could not stage cleaned {name}: {err}"));
+                    continue;
+                }
+                app.pending_replacement_assets
+                    .insert(txd_key.clone(), (name, bytes));
+                app.pending_txd_writes.insert(txd_key.clone());
+                app.pending_asset_deletes.remove(txd_key);
+                reindex_staged_txd(app, txd_key);
+                removed_textures += removed;
+            }
+            Ok(_) => {}
+            Err(err) => warnings.push(format!("Could not clean {txd_key}: {err}")),
+        }
+    }
+
+    for key in &deletes {
+        app.pending_replacement_assets.remove(key);
+        app.pending_txd_writes.remove(key);
+    }
+    app.pending_asset_deletes.extend(deletes.drain());
+    for root in [&app.root, &wip_root_path(&app.root)] {
+        if let Err(err) = remove_replacement_archive_entries(root, &app.pending_asset_deletes) {
+            warnings.push(format!(
+                "Could not prune staged assets in {}: {err}",
+                root.display()
+            ));
+        }
+    }
+    let deleted_txds = candidates
+        .txds
+        .intersection(&app.pending_asset_deletes)
+        .cloned()
+        .collect::<Vec<_>>();
+    for txd in deleted_txds {
+        remove_txd_from_texture_index(app, &txd);
+    }
+    app.meshes.retain(|key, _| {
+        key.split('|')
+            .next()
+            .is_none_or(|dff| !app.pending_asset_deletes.contains(dff))
+    });
+    app.collisions
+        .retain(|key, _| !app.pending_asset_deletes.contains(key));
+    if deleted > 0 || removed_textures > 0 {
+        app.loaded_wip = true;
+    }
+    (deleted, removed_textures, warnings)
+}
+
+fn clear_all_lods_in_world(
+    placements: &mut [Placement],
+    states: &mut [ElementState],
+) -> (usize, usize) {
+    let lod_ids = collect_lod_ids(placements);
+    let mut cleared = 0usize;
+    let mut removed = 0usize;
+    for (index, placement) in placements.iter_mut().enumerate() {
+        if states.get(index).is_some_and(|state| state.deleted) {
+            continue;
+        }
+        if placement.attrs.remove("lodParent").is_some() {
+            cleared += 1;
+        }
+        if placement_is_lod(placement, &lod_ids)
+            && let Some(state) = states.get_mut(index)
+        {
+            state.deleted = true;
+            removed += 1;
+        }
+    }
+    (cleared, removed)
+}
+
+pub(crate) fn clear_all_lods(app: &mut AppState) {
+    let candidates =
+        collect_lod_asset_candidates(&app.placements, &app.element_states, &app.definitions);
+    let (cleared, removed) = clear_all_lods_in_world(&mut app.placements, &mut app.element_states);
+    if cleared == 0 && removed == 0 {
+        app.status_message = "The scene no longer has any LODs to clear.".to_string();
+        return;
+    }
+    let active_definition_ids = app
+        .placements
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            !app.element_states
+                .get(*index)
+                .is_some_and(|state| state.deleted)
+        })
+        .map(|(_, placement)| placement.id.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let removed_definitions = candidates
+        .definitions
+        .iter()
+        .filter(|id| {
+            !active_definition_ids.contains(&id.to_ascii_lowercase())
+                && !app.readonly_definition_ids.contains(*id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for id in &removed_definitions {
+        app.definitions.remove(id);
+    }
+    let (deleted_assets, removed_textures, warnings) = stage_lod_asset_cleanup(app, &candidates);
+    app.lod_ids = collect_lod_ids(&app.placements);
+    invalidate_outliner_labels(app);
+    rebuild_outliner_filter(app);
+    invalidate_validation_cache(app);
+    rebuild_render_cells(app);
+    clear_history_for_external_change(app);
+    app.status_message = format!(
+        "Cleared {cleared} LOD assignment(s), removed {removed} LOD element(s) and {} definition(s), staged {deleted_assets} unused DFF/COL/TXD asset(s) for deletion, and removed {removed_textures} unused texture(s). Save to apply; Undo/Redo history cleared.",
+        removed_definitions.len()
+    );
+    if !warnings.is_empty() {
+        app.status_message.push_str(&format!(
+            " Completed with {} cleanup warning(s); click the status bar for details.",
+            warnings.len()
+        ));
+        let mut log = vec![app.status_message.clone()];
+        log.extend(warnings);
+        set_save_log(app, "Clear All LODs completed with warnings", log, true);
+    }
+}
+
 #[cfg(test)]
 mod lod_distance_tests {
     use super::*;
@@ -1839,24 +2369,67 @@ mod lod_distance_tests {
     }
 
     #[test]
-    fn large_requires_two_dimensions_at_or_above_threshold() {
-        assert!(has_two_dimensions_at_least_80(bounds(vec3(
-            80.0, 80.0, 1.0
-        ))));
-        assert!(has_two_dimensions_at_least_80(bounds(vec3(
-            100.0, 2.0, 90.0
-        ))));
-        assert!(!has_two_dimensions_at_least_80(bounds(vec3(
-            79.999, 80.0, 79.999
-        ))));
+    fn distance_defaults_follow_lod_graph() {
+        let small = bounds(vec3(20.0, 10.0, 5.0));
+        let large = bounds(vec3(100.0, 90.0, 2.0));
+        assert_eq!(repaired_lod_distance(false, false, false, Some(small)), 112);
+        assert_eq!(repaired_lod_distance(false, false, false, Some(large)), 168);
+        assert_eq!(repaired_lod_distance(false, false, true, Some(large)), 168);
+        assert_eq!(repaired_lod_distance(false, true, true, None), 299);
+        assert_eq!(repaired_lod_distance(true, false, false, None), 300);
+        assert_eq!(repaired_lod_distance(true, true, false, None), 1500);
     }
 
     #[test]
-    fn distance_defaults_follow_lod_graph() {
-        assert_eq!(default_lod_distance(false, false, false), 170);
-        assert_eq!(default_lod_distance(false, false, true), 300);
-        assert_eq!(default_lod_distance(false, true, true), 200);
-        assert_eq!(default_lod_distance(true, false, false), 700);
+    fn sa_detail_distance_adds_100_to_the_aabb_radius() {
+        let mesh_bounds = bounds(vec3(104.0, 0.0, 0.0));
+        assert_eq!(sa_detail_lod_distance(mesh_bounds), 152);
+        assert_eq!(
+            repaired_lod_distance(false, false, true, Some(mesh_bounds)),
+            152
+        );
+    }
+
+    #[test]
+    fn sa_detail_distance_stays_below_the_low_lod_boundary() {
+        let mesh_bounds = bounds(vec3(500.0, 500.0, 500.0));
+        assert_eq!(sa_detail_lod_distance(mesh_bounds), 299);
+    }
+
+    #[test]
+    fn object_lod_model_distance_accounts_for_the_five_times_rule() {
+        assert_eq!(generated_lod_distance(false), 300);
+        assert_eq!(generated_lod_distance(false) * 5, 1500);
+        let mesh_bounds = bounds(vec3(47.0, 13.0, 83.0));
+        let model_distance = sa_lod_model_distance(false, mesh_bounds);
+        assert_eq!(sa_effective_low_lod_distance(mesh_bounds), 1334);
+        assert_eq!(model_distance, 267);
+        assert!((1334..=1338).contains(&(model_distance * 5)));
+    }
+
+    #[test]
+    fn building_lod_model_distance_is_the_screen_space_distance() {
+        assert_eq!(generated_lod_distance(true), 1500);
+        assert_eq!(
+            sa_lod_model_distance(true, bounds(vec3(47.0, 13.0, 83.0))),
+            1334
+        );
+        assert_eq!(
+            sa_lod_model_distance(true, bounds(vec3(108.0, 124.0, 13.0))),
+            1500
+        );
+    }
+
+    #[test]
+    fn effective_lod_distance_respects_the_300_minimum_and_1500_maximum() {
+        assert_eq!(
+            sa_effective_low_lod_distance(bounds(vec3(10.0, 10.0, 10.0))),
+            300
+        );
+        assert_eq!(
+            sa_effective_low_lod_distance(bounds(vec3(500.0, 500.0, 500.0))),
+            1500
+        );
     }
 
     #[test]
@@ -2110,6 +2683,78 @@ pub(crate) fn select_element_with_mode(app: &mut AppState, index: usize, additiv
     }
 }
 
+/// Selects the inclusive element range between the active element and `index`
+/// in the currently displayed outliner. Group header rows are skipped.
+pub(crate) fn select_outliner_range(app: &mut AppState, index: usize) {
+    let anchor = app.selected;
+    let Some(range) = outliner_element_range(&app.outliner_filter, anchor, index) else {
+        select_element_additive(app, index);
+        return;
+    };
+    for idx in range {
+        if app.selected_elements.insert(idx) {
+            app.selected_element_order.push(idx);
+        }
+    }
+    app.selected = index;
+    app.selected_group = None;
+    app.selected_col_face = None;
+}
+
+fn outliner_element_range(
+    entries: &[OutlinerEntry],
+    anchor: usize,
+    target: usize,
+) -> Option<Vec<usize>> {
+    let row_for = |wanted| {
+        entries.iter().position(|entry| {
+            matches!(entry, OutlinerEntry::Element(idx) | OutlinerEntry::GroupChild(idx) if *idx == wanted)
+        })
+    };
+    let anchor_row = row_for(anchor)?;
+    let target_row = row_for(target)?;
+    let (start, end) = if anchor_row <= target_row {
+        (anchor_row, target_row)
+    } else {
+        (target_row, anchor_row)
+    };
+    Some(
+        entries[start..=end]
+            .iter()
+            .filter_map(|entry| match entry {
+                OutlinerEntry::Element(idx) | OutlinerEntry::GroupChild(idx) => Some(*idx),
+                OutlinerEntry::Group(_) => None,
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod outliner_range_tests {
+    use super::*;
+
+    #[test]
+    fn inclusive_range_skips_group_headers_and_works_in_reverse() {
+        let entries = vec![
+            OutlinerEntry::Element(4),
+            OutlinerEntry::Group("signals".to_string()),
+            OutlinerEntry::GroupChild(8),
+            OutlinerEntry::GroupChild(12),
+            OutlinerEntry::Element(20),
+        ];
+
+        assert_eq!(
+            outliner_element_range(&entries, 4, 20),
+            Some(vec![4, 8, 12, 20])
+        );
+        assert_eq!(
+            outliner_element_range(&entries, 20, 8),
+            Some(vec![8, 12, 20])
+        );
+        assert_eq!(outliner_element_range(&entries, 999, 8), None);
+    }
+}
+
 pub(crate) const OUTLINER_ROW_H: f32 = 28.0;
 
 pub(crate) fn outliner_list_top() -> f32 {
@@ -2241,6 +2886,7 @@ const TOOLBAR_SAVE_WIP: usize = 11;
 const TOOLBAR_GENERATE_TXD: usize = 13;
 const TOOLBAR_IMPORT_BLENDER: usize = 14;
 const TOOLBAR_PREFERENCES: usize = 15;
+const TOOLBAR_IMPORT_ASSET: usize = 16;
 
 fn toolbar_control_rect(control: usize) -> Rect {
     // File/project actions live in the top row. Transform actions have their
@@ -2255,6 +2901,10 @@ fn toolbar_control_rect(control: usize) -> Rect {
         (TOOLBAR_SAVE_WIP, 104.0),
         (TOOLBAR_GENERATE_TXD, 120.0),
         (TOOLBAR_PREFERENCES, 118.0),
+        // Noto Sans renders "Import new asset" at about 131px at 16px.
+        // Leave the same 9px inset used by text buttons on both sides so the
+        // full label is visible whenever the toolbar has its preferred width.
+        (TOOLBAR_IMPORT_ASSET, 150.0),
     ];
     let visible_count = controls.len();
     let gap_total = gap * visible_count.saturating_sub(1) as f32;
@@ -2276,11 +2926,11 @@ pub(crate) fn toolbar_button_rect(slot: usize) -> Rect {
 }
 
 pub(crate) fn snap_mode_rect() -> Rect {
-    Rect::new(330.0, TOP_H - 38.0, 66.0, 36.0)
+    Rect::new(374.0, TOP_H - 38.0, 66.0, 36.0)
 }
 
 pub(crate) fn transform_space_rect() -> Rect {
-    Rect::new(404.0, TOP_H - 38.0, 78.0, 36.0)
+    Rect::new(448.0, TOP_H - 38.0, 78.0, 36.0)
 }
 
 pub(crate) fn file_save_rect() -> Rect {
@@ -2301,6 +2951,10 @@ pub(crate) fn save_wip_rect() -> Rect {
 
 pub(crate) fn preferences_button_rect() -> Rect {
     toolbar_control_rect(TOOLBAR_PREFERENCES)
+}
+
+pub(crate) fn import_asset_button_rect() -> Rect {
+    toolbar_control_rect(TOOLBAR_IMPORT_ASSET)
 }
 
 pub(crate) fn import_blender_button_rect() -> Rect {
@@ -2409,6 +3063,7 @@ pub(crate) fn toolbar_contains(mouse: Vec2) -> bool {
         || generate_txd_button_rect().contains(mouse)
         || (SHOW_BLENDER_IMPORT && import_blender_button_rect().contains(mouse))
         || preferences_button_rect().contains(mouse)
+        || import_asset_button_rect().contains(mouse)
         || transform_space_rect().contains(mouse)
 }
 
@@ -2425,6 +3080,7 @@ pub(crate) fn app_tab_label(tab: AppTab) -> &'static str {
         AppTab::Lights => "Lights",
         AppTab::Bake => "Vertex Lighting",
         AppTab::Water => "Water",
+        AppTab::Cull => "CULL",
         AppTab::Race => "Race",
         AppTab::Simulate => "Simulate",
     }
@@ -2443,6 +3099,7 @@ pub(crate) fn app_tab_tooltip(tab: AppTab) -> &'static str {
         AppTab::Lights => "Place and configure scene lighting.",
         AppTab::Bake => "Bake vertex lighting for the current project.",
         AppTab::Water => "Create and adjust water planes.",
+        AppTab::Cull => "Create water hiding volumes stored as .map entries.",
         AppTab::Race => "Create and edit race tracks, checkpoints, and radar settings.",
         AppTab::Simulate => "Test the project in simulation mode.",
     }
@@ -2461,6 +3118,7 @@ pub(crate) fn app_tabs_for_mode(mode: LaunchMode) -> Vec<AppTab> {
         AppTab::Lights,
         AppTab::Bake,
         AppTab::Water,
+        AppTab::Cull,
         AppTab::Race,
     ];
     tabs.into_iter()
@@ -2693,32 +3351,81 @@ pub(crate) fn draw_text_tooltip(font: &Font, anchor: Rect, label: &str) {
     *pending_ui_tooltip() = Some((anchor, label.to_string()));
 }
 
+pub(crate) fn clear_pending_ui_tooltip() {
+    *pending_ui_tooltip() = None;
+}
+
 pub(crate) fn draw_pending_ui_tooltip(font: &Font) {
     let Some((anchor, label)) = pending_ui_tooltip().take() else {
         return;
     };
-    let tip_w = (ui_text_width(&label, 14) + 20.0)
-        .min(screen_width() - 16.0)
-        .max(48.0);
-    let tip_x = anchor.x.min(screen_width() - tip_w - 8.0).max(8.0);
+    let screen_w = screen_width();
+    let screen_h = screen_height();
+    let max_tip_w = (screen_w - 16.0).clamp(48.0, 380.0);
+    let max_text_w = (max_tip_w - 16.0).max(32.0);
+    let mut lines = Vec::<String>::new();
+    for paragraph in label.lines() {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            let candidate = if line.is_empty() {
+                word.to_string()
+            } else {
+                format!("{line} {word}")
+            };
+            if !line.is_empty() && ui_text_width(&candidate, 14) > max_text_w {
+                lines.push(line);
+                line = word.to_string();
+            } else {
+                line = candidate;
+            }
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    let tip_w = (lines
+        .iter()
+        .map(|line| ui_text_width(line, 14))
+        .fold(0.0_f32, f32::max)
+        + 16.0)
+        .clamp(48.0, max_tip_w);
+    let line_h = 18.0;
+    let tip_h = lines.len() as f32 * line_h + 10.0;
+    // Right-panel controls sit against the screen edge. Clamp both axes so
+    // their tooltips extend inward and remain fully visible at any window size.
+    let tip_x = anchor.x.min(screen_w - tip_w - 8.0).max(8.0);
     let below_y = anchor.y + anchor.h + 7.0;
-    let tip_y = if below_y + 26.0 < screen_height() {
+    let tip_y = if below_y + tip_h <= screen_h - 8.0 {
         below_y
     } else {
-        (anchor.y - 33.0).max(8.0)
+        (anchor.y - tip_h - 7.0)
+            .min(screen_h - tip_h - 8.0)
+            .max(8.0)
     };
     draw_rrect_bordered(
         tip_x,
         tip_y,
         tip_w,
-        26.0,
+        tip_h,
         8.0,
         1.0,
         Color::new(0.025, 0.035, 0.050, 0.98),
         Color::new(0.25, 0.27, 0.30, 1.0),
     );
-    let visible = ellipsize_width(&label, 14, tip_w - 16.0);
-    ui_text_size(font, &visible, tip_x + 8.0, tip_y + 18.0, 14, WHITE);
+    for (index, line) in lines.iter().enumerate() {
+        let visible = ellipsize_width(line, 14, tip_w - 16.0);
+        ui_text_size(
+            font,
+            &visible,
+            tip_x + 8.0,
+            tip_y + 17.0 + index as f32 * line_h,
+            14,
+            WHITE,
+        );
+    }
 }
 
 fn draw_text_button_state(
@@ -2847,6 +3554,10 @@ pub(crate) fn handle_toolbar_click(app: &mut AppState, mouse: Vec2) -> bool {
             app.transform_mode = TransformMode::Rotate;
         }
     } else if toolbar_button_rect(3).contains(mouse) {
+        if app.active_tab == AppTab::Editing && !selected_editing_dff_vertices(app).is_empty() {
+            app.transform_mode = TransformMode::Scale;
+        }
+    } else if toolbar_button_rect(4).contains(mouse) {
         if has_selection && !selected_deleted {
             if app.active_tab == AppTab::Lights {
                 duplicate_selected_light(app);
@@ -2854,7 +3565,7 @@ pub(crate) fn handle_toolbar_click(app: &mut AppState, mouse: Vec2) -> bool {
                 duplicate_selected(app);
             }
         }
-    } else if toolbar_button_rect(4).contains(mouse) {
+    } else if toolbar_button_rect(5).contains(mouse) {
         if has_selection {
             if app.active_tab == AppTab::Lights {
                 delete_selected_light(app);
@@ -2864,9 +3575,9 @@ pub(crate) fn handle_toolbar_click(app: &mut AppState, mouse: Vec2) -> bool {
                 delete_selected(app);
             }
         }
-    } else if toolbar_button_rect(5).contains(mouse) {
-        undo(app);
     } else if toolbar_button_rect(6).contains(mouse) {
+        undo(app);
+    } else if toolbar_button_rect(7).contains(mouse) {
         redo(app);
     } else if file_save_rect().contains(mouse) {
         save_scene(app);
@@ -2892,12 +3603,19 @@ pub(crate) fn handle_toolbar_click(app: &mut AppState, mouse: Vec2) -> bool {
         open_blender_import_dialog(app);
     } else if preferences_button_rect().contains(mouse) {
         open_preferences_dialog(app);
+    } else if import_asset_button_rect().contains(mouse) {
+        open_import_new_asset_picker(app);
     } else if transform_space_rect().contains(mouse) {
-        app.transform_space = if app.transform_space == TransformSpace::World {
-            TransformSpace::Local
+        if selected_editing_dff_freeform_pivot(app).is_some() {
+            app.transform_space = TransformSpace::Local;
+            app.status_message = "Freeform pivot gimbal follows the pivot's local axes".to_string();
         } else {
-            TransformSpace::World
-        };
+            app.transform_space = if app.transform_space == TransformSpace::World {
+                TransformSpace::Local
+            } else {
+                TransformSpace::World
+            };
+        }
     }
     true
 }
@@ -3467,15 +4185,37 @@ pub(crate) fn element_mesh<'a>(app: &'a AppState, placement: &Placement) -> Opti
         .get(&placement_mesh_key(placement, &app.definitions))
 }
 
-pub(crate) fn element_collision_key(app: &AppState, placement: &Placement) -> String {
-    let col_name = app
-        .definitions
+pub(crate) fn placement_collision_key_cow<'a>(
+    definitions: &'a HashMap<String, Definition>,
+    placement: &'a Placement,
+) -> std::borrow::Cow<'a, str> {
+    let col_name = definitions
         .get(&placement.id)
         .and_then(|def| def.attrs.get("col"))
         .filter(|value| !value.trim().is_empty())
-        .cloned()
-        .unwrap_or_else(|| placement.dff.clone());
-    lower(with_ext(&col_name, ".col"))
+        .map(String::as_str)
+        .unwrap_or(placement.dff.as_str());
+    let bytes = col_name.as_bytes();
+    let has_col_extension = bytes
+        .get(bytes.len().saturating_sub(4)..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".col"));
+    let already_lowercase = !bytes.iter().any(u8::is_ascii_uppercase);
+    if has_col_extension && already_lowercase {
+        std::borrow::Cow::Borrowed(col_name)
+    } else {
+        std::borrow::Cow::Owned(lower(with_ext(col_name, ".col")))
+    }
+}
+
+pub(crate) fn element_collision_key_cow<'a>(
+    app: &'a AppState,
+    placement: &'a Placement,
+) -> std::borrow::Cow<'a, str> {
+    placement_collision_key_cow(&app.definitions, placement)
+}
+
+pub(crate) fn element_collision_key(app: &AppState, placement: &Placement) -> String {
+    element_collision_key_cow(app, placement).into_owned()
 }
 
 pub(crate) fn element_collision_mesh<'a>(
@@ -3486,6 +4226,40 @@ pub(crate) fn element_collision_mesh<'a>(
         return None;
     }
     app.collisions.get(&element_collision_key(app, placement))
+}
+
+#[cfg(test)]
+mod collision_key_tests {
+    use super::*;
+
+    fn placement(dff: &str) -> Placement {
+        Placement {
+            id: "test".to_string(),
+            dff: dff.to_string(),
+            zone: String::new(),
+            tag: "object".to_string(),
+            attrs: BTreeMap::new(),
+            pos: V3::default(),
+            rot: V3::default(),
+        }
+    }
+
+    #[test]
+    fn normalized_collision_key_is_borrowed() {
+        let placement = placement("building.col");
+        let definitions = HashMap::new();
+        let key = placement_collision_key_cow(&definitions, &placement);
+        assert!(matches!(key, std::borrow::Cow::Borrowed("building.col")));
+    }
+
+    #[test]
+    fn collision_key_normalization_allocates_only_when_needed() {
+        let placement = placement("Building.DFF");
+        let definitions = HashMap::new();
+        let key = placement_collision_key_cow(&definitions, &placement);
+        assert!(matches!(key, std::borrow::Cow::Owned(_)));
+        assert_eq!(key, "building.dff.col");
+    }
 }
 
 pub(crate) fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
@@ -3782,8 +4556,17 @@ fn selected_editing_cuboid_rotation(app: &AppState) -> Option<Mat4> {
     )
 }
 
+fn selected_editing_dff_2dfx_rotation_matrix(app: &AppState) -> Option<Mat4> {
+    selected_editing_dff_2dfx_rotation(app).map(dff_2dfx_rotation_matrix)
+}
+
 pub(crate) fn selected_axis_vector(app: &AppState, axis: GizmoAxis) -> Vec3 {
     let base = axis_vector(axis);
+    // Cull volumes are always axis-aligned, so Local and World space are
+    // intentionally identical for their translation handles.
+    if app.active_tab == AppTab::Cull {
+        return base;
+    }
     if app.active_tab == AppTab::Lights {
         if app.transform_space == TransformSpace::Local {
             if let Some(light) = app.lights.get(app.selected_light) {
@@ -3796,16 +4579,27 @@ pub(crate) fn selected_axis_vector(app: &AppState, axis: GizmoAxis) -> Vec3 {
         }
         return base;
     }
-    if app.active_tab != AppTab::Race
-        && app.transform_space == TransformSpace::Local
-        && selected_live_indices(app).len() <= 1
+    // A freeform pivot gimbal represents the pivot's authored basis itself.
+    // Its handles must rotate with that basis even if some earlier editor
+    // state left the shared transform-space toggle on World.
+    if app.active_tab == AppTab::Editing
+        && let Some(pivot) = selected_editing_dff_freeform_pivot(app)
     {
-        if app.active_tab == AppTab::Editing
-            && let Some(rotation) = selected_editing_cuboid_rotation(app)
-        {
-            return transform_vec(rotation, base);
+        return transform_vec(dff_pivot_rotation_matrix(pivot.rotation), base);
+    }
+    if app.transform_space == TransformSpace::Local {
+        if app.active_tab == AppTab::Editing {
+            if let Some(rotation) = selected_editing_dff_2dfx_rotation_matrix(app) {
+                return transform_vec(rotation, base);
+            }
+            if let Some(rotation) = selected_editing_cuboid_rotation(app) {
+                return transform_vec(rotation, base);
+            }
         }
-        if let Some(placement) = app.placements.get(app.selected) {
+        if app.active_tab != AppTab::Race
+            && selected_live_indices(app).len() <= 1
+            && let Some(placement) = app.placements.get(app.selected)
+        {
             return transform_vec(placement_rotation_matrix(placement), base);
         }
     }
@@ -3832,16 +4626,25 @@ pub(crate) fn selected_ring_basis(app: &AppState, axis: GizmoAxis) -> (Vec3, Vec
             };
         }
     }
-    if app.active_tab != AppTab::Lights
-        && app.transform_space == TransformSpace::Local
-        && selected_live_indices(app).len() <= 1
+    if app.active_tab == AppTab::Editing
+        && let Some(pivot) = selected_editing_dff_freeform_pivot(app)
     {
-        if app.active_tab == AppTab::Editing
-            && let Some(rotation) = selected_editing_cuboid_rotation(app)
-        {
-            return (transform_vec(rotation, a), transform_vec(rotation, b));
+        let rotation = dff_pivot_rotation_matrix(pivot.rotation);
+        return (transform_vec(rotation, a), transform_vec(rotation, b));
+    }
+    if app.transform_space == TransformSpace::Local {
+        if app.active_tab == AppTab::Editing {
+            if let Some(rotation) = selected_editing_dff_2dfx_rotation_matrix(app) {
+                return (transform_vec(rotation, a), transform_vec(rotation, b));
+            }
+            if let Some(rotation) = selected_editing_cuboid_rotation(app) {
+                return (transform_vec(rotation, a), transform_vec(rotation, b));
+            }
         }
-        if let Some(placement) = app.placements.get(app.selected) {
+        if app.active_tab != AppTab::Lights
+            && selected_live_indices(app).len() <= 1
+            && let Some(placement) = app.placements.get(app.selected)
+        {
             let rot = placement_rotation_matrix(placement);
             return (transform_vec(rot, a), transform_vec(rot, b));
         }
@@ -3895,6 +4698,19 @@ pub(crate) fn gizmo_visual_length(app: &AppState, origin: Vec3) -> f32 {
 }
 
 pub(crate) fn selected_origin(app: &AppState) -> Option<Vec3> {
+    if app.transform_mode == TransformMode::Scale
+        && !(app.active_tab == AppTab::Editing
+            && matches!(app.editing.asset, Some(EditingAsset::Dff(_))))
+    {
+        return None;
+    }
+    if app.active_tab == AppTab::Cull {
+        if app.transform_mode == TransformMode::Rotate {
+            return None;
+        }
+        return selected_cull_zone(app)
+            .map(|zone| vec3(zone.center.x, zone.center.y, zone.center.z));
+    }
     if app.active_tab == AppTab::Lights {
         return app.lights.get(app.selected_light).map(|light| {
             light_world_transform(
@@ -3919,14 +4735,25 @@ pub(crate) fn selected_origin(app: &AppState) -> Option<Vec3> {
                 return selected_editing_col_vertex_position(app);
             }
             Some(EditingAsset::Dff(dff)) => {
-                if dff.selected_2dfx.is_some() {
-                    return selected_editing_dff_2dfx_position(app);
+                if let Some(pivot) = dff.freeform_pivot {
+                    return (app.transform_mode != TransformMode::Scale)
+                        .then_some(to_mq(pivot.position));
                 }
-                if dff.boolean_box.is_some() && dff.selected_vertex.is_none() {
+                if app.transform_mode == TransformMode::Scale {
+                    return selected_editing_dff_vertex_position(app);
+                }
+                if dff.boolean_box.is_some() {
                     return selected_editing_dff_boolean_box_position(app);
                 }
-                return selected_editing_dff_vertex_position(app)
-                    .or_else(|| selected_editing_dff_boolean_box_position(app));
+                if dff.selected_2dfx.is_some() {
+                    if app.transform_mode == TransformMode::Rotate
+                        && selected_editing_dff_2dfx_rotation(app).is_none()
+                    {
+                        return None;
+                    }
+                    return selected_editing_dff_2dfx_position(app);
+                }
+                return selected_editing_dff_vertex_position(app);
             }
             _ => {}
         }
@@ -3947,7 +4774,7 @@ fn gizmo_axis_at_threshold(
     let mut best_dist = threshold;
     match app.transform_mode {
         TransformMode::Select => {}
-        TransformMode::Move => {
+        TransformMode::Move | TransformMode::Scale => {
             for axis in [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
                 let axis_dir = selected_axis_vector(app, axis);
                 let mut prev = Some(origin_2d);
@@ -3996,6 +4823,43 @@ fn gizmo_axis_at_threshold(
                     }
                     prev = Some(screen);
                 }
+            }
+        }
+    }
+    best
+}
+
+pub(crate) fn gizmo_plane_axes(plane: GizmoPlane) -> (GizmoAxis, GizmoAxis) {
+    match plane {
+        GizmoPlane::XY => (GizmoAxis::X, GizmoAxis::Y),
+        GizmoPlane::XZ => (GizmoAxis::X, GizmoAxis::Z),
+        GizmoPlane::YZ => (GizmoAxis::Y, GizmoAxis::Z),
+    }
+}
+
+pub(crate) fn gizmo_scale_plane_at(
+    app: &AppState,
+    viewport: Rect,
+    mouse: Vec2,
+) -> Option<GizmoPlane> {
+    if app.transform_mode != TransformMode::Scale || app.active_tab != AppTab::Editing {
+        return None;
+    }
+    let origin = selected_origin(app)?;
+    let length = gizmo_visual_length(app, origin);
+    let mut best = None;
+    let mut best_distance = 16.0;
+    for plane in [GizmoPlane::XY, GizmoPlane::XZ, GizmoPlane::YZ] {
+        let (first, second) = gizmo_plane_axes(plane);
+        let center = origin
+            + (selected_axis_vector(app, first) + selected_axis_vector(app, second))
+                * length
+                * 0.28;
+        if let Some(screen) = world_to_screen(app, viewport, center) {
+            let distance = mouse.distance(screen);
+            if distance < best_distance {
+                best_distance = distance;
+                best = Some(plane);
             }
         }
     }
@@ -4621,7 +5485,7 @@ const WATER_WORLD_MAX: f32 = 3000.0;
 const WATER_Z_MIN: f32 = -1000.0;
 const WATER_Z_MAX: f32 = 1000.0;
 
-fn water_texture_source_bytes(
+pub(crate) fn water_texture_source_bytes(
     root: &Path,
     gta_sa_dir: &Path,
     dff_name: &str,
@@ -4746,6 +5610,7 @@ fn convert_water_texture(
     let mut raw = match source {
         WaterTextureDffSource::Raw(raw) => *raw,
         WaterTextureDffSource::Bytes(bytes) => parse_dff_mesh(&bytes),
+        WaterTextureDffSource::Entry(entry) => parse_dff_mesh(&read_img_entry(&entry)),
         WaterTextureDffSource::Archive {
             root,
             gta_sa_dir,
@@ -4820,7 +5685,10 @@ fn convert_water_texture(
     })
 }
 
-fn water_texture_source_for_app(app: &AppState, dff_name: &str) -> WaterTextureDffSource {
+pub(crate) fn water_texture_source_for_app(
+    app: &AppState,
+    dff_name: &str,
+) -> WaterTextureDffSource {
     let key = asset_key(dff_name, ".dff");
     if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref()
         && asset_key(&dff.name, ".dff") == key
@@ -4845,7 +5713,7 @@ pub(crate) fn request_water_texture_conversion(
     placement_index: usize,
     material: usize,
 ) {
-    if app.water_texture_conversion_job.is_some() {
+    if app.water_texture_conversion_job.is_some() || app.preview_world_uv_job.is_some() {
         app.status_message = "A texture-to-water conversion is already running.".to_string();
         return;
     }
@@ -5374,15 +6242,40 @@ pub(crate) fn cancel_texture_match_selection_for_undo(app: &mut AppState) -> boo
 
 pub(crate) fn context_menu_items(app: &AppState) -> Vec<(ContextAction, &'static str, bool)> {
     if matches!(
-        app.context_menu.as_ref().map(|menu| menu.target),
+        app.context_menu.as_ref().map(|menu| &menu.target),
+        Some(ContextMenuTarget::EditingTexture { .. })
+    ) {
+        return vec![(ContextAction::CategorizeTexture, "Categorize...", true)];
+    }
+    if matches!(
+        app.context_menu.as_ref().map(|menu| &menu.target),
+        Some(ContextMenuTarget::AssetBrowser { .. })
+    ) {
+        return vec![(ContextAction::ViewAssetPreview, "View preview", true)];
+    }
+    if matches!(
+        app.context_menu.as_ref().map(|menu| menu.target.clone()),
         Some(ContextMenuTarget::Scene { .. })
     ) {
-        return vec![(ContextAction::AddLight, "Add a light", true)];
+        let mut items = vec![(ContextAction::AddLight, "Add a light", true)];
+        let has_live_element = app.placements.get(app.selected).is_some()
+            && !app
+                .element_states
+                .get(app.selected)
+                .is_some_and(|state| state.deleted);
+        if has_live_element {
+            items.push((
+                ContextAction::AddLightToInstance,
+                "Add a light to instance",
+                true,
+            ));
+        }
+        return items;
     }
     if let Some(ContextMenuTarget::PreviewTexture {
         placement,
         material,
-    }) = app.context_menu.as_ref().map(|menu| menu.target)
+    }) = app.context_menu.as_ref().map(|menu| menu.target.clone())
     {
         let texture = preview_material_entry(app, placement, material);
         let has_name = texture
@@ -5410,8 +6303,89 @@ pub(crate) fn context_menu_items(app: &AppState) -> Vec<(ContextAction, &'static
             ),
         ];
     }
+    if let Some(ContextMenuTarget::EditingDffMaterial { dff_name, material }) =
+        app.context_menu.as_ref().map(|menu| menu.target.clone())
+    {
+        let selected = app.editing.asset.as_ref().and_then(|asset| match asset {
+            EditingAsset::Dff(dff)
+                if dff.name.eq_ignore_ascii_case(&dff_name)
+                    && material < dff_material_slot_count(&dff.raw) =>
+            {
+                Some(dff)
+            }
+            _ => None,
+        });
+        let valid = selected.is_some();
+        let has_texture = selected.is_some_and(|dff| {
+            dff.raw
+                .material_textures
+                .get(material)
+                .is_some_and(|name| !name.trim().is_empty())
+        });
+        let can_replace =
+            has_texture && selected.is_some_and(|dff| dff.txd_context.is_some() && !dff.read_only);
+        let emitter_enabled = valid && dff_material_emitter(app, &dff_name, material).enabled;
+        return vec![
+            (
+                ContextAction::ViewDffMaterialTexture,
+                "View full size",
+                has_texture,
+            ),
+            (
+                ContextAction::ExportDffMaterialTexture,
+                "Export",
+                has_texture,
+            ),
+            (
+                ContextAction::ReplaceDffMaterialTexture,
+                "Replace",
+                can_replace,
+            ),
+            (
+                ContextAction::CategorizeTexture,
+                "Categorize...",
+                has_texture && selected.is_some_and(|dff| dff.txd_context.is_some()),
+            ),
+            (
+                ContextAction::SelectAllDffMaterialFaces,
+                "Select all",
+                valid,
+            ),
+            (
+                ContextAction::MarkDffTextureElementsDoubleSided,
+                "Mark as double sided",
+                has_texture,
+            ),
+            (
+                ContextAction::ToggleDffMaterialEmitter,
+                if emitter_enabled {
+                    "Disable light source emitter"
+                } else {
+                    "Mark as light source emitter"
+                },
+                valid,
+            ),
+        ];
+    }
+    if let Some(ContextMenuTarget::EditingDffFaceLighting {
+        dff_name,
+        emitter_key,
+    }) = app.context_menu.as_ref().map(|menu| menu.target.clone())
+    {
+        let dff_key = asset_key(&dff_name, ".dff");
+        let key_matches_dff = material_emitter_face_group_from_key(&emitter_key)
+            .is_some_and(|(entry_dff, _)| entry_dff == dff_key)
+            || material_emitter_face_from_key(&emitter_key)
+                .is_some_and(|(entry_dff, _)| entry_dff == dff_key);
+        let valid = matches!(
+            app.editing.asset.as_ref(),
+            Some(EditingAsset::Dff(dff)) if dff.name.eq_ignore_ascii_case(&dff_name)
+        ) && key_matches_dff
+            && app.material_emitters.contains_key(&emitter_key);
+        return vec![(ContextAction::ClearDffFaceLighting, "Clear", valid)];
+    }
     if let Some(ContextMenuTarget::LodAuditIssue(issue_index)) =
-        app.context_menu.as_ref().map(|menu| menu.target)
+        app.context_menu.as_ref().map(|menu| menu.target.clone())
     {
         let issue = app
             .lod_audit
@@ -5521,10 +6495,12 @@ pub(crate) fn context_menu_items(app: &AppState) -> Vec<(ContextAction, &'static
 
 pub(crate) fn context_menu_rect(app: &AppState) -> Option<Rect> {
     let menu = app.context_menu.as_ref()?;
-    let w = if matches!(menu.target, ContextMenuTarget::PreviewTexture { .. }) {
-        370.0
-    } else {
-        178.0
+    let w = match menu.target {
+        ContextMenuTarget::PreviewTexture { .. } => 370.0,
+        ContextMenuTarget::EditingDffMaterial { .. } => 250.0,
+        ContextMenuTarget::EditingDffFaceLighting { .. } => 178.0,
+        ContextMenuTarget::EditingTexture { .. } => 190.0,
+        _ => 178.0,
     };
     let h = context_menu_items(app).len() as f32 * 26.0 + 12.0;
     let x = menu.pos.x.min(screen_width() - w - 8.0).max(8.0);
@@ -5549,18 +6525,54 @@ pub(crate) fn context_action_at(app: &AppState, mouse: Vec2) -> Option<ContextAc
 }
 
 pub(crate) fn run_context_action(app: &mut AppState, action: ContextAction) {
-    if let Some(ContextMenuTarget::Scene { position }) =
-        app.context_menu.as_ref().map(|menu| menu.target)
+    if let Some(ContextMenuTarget::EditingTexture {
+        txd_name,
+        texture_name,
+    }) = app.context_menu.as_ref().map(|menu| menu.target.clone())
     {
-        if action == ContextAction::AddLight {
-            add_light_at(app, to_mq(position));
+        if action == ContextAction::CategorizeTexture {
+            let position = app
+                .context_menu
+                .as_ref()
+                .map(|menu| menu.pos)
+                .unwrap_or_else(|| mouse_position().into());
+            app.editing.texture_category_menu = Some(TextureCategoryMenu {
+                txd_name,
+                texture_name,
+                position,
+            });
+        }
+        return;
+    }
+    if let Some(ContextMenuTarget::AssetBrowser { entry_id }) =
+        app.context_menu.as_ref().map(|menu| menu.target.clone())
+    {
+        if action == ContextAction::ViewAssetPreview
+            && let Some(entry) = asset_browser_entries(app)
+                .iter()
+                .find(|entry| entry.id == entry_id)
+                .cloned()
+        {
+            preview_asset_from_browser(app, &entry);
+        }
+        return;
+    }
+    if let Some(ContextMenuTarget::Scene { position }) =
+        app.context_menu.as_ref().map(|menu| menu.target.clone())
+    {
+        match action {
+            ContextAction::AddLight => add_light_at(app, to_mq(position)),
+            ContextAction::AddLightToInstance => {
+                add_light_to_selected_instance_at(app, to_mq(position));
+            }
+            _ => {}
         }
         return;
     }
     if let Some(ContextMenuTarget::PreviewTexture {
         placement,
         material,
-    }) = app.context_menu.as_ref().map(|menu| menu.target)
+    }) = app.context_menu.as_ref().map(|menu| menu.target.clone())
     {
         match action {
             ContextAction::SelectMatchingTextureName => {
@@ -5581,8 +6593,65 @@ pub(crate) fn run_context_action(app: &mut AppState, action: ContextAction) {
         }
         return;
     }
+    if let Some(ContextMenuTarget::EditingDffMaterial { dff_name, material }) =
+        app.context_menu.as_ref().map(|menu| menu.target.clone())
+    {
+        match action {
+            ContextAction::ViewDffMaterialTexture => {
+                open_dff_material_texture_view_dialog(app, &dff_name, material);
+            }
+            ContextAction::ExportDffMaterialTexture => {
+                open_dff_material_texture_export_picker(app, &dff_name, material);
+            }
+            ContextAction::ReplaceDffMaterialTexture => {
+                start_dff_material_texture_replace_browse(app, &dff_name, material);
+            }
+            ContextAction::CategorizeTexture => {
+                let target = app.editing.asset.as_ref().and_then(|asset| match asset {
+                    EditingAsset::Dff(dff) if dff.name.eq_ignore_ascii_case(&dff_name) => Some((
+                        dff.txd_context.clone()?,
+                        dff.raw.material_textures.get(material)?.clone(),
+                    )),
+                    _ => None,
+                });
+                if let Some((txd_name, texture_name)) = target {
+                    let position = app
+                        .context_menu
+                        .as_ref()
+                        .map(|menu| menu.pos)
+                        .unwrap_or_else(|| mouse_position().into());
+                    app.editing.texture_category_menu = Some(TextureCategoryMenu {
+                        txd_name,
+                        texture_name,
+                        position,
+                    });
+                }
+            }
+            ContextAction::SelectAllDffMaterialFaces => {
+                editing_select_all_dff_material_faces(app, &dff_name, material);
+            }
+            ContextAction::MarkDffTextureElementsDoubleSided => {
+                request_mark_dff_texture_elements_double_sided(app, &dff_name, material);
+            }
+            ContextAction::ToggleDffMaterialEmitter => {
+                editing_toggle_dff_material_emitter(app, &dff_name, material);
+            }
+            _ => {}
+        }
+        return;
+    }
+    if let Some(ContextMenuTarget::EditingDffFaceLighting {
+        dff_name,
+        emitter_key,
+    }) = app.context_menu.as_ref().map(|menu| menu.target.clone())
+    {
+        if action == ContextAction::ClearDffFaceLighting {
+            editing_clear_dff_face_lighting(app, &dff_name, &emitter_key);
+        }
+        return;
+    }
     if let Some(ContextMenuTarget::LodAuditIssue(issue_index)) =
-        app.context_menu.as_ref().map(|menu| menu.target)
+        app.context_menu.as_ref().map(|menu| menu.target.clone())
     {
         match action {
             ContextAction::LodAuditGenerate => {
@@ -5640,6 +6709,7 @@ pub(crate) fn run_context_action(app: &mut AppState, action: ContextAction) {
                 app.hovered_gizmo = None;
             }
             ContextAction::AddLight
+            | ContextAction::ViewAssetPreview
             | ContextAction::CopyDff
             | ContextAction::ExportDff
             | ContextAction::ExportCol
@@ -5656,12 +6726,22 @@ pub(crate) fn run_context_action(app: &mut AppState, action: ContextAction) {
             | ContextAction::SelectMatchingTextureContent
             | ContextAction::AddTextureToWater
             | ContextAction::LodAuditGenerate
-            | ContextAction::LodAuditToggleIgnore => {}
+            | ContextAction::LodAuditToggleIgnore
+            | ContextAction::ViewDffMaterialTexture
+            | ContextAction::ExportDffMaterialTexture
+            | ContextAction::ReplaceDffMaterialTexture
+            | ContextAction::SelectAllDffMaterialFaces
+            | ContextAction::MarkDffTextureElementsDoubleSided
+            | ContextAction::ToggleDffMaterialEmitter
+            | ContextAction::ClearDffFaceLighting
+            | ContextAction::CategorizeTexture => {}
         }
         return;
     }
     match action {
-        ContextAction::AddLight | ContextAction::AddLightToInstance => {}
+        ContextAction::AddLight
+        | ContextAction::AddLightToInstance
+        | ContextAction::ViewAssetPreview => {}
         ContextAction::CopyId => {
             if let Some(p) = selected_placement(app) {
                 copy_to_clipboard(app, "ID", p.id.clone());
@@ -5728,8 +6808,177 @@ pub(crate) fn run_context_action(app: &mut AppState, action: ContextAction) {
         | ContextAction::SelectMatchingTextureContent
         | ContextAction::AddTextureToWater
         | ContextAction::LodAuditGenerate
-        | ContextAction::LodAuditToggleIgnore => {}
+        | ContextAction::LodAuditToggleIgnore
+        | ContextAction::ViewDffMaterialTexture
+        | ContextAction::ExportDffMaterialTexture
+        | ContextAction::ReplaceDffMaterialTexture
+        | ContextAction::SelectAllDffMaterialFaces
+        | ContextAction::MarkDffTextureElementsDoubleSided
+        | ContextAction::ToggleDffMaterialEmitter
+        | ContextAction::ClearDffFaceLighting
+        | ContextAction::CategorizeTexture => {}
     }
+}
+
+fn placement_indices_referencing_texture(app: &AppState, texture_name: &str) -> Vec<usize> {
+    let texture_name = texture_name.trim();
+    if texture_name.is_empty() {
+        return Vec::new();
+    }
+    app.placements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, placement)| {
+            if !is_live_element(app, index) {
+                return None;
+            }
+            element_mesh(app, placement)
+                .is_some_and(|mesh| {
+                    mesh.parts
+                        .iter()
+                        .any(|part| part.texture_name.trim().eq_ignore_ascii_case(texture_name))
+                })
+                .then_some(index)
+        })
+        .collect()
+}
+
+pub(crate) fn request_mark_dff_texture_elements_double_sided(
+    app: &mut AppState,
+    dff_name: &str,
+    material: usize,
+) {
+    let texture_name = match app.editing.asset.as_ref() {
+        Some(EditingAsset::Dff(dff))
+            if dff.name.eq_ignore_ascii_case(dff_name)
+                && material < dff_material_slot_count(&dff.raw) =>
+        {
+            dff.raw
+                .material_textures
+                .get(material)
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+        }
+        _ => None,
+    };
+    let Some(texture_name) = texture_name else {
+        app.status_message = "The selected DFF material has no texture to match".to_string();
+        return;
+    };
+    let indices = placement_indices_referencing_texture(app, &texture_name);
+    if indices.is_empty() {
+        app.status_message = format!("No live elements reference texture '{texture_name}'");
+        return;
+    }
+    let change_count = indices
+        .iter()
+        .filter(|index| {
+            app.placements.get(**index).is_some_and(|placement| {
+                !placement_override_flag_enabled(placement, "double_sided")
+            })
+        })
+        .count();
+    app.confirm_dialog = Some(ConfirmDialog {
+        action: ConfirmAction::MarkTextureElementsDoubleSided {
+            indices,
+            texture_name: texture_name.clone(),
+        },
+        title: "Mark Elements Double Sided?".to_string(),
+        body: format!(
+            "Mark every live element that references texture '{texture_name}' as double sided?"
+        ),
+        detail: format!(
+            "This will update {change_count} element{}; elements already marked double sided will be left unchanged.",
+            if change_count == 1 { "" } else { "s" }
+        ),
+        primary_label: "Mark Double Sided".to_string(),
+        secondary_label: None,
+        secondary_action: None,
+    });
+    app.status_message =
+        format!("Confirm marking elements that reference '{texture_name}' double sided");
+}
+
+pub(crate) fn mark_texture_elements_double_sided(
+    app: &mut AppState,
+    indices: Vec<usize>,
+    texture_name: &str,
+) {
+    let before = world_history_snapshot(app);
+    let changed = mark_placements_double_sided(&mut app.placements, &indices);
+    if changed > 0 {
+        rebuild_render_cells(app);
+        commit_world_history(app, "Mark Texture Elements Double Sided", before);
+    }
+    app.status_message = format!(
+        "Marked {changed} element{} referencing texture '{}' as double sided",
+        if changed == 1 { "" } else { "s" },
+        texture_name
+    );
+}
+
+fn mark_placements_double_sided(placements: &mut [Placement], indices: &[usize]) -> usize {
+    let mut changed = 0usize;
+    for &index in indices {
+        let Some(placement) = placements.get_mut(index) else {
+            continue;
+        };
+        if placement_override_flag_enabled(placement, "double_sided") {
+            continue;
+        }
+        set_placement_override_flag(placement, "double_sided", true);
+        changed += 1;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod double_sided_texture_tests {
+    use super::*;
+
+    fn placement(attrs: &[(&str, &str)]) -> Placement {
+        Placement {
+            id: "test".to_string(),
+            dff: "test.dff".to_string(),
+            zone: "test".to_string(),
+            tag: "object".to_string(),
+            attrs: attrs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            pos: V3::default(),
+            rot: V3::default(),
+        }
+    }
+
+    #[test]
+    fn bulk_double_sided_marks_only_requested_unmarked_placements() {
+        let mut placements = vec![
+            placement(&[]),
+            placement(&[("overrideFlags", "double_sided")]),
+            placement(&[]),
+        ];
+
+        assert_eq!(mark_placements_double_sided(&mut placements, &[0, 1, 8]), 1);
+        assert!(placement_override_flag_enabled(
+            &placements[0],
+            "double_sided"
+        ));
+        assert!(placement_override_flag_enabled(
+            &placements[1],
+            "double_sided"
+        ));
+        assert!(!placement_override_flag_enabled(
+            &placements[2],
+            "double_sided"
+        ));
+    }
+}
+
+fn duplicate_placement(source: &Placement) -> Placement {
+    let mut copy = source.clone();
+    sync_placement_attrs(&mut copy);
+    copy
 }
 
 pub(crate) fn duplicate_selected(app: &mut AppState) {
@@ -5743,10 +6992,7 @@ pub(crate) fn duplicate_selected(app: &mut AppState) {
         let Some(source) = app.placements.get(idx) else {
             continue;
         };
-        let mut copy = source.clone();
-        copy.pos.x += 32.0;
-        copy.pos.y += 32.0;
-        sync_placement_attrs(&mut copy);
+        let copy = duplicate_placement(source);
         app.placements.push(copy);
         app.element_states.push(ElementState::default());
         app.outliner_labels.push(None);
@@ -5759,6 +7005,37 @@ pub(crate) fn duplicate_selected(app: &mut AppState) {
     rebuild_outliner_filter(app);
     rebuild_render_cells(app);
     commit_world_history(app, "Duplicate", before);
+}
+
+#[cfg(test)]
+mod duplicate_placement_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_keeps_the_source_position() {
+        let source = Placement {
+            id: "test_object".to_string(),
+            dff: "test_object".to_string(),
+            zone: "test".to_string(),
+            tag: "object".to_string(),
+            attrs: BTreeMap::new(),
+            pos: V3 {
+                x: 123.0,
+                y: -456.0,
+                z: 78.0,
+            },
+            rot: V3 {
+                x: 10.0,
+                y: 20.0,
+                z: 30.0,
+            },
+        };
+
+        let copy = duplicate_placement(&source);
+
+        assert_eq!(copy.pos, source.pos);
+        assert_eq!(copy.rot, source.rot);
+    }
 }
 
 pub(crate) fn assigned_lod_indices_for_delete(app: &AppState, indices: &[usize]) -> Vec<usize> {
@@ -6118,10 +7395,76 @@ pub(crate) fn import_lights_from_path(app: &mut AppState, path: &Path) {
     }
 }
 
-pub(crate) fn update_dropped_light_files(app: &mut AppState) {
-    for dropped in get_dropped_files() {
+pub(crate) fn update_dropped_resource_files(app: &mut AppState) -> bool {
+    let editing_txd = if app.active_tab == AppTab::Editing {
+        match app.editing.asset.as_ref() {
+            Some(EditingAsset::Txd(txd)) => Some(txd.name.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let mut dropped_textures = Vec::new();
+    let dropped_files = get_dropped_files();
+    let had_drop = !dropped_files.is_empty();
+    for dropped in dropped_files {
         if let Some(path) = dropped.path {
             if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("dff"))
+            {
+                if app.active_tab == AppTab::Editing || app.active_tab == AppTab::Vehicles {
+                    app.status_message = "Drop new scene assets from a game-world tab".to_string();
+                    continue;
+                }
+                // A native DFF drop is a complete import request of its own.
+                // It must not remain hidden behind, or later be overwritten by,
+                // a file-picker import modal that was just dismissed.
+                app.import_asset_dialog = None;
+                app.dff_picker_rx = None;
+                let stem = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("new_asset");
+                let mut id = stem.to_string();
+                let mut suffix = 2usize;
+                while app.definitions.contains_key(&id) {
+                    id = format!("{stem}_{suffix}");
+                    suffix += 1;
+                }
+                let mouse: Vec2 = mouse_position().into();
+                let position = asset_browser_drag_position(app, editor_viewport_rect(), mouse);
+                let textures = automatic_texture_folder(&path);
+                match position {
+                    Some(position) => {
+                        if let Err(err) =
+                            import_new_asset(app, &path, textures.as_deref(), &id, Some(position))
+                        {
+                            app.status_message = format!("Import failed: {err}");
+                        }
+                    }
+                    None => {
+                        app.status_message =
+                            "Drop the DFF inside the 3D viewport to place it".to_string();
+                    }
+                }
+            } else if editing_txd.is_some() && path.is_dir() {
+                dropped_textures.extend(texture_paths_in_folder(&path));
+            } else if editing_txd.is_some()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+            {
+                dropped_textures.push(path);
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("blend"))
+            {
+                start_blender_import(app, path);
+            } else if path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.eq_ignore_ascii_case("Light_List.xml"))
@@ -6136,6 +7479,12 @@ pub(crate) fn update_dropped_light_files(app: &mut AppState) {
             }
         }
     }
+    if let Some(entry_name) = editing_txd
+        && !dropped_textures.is_empty()
+    {
+        editing_import_textures_from_paths(app, entry_name, None, dropped_textures);
+    }
+    had_drop
 }
 
 pub(crate) fn add_light(app: &mut AppState) {
@@ -6144,8 +7493,16 @@ pub(crate) fn add_light(app: &mut AppState) {
 
 pub(crate) fn add_light_at(app: &mut AppState, position: Vec3) {
     let before = light_history_snapshot(app);
-    app.lights.push(EditorLight {
-        name: format!("Light {}", app.lights.len() + 1),
+    app.lights
+        .push(default_editor_light(app.lights.len(), position));
+    app.selected_light = app.lights.len() - 1;
+    mark_lights_changed(app);
+    commit_light_history(app, "Add Light", before);
+}
+
+fn default_editor_light(existing_light_count: usize, position: Vec3) -> EditorLight {
+    EditorLight {
+        name: format!("Light {}", existing_light_count + 1),
         attached_to: None,
         kind: LightKind::Point,
         profile: LightProfile::Both,
@@ -6163,13 +7520,40 @@ pub(crate) fn add_light_at(app: &mut AppState, position: Vec3) {
         temperature: 6500.0,
         use_temperature: false,
         intensity: 1.0,
-        radius: 300.0,
+        radius: DEFAULT_EDITOR_LIGHT_RADIUS,
         casts_shadow: false,
         point_lobe: PointLightLobe::Omni,
-    });
+    }
+}
+
+pub(crate) fn add_light_to_selected_instance_at(app: &mut AppState, position: Vec3) -> bool {
+    let Some(placement) = app.placements.get(app.selected).cloned() else {
+        app.status_message = "ALT-select a scene instance before adding the light".to_string();
+        return false;
+    };
+    if app
+        .element_states
+        .get(app.selected)
+        .is_some_and(|state| state.deleted)
+    {
+        return false;
+    }
+
+    let before = light_history_snapshot(app);
+    let mut light = default_editor_light(app.lights.len(), position);
+    let inv = placement_matrix(&placement).inverse();
+    light.position = from_mq(inv.transform_point3(position));
+    light.direction = from_mq(
+        inv.transform_vector3(to_mq(light.direction))
+            .normalize_or_zero(),
+    );
+    light.attached_to = Some(placement.id.clone());
+    app.lights.push(light);
     app.selected_light = app.lights.len() - 1;
     mark_lights_changed(app);
-    commit_light_history(app, "Add Light", before);
+    commit_light_history(app, "Add Light to Instance", before);
+    app.status_message = format!("Light added to every instance of {}", placement.id);
+    true
 }
 
 pub(crate) fn attach_selected_light_to_instance(app: &mut AppState) -> bool {
@@ -6242,6 +7626,12 @@ pub(crate) fn delete_selected_light(app: &mut AppState) {
 #[cfg(test)]
 mod light_instance_tests {
     use super::*;
+
+    #[test]
+    fn new_lights_use_the_file_format_default_radius() {
+        let light = default_editor_light(0, Vec3::ZERO);
+        assert_eq!(light.radius, DEFAULT_EDITOR_LIGHT_RADIUS);
+    }
 
     #[test]
     fn attached_light_transform_follows_instance_position_and_rotation() {
@@ -6330,6 +7720,111 @@ mod instance_lod_removal_tests {
         assert_eq!(plan.instance_count, 2);
         assert_eq!(plan.detail_indices, vec![0, 1]);
         assert_eq!(plan.lod_indices, vec![2, 3]);
+    }
+
+    #[test]
+    fn clear_all_removes_self_links_external_links_and_lod_elements() {
+        let mut placements = vec![
+            placement("building", Some("lod_building"), None),
+            placement("tree", Some("self"), None),
+            placement("lod_building", None, None),
+            placement("lod_stray", None, None),
+            placement("bench", None, None),
+        ];
+        let mut states = vec![ElementState::default(); placements.len()];
+
+        let (cleared, removed) = clear_all_lods_in_world(&mut placements, &mut states);
+
+        assert_eq!((cleared, removed), (2, 2));
+        assert!(
+            placements
+                .iter()
+                .all(|item| !item.attrs.contains_key("lodParent"))
+        );
+        assert!(!states[0].deleted);
+        assert!(!states[1].deleted);
+        assert!(states[2].deleted);
+        assert!(states[3].deleted);
+        assert!(!states[4].deleted);
+    }
+
+    #[test]
+    fn clear_all_collects_only_lod_dff_col_and_txd_assets() {
+        let placements = vec![
+            placement("building", Some("lod_building"), None),
+            placement("lod_building", None, None),
+            placement("bench", None, None),
+        ];
+        let states = vec![ElementState::default(); placements.len()];
+        let definitions = HashMap::from([
+            (
+                "lod_building".to_string(),
+                Definition {
+                    id: "lod_building".to_string(),
+                    zone: "test".to_string(),
+                    attrs: BTreeMap::from([
+                        ("dff".to_string(), "generated_visual".to_string()),
+                        ("col".to_string(), "generated_collision".to_string()),
+                        ("txd".to_string(), "world_lod".to_string()),
+                    ]),
+                },
+            ),
+            (
+                "bench".to_string(),
+                Definition {
+                    id: "bench".to_string(),
+                    zone: "test".to_string(),
+                    attrs: BTreeMap::from([
+                        ("dff".to_string(), "bench".to_string()),
+                        ("txd".to_string(), "shared".to_string()),
+                    ]),
+                },
+            ),
+        ]);
+
+        let candidates = collect_lod_asset_candidates(&placements, &states, &definitions);
+
+        assert_eq!(
+            candidates.definitions,
+            HashSet::from(["lod_building".to_string()])
+        );
+        assert_eq!(
+            candidates.dffs,
+            HashSet::from(["generated_visual.dff".to_string()])
+        );
+        assert_eq!(
+            candidates.cols,
+            HashSet::from(["generated_collision.col".to_string()])
+        );
+        assert_eq!(
+            candidates.txds,
+            HashSet::from(["world_lod.txd".to_string()])
+        );
+    }
+
+    #[test]
+    fn clear_all_uses_the_lod_dff_stem_for_implicit_collision() {
+        let placements = vec![placement("lod_bridge", None, None)];
+        let states = vec![ElementState::default()];
+        let definitions = HashMap::from([(
+            "lod_bridge".to_string(),
+            Definition {
+                id: "lod_bridge".to_string(),
+                zone: "test".to_string(),
+                attrs: BTreeMap::from([("dff".to_string(), "bridge_low".to_string())]),
+            },
+        )]);
+
+        let candidates = collect_lod_asset_candidates(&placements, &states, &definitions);
+
+        assert_eq!(
+            candidates.dffs,
+            HashSet::from(["bridge_low.dff".to_string()])
+        );
+        assert_eq!(
+            candidates.cols,
+            HashSet::from(["bridge_low.col".to_string()])
+        );
     }
 
     #[test]

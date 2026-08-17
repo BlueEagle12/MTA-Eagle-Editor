@@ -1,11 +1,15 @@
 use super::super::*;
 
 pub(crate) fn shadow_sample_offset(sample: usize, samples: usize, softness: f32) -> Vec2 {
-    if samples <= 1 || softness <= 0.0 {
+    // Always anchor the kernel with an exact center ray. Without it, even a
+    // fully covered receiver can leak light because every ray is displaced
+    // toward the edge of the source disk.
+    if sample == 0 || samples <= 1 || softness <= 0.0 {
         return Vec2::ZERO;
     }
-    let angle = sample as f32 * 2.3999631;
-    let radius = ((sample as f32 + 0.5) / samples as f32).sqrt() * softness;
+    let disk_sample = sample as f32 - 0.5;
+    let angle = disk_sample * 2.3999631;
+    let radius = (disk_sample / (samples - 1) as f32).sqrt() * softness;
     vec2(angle.cos() * radius, angle.sin() * radius)
 }
 
@@ -343,10 +347,15 @@ pub(crate) fn light_visibility(
     } else {
         settings.shadow_samples
     };
-    let origin = world_pos + normal.normalize_or_zero() * 2.0;
+    // A small world-space lift avoids self-intersections while keeping contact
+    // shadows attached to their caster. Generate local-light rays from this
+    // lifted point too: retaining a direction/distance computed from the
+    // unshifted receiver extends the ray past the light and can make geometry
+    // behind the source cast a false shadow.
+    let origin = world_pos + normal.normalize_or_zero() * 0.5;
     let mut visible = 0usize;
     for sample in 0..samples {
-        let Some((dir, max_dist)) = light_ray_for_sample(light, world_pos, sample, settings) else {
+        let Some((dir, max_dist)) = light_ray_for_sample(light, origin, sample, settings) else {
             visible += 1;
             continue;
         };
@@ -521,6 +530,81 @@ pub(crate) fn smooth_distance_attenuation(distance: f32, falloff_distance: f32) 
     }
     let t = (distance / falloff_distance).clamp(0.0, 1.0);
     1.0 - t * t * (3.0 - 2.0 * t)
+}
+
+/// Closest point on a triangle to `point` (Real-Time Collision Detection,
+/// section 5.1.5). Vertex lighting normally samples only the three corners of
+/// a face. This surface sample lets finite-radius lights which land between
+/// those corners contribute to the face instead of disappearing completely.
+pub(crate) fn closest_point_on_triangle(point: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = point - a;
+    let d1 = ab.dot(ap);
+    let d2 = ac.dot(ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = point - b;
+    let d3 = ab.dot(bp);
+    let d4 = ac.dot(bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return a + ab * (d1 / (d1 - d3));
+    }
+    let cp = point - c;
+    let d5 = ab.dot(cp);
+    let d6 = ac.dot(cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return a + ac * (d2 / (d2 - d6));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 {
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+    let denom = 1.0 / (va + vb + vc);
+    a + ab * (vb * denom) + ac * (vc * denom)
+}
+
+fn local_light_has_geometric_influence(light: &EditorLight, point: Vec3) -> bool {
+    let light_pos = vec3(light.position.x, light.position.y, light.position.z);
+    let distance = light_pos.distance(point);
+    if light.radius <= 0.001 || distance > light.radius {
+        return false;
+    }
+    match light.kind {
+        LightKind::Spot => spot_cone_attenuation(light, point) > 0.0,
+        LightKind::Point => point_lobe_attenuation(light, point) > 0.0,
+        LightKind::Area => true,
+        LightKind::Ambient | LightKind::Directional => true,
+    }
+}
+
+/// Selects a face-surface fallback only when a local light cannot geometrically
+/// reach the corner itself. The normal per-corner path remains unchanged, but
+/// sparse faces no longer miss a light whose volume intersects their interior.
+fn triangle_receiver_sample(light: &EditorLight, vertex: Vec3, triangle: [Vec3; 3]) -> Vec3 {
+    if !matches!(
+        light.kind,
+        LightKind::Point | LightKind::Spot | LightKind::Area
+    ) || local_light_has_geometric_influence(light, vertex)
+    {
+        return vertex;
+    }
+    let light_pos = vec3(light.position.x, light.position.y, light.position.z);
+    let surface = closest_point_on_triangle(light_pos, triangle[0], triangle[1], triangle[2]);
+    if local_light_has_geometric_influence(light, surface) {
+        surface
+    } else {
+        vertex
+    }
 }
 
 pub(crate) fn uniform_location(program: u32, name: &str) -> i32 {
@@ -1286,7 +1370,7 @@ fn material_emitter_lights(
                             * total_area
                             / (sample_count as f32 * std::f32::consts::PI),
                         radius: emitter.falloff_distance.clamp(1.0, 100_000.0),
-                        casts_shadow: true,
+                        casts_shadow: emitter.casts_shadow,
                         point_lobe: PointLightLobe::Omni,
                     });
                 }
@@ -1444,6 +1528,56 @@ fn visit_bake_light_candidates(
             };
             let center = vec3(light.position.x, light.position.y, light.position.z);
             if (center - point).length_squared() <= light.radius.max(0.0).powi(2) {
+                visit(*light_idx);
+            }
+        }
+    }
+}
+
+fn light_index_node_intersects_bounds(node: &BakeLightIndexNode, min: Vec3, max: Vec3) -> bool {
+    node.min.x <= max.x
+        && node.max.x >= min.x
+        && node.min.y <= max.y
+        && node.max.y >= min.y
+        && node.min.z <= max.z
+        && node.max.z >= min.z
+}
+
+fn visit_bake_light_candidates_for_triangle(
+    index: &BakeLightIndex,
+    lights: &[EditorLight],
+    triangle: [Vec3; 3],
+    mut visit: impl FnMut(usize),
+) {
+    for light_idx in &index.global_lights {
+        visit(*light_idx);
+    }
+    let tri_min = triangle[0].min(triangle[1]).min(triangle[2]);
+    let tri_max = triangle[0].max(triangle[1]).max(triangle[2]);
+    let mut nodes = Vec::with_capacity(32);
+    if let Some(root) = index.root {
+        nodes.push(root);
+    }
+    while let Some(node_idx) = nodes.pop() {
+        let Some(node) = index.nodes.get(node_idx) else {
+            continue;
+        };
+        if !light_index_node_intersects_bounds(node, tri_min, tri_max) {
+            continue;
+        }
+        if let Some(left) = node.left {
+            nodes.push(left);
+        }
+        if let Some(right) = node.right {
+            nodes.push(right);
+        }
+        for light_idx in &node.lights {
+            let Some(light) = lights.get(*light_idx) else {
+                continue;
+            };
+            let center = vec3(light.position.x, light.position.y, light.position.z);
+            let surface = closest_point_on_triangle(center, triangle[0], triangle[1], triangle[2]);
+            if center.distance_squared(surface) <= light.radius.max(0.0).powi(2) {
                 visit(*light_idx);
             }
         }
@@ -2161,7 +2295,11 @@ pub(crate) fn run_gpu_transform_feedback(
     if input.is_empty() {
         return Ok(());
     }
-    let vertices = input.len() / 6;
+    const INPUT_FLOATS: usize = 15;
+    if input.len() % INPUT_FLOATS != 0 {
+        return Err("GPU bake input buffer has the wrong stride".to_string());
+    }
+    let vertices = input.len() / INPUT_FLOATS;
     if output.len() != vertices * 3 {
         return Err("GPU bake output buffer has the wrong size".to_string());
     }
@@ -2175,7 +2313,10 @@ pub(crate) fn run_gpu_transform_feedback(
         );
         gl::EnableVertexAttribArray(0);
         gl::EnableVertexAttribArray(1);
-        let stride = (6 * std::mem::size_of::<f32>()) as i32;
+        gl::EnableVertexAttribArray(2);
+        gl::EnableVertexAttribArray(3);
+        gl::EnableVertexAttribArray(4);
+        let stride = (INPUT_FLOATS * std::mem::size_of::<f32>()) as i32;
         gl::VertexAttribPointer(0, 3, gl::FLOAT, gl::FALSE, stride, std::ptr::null());
         gl::VertexAttribPointer(
             1,
@@ -2185,6 +2326,16 @@ pub(crate) fn run_gpu_transform_feedback(
             stride,
             (3 * std::mem::size_of::<f32>()) as *const c_void,
         );
+        for (attribute, float_offset) in [(2u32, 6usize), (3, 9), (4, 12)] {
+            gl::VertexAttribPointer(
+                attribute,
+                3,
+                gl::FLOAT,
+                gl::FALSE,
+                stride,
+                (float_offset * std::mem::size_of::<f32>()) as *const c_void,
+            );
+        }
         gl::BindBuffer(
             gl::TRANSFORM_FEEDBACK_BUFFER,
             app.gpu_lightmap.output_buffer,
@@ -2220,6 +2371,9 @@ pub(crate) fn run_gpu_transform_feedback(
         gl::BindTransformFeedback(gl::TRANSFORM_FEEDBACK, 0);
         gl::DisableVertexAttribArray(0);
         gl::DisableVertexAttribArray(1);
+        gl::DisableVertexAttribArray(2);
+        gl::DisableVertexAttribArray(3);
+        gl::DisableVertexAttribArray(4);
         gl::BindBuffer(gl::ARRAY_BUFFER, 0);
     }
     if output.iter().any(|value| !value.is_finite()) {
@@ -2228,10 +2382,10 @@ pub(crate) fn run_gpu_transform_feedback(
     Ok(())
 }
 
-/// Runs one GPU light batch. Explicit shadowed lights are isolated because the
-/// shadow map is bound per pass; face-emitter area samples are unshadowed GPU
-/// batches and CPU baking remains available when their shadow visibility is
-/// required.
+/// Runs one GPU light batch. Every explicit shadowed light is isolated because
+/// one shadow map is bound per pass. Area-emitter quadrature samples use the
+/// existing point-shadow cubemap path, preserving GPU baking without dropping
+/// their visibility term.
 fn run_gpu_light_batch(
     app: &mut AppState,
     lights: &[EditorLight],
@@ -2294,10 +2448,10 @@ fn run_gpu_light_batch(
                 None,
             );
             upload_gpu_shadow_occluder_window(app.gpu_lightmap.program, 0.0, 0.0, 0.0);
-            let mut chunk_input = Vec::with_capacity(bucket.len() * 6);
+            let mut chunk_input = Vec::with_capacity(bucket.len() * 15);
             for idx in bucket {
-                let base = idx * 6;
-                chunk_input.extend_from_slice(&input[base..base + 6]);
+                let base = idx * 15;
+                chunk_input.extend_from_slice(&input[base..base + 15]);
             }
             let mut chunk_output = vec![0.0; bucket.len() * 3];
             run_gpu_transform_feedback(app, &chunk_input, &mut chunk_output)?;
@@ -2637,7 +2791,20 @@ pub(crate) fn run_gpu_ao_pass(app: &mut AppState, scope: BakeScope) -> Result<()
             for (vertex_idx, vertex) in part.cpu_vertices.iter().enumerate() {
                 let pos = transform_point_gl(&model, vertex.pos);
                 let normal = transform_normal_gl(&model, vertex.normal).normalize_or_zero();
-                input.extend_from_slice(&[pos.x, pos.y, pos.z, normal.x, normal.y, normal.z]);
+                let tri_start = (vertex_idx / 3) * 3;
+                let triangle = if let Some(tri) = part.cpu_vertices.get(tri_start..tri_start + 3) {
+                    [
+                        transform_point_gl(&model, tri[0].pos),
+                        transform_point_gl(&model, tri[1].pos),
+                        transform_point_gl(&model, tri[2].pos),
+                    ]
+                } else {
+                    [pos; 3]
+                };
+                // Transform feedback uses the same 15-float layout as the
+                // regular GPU light bake. Supplying the former six-float AO
+                // layout trips the stride guard and silently falls back to CPU.
+                push_gpu_bake_vertex(&mut input, pos, normal, triangle);
                 positions.push(pos);
                 normals.push(normal);
                 mapping.push((mesh_key.clone(), part_idx, vertex_idx));
@@ -2818,22 +2985,29 @@ pub(crate) fn run_gpu_ao_pass(app: &mut AppState, scope: BakeScope) -> Result<()
 }
 
 fn gpu_light_needs_individual_shadow(light: &EditorLight) -> bool {
-    light.casts_shadow && !matches!(light.kind, LightKind::Ambient | LightKind::Area)
+    light.casts_shadow && !matches!(light.kind, LightKind::Ambient)
 }
 
 fn gpu_light_batches(lights: &[EditorLight]) -> Vec<Vec<EditorLight>> {
     const MAX_GPU_LIGHTS: usize = 32;
     let mut batches = Vec::new();
-    let unshadowed: Vec<EditorLight> = lights
+    let (global, mut local): (Vec<EditorLight>, Vec<EditorLight>) = lights
         .iter()
         .filter(|light| !gpu_light_needs_individual_shadow(light))
         .cloned()
-        .collect();
-    batches.extend(
-        unshadowed
-            .chunks(MAX_GPU_LIGHTS)
-            .map(|batch| batch.to_vec()),
-    );
+        .partition(|light| matches!(light.kind, LightKind::Ambient | LightKind::Directional));
+    // Keep finite-radius lights spatially coherent. This gives each batch a
+    // tight influence AABB, avoiding a full-scene vertex pass for every group
+    // of instanced lights.
+    local.sort_unstable_by(|a, b| {
+        a.position
+            .x
+            .total_cmp(&b.position.x)
+            .then_with(|| a.position.y.total_cmp(&b.position.y))
+            .then_with(|| a.position.z.total_cmp(&b.position.z))
+    });
+    batches.extend(global.chunks(MAX_GPU_LIGHTS).map(|batch| batch.to_vec()));
+    batches.extend(local.chunks(MAX_GPU_LIGHTS).map(|batch| batch.to_vec()));
     batches.extend(
         lights
             .iter()
@@ -2842,6 +3016,57 @@ fn gpu_light_batches(lights: &[EditorLight]) -> Vec<Vec<EditorLight>> {
             .map(|light| vec![light]),
     );
     batches
+}
+
+/// Returns vertices that can possibly receive light from a local-light batch.
+/// `None` means a global light is present and every vertex must be processed.
+/// The union AABB is conservative; the shader still performs the exact radius
+/// and spotlight cone tests.
+fn gpu_batch_vertex_indices(lights: &[EditorLight], triangles: &[[Vec3; 3]]) -> Option<Vec<usize>> {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for light in lights {
+        let (_, light_min, light_max) = local_light_bounds(light)?;
+        min = min.min(light_min);
+        max = max.max(light_max);
+    }
+    Some(
+        triangles
+            .iter()
+            .enumerate()
+            .filter_map(|(index, triangle)| {
+                let tri_min = triangle[0].min(triangle[1]).min(triangle[2]);
+                let tri_max = triangle[0].max(triangle[1]).max(triangle[2]);
+                (tri_min.x <= max.x
+                    && tri_max.x >= min.x
+                    && tri_min.y <= max.y
+                    && tri_max.y >= min.y
+                    && tri_min.z <= max.z
+                    && tri_max.z >= min.z)
+                    .then_some(index)
+            })
+            .collect(),
+    )
+}
+
+fn push_gpu_bake_vertex(input: &mut Vec<f32>, position: Vec3, normal: Vec3, triangle: [Vec3; 3]) {
+    input.extend_from_slice(&[
+        position.x,
+        position.y,
+        position.z,
+        normal.x,
+        normal.y,
+        normal.z,
+        triangle[0].x,
+        triangle[0].y,
+        triangle[0].z,
+        triangle[1].x,
+        triangle[1].y,
+        triangle[1].z,
+        triangle[2].x,
+        triangle[2].y,
+        triangle[2].z,
+    ]);
 }
 
 fn prepare_gpu_bake_state(
@@ -2855,6 +3080,7 @@ fn prepare_gpu_bake_state(
     let requested_mode = app.bake_settings.light_mode;
     let mut input = Vec::<f32>::new();
     let mut positions = Vec::<Vec3>::new();
+    let mut triangles = Vec::<[Vec3; 3]>::new();
     let mut mapping = Vec::<(String, usize, usize)>::new();
     let target_indices = bake_target_indices(app, scope);
     for (idx, placement) in app.placements.iter().enumerate() {
@@ -2875,8 +3101,19 @@ fn prepare_gpu_bake_state(
             for (vertex_idx, vertex) in part.cpu_vertices.iter().enumerate() {
                 let pos = transform_point_gl(&model, vertex.pos);
                 let normal = transform_normal_gl(&model, vertex.normal).normalize_or_zero();
-                input.extend_from_slice(&[pos.x, pos.y, pos.z, normal.x, normal.y, normal.z]);
+                let tri_start = (vertex_idx / 3) * 3;
+                let triangle = if let Some(tri) = part.cpu_vertices.get(tri_start..tri_start + 3) {
+                    [
+                        transform_point_gl(&model, tri[0].pos),
+                        transform_point_gl(&model, tri[1].pos),
+                        transform_point_gl(&model, tri[2].pos),
+                    ]
+                } else {
+                    [pos; 3]
+                };
+                push_gpu_bake_vertex(&mut input, pos, normal, triangle);
                 positions.push(pos);
+                triangles.push(triangle);
                 mapping.push((mesh_key.clone(), part_idx, vertex_idx));
             }
         }
@@ -2907,6 +3144,7 @@ fn prepare_gpu_bake_state(
         GpuBakeState {
             input,
             positions,
+            triangles,
             mapping,
             channels,
             current_channel: 0,
@@ -3314,6 +3552,7 @@ fn cpu_light_channel_value(
     mode: BakeLightMode,
     pos: Vec3,
     normal: Vec3,
+    triangle: [Vec3; 3],
 ) -> Vec3 {
     let mut direct = Vec3::ZERO;
     let mut indirect = Vec3::ZERO;
@@ -3327,11 +3566,17 @@ fn cpu_light_channel_value(
             return;
         };
         if light_active_for_bake(light, mode) {
-            direct += bake_light_value(&job.shadow_grid, job.settings, light, pos, normal);
-            indirect += bake_indirect_light_value(light, pos) * bounce_gain;
+            let receiver = triangle_receiver_sample(light, pos, triangle);
+            direct += bake_light_value(&job.shadow_grid, job.settings, light, receiver, normal);
+            indirect += bake_indirect_light_value(light, receiver) * bounce_gain;
         }
     };
-    visit_bake_light_candidates(&job.light_index, &job.lights, pos, &mut accumulate_light);
+    visit_bake_light_candidates_for_triangle(
+        &job.light_index,
+        &job.lights,
+        triangle,
+        &mut accumulate_light,
+    );
     direct + indirect
 }
 
@@ -3360,14 +3605,34 @@ fn update_gpu_bake_job(app: &mut AppState, mut job: BakeJob, mut state: GpuBakeS
     let channel_idx = state.current_channel;
     let batch_idx = state.channels[channel_idx].next_batch;
     let batch = state.channels[channel_idx].batches[batch_idx].clone();
-    let mut batch_output = vec![0.0f32; state.positions.len() * 3];
-    if let Err(err) = run_gpu_light_batch(
-        app,
-        &batch,
-        &state.input,
-        &state.positions,
-        &mut batch_output,
-    ) {
+    let active_indices = gpu_batch_vertex_indices(&batch, &state.triangles);
+    let active_vertex_count = active_indices
+        .as_ref()
+        .map_or(state.positions.len(), Vec::len);
+    let mut batch_output = vec![0.0f32; active_vertex_count * 3];
+    let batch_result = if let Some(indices) = active_indices.as_ref() {
+        let mut input = Vec::with_capacity(indices.len() * 15);
+        let mut positions = Vec::with_capacity(indices.len());
+        for index in indices {
+            let base = index * 15;
+            input.extend_from_slice(&state.input[base..base + 15]);
+            positions.push(state.positions[*index]);
+        }
+        if indices.is_empty() {
+            Ok(())
+        } else {
+            run_gpu_light_batch(app, &batch, &input, &positions, &mut batch_output)
+        }
+    } else {
+        run_gpu_light_batch(
+            app,
+            &batch,
+            &state.input,
+            &state.positions,
+            &mut batch_output,
+        )
+    };
+    if let Err(err) = batch_result {
         reset_gpu_bake_bindings();
         job.settings.backend = BakeBackend::Cpu;
         job.gpu_state = None;
@@ -3395,12 +3660,23 @@ fn update_gpu_bake_job(app: &mut AppState, mut job: BakeJob, mut state: GpuBakeS
     }
     reset_gpu_bake_bindings();
 
-    for (total, value) in state.channels[channel_idx]
-        .output
-        .iter_mut()
-        .zip(batch_output)
-    {
-        *total += value;
+    if let Some(indices) = active_indices {
+        for (local_index, global_index) in indices.into_iter().enumerate() {
+            let source = local_index * 3;
+            let target = global_index * 3;
+            for channel in 0..3 {
+                state.channels[channel_idx].output[target + channel] +=
+                    batch_output[source + channel];
+            }
+        }
+    } else {
+        for (total, value) in state.channels[channel_idx]
+            .output
+            .iter_mut()
+            .zip(batch_output)
+        {
+            *total += value;
+        }
     }
     state.channels[channel_idx].next_batch += 1;
     state.completed_batches += 1;
@@ -3409,7 +3685,7 @@ fn update_gpu_bake_job(app: &mut AppState, mut job: BakeJob, mut state: GpuBakeS
         .round()
         .min(state.mapping.len() as f32) as usize;
     app.status_message = format!(
-        "GPU baking {} for {}... {:.0}% (batch {}/{}, {} vertices)",
+        "GPU baking {} for {}... {:.0}% (batch {}/{}, {active_vertex_count}/{} vertices)",
         bake_light_mode_label(state.channels[channel_idx].mode),
         bake_scope_label(job.scope),
         progress * 100.0,
@@ -3475,6 +3751,16 @@ pub(crate) fn update_bake_job(app: &mut AppState) {
         let model = placement_matrix(placement).to_cols_array();
         let pos = transform_point_gl(&model, vertex.pos);
         let normal = transform_normal_gl(&model, vertex.normal).normalize_or_zero();
+        let tri_start = (job.vertex_index / 3) * 3;
+        let triangle = if let Some(tri) = part.cpu_vertices.get(tri_start..tri_start + 3) {
+            [
+                transform_point_gl(&model, tri[0].pos),
+                transform_point_gl(&model, tri[1].pos),
+                transform_point_gl(&model, tri[2].pos),
+            ]
+        } else {
+            [pos; 3]
+        };
         let (accum, secondary_accum) = match job.pass {
             BakePassKind::Light => {
                 let (primary_mode, secondary_mode) = bake_output_modes(job.settings.light_mode);
@@ -3487,6 +3773,7 @@ pub(crate) fn update_bake_job(app: &mut AppState) {
                     primary_mode,
                     pos,
                     normal,
+                    triangle,
                 );
                 let secondary = secondary_mode.map(|mode| {
                     cpu_light_channel_value(
@@ -3498,6 +3785,7 @@ pub(crate) fn update_bake_job(app: &mut AppState) {
                         mode,
                         pos,
                         normal,
+                        triangle,
                     )
                 });
                 (primary, secondary)
@@ -3832,6 +4120,66 @@ mod emitter_tests {
     }
 
     #[test]
+    fn soft_shadow_kernel_keeps_an_exact_center_ray() {
+        assert_eq!(shadow_sample_offset(0, 32, 160.0), Vec2::ZERO);
+        assert_ne!(shadow_sample_offset(1, 32, 160.0), Vec2::ZERO);
+        assert_eq!(shadow_sample_offset(7, 8, 0.0), Vec2::ZERO);
+    }
+
+    #[test]
+    fn point_shadow_ray_stops_at_the_light_after_receiver_bias() {
+        let blocker = ShadowTri {
+            a: vec3(-10.0, -10.0, 10.25),
+            b: vec3(10.0, -10.0, 10.25),
+            c: vec3(0.0, 10.0, 10.25),
+            min: vec3(-10.0, -10.0, 10.25),
+            max: vec3(10.0, 10.0, 10.25),
+        };
+        let mut cells = HashMap::new();
+        cells.insert((0, 0), vec![0]);
+        let grid = ShadowGrid {
+            cell_size: 100.0,
+            cells,
+            tris: vec![blocker],
+        };
+        let light = EditorLight {
+            name: "Point".to_string(),
+            attached_to: None,
+            kind: LightKind::Point,
+            profile: LightProfile::Both,
+            position: V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 10.0,
+            },
+            direction: V3::default(),
+            color: neutral_vertex_color(),
+            temperature: 6500.0,
+            use_temperature: false,
+            intensity: 1.0,
+            radius: 100.0,
+            casts_shadow: true,
+            point_lobe: PointLightLobe::Omni,
+        };
+        let mut settings = default_bake_settings();
+        settings.shadow_softness = 0.0;
+
+        assert_eq!(
+            light_visibility(&grid, settings, &light, Vec3::ZERO, Vec3::Z),
+            1.0
+        );
+    }
+
+    #[test]
+    fn gpu_supports_area_emitter_shadows_as_individual_cubemap_batches() {
+        let mut area = test_area_sample(1.0);
+        area.casts_shadow = true;
+        assert_eq!(first_gpu_shadow_light(&[area.clone()]), Some(0));
+        assert!(gpu_light_needs_individual_shadow(&area));
+        assert_eq!(gpu_light_batches(&[area]).len(), 1);
+    }
+
+    #[test]
     fn gpu_shadow_quality_uses_configured_samples_and_tighter_softness() {
         assert_eq!(gpu_shadow_sample_count(1), 1);
         assert_eq!(gpu_shadow_sample_count(128), 128);
@@ -3909,6 +4257,63 @@ mod emitter_tests {
         assert!((middle - 0.5).abs() < 0.0001);
         assert_eq!(smooth_distance_attenuation(radius, radius), 0.0);
         assert_eq!(smooth_distance_attenuation(radius + 1.0, radius), 0.0);
+    }
+
+    #[test]
+    fn local_light_between_sparse_vertices_uses_the_triangle_surface() {
+        let triangle = [
+            vec3(-100.0, -100.0, 0.0),
+            vec3(100.0, -100.0, 0.0),
+            vec3(0.0, 100.0, 0.0),
+        ];
+        let light = EditorLight {
+            name: "Ground light".to_string(),
+            attached_to: None,
+            kind: LightKind::Point,
+            profile: LightProfile::Both,
+            position: V3 {
+                x: 0.0,
+                y: 0.0,
+                z: 10.0,
+            },
+            direction: V3::default(),
+            color: neutral_vertex_color(),
+            temperature: 6500.0,
+            use_temperature: false,
+            intensity: 1.0,
+            radius: 30.0,
+            casts_shadow: false,
+            point_lobe: PointLightLobe::Omni,
+        };
+        let corner = triangle[0];
+        assert_eq!(
+            bake_light_value(
+                &ShadowGrid {
+                    cell_size: 1.0,
+                    cells: HashMap::new(),
+                    tris: Vec::new(),
+                },
+                default_bake_settings(),
+                &light,
+                corner,
+                Vec3::Z,
+            ),
+            Vec3::ZERO
+        );
+        let receiver = triangle_receiver_sample(&light, corner, triangle);
+        assert!(receiver.distance(Vec3::ZERO) < 0.0001);
+        let baked = bake_light_value(
+            &ShadowGrid {
+                cell_size: 1.0,
+                cells: HashMap::new(),
+                tris: Vec::new(),
+            },
+            default_bake_settings(),
+            &light,
+            receiver,
+            Vec3::Z,
+        );
+        assert!(baked.x > 0.5, "surface fallback produced {baked:?}");
     }
 
     fn test_area_sample(area: f32) -> EditorLight {
@@ -3990,29 +4395,21 @@ mod emitter_tests {
     }
 
     #[test]
-    fn gpu_batches_area_samples_without_per_sample_scene_shadow_maps() {
+    fn gpu_isolates_shadowed_area_samples_for_per_sample_cubemaps() {
         let mut area = test_area_sample(1.0);
         area.casts_shadow = true;
-        assert!(!gpu_light_needs_individual_shadow(&area));
+        assert!(gpu_light_needs_individual_shadow(&area));
 
         let mut point = area.clone();
         point.kind = LightKind::Point;
         assert!(gpu_light_needs_individual_shadow(&point));
 
-        let mut lights = vec![area; 65];
-        lights.push(point.clone());
-        lights.push(point);
+        let lights = vec![area.clone(), area, point];
         let batches = gpu_light_batches(&lights);
         let batch_lengths: Vec<usize> = batches.iter().map(Vec::len).collect();
-        assert_eq!(batch_lengths, vec![32, 32, 1, 1, 1]);
+        assert_eq!(batch_lengths, vec![1, 1, 1]);
         assert!(
-            batches[..3]
-                .iter()
-                .flatten()
-                .all(|light| matches!(light.kind, LightKind::Area))
-        );
-        assert!(
-            batches[3..]
+            batches
                 .iter()
                 .flatten()
                 .all(gpu_light_needs_individual_shadow)
@@ -4020,10 +4417,40 @@ mod emitter_tests {
     }
 
     #[test]
+    fn gpu_local_light_batches_cull_vertices_outside_their_influence_bounds() {
+        let mut light = test_area_sample(1.0);
+        light.position = V3 {
+            x: 100.0,
+            y: 20.0,
+            z: 5.0,
+        };
+        light.radius = 10.0;
+        let triangles = [
+            [vec3(95.0, 20.0, 5.0); 3],
+            [vec3(100.0, 30.0, 5.0); 3],
+            [vec3(111.0, 20.0, 5.0); 3],
+            [vec3(-500.0, 20.0, 5.0); 3],
+        ];
+
+        assert_eq!(
+            gpu_batch_vertex_indices(&[light], &triangles),
+            Some(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn gpu_global_light_batches_keep_all_vertices() {
+        let mut light = test_area_sample(1.0);
+        light.kind = LightKind::Directional;
+        assert_eq!(gpu_batch_vertex_indices(&[light], &[[Vec3::ZERO; 3]]), None);
+    }
+
+    #[test]
     fn gpu_progress_tracks_completed_light_batches() {
         let mut state = GpuBakeState {
             input: Vec::new(),
             positions: Vec::new(),
+            triangles: Vec::new(),
             mapping: Vec::new(),
             channels: Vec::new(),
             current_channel: 0,

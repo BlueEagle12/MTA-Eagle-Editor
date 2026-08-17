@@ -1,9 +1,9 @@
 //! Asynchronous DFF level-of-detail generation.
 //!
 //! Mesh simplification, texture decoding/resizing/compression, DFF/TXD
-//! serialization, and replacement-archive writes all happen on a worker. The
-//! main thread only snapshots the selected source and installs the completed
-//! result.
+//! serialization happen on workers. The main thread snapshots each source,
+//! merges generated atlases into the shared world LOD dictionary, and installs
+//! completed results in deterministic order.
 
 use super::super::*;
 use meshopt::{
@@ -14,23 +14,55 @@ use std::mem;
 // Aim aggressively, but allow the topology-aware simplifier to stop before the
 // target when reaching it would exceed the silhouette error budget. A slightly
 // higher triangle budget and tighter error limit keep the result recognizable
-// at the generated definition's 700-unit LOD distance.
+// at the generated definition's long-range LOD distance.
 const LOD_TARGET_TRIANGLE_RATIO: f32 = 0.12;
 const LOD_SIMPLIFY_ERROR: f32 = 0.06;
-const LOD_MAX_TEXTURE_DIMENSION: u32 = 256;
-const LOD_MAX_ATLAS_DIMENSION: u32 = 256;
+const LOD_MAX_TEXTURE_DIMENSION: u32 = 512;
+const LOD_MAX_ATLAS_DIMENSION: u32 = 512;
+const LOD_MIN_ATLAS_DIMENSION: u32 = 32;
+/// Accept a smaller atlas only while it still holds this much of the source
+/// texel density. Below it the next power of two is worth the extra bytes.
+const LOD_ATLAS_MIN_SCALE: f32 = 0.7;
+/// A material is baked into an atlas cell at exactly the repeat count its UVs
+/// ask for, so the cell always shows the tiling the source material shows.
+/// Past this many repeats the duplicated pixels are not worth the atlas space
+/// and the texture stays standalone instead.
+const LOD_ATLAS_MAX_BAKED_REPEATS: f32 = 2.0;
+/// A standalone tiled texture repeats across its surface, so every screen pixel
+/// already averages many texels. It does not need full source resolution.
+const LOD_TILED_TEXTURE_DIMENSION: u32 = 128;
 const LOD_MIN_SIMPLIFY_TRIANGLES: usize = 4;
+/// Share of the surface that may end up in pieces the source did not have.
+/// Sized to pass shed slivers and fail an actually shredded model.
+const LOD_MAX_DETACHED_AREA_RATIO: f32 = 0.0025;
+const DEFAULT_LOD_BATCH_MINIMUM_SIZE: f32 = 100.0;
+pub(crate) const WORLD_LOD_TXD_NAME: &str = "world_lod.txd";
+/// A VER2 IMG directory stores an entry's streaming size in 16 bits, so no
+/// asset may exceed 65,535 sectors (128 MB). Generated atlases roll over into
+/// `world_lod_2.txd`, `world_lod_3.txd`, ... well before that ceiling: a
+/// dictionary this large is already more than the streamer wants resident.
+const WORLD_LOD_TXD_MAX_BYTES: usize = 48 * 1024 * 1024;
+
+/// Name of the nth shared LOD dictionary. The first keeps the historical name
+/// so existing projects keep loading their generated LODs.
+fn world_lod_txd_name(index: usize) -> String {
+    if index == 0 {
+        WORLD_LOD_TXD_NAME.to_string()
+    } else {
+        format!("world_lod_{}.txd", index + 1)
+    }
+}
 
 #[derive(Clone)]
 enum LodMeshSource {
     Raw(RawMesh),
-    Bytes(Vec<u8>),
+    Bytes(Arc<Vec<u8>>),
     Entry(ImgEntry),
 }
 
 #[derive(Clone)]
 enum LodTxdSource {
-    Bytes(Vec<u8>),
+    Bytes(Arc<Vec<u8>>),
     Entry(ImgEntry),
 }
 
@@ -46,8 +78,9 @@ struct LodGenerationRequest {
     replaced_lod_parent: Option<String>,
     replaced_lod_index: Option<usize>,
     project_root: PathBuf,
-    reserved_stems: BTreeSet<String>,
+    reserved_stems: Arc<BTreeSet<String>>,
     wip_root: PathBuf,
+    stem_preallocated: bool,
 }
 
 pub(crate) struct LodGenerationResult {
@@ -78,12 +111,15 @@ pub(crate) struct LodGenerationResult {
 }
 
 pub(crate) struct LodGenerationJob {
-    rx: mpsc::Receiver<Result<LodGenerationResult, String>>,
+    workers: Vec<LodGenerationWorker>,
     started_at: Instant,
     result: Option<LodGenerationResult>,
     apply_phase: u8,
     attached: bool,
-    pending: std::collections::VecDeque<LodGenerationRequest>,
+    pending: std::collections::VecDeque<(usize, LodGenerationRequest)>,
+    ready: BTreeMap<usize, Result<LodGenerationResult, String>>,
+    next_apply_order: usize,
+    request_count: usize,
     total: usize,
     processed: usize,
     successes: usize,
@@ -94,7 +130,18 @@ pub(crate) struct LodGenerationJob {
     output_triangles: usize,
     history_before: WorldHistorySnapshot,
     history_artifacts: Vec<LodGenerationHistoryArtifact>,
+    /// Prior contents of every shared LOD dictionary this batch wrote to,
+    /// keyed by asset key. `None` marks a dictionary the batch created.
+    history_txd_before: BTreeMap<String, (String, Option<Vec<u8>>)>,
 }
+
+struct LodGenerationWorker {
+    order: usize,
+    source_name: String,
+    rx: mpsc::Receiver<Result<LodGenerationResult, String>>,
+}
+
+const LOD_GENERATION_MAX_WORKERS: usize = 4;
 
 #[derive(Clone)]
 struct DecodedLodTexture {
@@ -107,7 +154,7 @@ struct DecodedLodTexture {
 fn read_mesh_source(source: LodMeshSource) -> Result<RawMesh, String> {
     let raw = match source {
         LodMeshSource::Raw(raw) => raw,
-        LodMeshSource::Bytes(bytes) => parse_dff_mesh(&bytes),
+        LodMeshSource::Bytes(bytes) => parse_dff_mesh(bytes.as_slice()),
         LodMeshSource::Entry(entry) => parse_dff_mesh(&read_img_entry(&entry)),
     };
     if raw.vertices.is_empty() || raw.triangles.is_empty() {
@@ -119,7 +166,7 @@ fn read_mesh_source(source: LodMeshSource) -> Result<RawMesh, String> {
 
 fn read_txd_source(source: LodTxdSource) -> Vec<u8> {
     match source {
-        LodTxdSource::Bytes(bytes) => bytes,
+        LodTxdSource::Bytes(bytes) => Arc::unwrap_or_clone(bytes),
         LodTxdSource::Entry(entry) => read_txd_entry_bytes(&entry),
     }
 }
@@ -294,6 +341,42 @@ fn lod_component_support_positions(vertices: &[V3], indices: &[u32]) -> BTreeSet
         }
     }
     protected_positions
+}
+
+/// Find the position-welded outline of an open mesh.
+///
+/// Roads, terrain patches, roofs, and similar map pieces are often broad open
+/// surfaces. Keeping only their extrema allows the simplifier to bridge across
+/// bends or tapers, turning the outline into a handful of large fans. Use
+/// position keys here so a UV or normal seam does not make an otherwise closed
+/// edge look like part of the silhouette.
+fn lod_open_boundary_positions(source: &RawMesh) -> BTreeSet<[u32; 3]> {
+    let mut edge_counts = BTreeMap::<([u32; 3], [u32; 3]), usize>::new();
+    for triangle in &source.triangles {
+        for (a, b) in [
+            (triangle.a, triangle.b),
+            (triangle.b, triangle.c),
+            (triangle.c, triangle.a),
+        ] {
+            let (Some(a), Some(b)) = (
+                source.vertices.get(a as usize),
+                source.vertices.get(b as usize),
+            ) else {
+                continue;
+            };
+            let mut edge = (lod_position_key(*a), lod_position_key(*b));
+            if edge.1 < edge.0 {
+                mem::swap(&mut edge.0, &mut edge.1);
+            }
+            *edge_counts.entry(edge).or_default() += 1;
+        }
+    }
+
+    edge_counts
+        .into_iter()
+        .filter(|(_, count)| *count == 1)
+        .flat_map(|((a, b), _)| [a, b])
+        .collect()
 }
 
 /// Split material batches into position-connected pieces for visibility
@@ -534,7 +617,8 @@ fn simplify_lod_mesh_once(
     let mut weights = vec![0.15f32, 0.15, 0.15, 0.035, 0.035];
     weights.extend(std::iter::repeat_n(0.035, secondary_uv_sets.len() * 2));
     let material_components = lod_material_components(source);
-    let protected_positions = lod_protected_silhouette_positions(source, &material_components);
+    let mut protected_positions = lod_protected_silhouette_positions(source, &material_components);
+    protected_positions.extend(lod_open_boundary_positions(source));
     let mut exact_materials = BTreeMap::<[u32; 3], u16>::new();
     let mut vertex_materials = vec![BTreeMap::<u16, usize>::new(); source.vertices.len()];
     for triangle in &source.triangles {
@@ -622,8 +706,64 @@ fn simplify_lod_mesh_once(
     Ok(out)
 }
 
+#[cfg(test)]
 fn lod_geometry_component_count(raw: &RawMesh) -> usize {
     lod_geometry_components(raw).len()
+}
+
+/// Connected pieces of a mesh, treating two triangles as joined when they share
+/// an edge rather than a single welded position.
+///
+/// Kitbashed map geometry routinely has parts that only touch at one corner - a
+/// balcony meeting a wall, a kerb meeting a road. Those contacts are
+/// incidental: simplification nudges the shared vertex and the contact is gone.
+/// Counting them as connections made the LOD validator report a mesh as "split
+/// into additional disconnected pieces" when nothing had actually been torn,
+/// and it rejected every quality target for such models.
+fn lod_connected_pieces(raw: &RawMesh) -> Vec<Vec<u32>> {
+    fn root(parents: &mut [usize], mut node: usize) -> usize {
+        while parents[node] != node {
+            parents[node] = parents[parents[node]];
+            node = parents[node];
+        }
+        node
+    }
+
+    let mut parents = (0..raw.triangles.len()).collect::<Vec<_>>();
+    let mut triangle_at_edge = BTreeMap::<([u32; 3], [u32; 3]), usize>::new();
+    for (index, triangle) in raw.triangles.iter().enumerate() {
+        for (a, b) in [
+            (triangle.a, triangle.b),
+            (triangle.b, triangle.c),
+            (triangle.c, triangle.a),
+        ] {
+            let (Some(a_position), Some(b_position)) =
+                (raw.vertices.get(a as usize), raw.vertices.get(b as usize))
+            else {
+                continue;
+            };
+            let mut a_key = lod_position_key(*a_position);
+            let mut b_key = lod_position_key(*b_position);
+            if b_key < a_key {
+                mem::swap(&mut a_key, &mut b_key);
+            }
+            let Some(other) = triangle_at_edge.insert((a_key, b_key), index) else {
+                continue;
+            };
+            let (left, right) = (root(&mut parents, index), root(&mut parents, other));
+            if left != right {
+                parents[right] = left;
+            }
+        }
+    }
+    let mut pieces = BTreeMap::<usize, Vec<u32>>::new();
+    for (index, triangle) in raw.triangles.iter().enumerate() {
+        pieces
+            .entry(root(&mut parents, index))
+            .or_default()
+            .extend([triangle.a, triangle.b, triangle.c]);
+    }
+    pieces.into_values().collect()
 }
 
 fn lod_edge_topology(raw: &RawMesh) -> (usize, usize, f32) {
@@ -930,18 +1070,39 @@ fn validate_lod_candidate(source: &RawMesh, candidate: &RawMesh) -> Result<(), S
         ));
     }
 
-    if lod_geometry_component_count(candidate) > lod_geometry_component_count(source) {
-        return Err(format!(
-            "simplification split the mesh into additional disconnected pieces ({} -> {})",
-            lod_geometry_component_count(source),
-            lod_geometry_component_count(candidate)
-        ));
+    let source_pieces = lod_connected_pieces(source).len();
+    let candidate_pieces = lod_connected_pieces(candidate);
+    if candidate_pieces.len() > source_pieces {
+        // Collapsing an edge can shed a sliver a few thousandths of a square
+        // unit across. What this check is here to catch is the simplifier
+        // shredding the model, so weigh the extra pieces by surface instead of
+        // counting them.
+        let mut areas = candidate_pieces
+            .iter()
+            .map(|indices| lod_triangle_area(&candidate.vertices, indices))
+            .collect::<Vec<_>>();
+        areas.sort_by(|a, b| b.total_cmp(a));
+        let detached = areas[source_pieces..].iter().sum::<f32>();
+        if detached > candidate_area * LOD_MAX_DETACHED_AREA_RATIO {
+            return Err(format!(
+                "simplification split {:.2}% of the surface into {} additional disconnected piece(s) ({source_pieces} -> {})",
+                detached / candidate_area.max(1e-8) * 100.0,
+                candidate_pieces.len() - source_pieces,
+                candidate_pieces.len()
+            ));
+        }
     }
     let (source_open, source_non_manifold, source_open_length) = lod_edge_topology(source);
     let (candidate_open, candidate_non_manifold, candidate_open_length) =
         lod_edge_topology(candidate);
-    if candidate_non_manifold > source_non_manifold {
-        return Err("simplification introduced non-manifold edges".to_string());
+    // meshopt keeps a well-formed mesh well-formed, so new non-manifold edges on
+    // a clean source are a real defect. Map geometry that already has coincident
+    // surfaces gains and loses a handful of them at every quality target, and
+    // rejecting that turned "already slightly non-manifold" into "no LOD at all".
+    if candidate_non_manifold > source_non_manifold * 2 + 2 {
+        return Err(format!(
+            "simplification introduced non-manifold edges ({source_non_manifold} -> {candidate_non_manifold})"
+        ));
     }
     if candidate_open > source_open.saturating_add(2)
         && candidate_open_length > source_open_length + mesh_scale * 0.02
@@ -964,13 +1125,17 @@ fn validate_lod_candidate(source: &RawMesh, candidate: &RawMesh) -> Result<(), S
             continue;
         }
         let candidate_mask = lod_projection_mask(candidate, axes, source_bounds);
-        let retained = source_mask
+        let intersection = source_mask
             .iter()
             .zip(&candidate_mask)
             .filter(|(source, candidate)| **source && **candidate)
             .count();
-        if retained as f32 / (source_pixels as f32) < 0.86 {
+        if intersection as f32 / (source_pixels as f32) < 0.86 {
             return Err("projected silhouette lost visible surface coverage".to_string());
+        }
+        let candidate_pixels = candidate_mask.iter().filter(|covered| **covered).count();
+        if candidate_pixels >= 8 && intersection as f32 / (candidate_pixels as f32) < 0.86 {
+            return Err("projected silhouette gained surface outside the source shape".to_string());
         }
     }
 
@@ -1064,6 +1229,32 @@ fn lod_texture_size(width: u32, height: u32) -> (u32, u32) {
     let width = lower_power_of_two(((width as f32 * scale).floor() as u32).max(1));
     let height = lower_power_of_two(((height as f32 * scale).floor() as u32).max(1));
     (width, height)
+}
+
+/// Power-of-two size for a standalone tiled texture.
+fn lod_tiled_texture_size(width: u32, height: u32) -> (u32, u32) {
+    let scale = (LOD_TILED_TEXTURE_DIMENSION as f32 / width.max(1) as f32)
+        .min(LOD_TILED_TEXTURE_DIMENSION as f32 / height.max(1) as f32)
+        .min(1.0);
+    let width = lower_power_of_two(((width as f32 * scale).floor() as u32).max(1));
+    let height = lower_power_of_two(((height as f32 * scale).floor() as u32).max(1));
+    (width, height)
+}
+
+fn resize_lod_texture_to(
+    texture: &DecodedLodTexture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, String> {
+    if (texture.width, texture.height) == (width, height) {
+        return Ok(texture.rgba.clone());
+    }
+    let image = image::RgbaImage::from_raw(texture.width, texture.height, texture.rgba.clone())
+        .ok_or_else(|| format!("Could not decode texture '{}' pixels", texture.name))?;
+    Ok(
+        image::imageops::resize(&image, width, height, image::imageops::FilterType::Triangle)
+            .into_raw(),
+    )
 }
 
 fn resize_lod_texture(
@@ -1176,13 +1367,16 @@ fn atlas_is_possible(raw: &RawMesh, textures: &[DecodedLodTexture]) -> bool {
         })
 }
 
-fn build_texture_txd(textures: &[DecodedLodTexture], atlased: bool) -> Result<Vec<u8>, String> {
+fn build_texture_txd(
+    textures: &[DecodedLodTexture],
+    mipped: &BTreeSet<String>,
+) -> Result<Vec<u8>, String> {
     let mut txd = rw_chunk(0x16, rw_chunk(0x01, vec![0, 0, 0, 0]));
     for texture in textures {
         // Atlas mip levels need per-region filtering to avoid bleeding across
         // cells. Keep the generated atlas to its top level; independent
         // textures can safely receive a complete mip chain.
-        let native = if atlased {
+        let native = if !mipped.contains(&lower(&texture.name)) {
             texture_native_from_rgba(
                 &texture.rgba,
                 texture.width as u16,
@@ -1202,26 +1396,216 @@ fn build_texture_txd(textures: &[DecodedLodTexture], atlased: bool) -> Result<Ve
     Ok(txd)
 }
 
-fn remap_raw_for_atlas(
+#[derive(Clone, Copy, Debug)]
+struct LodAtlasCrop {
+    u_min: f32,
+    v_min: f32,
+    u_span: f32,
+    v_span: f32,
+    texel_width: f32,
+    texel_height: f32,
+}
+
+fn lod_atlas_crop(
+    texture: &DecodedLodTexture,
+    bounds: Option<(f32, f32, f32, f32)>,
+) -> LodAtlasCrop {
+    let (u_min, v_min, u_max, v_max) = bounds.unwrap_or((0.0, 0.0, 1.0, 1.0));
+    // A zero-width UV footprint can still be sampled by filtering. Reserve one
+    // source texel instead of expanding it to a complete texture tile.
+    let u_span = (u_max - u_min).max(1.0 / texture.width.max(1) as f32);
+    let v_span = (v_max - v_min).max(1.0 / texture.height.max(1) as f32);
+    LodAtlasCrop {
+        u_min,
+        v_min,
+        u_span,
+        v_span,
+        texel_width: (texture.width as f32 * u_span).max(1.0),
+        texel_height: (texture.height as f32 * v_span).max(1.0),
+    }
+}
+
+/// Whether a material repeats its texture too often to be worth baking into an
+/// atlas cell. Such a material keeps its own wrapped texture: squeezing it into
+/// a cell would either duplicate the same pixels many times over or stretch the
+/// tiling across the surface.
+fn lod_texture_is_tiled(bounds: Option<(f32, f32, f32, f32)>) -> bool {
+    let Some((u_min, v_min, u_max, v_max)) = bounds else {
+        return false;
+    };
+    u_max - u_min > LOD_ATLAS_MAX_BAKED_REPEATS || v_max - v_min > LOD_ATLAS_MAX_BAKED_REPEATS
+}
+
+/// Name a generated texture after its own contents.
+///
+/// Neighbouring instances of the same building generate the same sheet, and a
+/// tiled road texture is shared by every LOD that touches the road. Naming by
+/// content makes those collapse to a single entry in the shared dictionary
+/// instead of being stored once per generated LOD.
+fn lod_texture_content_name(seed: &str, width: u32, height: u32, rgba: &[u8]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in width
+        .to_le_bytes()
+        .iter()
+        .chain(height.to_le_bytes().iter())
+        .chain(rgba)
+    {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    let mut seed = sanitize_texture_name(seed);
+    seed.truncate(GTA_SA_TEXTURE_NAME_MAX - 17);
+    format!("{seed}_{hash:016x}")
+}
+
+/// Shelf-pack the cropped footprints at one shared scale. Every crop receives
+/// the same scale, preserving relative texel density across materials.
+fn try_pack_lod_atlas_crops(
+    crops: &[LodAtlasCrop],
+    atlas_width: u32,
+    atlas_height: u32,
+    gutter: u32,
+    scale: f32,
+) -> Option<Vec<(u32, u32, u32, u32)>> {
+    let available_width = atlas_width.saturating_sub(gutter * 2);
+    let available_height = atlas_height.saturating_sub(gutter * 2);
+    if crops.is_empty() || available_width == 0 || available_height == 0 {
+        return None;
+    }
+    // A crop that no longer fits must fail the attempt. Clamping it to the
+    // sheet instead would silently squash its aspect ratio, which is how a
+    // single heavily tiled material used to distort a whole atlas.
+    let mut rectangles = Vec::with_capacity(crops.len());
+    for (index, crop) in crops.iter().enumerate() {
+        let width = (crop.texel_width * scale).round().max(1.0);
+        let height = (crop.texel_height * scale).round().max(1.0);
+        if width > available_width as f32 || height > available_height as f32 {
+            return None;
+        }
+        rectangles.push((index, width as u32, height as u32));
+    }
+    rectangles.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
+    let mut shelves = Vec::<(u32, u32, u32)>::new(); // y, height, next x
+    let mut placements = vec![(0, 0, 0, 0); crops.len()];
+    for (index, width, height) in rectangles {
+        let outer_width = width + gutter * 2;
+        let outer_height = height + gutter * 2;
+        let mut placed = None;
+        for shelf in &mut shelves {
+            if outer_height <= shelf.1 && shelf.2 + outer_width <= atlas_width {
+                placed = Some((shelf.2 + gutter, shelf.0 + gutter));
+                shelf.2 += outer_width;
+                break;
+            }
+        }
+        if placed.is_none() {
+            let y = shelves.iter().map(|shelf| shelf.1).sum::<u32>();
+            if outer_width > atlas_width || y + outer_height > atlas_height {
+                return None;
+            }
+            shelves.push((y, outer_height, outer_width));
+            placed = Some((gutter, y + gutter));
+        }
+        let (x, y) = placed.expect("a fitting atlas crop has a placement");
+        placements[index] = (x, y, width, height);
+    }
+    Some(placements)
+}
+
+/// Largest scale up to `max_scale` that still packs, with its placements.
+fn pack_lod_atlas_crops_at_best_scale(
+    crops: &[LodAtlasCrop],
+    atlas_width: u32,
+    atlas_height: u32,
+    gutter: u32,
+    max_scale: f32,
+) -> Option<(f32, Vec<(u32, u32, u32, u32)>)> {
+    let pack = |scale| try_pack_lod_atlas_crops(crops, atlas_width, atlas_height, gutter, scale);
+    if let Some(placements) = pack(max_scale) {
+        return Some((max_scale, placements));
+    }
+    pack(0.0)?;
+    let mut low = 0.0f32;
+    let mut high = max_scale;
+    for _ in 0..24 {
+        let middle = (low + high) * 0.5;
+        if pack(middle).is_some() {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    Some((low, pack(low)?))
+}
+
+/// Pick the smallest power-of-two sheet that holds every crop at (close to)
+/// its native texel density.
+///
+/// The generator used to emit a 512x512 sheet for every LOD regardless of how
+/// little of it was covered, which upscaled small source textures into an
+/// otherwise empty page and cost 128-256 KB per LOD in the shared dictionary.
+/// Sizing the sheet to its contents keeps the same on-screen detail in a
+/// fraction of the bytes.
+fn choose_lod_atlas_size(
+    crops: &[LodAtlasCrop],
+    gutter: u32,
+) -> Result<(u32, u32, Vec<(u32, u32, u32, u32)>), String> {
+    if crops.is_empty() {
+        return Err("LOD atlas has no usable crop area".to_string());
+    }
+    let mut sizes = Vec::new();
+    let mut width = LOD_MIN_ATLAS_DIMENSION;
+    while width <= LOD_MAX_ATLAS_DIMENSION {
+        let mut height = LOD_MIN_ATLAS_DIMENSION;
+        while height <= LOD_MAX_ATLAS_DIMENSION {
+            sizes.push((width, height));
+            height *= 2;
+        }
+        width *= 2;
+    }
+    // Smallest sheet first, then the squarest of equal-area candidates.
+    sizes.sort_by_key(|(width, height)| (width * height, width.abs_diff(*height)));
+    for (width, height) in sizes {
+        if let Some((scale, placements)) =
+            pack_lod_atlas_crops_at_best_scale(crops, width, height, gutter, 1.0)
+            && scale >= LOD_ATLAS_MIN_SCALE
+        {
+            return Ok((width, height, placements));
+        }
+    }
+    // Nothing fits at a usable density even on the largest sheet: fall back to
+    // the densest packing the maximum size allows.
+    let (_, placements) = pack_lod_atlas_crops_at_best_scale(
+        crops,
+        LOD_MAX_ATLAS_DIMENSION,
+        LOD_MAX_ATLAS_DIMENSION,
+        gutter,
+        1.0,
+    )
+    .ok_or_else(|| "There are too many cropped textures to fit in a LOD atlas".to_string())?;
+    Ok((LOD_MAX_ATLAS_DIMENSION, LOD_MAX_ATLAS_DIMENSION, placements))
+}
+
+/// Textures generated for one LOD: packed atlas sheets plus any material that
+/// stayed standalone because it tiles.
+struct LodAtlasSet {
+    textures: Vec<DecodedLodTexture>,
+    /// Lowercased names of the standalone tiled textures in `textures`. They
+    /// are sampled with wrapping, so unlike an atlas sheet they want mip maps.
+    tiled: BTreeSet<String>,
+}
+
+fn remap_raw_for_atlases(
     raw: &mut RawMesh,
     textures: &[DecodedLodTexture],
-    atlas_name: &str,
-) -> Result<DecodedLodTexture, String> {
+) -> Result<LodAtlasSet, String> {
     const GUTTER: u32 = 2;
-    let columns = (textures.len() as f32).sqrt().ceil().max(1.0) as u32;
-    let rows = (textures.len() as u32).div_ceil(columns).max(1);
-    let atlas_width = LOD_MAX_ATLAS_DIMENSION;
-    let atlas_height = LOD_MAX_ATLAS_DIMENSION;
-    let cell_width = atlas_width / columns;
-    let cell_height = atlas_height / rows;
-    let max_region_width = cell_width.saturating_sub(GUTTER * 2);
-    let max_region_height = cell_height.saturating_sub(GUTTER * 2);
-    if max_region_width == 0 || max_region_height == 0 {
-        return Err("There are too many textures to fit in the LOD atlas".to_string());
-    }
 
     #[derive(Clone, Copy)]
     struct AtlasRegion {
+        atlas: usize,
+        atlas_width: u32,
+        atlas_height: u32,
         x: u32,
         y: u32,
         width: u32,
@@ -1259,72 +1643,117 @@ fn remap_raw_for_atlas(
         }
     }
 
-    let mut atlas = vec![0u8; (atlas_width * atlas_height * 4) as usize];
-    let mut regions = HashMap::<String, AtlasRegion>::new();
-    for (index, texture) in textures.iter().enumerate() {
-        let cell_x = index as u32 % columns * cell_width;
-        let cell_y = index as u32 / columns * cell_height;
-        let (min_u, min_v, max_u, max_v) = uv_bounds
-            .get(&lower(&texture.name))
-            .copied()
-            .unwrap_or((0.0, 0.0, 1.0, 1.0));
-        let u_min = min_u.floor();
-        let v_min = min_v.floor();
-        let u_span = (max_u.ceil() - u_min).max(1.0);
-        let v_span = (max_v.ceil() - v_min).max(1.0);
-        // Fit the baked repeat domain without changing its source texel aspect
-        // ratio. This prevents the atlas transform itself from stretching or
-        // rotating UV islands.
-        let content_aspect = (texture.width as f32 * u_span) / (texture.height as f32 * v_span);
-        let available_aspect = max_region_width as f32 / max_region_height as f32;
-        let (region_width, region_height) = if content_aspect >= available_aspect {
-            (
-                max_region_width,
-                ((max_region_width as f32 / content_aspect).round() as u32)
-                    .clamp(1, max_region_height),
-            )
-        } else {
-            (
-                ((max_region_height as f32 * content_aspect).round() as u32)
-                    .clamp(1, max_region_width),
-                max_region_height,
-            )
-        };
-        let x = cell_x + GUTTER + (max_region_width - region_width) / 2;
-        let y = cell_y + GUTTER + (max_region_height - region_height) / 2;
-        for gutter_y in 0..region_height + GUTTER * 2 {
-            let local_y = gutter_y as i64 - GUTTER as i64;
-            let domain_v = v_min + (local_y as f32 + 0.5) / region_height as f32 * v_span;
-            let source_y = (domain_v.rem_euclid(1.0) * texture.height as f32)
-                .floor()
-                .min(texture.height.saturating_sub(1) as f32) as u32;
-            for gutter_x in 0..region_width + GUTTER * 2 {
-                let local_x = gutter_x as i64 - GUTTER as i64;
-                let domain_u = u_min + (local_x as f32 + 0.5) / region_width as f32 * u_span;
-                let source_x = (domain_u.rem_euclid(1.0) * texture.width as f32)
-                    .floor()
-                    .min(texture.width.saturating_sub(1) as f32)
-                    as u32;
-                let source = ((source_y * texture.width + source_x) * 4) as usize;
-                let destination =
-                    (((y - GUTTER + gutter_y) * atlas_width + x - GUTTER + gutter_x) * 4) as usize;
-                atlas[destination..destination + 4]
-                    .copy_from_slice(&texture.rgba[source..source + 4]);
-            }
+    // A material that repeats its texture many times cannot be atlased: baking
+    // every repeat wastes the sheet, and baking fewer stretches the tiling. It
+    // keeps its own texture and its original wrapped UVs instead.
+    let mut generated = Vec::new();
+    let mut tiled_names = BTreeSet::new();
+    let mut standalone = HashMap::<String, String>::new();
+    for texture in textures {
+        if !lod_texture_is_tiled(uv_bounds.get(&lower(&texture.name)).copied()) {
+            continue;
         }
-        regions.insert(
-            lower(&texture.name),
-            AtlasRegion {
-                x,
-                y,
-                width: region_width,
-                height: region_height,
-                u_min,
-                v_min,
-                u_span,
-                v_span,
-            },
-        );
+        let (width, height) = lod_tiled_texture_size(texture.width, texture.height);
+        let resized = resize_lod_texture_to(texture, width, height)?;
+        let name = lod_texture_content_name(&texture.name, width, height, &resized);
+        standalone.insert(lower(&texture.name), name.clone());
+        tiled_names.insert(lower(&name));
+        generated.push(DecodedLodTexture {
+            name,
+            width,
+            height,
+            rgba: resized,
+        });
+    }
+
+    let atlasable = textures
+        .iter()
+        .filter(|texture| !standalone.contains_key(&lower(&texture.name)))
+        .collect::<Vec<_>>();
+    let opaque = atlasable
+        .iter()
+        .copied()
+        .filter(|texture| !rgba_has_alpha(&texture.rgba))
+        .collect::<Vec<_>>();
+    let alpha = atlasable
+        .iter()
+        .copied()
+        .filter(|texture| rgba_has_alpha(&texture.rgba))
+        .collect::<Vec<_>>();
+    // Opaque is intentionally emitted first. The normalized DFF writer keeps
+    // each material's first-occurrence order for BinMesh batches, so this also
+    // makes opaque geometry draw before alpha geometry in-game.
+    let groups = [opaque, alpha];
+    let mut atlases = Vec::new();
+    let mut regions = HashMap::<String, AtlasRegion>::new();
+    for group in groups {
+        if group.is_empty() {
+            continue;
+        }
+        let atlas_index = atlases.len();
+        // Seed the content hash with a source texture name so the dictionary
+        // stays browsable instead of listing bare hashes.
+        let seed_name = group[0].name.clone();
+        let crops = group
+            .iter()
+            .map(|texture| lod_atlas_crop(texture, uv_bounds.get(&lower(&texture.name)).copied()))
+            .collect::<Vec<_>>();
+        let (atlas_width, atlas_height, placements) = choose_lod_atlas_size(&crops, GUTTER)?;
+        // Padding is opaque even for the alpha atlas. This prevents filtering
+        // outside an assigned region from introducing a translucent fringe.
+        let mut atlas = [0u8, 0, 0, 255].repeat((atlas_width * atlas_height) as usize);
+        for ((texture, crop), (x, y, region_width, region_height)) in
+            group.into_iter().zip(crops).zip(placements)
+        {
+            let u_min = crop.u_min;
+            let v_min = crop.v_min;
+            let u_span = crop.u_span;
+            let v_span = crop.v_span;
+            for gutter_y in 0..region_height + GUTTER * 2 {
+                let local_y = gutter_y as i64 - GUTTER as i64;
+                let domain_v = v_min + (local_y as f32 + 0.5) / region_height as f32 * v_span;
+                let source_y = (domain_v.rem_euclid(1.0) * texture.height as f32)
+                    .floor()
+                    .min(texture.height.saturating_sub(1) as f32)
+                    as u32;
+                for gutter_x in 0..region_width + GUTTER * 2 {
+                    let local_x = gutter_x as i64 - GUTTER as i64;
+                    let domain_u = u_min + (local_x as f32 + 0.5) / region_width as f32 * u_span;
+                    let source_x = (domain_u.rem_euclid(1.0) * texture.width as f32)
+                        .floor()
+                        .min(texture.width.saturating_sub(1) as f32)
+                        as u32;
+                    let source = ((source_y * texture.width + source_x) * 4) as usize;
+                    let destination = (((y - GUTTER + gutter_y) * atlas_width + x - GUTTER
+                        + gutter_x)
+                        * 4) as usize;
+                    atlas[destination..destination + 4]
+                        .copy_from_slice(&texture.rgba[source..source + 4]);
+                }
+            }
+            regions.insert(
+                lower(&texture.name),
+                AtlasRegion {
+                    atlas: atlas_index,
+                    atlas_width,
+                    atlas_height,
+                    x,
+                    y,
+                    width: region_width,
+                    height: region_height,
+                    u_min,
+                    v_min,
+                    u_span,
+                    v_span,
+                },
+            );
+        }
+        atlases.push(DecodedLodTexture {
+            name: lod_texture_content_name(&seed_name, atlas_width, atlas_height, &atlas),
+            width: atlas_width,
+            height: atlas_height,
+            rgba: atlas,
+        });
     }
 
     let source = raw.clone();
@@ -1337,8 +1766,8 @@ fn remap_raw_for_atlas(
             Some((
                 triangle.material,
                 (
-                    region.width as f64 / atlas_width as f64 / region.u_span as f64,
-                    region.height as f64 / atlas_height as f64 / region.v_span as f64,
+                    region.width as f64 / region.atlas_width as f64 / region.u_span as f64,
+                    region.height as f64 / region.atlas_height as f64 / region.v_span as f64,
                 ),
             ))
         })
@@ -1371,7 +1800,9 @@ fn remap_raw_for_atlas(
             .get(triangle.material as usize)
             .map(|name| name.trim())
             .unwrap_or_default();
-        let region = if texture_name.is_empty() {
+        // Standalone tiled materials keep their wrapped UVs untouched; only
+        // atlased materials are folded into a cell.
+        let region = if texture_name.is_empty() || standalone.contains_key(&lower(texture_name)) {
             None
         } else {
             Some(
@@ -1399,10 +1830,10 @@ fn remap_raw_for_atlas(
                         V2 {
                             u: (region.x as f32
                                 + (uv.u - region.u_min) / region.u_span * region.width as f32)
-                                / atlas_width as f32,
+                                / region.atlas_width as f32,
                             v: (region.y as f32
                                 + (uv.v - region.v_min) / region.v_span * region.height as f32)
-                                / atlas_height as f32,
+                                / region.atlas_height as f32,
                         }
                     } else {
                         uv
@@ -1446,43 +1877,62 @@ fn remap_raw_for_atlas(
     raw.light_flags = flags;
     raw.triangles = triangles;
     raw.material_textures = source.material_textures.clone();
-    for triangle in &raw.triangles {
-        let material = triangle.material as usize;
-        if raw
-            .material_textures
-            .get(material)
-            .is_some_and(|name| !name.trim().is_empty())
-        {
-            raw.material_textures[material] = atlas_name.to_string();
+    for material in 0..raw.material_textures.len() {
+        let texture = lower(raw.material_textures[material].trim());
+        if let Some(region) = regions.get(&texture) {
+            raw.material_textures[material] = atlases[region.atlas].name.clone();
+        } else if let Some(name) = standalone.get(&texture) {
+            raw.material_textures[material] = name.clone();
         }
     }
     raw.material_animations.clear();
     raw.uv_anim_dictionaries.clear();
     raw.uv_animations.clear();
-    let atlas = DecodedLodTexture {
-        name: atlas_name.to_string(),
-        width: atlas_width,
-        height: atlas_height,
-        rgba: atlas,
-    };
-    validate_atlas_layout(&source, raw, &atlas, &material_uv_scales)?;
-    Ok(atlas)
+    generated.extend(atlases);
+    validate_atlas_layout(&source, raw, &generated, &material_uv_scales)?;
+
+    let alpha_atlas_names = generated
+        .iter()
+        .filter(|texture| rgba_has_alpha(&texture.rgba))
+        .map(|texture| lower(&texture.name))
+        .collect::<BTreeSet<_>>();
+    let alpha_materials = raw
+        .material_textures
+        .iter()
+        .enumerate()
+        .filter_map(|(index, texture)| {
+            let material_alpha = raw
+                .materials
+                .get(index)
+                .map_or(1.0, |material| material.alpha);
+            (material_alpha < 0.996 || alpha_atlas_names.contains(&lower(texture.trim())))
+                .then_some(index as u16)
+        })
+        .collect::<BTreeSet<_>>();
+    raw.triangles
+        .sort_by_key(|triangle| alpha_materials.contains(&triangle.material));
+    Ok(LodAtlasSet {
+        textures: generated,
+        tiled: tiled_names,
+    })
 }
 
 fn validate_atlas_layout(
     source: &RawMesh,
     atlased: &RawMesh,
-    atlas: &DecodedLodTexture,
+    atlases: &[DecodedLodTexture],
     material_uv_scales: &HashMap<u16, (f64, f64)>,
 ) -> Result<(), String> {
-    if atlas.width > LOD_MAX_ATLAS_DIMENSION || atlas.height > LOD_MAX_ATLAS_DIMENSION {
-        return Err(format!(
-            "Generated atlas is {}x{}, above the {}x{} limit",
-            atlas.width, atlas.height, LOD_MAX_ATLAS_DIMENSION, LOD_MAX_ATLAS_DIMENSION
-        ));
-    }
-    if atlas.rgba.len() != (atlas.width * atlas.height * 4) as usize {
-        return Err("Generated atlas pixel buffer has an invalid size".to_string());
+    for atlas in atlases {
+        if atlas.width > LOD_MAX_ATLAS_DIMENSION || atlas.height > LOD_MAX_ATLAS_DIMENSION {
+            return Err(format!(
+                "Generated atlas is {}x{}, above the {}x{} limit",
+                atlas.width, atlas.height, LOD_MAX_ATLAS_DIMENSION, LOD_MAX_ATLAS_DIMENSION
+            ));
+        }
+        if atlas.rgba.len() != (atlas.width * atlas.height * 4) as usize {
+            return Err("Generated atlas pixel buffer has an invalid size".to_string());
+        }
     }
     if source.triangles.len() != atlased.triangles.len()
         || source.vertices.is_empty()
@@ -1490,13 +1940,12 @@ fn validate_atlas_layout(
     {
         return Err("Atlas remapping lost polygons or vertex UVs".to_string());
     }
-    if atlased.uvs.iter().any(|uv| {
-        !uv.u.is_finite()
-            || !uv.v.is_finite()
-            || !(-1e-5..=1.00001).contains(&uv.u)
-            || !(-1e-5..=1.00001).contains(&uv.v)
-    }) {
-        return Err("Atlas remapping produced missing or out-of-range UVs".to_string());
+    if atlased
+        .uvs
+        .iter()
+        .any(|uv| !uv.u.is_finite() || !uv.v.is_finite())
+    {
+        return Err("Atlas remapping produced missing UVs".to_string());
     }
     for (triangle_index, (source_triangle, atlas_triangle)) in
         source.triangles.iter().zip(&atlased.triangles).enumerate()
@@ -1511,6 +1960,26 @@ fn validate_atlas_layout(
             atlased.uvs[atlas_triangle.b as usize],
             atlased.uvs[atlas_triangle.c as usize],
         ];
+        // A material left out of the atlas keeps its own wrapped texture, so
+        // its UVs must come through untouched, tiling and all.
+        if !material_uv_scales.contains_key(&source_triangle.material) {
+            if atlas_uv != source_uv {
+                return Err(format!(
+                    "Standalone tiled UV polygon {triangle_index} was rewritten (material {})",
+                    source_triangle.material
+                ));
+            }
+            continue;
+        }
+        if atlas_uv
+            .iter()
+            .any(|uv| !(-1e-5..=1.00001).contains(&uv.u) || !(-1e-5..=1.00001).contains(&uv.v))
+        {
+            return Err(format!(
+                "Atlas remapping placed UV polygon {triangle_index} outside its sheet (material {})",
+                source_triangle.material
+            ));
+        }
         let signed_area = |uv: [V2; 3]| {
             let ab_u = uv[1].u as f64 - uv[0].u as f64;
             let ab_v = uv[1].v as f64 - uv[0].v as f64;
@@ -1589,21 +2058,24 @@ fn build_lod_bounds_collision(
 
 fn generate_lod(request: LodGenerationRequest) -> Result<LodGenerationResult, String> {
     let mut request = request;
-    let base_stem = request.output_stem.clone();
-    for suffix in 1usize.. {
-        let tail = if suffix == 1 {
-            String::new()
-        } else {
-            format!("_{suffix}")
-        };
-        let keep = (IMG_RUNTIME_SAFE_ENTRY_NAME_BYTES - ".dff".len()).saturating_sub(tail.len());
-        let candidate = format!("{}{}", &base_stem[..base_stem.len().min(keep)], tail);
-        if !request.reserved_stems.contains(&lower(&candidate))
-            && find_dff_entry(&request.project_root, &candidate).is_none()
-            && replacement_img_entry(&request.wip_root, &format!("{candidate}.dff")).is_none()
-        {
-            request.output_stem = candidate;
-            break;
+    if !request.stem_preallocated {
+        let base_stem = request.output_stem.clone();
+        for suffix in 1usize.. {
+            let tail = if suffix == 1 {
+                String::new()
+            } else {
+                format!("_{suffix}")
+            };
+            let keep =
+                (IMG_RUNTIME_SAFE_ENTRY_NAME_BYTES - ".dff".len()).saturating_sub(tail.len());
+            let candidate = format!("{}{}", &base_stem[..base_stem.len().min(keep)], tail);
+            if !request.reserved_stems.contains(&lower(&candidate))
+                && find_dff_entry(&request.project_root, &candidate).is_none()
+                && replacement_img_entry(&request.wip_root, &format!("{candidate}.dff")).is_none()
+            {
+                request.output_stem = candidate;
+                break;
+            }
         }
     }
     let source = read_mesh_source(request.mesh_source)?;
@@ -1614,10 +2086,6 @@ fn generate_lod(request: LodGenerationRequest) -> Result<LodGenerationResult, St
     let mut texture_count = 0usize;
     let mut atlased = false;
     let mut txd_bytes = None;
-    let txd_name = request
-        .txd_source
-        .as_ref()
-        .map(|_| format!("{}.txd", request.output_stem));
     if let (Some(txd_source), Some(source_txd_name)) =
         (request.txd_source, request.source_txd_name.as_deref())
     {
@@ -1637,16 +2105,14 @@ fn generate_lod(request: LodGenerationRequest) -> Result<LodGenerationResult, St
             textures.retain(|texture| base_textures.contains(&lower(&texture.name)));
             if !atlas_is_possible(&raw, &textures) {
                 return Err(
-                    "The referenced LOD textures could not be combined into one atlas because the mesh has missing UVs or unresolved material textures"
+                    "The referenced LOD textures could not be combined into atlases because the mesh has missing UVs or unresolved material textures"
                         .to_string(),
                 );
             }
-            let atlas_name = sanitize_texture_name(&format!("{}_atlas", request.output_stem));
-            let atlas = remap_raw_for_atlas(&mut raw, &textures, &atlas_name)?;
-            textures = vec![atlas];
+            let generated = remap_raw_for_atlases(&mut raw, &textures)?;
             atlased = true;
-            texture_count = textures.len();
-            txd_bytes = Some(build_texture_txd(&textures, atlased)?);
+            texture_count = generated.textures.len();
+            txd_bytes = Some(build_texture_txd(&generated.textures, &generated.tiled)?);
         }
     }
     let dff_name = format!("{}.dff", request.output_stem);
@@ -1657,25 +2123,18 @@ fn generate_lod(request: LodGenerationRequest) -> Result<LodGenerationResult, St
     if let Some(bytes) = txd_bytes.as_deref() {
         let contents = parse_txd_texture_contents(bytes)
             .map_err(|reason| format!("Generated LOD TXD failed final validation: {reason}"))?;
-        if contents.len() != 1
-            || contents[0].width as u32 > LOD_MAX_ATLAS_DIMENSION
-            || contents[0].height as u32 > LOD_MAX_ATLAS_DIMENSION
+        if contents.len() != texture_count
+            || contents.iter().any(|texture| {
+                texture.width as u32 > LOD_MAX_ATLAS_DIMENSION
+                    || texture.height as u32 > LOD_MAX_ATLAS_DIMENSION
+            })
         {
-            return Err(
-                "Generated LOD TXD did not contain exactly one atlas within 256x256".to_string(),
-            );
+            return Err(format!(
+                "Generated LOD TXD did not round-trip {texture_count} texture(s) of at most {LOD_MAX_ATLAS_DIMENSION}x{LOD_MAX_ATLAS_DIMENSION}"
+            ));
         }
     }
     let (col_name, col_bytes, col_mesh) = build_lod_bounds_collision(&raw, &request.output_stem)?;
-    let mut replacements = vec![
-        (dff_name.clone(), dff_bytes.clone()),
-        (col_name.clone(), col_bytes.clone()),
-    ];
-    if let (Some(name), Some(bytes)) = (&txd_name, &txd_bytes) {
-        replacements.push((name.clone(), bytes.clone()));
-    }
-    upsert_replacement_assets(&request.wip_root, &replacements)
-        .map_err(|error| format!("Could not stage generated LOD assets: {error}"))?;
     Ok(LodGenerationResult {
         stem: request.output_stem,
         dff_name,
@@ -1683,7 +2142,7 @@ fn generate_lod(request: LodGenerationRequest) -> Result<LodGenerationResult, St
         col_name,
         col_bytes,
         col_mesh,
-        txd_name: txd_bytes.as_ref().and(txd_name),
+        txd_name: txd_bytes.as_ref().map(|_| WORLD_LOD_TXD_NAME.to_string()),
         txd_bytes,
         output_triangles: raw.triangles.len(),
         output_vertices: raw.vertices.len(),
@@ -1704,7 +2163,7 @@ fn generate_lod(request: LodGenerationRequest) -> Result<LodGenerationResult, St
     })
 }
 
-fn writer_is_busy(app: &AppState) -> bool {
+pub(crate) fn writer_is_busy(app: &AppState) -> bool {
     app.manual_save_job.is_some()
         || app.editing.save_rx.is_some()
         || app.lod_generation_job.is_some()
@@ -1754,19 +2213,56 @@ fn reserved_lod_stems(app: &AppState) -> BTreeSet<String> {
     stems
 }
 
-fn dff_source_for_app(app: &AppState, dff_name: &str) -> Option<LodMeshSource> {
+fn indexed_lod_sources(app: &AppState) -> (BTreeMap<String, ImgEntry>, BTreeMap<String, ImgEntry>) {
+    let mut dffs = collect_resource_dff_entries(&app.root);
+    let mut txds = collect_resource_txd_entries(&app.root);
+    for path in gta_sa_img_files(&app.gta_sa_dir) {
+        for entry in parse_img(&path) {
+            let name = lower(&entry.name);
+            if name.ends_with(".dff") {
+                dffs.entry(asset_key(&name, ".dff")).or_insert(entry);
+            } else if name.ends_with(".txd") {
+                txds.entry(asset_key(&name, ".txd")).or_insert(entry);
+            }
+        }
+    }
+    (dffs, txds)
+}
+
+fn dff_source_from_index(
+    app: &AppState,
+    dff_name: &str,
+    entries: &BTreeMap<String, ImgEntry>,
+) -> Option<LodMeshSource> {
     let key = asset_key(dff_name, ".dff");
     app.editing
         .modified_entries
         .get(&key)
-        .cloned()
-        .map(LodMeshSource::Bytes)
+        .map(|bytes| LodMeshSource::Bytes(Arc::new(bytes.clone())))
         .or_else(|| {
             app.pending_replacement_assets
                 .get(&key)
-                .map(|(_, bytes)| LodMeshSource::Bytes(bytes.clone()))
+                .map(|(_, bytes)| LodMeshSource::Bytes(Arc::new(bytes.clone())))
         })
-        .or_else(|| find_dff_entry_for_app(app, &key).map(LodMeshSource::Entry))
+        .or_else(|| entries.get(&key).cloned().map(LodMeshSource::Entry))
+}
+
+fn txd_source_from_index(
+    app: &AppState,
+    txd_name: &str,
+    entries: &BTreeMap<String, ImgEntry>,
+) -> Option<LodTxdSource> {
+    let key = asset_key(txd_name, ".txd");
+    app.editing
+        .modified_entries
+        .get(&key)
+        .map(|bytes| LodTxdSource::Bytes(Arc::new(bytes.clone())))
+        .or_else(|| {
+            app.pending_replacement_assets
+                .get(&key)
+                .map(|(_, bytes)| LodTxdSource::Bytes(Arc::new(bytes.clone())))
+        })
+        .or_else(|| entries.get(&key).cloned().map(LodTxdSource::Entry))
 }
 
 fn txd_source_for_app(app: &AppState, txd_name: &str) -> Option<LodTxdSource> {
@@ -1775,21 +2271,20 @@ fn txd_source_for_app(app: &AppState, txd_name: &str) -> Option<LodTxdSource> {
         .modified_entries
         .get(&key)
         .cloned()
-        .map(LodTxdSource::Bytes)
+        .map(|bytes| LodTxdSource::Bytes(Arc::new(bytes)))
         .or_else(|| {
             app.pending_replacement_assets
                 .get(&key)
-                .map(|(_, bytes)| LodTxdSource::Bytes(bytes.clone()))
+                .map(|(_, bytes)| LodTxdSource::Bytes(Arc::new(bytes.clone())))
         })
         .or_else(|| find_txd_entry_for_app(app, &key).map(LodTxdSource::Entry))
 }
 
-fn spawn_lod_worker(
-    request: LodGenerationRequest,
-) -> mpsc::Receiver<Result<LodGenerationResult, String>> {
+fn spawn_lod_worker(order: usize, request: LodGenerationRequest) -> LodGenerationWorker {
     let (tx, rx) = mpsc::channel();
+    let source_name = request.source_dff_name.clone();
+    let worker_source_name = source_name.clone();
     thread::spawn(move || {
-        let source_name = request.source_dff_name.clone();
         let result = std::panic::catch_unwind(|| generate_lod(request))
             .map_err(|panic| {
                 panic
@@ -1802,12 +2297,62 @@ fn spawn_lod_worker(
             .map_err(|error| format!("{source_name}: {error}"));
         let _ = tx.send(result);
     });
-    rx
+    LodGenerationWorker {
+        order,
+        source_name: worker_source_name,
+        rx,
+    }
+}
+
+fn reserve_batch_lod_stems(requests: &mut [LodGenerationRequest]) {
+    let verify_filesystem = requests.len() == 1;
+    let mut occupied = requests
+        .first()
+        .map(|request| (*request.reserved_stems).clone())
+        .unwrap_or_default();
+    let mut next_suffix = HashMap::<String, usize>::new();
+    for request in requests {
+        let base_stem = request.output_stem.clone();
+        let suffix = next_suffix.entry(lower(&base_stem)).or_insert(1);
+        loop {
+            let tail = if *suffix == 1 {
+                String::new()
+            } else {
+                format!("_{}", *suffix)
+            };
+            let keep =
+                (IMG_RUNTIME_SAFE_ENTRY_NAME_BYTES - ".dff".len()).saturating_sub(tail.len());
+            let candidate = format!("{}{}", &base_stem[..base_stem.len().min(keep)], tail);
+            *suffix += 1;
+            let available = !occupied.contains(&lower(&candidate))
+                && (!verify_filesystem
+                    || (find_dff_entry(&request.project_root, &candidate).is_none()
+                        && replacement_img_entry(&request.wip_root, &format!("{candidate}.dff"))
+                            .is_none()));
+            if available {
+                request.output_stem = candidate.clone();
+                request.stem_preallocated = true;
+                occupied.insert(lower(&candidate));
+                break;
+            }
+        }
+    }
+}
+
+fn fill_lod_worker_slots(job: &mut LodGenerationJob) {
+    while job.workers.len() + job.ready.len() + usize::from(job.result.is_some())
+        < LOD_GENERATION_MAX_WORKERS
+    {
+        let Some((order, request)) = job.pending.pop_front() else {
+            break;
+        };
+        job.workers.push(spawn_lod_worker(order, request));
+    }
 }
 
 fn start_lod_jobs(
     app: &mut AppState,
-    requests: Vec<LodGenerationRequest>,
+    mut requests: Vec<LodGenerationRequest>,
     skipped: Vec<String>,
     failures: Vec<String>,
     total: usize,
@@ -1816,8 +2361,7 @@ fn start_lod_jobs(
     let queued = requests.len();
     let skipped_count = skipped.len();
     let failed_count = failures.len();
-    let mut pending = std::collections::VecDeque::from(requests);
-    let Some(request) = pending.pop_front() else {
+    if requests.is_empty() {
         app.status_message = if !skipped.is_empty() && failures.is_empty() {
             format!(
                 "Skipped {} selected element{} because {} already {} an LOD.",
@@ -1837,14 +2381,20 @@ fn start_lod_jobs(
             )
         };
         return;
-    };
-    app.lod_generation_job = Some(LodGenerationJob {
-        rx: spawn_lod_worker(request),
+    }
+    reserve_batch_lod_stems(&mut requests);
+    let request_count = requests.len();
+    let pending = requests.into_iter().enumerate().collect();
+    let mut job = LodGenerationJob {
+        workers: Vec::new(),
         started_at: Instant::now(),
         result: None,
         apply_phase: 0,
         attached: false,
         pending,
+        ready: BTreeMap::new(),
+        next_apply_order: 0,
+        request_count,
         total,
         processed: failures.len() + skipped.len(),
         successes: 0,
@@ -1855,10 +2405,14 @@ fn start_lod_jobs(
         output_triangles: 0,
         history_before,
         history_artifacts: Vec::new(),
-    });
+        history_txd_before: BTreeMap::new(),
+    };
+    fill_lod_worker_slots(&mut job);
+    let active = job.workers.len();
+    app.lod_generation_job = Some(job);
     app.status_message = if total > 1 {
         format!(
-            "Generating LODs for {queued} of {total} selected elements in background; {skipped_count} already had LODs and {failed_count} could not be prepared."
+            "Generating LODs for {queued} of {total} elements with {active} parallel worker(s); {skipped_count} already had LODs and {failed_count} could not be prepared."
         )
     } else {
         "Generating simplified DFF and texture atlas in background...".to_string()
@@ -1895,15 +2449,36 @@ fn existing_lod_for_placement<'a>(
         .then_some(parent)
 }
 
+fn live_placement_ids(placements: &[Placement], states: &[ElementState]) -> HashSet<String> {
+    placements
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !states.get(*index).is_some_and(|state| state.deleted))
+        .map(|(_, placement)| lower(&placement.id))
+        .collect()
+}
+
+fn existing_lod_with_live_ids<'a>(
+    placements: &'a [Placement],
+    index: usize,
+    live_ids: &HashSet<String>,
+) -> Option<&'a str> {
+    let parent = placements.get(index)?.attrs.get("lodParent")?.trim();
+    (!parent.is_empty()
+        && (parent.eq_ignore_ascii_case("self") || live_ids.contains(&lower(parent))))
+    .then_some(parent)
+}
+
 fn partition_existing_lod_indices(
     placements: &[Placement],
     states: &[ElementState],
     indices: Vec<usize>,
 ) -> (Vec<usize>, Vec<(usize, String)>) {
+    let live_ids = live_placement_ids(placements, states);
     let mut ready = Vec::new();
     let mut skipped = Vec::new();
     for index in indices {
-        if let Some(parent) = existing_lod_for_placement(placements, states, index) {
+        if let Some(parent) = existing_lod_with_live_ids(placements, index, &live_ids) {
             skipped.push((index, parent.to_string()));
         } else {
             ready.push(index);
@@ -1917,10 +2492,11 @@ fn all_indices_have_existing_lods(
     states: &[ElementState],
     indices: &[usize],
 ) -> bool {
+    let live_ids = live_placement_ids(placements, states);
     !indices.is_empty()
         && indices
             .iter()
-            .all(|index| existing_lod_for_placement(placements, states, *index).is_some())
+            .all(|index| existing_lod_with_live_ids(placements, *index, &live_ids).is_some())
 }
 
 pub(crate) fn selected_models_all_have_lods(app: &AppState) -> bool {
@@ -1991,8 +2567,10 @@ pub(crate) fn lod_batch_minimum_size(dialog: &LodBatchDialog) -> Option<f32> {
 pub(crate) fn lod_batch_candidate_included(
     candidate: &LodBatchCandidate,
     minimum_size: f32,
+    mode: LodBatchMode,
 ) -> bool {
-    candidate.existing_lod.is_none() && candidate.size >= minimum_size
+    candidate.size >= minimum_size
+        && (mode == LodBatchMode::RegenerateScene || candidate.existing_lod.is_none())
 }
 
 pub(crate) fn lod_batch_included_count(dialog: &LodBatchDialog) -> usize {
@@ -2002,12 +2580,17 @@ pub(crate) fn lod_batch_included_count(dialog: &LodBatchDialog) -> usize {
     dialog
         .candidates
         .iter()
-        .filter(|candidate| lod_batch_candidate_included(candidate, minimum_size))
+        .filter(|candidate| lod_batch_candidate_included(candidate, minimum_size, dialog.mode))
         .count()
 }
 
-fn open_lod_batch_dialog(app: &mut AppState, selected_indices: Vec<usize>) {
-    let candidates = selected_indices
+fn default_lod_batch_minimum_size() -> String {
+    format!("{DEFAULT_LOD_BATCH_MINIMUM_SIZE:.0}")
+}
+
+fn open_lod_batch_dialog(app: &mut AppState, indices: Vec<usize>, mode: LodBatchMode) {
+    let live_ids = live_placement_ids(&app.placements, &app.element_states);
+    let candidates = indices
         .into_iter()
         .filter_map(|index| {
             let placement = app.placements.get(index)?;
@@ -2016,24 +2599,55 @@ fn open_lod_batch_dialog(app: &mut AppState, selected_indices: Vec<usize>) {
                 id: placement.id.clone(),
                 dff: placement.dff.clone(),
                 size: placement_lod_size(app, index),
-                existing_lod: existing_lod_for_placement(
-                    &app.placements,
-                    &app.element_states,
-                    index,
-                )
-                .map(ToOwned::to_owned),
+                existing_lod: existing_lod_with_live_ids(&app.placements, index, &live_ids)
+                    .map(ToOwned::to_owned),
             })
         })
         .collect::<Vec<_>>();
+    let minimum_size = default_lod_batch_minimum_size();
     app.lod_batch_dialog = Some(LodBatchDialog {
+        mode,
         candidates,
-        minimum_size: "0".to_string(),
-        cursor: 1,
+        cursor: minimum_size.len(),
+        minimum_size,
         selection_anchor: None,
         scroll: 0.0,
     });
-    app.status_message =
-        "Review the selected elements and set a minimum size for LOD generation.".to_string();
+    app.status_message = match mode {
+        LodBatchMode::GenerateSelection =>
+            "Review the selected elements and set a minimum size for LOD generation.".to_string(),
+        LodBatchMode::GenerateSceneMissing =>
+            "Set the minimum size; blue scene outlines preview elements missing an LOD."
+                .to_string(),
+        LodBatchMode::RegenerateScene =>
+            "Set the minimum size; blue scene outlines preview every element that will receive a regenerated LOD."
+                .to_string(),
+    };
+}
+
+pub(crate) fn request_scene_lod_generation(app: &mut AppState) {
+    if writer_is_busy(app) {
+        app.status_message =
+            "Scene LOD generation cannot start while another asset writer is running.".to_string();
+        return;
+    }
+    let indices = app
+        .placements
+        .iter()
+        .enumerate()
+        .filter(|(index, placement)| {
+            !app.element_states
+                .get(*index)
+                .is_some_and(|state| state.deleted)
+                && !placement_is_app_lod(app, placement)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if indices.is_empty() {
+        app.status_message = "The scene has no live detail elements eligible for LODs.".to_string();
+        return;
+    }
+    open_lod_batch_dialog(app, indices, LodBatchMode::GenerateSceneMissing);
 }
 
 pub(crate) fn continue_lod_batch_dialog(app: &mut AppState) {
@@ -2048,16 +2662,24 @@ pub(crate) fn continue_lod_batch_dialog(app: &mut AppState) {
     let indices = dialog
         .candidates
         .iter()
-        .filter(|candidate| lod_batch_candidate_included(candidate, minimum_size))
+        .filter(|candidate| lod_batch_candidate_included(candidate, minimum_size, dialog.mode))
         .map(|candidate| candidate.placement_index)
         .collect::<Vec<_>>();
     if indices.is_empty() {
-        app.status_message =
-            "No selected elements meet the minimum size and existing-LOD filters.".to_string();
+        app.status_message = if dialog.mode == LodBatchMode::GenerateSelection {
+            "No selected elements meet the minimum size and existing-LOD filters.".to_string()
+        } else {
+            "No scene elements meet the current size and generation-mode filters.".to_string()
+        };
         app.lod_batch_dialog = Some(dialog);
         return;
     }
-    start_selected_element_lod_generation(app, indices);
+    match dialog.mode {
+        LodBatchMode::GenerateSelection | LodBatchMode::GenerateSceneMissing => {
+            start_selected_element_lod_generation(app, indices)
+        }
+        LodBatchMode::RegenerateScene => start_mass_element_lod_regeneration(app, indices),
+    }
 }
 
 pub(crate) fn request_selected_element_lod(app: &mut AppState) {
@@ -2089,7 +2711,7 @@ pub(crate) fn request_selected_element_lod(app: &mut AppState) {
         return;
     }
     if selected_indices.len() > 1 {
-        open_lod_batch_dialog(app, selected_indices);
+        open_lod_batch_dialog(app, selected_indices, LodBatchMode::GenerateSelection);
         return;
     }
     start_selected_element_lod_generation(app, selected_indices);
@@ -2242,15 +2864,30 @@ fn start_selected_element_lod_regeneration(app: &mut AppState, selected_indices:
     start_selected_element_lod_jobs(app, selected_indices, Vec::new(), total, true);
 }
 
+fn start_mass_element_lod_regeneration(app: &mut AppState, indices: Vec<usize>) {
+    let total = indices.len();
+    start_selected_element_lod_jobs(app, indices, Vec::new(), total, true);
+}
+
 fn start_selected_element_lod_jobs(
     app: &mut AppState,
     indices: Vec<usize>,
     existing_lods: Vec<(usize, String)>,
     total: usize,
-    regenerate: bool,
+    replace_existing: bool,
 ) {
-    let reserved_stems = reserved_lod_stems(app);
+    let (dff_entries, txd_entries) = indexed_lod_sources(app);
+    let mut reserved_stems = reserved_lod_stems(app);
+    reserved_stems.extend(dff_entries.keys().filter_map(|name| {
+        Path::new(name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(lower)
+    }));
+    let reserved_stems = Arc::new(reserved_stems);
     let wip_root = wip_root_path(&app.root);
+    let mut mesh_sources = HashMap::<String, LodMeshSource>::new();
+    let mut txd_sources = HashMap::<String, LodTxdSource>::new();
     let mut requests = Vec::with_capacity(total);
     let skipped = existing_lods
         .into_iter()
@@ -2269,31 +2906,35 @@ fn start_selected_element_lod_jobs(
             failures.push(format!("element #{index}: selection no longer exists"));
             continue;
         };
-        let replaced_lod_parent = if regenerate {
+        let replaced_lod_parent = if replace_existing {
             existing_lod_for_placement(&app.placements, &app.element_states, index)
                 .map(ToOwned::to_owned)
         } else {
             None
         };
-        if regenerate && replaced_lod_parent.is_none() {
-            failures.push(format!(
-                "{}: LOD assignment no longer exists",
-                placement.dff
-            ));
-            continue;
-        }
         let replaced_lod_index = replaced_lod_parent
             .as_deref()
             .and_then(|parent| existing_lod_index_for_parent(app, index, parent));
-        let Some(mesh_source) = dff_source_for_app(app, &placement.dff) else {
+        let mesh_key = asset_key(&placement.dff, ".dff");
+        let mesh_source = mesh_sources.get(&mesh_key).cloned().or_else(|| {
+            let source = dff_source_from_index(app, &placement.dff, &dff_entries)?;
+            mesh_sources.insert(mesh_key.clone(), source.clone());
+            Some(source)
+        });
+        let Some(mesh_source) = mesh_source else {
             failures.push(format!("{}: DFF could not be located", placement.dff));
             continue;
         };
         let source_txd_name =
             definition_txd_name(&app.definitions, &placement.id).map(ToOwned::to_owned);
-        let txd_source = source_txd_name
-            .as_deref()
-            .and_then(|name| txd_source_for_app(app, name));
+        let txd_source = source_txd_name.as_deref().and_then(|name| {
+            let key = asset_key(name, ".txd");
+            txd_sources.get(&key).cloned().or_else(|| {
+                let source = txd_source_from_index(app, name, &txd_entries)?;
+                txd_sources.insert(key, source.clone());
+                Some(source)
+            })
+        });
         if source_txd_name.is_some() && txd_source.is_none() {
             failures.push(format!(
                 "{}: TXD {} could not be located",
@@ -2314,8 +2955,9 @@ fn start_selected_element_lod_jobs(
             replaced_lod_parent,
             replaced_lod_index,
             project_root: app.root.clone(),
-            reserved_stems: reserved_stems.clone(),
+            reserved_stems: Arc::clone(&reserved_stems),
             wip_root: wip_root.clone(),
+            stem_preallocated: false,
         });
     }
     start_lod_jobs(app, requests, skipped, failures, total);
@@ -2374,13 +3016,124 @@ pub(crate) fn request_editing_dff_lod(app: &mut AppState) {
         replaced_lod_parent: None,
         replaced_lod_index: None,
         project_root: app.root.clone(),
-        reserved_stems: reserved_lod_stems(app),
+        reserved_stems: Arc::new(reserved_lod_stems(app)),
         wip_root: wip_root_path(&app.root),
+        stem_preallocated: false,
     };
     start_lod_job(app, request);
 }
 
-fn stage_lod_result(app: &mut AppState, result: &LodGenerationResult) {
+fn write_lod_result_to_wip(wip_root: &Path, result: &LodGenerationResult) -> Result<(), String> {
+    let mut replacements = vec![
+        (result.dff_name.clone(), result.dff_bytes.clone()),
+        (result.col_name.clone(), result.col_bytes.clone()),
+    ];
+    if let (Some(name), Some(bytes)) = (&result.txd_name, &result.txd_bytes) {
+        replacements.push((name.clone(), bytes.clone()));
+    }
+    upsert_replacement_assets(wip_root, &replacements)
+        .map_err(|error| format!("Could not stage generated LOD assets: {error}"))
+}
+
+fn empty_lod_txd() -> Vec<u8> {
+    rw_chunk(0x16, rw_chunk(0x01, vec![0, 0, 0, 0]))
+}
+
+fn merge_generated_lod_txd(mut destination: Vec<u8>, generated: &[u8]) -> Result<Vec<u8>, String> {
+    for texture in parse_txd_texture_contents_with_natives(generated)? {
+        // Generated names are content addressed, so a name already in the
+        // dictionary holds these exact pixels. Skipping it keeps a batch of
+        // repeated buildings from rewriting the whole dictionary per LOD.
+        if txd_contains_texture_native(&destination, &lower(&texture.name)) {
+            continue;
+        }
+        destination =
+            replace_or_append_texture_native_in_txd(destination, &texture.native, &texture.name)?;
+    }
+    Ok(destination)
+}
+
+/// Rebuild a dictionary whose header claims more bytes than the asset actually
+/// holds, keeping every texture that is completely present.
+///
+/// Editor builds before the IMG entry-size guard could store a shared LOD
+/// dictionary past the 65,535-sector directory limit, which wrapped the entry
+/// size and handed back a cut-off asset. Salvaging what survived lets the next
+/// generation continue instead of failing on every LOD; the textures that were
+/// cut off come back by regenerating the LODs that referenced them.
+fn repair_truncated_lod_txd(bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.len() < 12 || rd32(&bytes, 0) != 0x16 {
+        return bytes;
+    }
+    let declared = 12usize.saturating_add(rd32(&bytes, 4) as usize);
+    if declared <= bytes.len() {
+        return bytes;
+    }
+    let mut natives = Vec::new();
+    let mut chunk = 12usize;
+    let mut device = [0u8; 2];
+    while chunk + 12 <= bytes.len() {
+        let id = rd32(&bytes, chunk);
+        let end = chunk
+            .saturating_add(12)
+            .saturating_add(rd32(&bytes, chunk + 4) as usize);
+        if end > bytes.len() {
+            break;
+        }
+        match id {
+            0x15 => natives.push(&bytes[chunk..end]),
+            0x01 if end >= chunk + 16 => device.copy_from_slice(&bytes[chunk + 14..chunk + 16]),
+            _ => {}
+        }
+        chunk = end;
+    }
+    let count = u16::try_from(natives.len()).unwrap_or(u16::MAX);
+    let mut body = rw_chunk(0x01, [count.to_le_bytes(), device].concat());
+    for native in natives {
+        body.extend_from_slice(native);
+    }
+    rw_chunk(0x16, body)
+}
+
+/// Pick the shared dictionary this atlas set belongs in, rolling over to the
+/// next one once the current dictionary has no room left for it.
+///
+/// Returns the dictionary name and its current contents, which are empty when
+/// the dictionary does not exist yet.
+fn world_lod_txd_destination(app: &AppState, generated_len: usize) -> (String, Option<Vec<u8>>) {
+    for index in 0.. {
+        let name = world_lod_txd_name(index);
+        let Some(current) = txd_source_for_app(app, &name)
+            .map(read_txd_source)
+            .map(repair_truncated_lod_txd)
+        else {
+            return (name, None);
+        };
+        if current.len().saturating_add(generated_len) <= WORLD_LOD_TXD_MAX_BYTES {
+            return (name, Some(current));
+        }
+    }
+    unreachable!("the dictionary index is unbounded")
+}
+
+fn stage_lod_result(
+    app: &mut AppState,
+    result: &mut LodGenerationResult,
+    touched_txds: &mut BTreeMap<String, (String, Option<Vec<u8>>)>,
+) -> Result<(), String> {
+    if let Some(generated) = result.txd_bytes.take() {
+        let (name, current) = world_lod_txd_destination(app, generated.len());
+        let key = asset_key(&name, ".txd");
+        // Undo restores whatever each touched dictionary held before this
+        // batch, so record that the first time the batch reaches it.
+        touched_txds
+            .entry(key)
+            .or_insert_with(|| (name.clone(), current.clone()));
+        let destination = current.unwrap_or_else(empty_lod_txd);
+        result.txd_bytes = Some(merge_generated_lod_txd(destination, &generated)?);
+        result.txd_name = Some(name);
+    }
+    write_lod_result_to_wip(&wip_root_path(&app.root), result)?;
     app.pending_replacement_assets.insert(
         asset_key(&result.dff_name, ".dff"),
         (result.dff_name.clone(), result.dff_bytes.clone()),
@@ -2396,6 +3149,7 @@ fn stage_lod_result(app: &mut AppState, result: &LodGenerationResult) {
         reindex_staged_txd(app, name);
     }
     app.loaded_wip = true;
+    Ok(())
 }
 
 fn compile_lod_result(app: &mut AppState, result: &LodGenerationResult) {
@@ -2416,16 +3170,28 @@ fn compile_lod_result(app: &mut AppState, result: &LodGenerationResult) {
         let key = mesh_key_from_dff_txd(&result.dff_name, txd_context);
         replace_render_mesh(&mut app.meshes, key, render_mesh);
     }
+    let collision_key = asset_key(&result.col_name, ".col");
+    invalidate_collision_render_cache(app, &collision_key);
     app.collisions
-        .insert(asset_key(&result.col_name, ".col"), result.col_mesh.clone());
+        .insert(collision_key, result.col_mesh.clone());
 }
 
-fn attach_lod_result(app: &mut AppState, result: &LodGenerationResult) -> bool {
+fn attach_lod_result(
+    app: &mut AppState,
+    result: &LodGenerationResult,
+    rebuild_scene: bool,
+) -> bool {
     let mut attached = false;
     if let Some(source_index) = result.attach_to_placement
         && let Some(source) = app.placements.get(source_index).cloned()
         && asset_key(&source.dff, ".dff") == asset_key(&result.source_dff_name, ".dff")
     {
+        let source_is_building = source.tag.eq_ignore_ascii_case("building");
+        let generated_mesh_key =
+            mesh_key_from_dff_txd(&result.dff_name, result.txd_name.as_deref());
+        let generated_bounds = app.meshes.get(&generated_mesh_key).map(|mesh| mesh.bounds);
+        let generated_model_distance =
+            repaired_lod_distance(true, source_is_building, false, generated_bounds);
         let mut definition = result
             .source_definition_id
             .as_ref()
@@ -2448,22 +3214,48 @@ fn attach_lod_result(app: &mut AppState, result: &LodGenerationResult) -> bool {
         definition.attrs.remove("source");
         definition.attrs.remove("__override");
         definition.attrs.remove("__overrideAttrs");
-        definition
-            .attrs
-            .insert("lodDistance".to_string(), "700".to_string());
+        definition.attrs.insert(
+            "lodDistance".to_string(),
+            generated_model_distance.to_string(),
+        );
         definition
             .attrs
             .insert("col".to_string(), result.stem.clone());
         if result.txd_name.is_some() {
-            definition
-                .attrs
-                .insert("txd".to_string(), result.stem.clone());
+            let txd = result
+                .txd_name
+                .as_deref()
+                .unwrap_or(WORLD_LOD_TXD_NAME)
+                .trim_end_matches(".txd");
+            definition.attrs.insert("txd".to_string(), txd.to_string());
         } else if let Some(source_txd) = &result.source_txd_name {
             definition
                 .attrs
                 .insert("txd".to_string(), source_txd.clone());
         }
         app.definitions.insert(result.stem.clone(), definition);
+
+        // Calculate both sides with the same role-aware helper as Repair LODs.
+        let source_detail_distance = repaired_lod_distance(
+            false,
+            source_is_building,
+            true,
+            element_mesh(app, &source).map(|mesh| mesh.bounds),
+        );
+        let source_definition_id = result
+            .source_definition_id
+            .as_deref()
+            .unwrap_or(source.id.as_str());
+        if app.readonly_definition_ids.contains(source_definition_id) {
+            make_definition_override_writable(app, source_definition_id, source.zone.clone());
+        }
+        if let Some(source_definition) = app.definitions.get_mut(source_definition_id) {
+            source_definition.attrs.insert(
+                "lodDistance".to_string(),
+                source_detail_distance.to_string(),
+            );
+            mark_definition_override_attr(source_definition, "lodDistance");
+        }
 
         let mut lod = source.clone();
         lod.id = result.stem.clone();
@@ -2492,8 +3284,10 @@ fn attach_lod_result(app: &mut AppState, result: &LodGenerationResult) -> bool {
         app.lod_ids.insert(lower(&result.stem));
         attached = true;
         invalidate_outliner_labels(app);
-        rebuild_outliner_filter(app);
-        rebuild_render_cells(app);
+        if rebuild_scene {
+            rebuild_outliner_filter(app);
+            rebuild_render_cells(app);
+        }
     }
     invalidate_validation_cache(app);
     attached
@@ -2503,7 +3297,7 @@ fn lod_history_artifact(
     app: &AppState,
     result: &LodGenerationResult,
 ) -> LodGenerationHistoryArtifact {
-    let mut assets = vec![
+    let assets = vec![
         (
             asset_key(&result.dff_name, ".dff"),
             result.dff_name.clone(),
@@ -2515,13 +3309,9 @@ fn lod_history_artifact(
             result.col_bytes.clone(),
         ),
     ];
-    if let (Some(name), Some(bytes)) = (&result.txd_name, &result.txd_bytes) {
-        assets.push((asset_key(name, ".txd"), name.clone(), bytes.clone()));
-    }
     let mesh_key = mesh_key_from_dff_txd(&result.dff_name, result.txd_name.as_deref());
     LodGenerationHistoryArtifact {
         assets,
-        txd_name: result.txd_name.clone(),
         mesh: app.meshes.get(&mesh_key).cloned(),
         mesh_key,
         collision_key: asset_key(&result.col_name, ".col"),
@@ -2540,7 +3330,11 @@ fn finish_lod_result(
     } else if result.texture_count == 0 {
         "no texture TXD was needed".to_string()
     } else if result.atlased {
-        "combined all materials into one 256x256 texture atlas".to_string()
+        format!(
+            "packed materials into {} texture{} (opaque and alpha separated; tiled materials kept standalone)",
+            result.texture_count,
+            if result.texture_count == 1 { "" } else { "s" },
+        )
     } else {
         format!(
             "wrote {} lower-resolution texture{}",
@@ -2573,28 +3367,62 @@ fn finish_lod_result(
     );
 }
 
-fn begin_next_lod_in_batch(app: &mut AppState, job: &mut LodGenerationJob) -> bool {
-    let Some(request) = job.pending.pop_front() else {
-        return false;
-    };
-    job.rx = spawn_lod_worker(request);
-    job.result = None;
-    job.apply_phase = 0;
-    job.attached = false;
-    app.status_message = format!(
-        "Generating LOD {} of {} in background...",
-        (job.processed + 1).min(job.total),
-        job.total
-    );
-    true
+fn poll_lod_workers(job: &mut LodGenerationJob) {
+    let mut index = 0usize;
+    while index < job.workers.len() {
+        let outcome = match job.workers[index].rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err(format!(
+                "{}: LOD generation worker disconnected unexpectedly",
+                job.workers[index].source_name
+            ))),
+        };
+        let Some(outcome) = outcome else {
+            index += 1;
+            continue;
+        };
+        let worker = job.workers.swap_remove(index);
+        job.ready.insert(worker.order, outcome);
+    }
+    fill_lod_worker_slots(job);
+}
+
+fn select_next_lod_result(job: &mut LodGenerationJob) {
+    while job.result.is_none() {
+        let Some(outcome) = job.ready.remove(&job.next_apply_order) else {
+            break;
+        };
+        job.next_apply_order += 1;
+        match outcome {
+            Ok(result) => job.result = Some(result),
+            Err(error) => {
+                job.failures.push(error);
+                job.processed += 1;
+            }
+        }
+    }
+}
+
+fn lod_job_has_no_more_results(job: &LodGenerationJob) -> bool {
+    job.result.is_none()
+        && job.next_apply_order >= job.request_count
+        && job.pending.is_empty()
+        && job.workers.is_empty()
+        && job.ready.is_empty()
 }
 
 fn finish_lod_batch(app: &mut AppState, job: &mut LodGenerationJob) {
+    if job.attached_count > 0 {
+        rebuild_outliner_filter(app);
+        rebuild_render_cells(app);
+    }
     if !job.history_artifacts.is_empty() {
         commit_lod_generation_history(
             app,
             job.history_before.clone(),
             mem::take(&mut job.history_artifacts),
+            mem::take(&mut job.history_txd_before),
         );
     }
     let elapsed = job.started_at.elapsed().as_secs_f32();
@@ -2641,39 +3469,51 @@ pub(crate) fn update_lod_generation_job(app: &mut AppState) {
     let Some(mut job) = app.lod_generation_job.take() else {
         return;
     };
+    poll_lod_workers(&mut job);
     if job.result.is_none() {
-        match job.rx.try_recv() {
-            Ok(Ok(result)) => {
-                job.result = Some(result);
-                app.status_message =
-                    "LOD generated; installing staged assets across frames...".to_string();
-                app.lod_generation_job = Some(job);
-            }
-            Ok(Err(error)) => {
-                job.failures.push(error);
-                job.processed += 1;
-                if begin_next_lod_in_batch(app, &mut job) {
-                    app.lod_generation_job = Some(job);
-                } else {
-                    finish_lod_batch(app, &mut job);
-                }
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                app.lod_generation_job = Some(job);
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                app.status_message = "LOD generation worker disconnected unexpectedly.".to_string();
-            }
+        select_next_lod_result(&mut job);
+        if lod_job_has_no_more_results(&job) {
+            finish_lod_batch(app, &mut job);
+            return;
         }
+        if job.result.is_some() {
+            app.status_message = format!(
+                "LOD {} of {} generated; installing assets while {} worker(s) continue...",
+                (job.processed + 1).min(job.total),
+                job.total,
+                job.workers.len()
+            );
+        } else {
+            app.status_message = format!(
+                "Generating LODs in parallel: {} active, {} completed of {}...",
+                job.workers.len(),
+                job.processed,
+                job.total
+            );
+        }
+        app.lod_generation_job = Some(job);
         return;
     }
-    let result = job
-        .result
-        .as_ref()
-        .expect("LOD result exists while applying");
     match job.apply_phase {
         0 => {
-            stage_lod_result(app, result);
+            let result = job
+                .result
+                .as_mut()
+                .expect("LOD result exists while applying");
+            if let Err(error) = stage_lod_result(app, result, &mut job.history_txd_before) {
+                job.failures
+                    .push(format!("{}: {error}", result.source_dff_name));
+                job.processed += 1;
+                job.result = None;
+                job.apply_phase = 0;
+                job.attached = false;
+                if lod_job_has_no_more_results(&job) {
+                    finish_lod_batch(app, &mut job);
+                } else {
+                    app.lod_generation_job = Some(job);
+                }
+                return;
+            }
             app.status_message = format!(
                 "LOD {} of {} generated; indexed texture atlas...",
                 (job.processed + 1).min(job.total),
@@ -2683,6 +3523,10 @@ pub(crate) fn update_lod_generation_job(app: &mut AppState) {
             app.lod_generation_job = Some(job);
         }
         1 => {
+            let result = job
+                .result
+                .as_ref()
+                .expect("LOD result exists while applying");
             compile_lod_result(app, result);
             app.status_message = format!(
                 "LOD {} of {} generated; refreshed preview mesh...",
@@ -2693,11 +3537,19 @@ pub(crate) fn update_lod_generation_job(app: &mut AppState) {
             app.lod_generation_job = Some(job);
         }
         2 => {
-            job.attached = attach_lod_result(app, result);
+            let result = job
+                .result
+                .as_ref()
+                .expect("LOD result exists while applying");
+            job.attached = attach_lod_result(app, result, job.total == 1);
             job.apply_phase = 3;
             app.lod_generation_job = Some(job);
         }
         _ => {
+            let result = job
+                .result
+                .as_ref()
+                .expect("LOD result exists while applying");
             job.successes += 1;
             job.processed += 1;
             job.attached_count += usize::from(job.attached);
@@ -2710,6 +3562,7 @@ pub(crate) fn update_lod_generation_job(app: &mut AppState) {
                     app,
                     job.history_before.clone(),
                     mem::take(&mut job.history_artifacts),
+                    mem::take(&mut job.history_txd_before),
                 );
                 finish_lod_result(
                     app,
@@ -2719,10 +3572,14 @@ pub(crate) fn update_lod_generation_job(app: &mut AppState) {
                 );
                 return;
             }
-            if begin_next_lod_in_batch(app, &mut job) {
-                app.lod_generation_job = Some(job);
-            } else {
+            job.result = None;
+            job.apply_phase = 0;
+            job.attached = false;
+            select_next_lod_result(&mut job);
+            if lod_job_has_no_more_results(&job) {
                 finish_lod_batch(app, &mut job);
+            } else {
+                app.lod_generation_job = Some(job);
             }
         }
     }
@@ -2761,8 +3618,8 @@ mod tests {
         let txd_bytes = read_txd_entry_bytes(&txd_entry);
         let textures = decode_lod_textures(&lod, "man_grnds_kb.txd", &txd_bytes).unwrap();
         eprintln!("decoded {} textures", textures.len());
-        let atlas = remap_raw_for_atlas(&mut lod, &textures, "lod_man_grnd2_atlas").unwrap();
-        eprintln!("atlas: {}x{}", atlas.width, atlas.height);
+        let atlases = remap_raw_for_atlases(&mut lod, &textures).unwrap().textures;
+        eprintln!("generated {} atlas/atlases", atlases.len());
         let dff = write_normalized_dff(&lod, "lod_man_grnd2").unwrap();
         validate_lod_candidate(&lod, &parse_dff_mesh(&dff)).unwrap();
 
@@ -2788,8 +3645,9 @@ mod tests {
             replaced_lod_parent: None,
             replaced_lod_index: None,
             project_root: root,
-            reserved_stems: BTreeSet::new(),
+            reserved_stems: Arc::new(BTreeSet::new()),
             wip_root: staging_root.clone(),
+            stem_preallocated: false,
         })
         .unwrap();
         assert!(result.atlased);
@@ -2946,18 +3804,38 @@ mod tests {
             existing_lod: existing_lod.map(ToOwned::to_owned),
         };
 
-        assert!(!lod_batch_candidate_included(&candidate(9.99, None), 10.0));
-        assert!(lod_batch_candidate_included(&candidate(10.0, None), 10.0));
-        assert!(lod_batch_candidate_included(&candidate(12.0, None), 10.0));
+        let selection = LodBatchMode::GenerateSelection;
+        assert!(!lod_batch_candidate_included(
+            &candidate(9.99, None),
+            10.0,
+            selection
+        ));
+        assert!(lod_batch_candidate_included(
+            &candidate(10.0, None),
+            10.0,
+            selection
+        ));
+        assert!(lod_batch_candidate_included(
+            &candidate(12.0, None),
+            10.0,
+            selection
+        ));
         assert!(!lod_batch_candidate_included(
             &candidate(12.0, Some("lod_detail")),
-            10.0
+            10.0,
+            selection
+        ));
+        assert!(lod_batch_candidate_included(
+            &candidate(12.0, Some("lod_detail")),
+            10.0,
+            LodBatchMode::RegenerateScene
         ));
     }
 
     #[test]
     fn batch_minimum_size_rejects_invalid_or_negative_values() {
         let dialog = |minimum_size: &str| LodBatchDialog {
+            mode: LodBatchMode::GenerateSelection,
             candidates: Vec::new(),
             minimum_size: minimum_size.to_string(),
             cursor: minimum_size.len(),
@@ -2969,6 +3847,22 @@ mod tests {
         assert_eq!(lod_batch_minimum_size(&dialog("25.5")), Some(25.5));
         assert_eq!(lod_batch_minimum_size(&dialog("-1")), None);
         assert_eq!(lod_batch_minimum_size(&dialog("not a number")), None);
+    }
+
+    #[test]
+    fn lod_batch_defaults_to_100_units() {
+        let minimum_size = default_lod_batch_minimum_size();
+        assert_eq!(minimum_size, "100");
+
+        let dialog = LodBatchDialog {
+            mode: LodBatchMode::GenerateSelection,
+            candidates: Vec::new(),
+            cursor: minimum_size.len(),
+            minimum_size,
+            selection_anchor: None,
+            scroll: 0.0,
+        };
+        assert_eq!(lod_batch_minimum_size(&dialog), Some(100.0));
     }
 
     fn grid_mesh(size: usize) -> RawMesh {
@@ -3056,6 +3950,242 @@ mod tests {
         assert_eq!(lod.uvs.len(), lod.vertices.len());
         assert_same_bounds(&source, &lod);
         validate_lod_candidate(&source, &lod).unwrap();
+    }
+
+    fn winding_road_mesh() -> RawMesh {
+        let center_and_width = [
+            (0.0f32, 5.0f32),
+            (0.0, 5.0),
+            (1.0, 5.5),
+            (3.0, 6.0),
+            (6.0, 5.0),
+            (8.0, 4.0),
+            (9.0, 4.5),
+            (9.0, 5.0),
+            (8.0, 5.0),
+        ];
+        let mut raw = RawMesh::default();
+        for (column, (center, width)) in center_and_width.into_iter().enumerate() {
+            for across in [-1.0f32, 0.0, 1.0] {
+                raw.vertices.push(V3 {
+                    x: column as f32 * 12.0,
+                    y: center + width * across,
+                    z: (column as f32 * 0.15).sin(),
+                });
+                raw.uvs.push(V2 {
+                    u: column as f32,
+                    v: (across + 1.0) * 0.5,
+                });
+            }
+        }
+        for column in 0..center_and_width.len() - 1 {
+            for across in 0..2u32 {
+                let a = column as u32 * 3 + across;
+                let b = a + 1;
+                let c = a + 3;
+                let d = c + 1;
+                raw.triangles.push(Tri {
+                    a,
+                    b,
+                    c: d,
+                    material: 0,
+                });
+                raw.triangles.push(Tri {
+                    a,
+                    b: d,
+                    c,
+                    material: 0,
+                });
+            }
+        }
+        raw.material_textures.push("road".to_string());
+        raw
+    }
+
+    #[test]
+    fn open_road_lod_preserves_every_outline_bend_and_taper() {
+        let source = winding_road_mesh();
+        let source_boundary = lod_open_boundary_positions(&source);
+        assert!(source_boundary.len() > 4);
+
+        let lod = simplify_lod_mesh(&source).unwrap();
+        let lod_positions = lod
+            .vertices
+            .iter()
+            .copied()
+            .map(lod_position_key)
+            .collect::<BTreeSet<_>>();
+
+        assert!(
+            source_boundary.is_subset(&lod_positions),
+            "LOD dropped a road outline vertex and can bridge across its shape"
+        );
+        validate_lod_candidate(&source, &lod).unwrap();
+    }
+
+    #[test]
+    fn lod_validation_rejects_filling_a_concave_outline() {
+        let mut source = RawMesh::default();
+        for y in 0..=2 {
+            for x in 0..=2 {
+                source.vertices.push(V3 {
+                    x: x as f32,
+                    y: y as f32,
+                    z: 0.0,
+                });
+            }
+        }
+        let add_cell = |raw: &mut RawMesh, x: u32, y: u32| {
+            let a = y * 3 + x;
+            let b = a + 1;
+            let c = a + 3;
+            let d = c + 1;
+            raw.triangles.push(Tri {
+                a,
+                b,
+                c: d,
+                material: 0,
+            });
+            raw.triangles.push(Tri {
+                a,
+                b: d,
+                c,
+                material: 0,
+            });
+        };
+        add_cell(&mut source, 0, 0);
+        add_cell(&mut source, 1, 0);
+        add_cell(&mut source, 0, 1);
+
+        let mut filled = source.clone();
+        add_cell(&mut filled, 1, 1);
+        let error = validate_lod_candidate(&source, &filled).unwrap_err();
+        assert!(error.contains("outside the source shape"), "{error}");
+    }
+
+    /// Two axis-aligned quads in the z=0 plane, as one mesh.
+    fn two_quad_mesh(second_origin: (f32, f32), second_size: f32) -> RawMesh {
+        let mut raw = RawMesh::default();
+        for (origin, size) in [((0.0, 0.0), 40.0), (second_origin, second_size)] {
+            let base = raw.vertices.len() as u32;
+            for (x, y) in [(0.0, 0.0), (size, 0.0), (0.0, size), (size, size)] {
+                raw.vertices.push(V3 {
+                    x: origin.0 + x,
+                    y: origin.1 + y,
+                    z: 0.0,
+                });
+                raw.uvs.push(V2 {
+                    u: x / size,
+                    v: y / size,
+                });
+            }
+            raw.triangles.push(Tri {
+                a: base,
+                b: base + 1,
+                c: base + 3,
+                material: 0,
+            });
+            raw.triangles.push(Tri {
+                a: base,
+                b: base + 3,
+                c: base + 2,
+                material: 0,
+            });
+        }
+        raw.material_textures.push(String::new());
+        raw
+    }
+
+    #[test]
+    fn pieces_that_only_touch_at_a_corner_count_separately() {
+        // The small quad's corner sits exactly on the big quad's corner.
+        let touching = two_quad_mesh((40.0, 40.0), 1.0);
+
+        // Welding by position sees one piece, which is why simplification
+        // nudging that shared corner used to read as the mesh being torn.
+        assert_eq!(lod_geometry_component_count(&touching), 1);
+        assert_eq!(lod_connected_pieces(&touching).len(), 2);
+
+        let apart = two_quad_mesh((41.0, 41.0), 1.0);
+        assert_eq!(lod_connected_pieces(&apart).len(), 2);
+    }
+
+    #[test]
+    fn a_shed_sliver_is_tolerated_but_a_shredded_mesh_is_not() {
+        // A run of unit quads sharing their vertical edges, so dropping one
+        // quad breaks the run in two exactly the way a collapse can.
+        const QUADS: u32 = 1000;
+        let mut source = RawMesh::default();
+        for column in 0..=QUADS {
+            for row in [0.0f32, 1.0] {
+                source.vertices.push(V3 {
+                    x: column as f32,
+                    y: row,
+                    z: 0.0,
+                });
+                source.uvs.push(V2 { u: 0.0, v: row });
+            }
+        }
+        for column in 0..QUADS {
+            let base = column * 2;
+            source.triangles.push(Tri {
+                a: base,
+                b: base + 1,
+                c: base + 3,
+                material: 0,
+            });
+            source.triangles.push(Tri {
+                a: base,
+                b: base + 3,
+                c: base + 2,
+                material: 0,
+            });
+        }
+        source.material_textures.push(String::new());
+        assert_eq!(lod_connected_pieces(&source).len(), 1);
+
+        let without_quad = |quad: u32| {
+            let mut candidate = source.clone();
+            candidate
+                .triangles
+                .drain(quad as usize * 2..quad as usize * 2 + 2);
+            candidate
+        };
+
+        // Losing the second-to-last quad strands the last one: one part in a
+        // thousand, which is a sliver rather than a broken model.
+        let sliver = without_quad(QUADS - 2);
+        assert_eq!(lod_connected_pieces(&sliver).len(), 2);
+        validate_lod_candidate(&source, &sliver).unwrap();
+
+        // Cutting the run down the middle strands half the surface.
+        let shredded = without_quad(QUADS / 2);
+        assert_eq!(lod_connected_pieces(&shredded).len(), 2);
+        let error = validate_lod_candidate(&source, &shredded).unwrap_err();
+        assert!(error.contains("additional disconnected piece"), "{error}");
+    }
+
+    #[test]
+    fn non_manifold_edges_are_budgeted_against_what_the_source_already_had() {
+        // Duplicating a triangle in place makes each of its edges non-manifold.
+        let with_duplicates = |count: usize| {
+            let mut raw = grid_mesh(8);
+            let duplicates = raw.triangles[..count].to_vec();
+            raw.triangles.extend(duplicates);
+            raw
+        };
+        let clean = grid_mesh(8);
+        assert_eq!(lod_edge_topology(&clean).1, 0);
+
+        // A clean source is still held to a clean result.
+        let error = validate_lod_candidate(&clean, &with_duplicates(2)).unwrap_err();
+        assert!(error.contains("non-manifold"), "{error}");
+
+        // A source that already has them may wobble by a few without losing its
+        // LOD entirely.
+        let dirty = with_duplicates(4);
+        assert!(lod_edge_topology(&dirty).1 >= 4);
+        validate_lod_candidate(&dirty, &with_duplicates(5)).unwrap();
     }
 
     #[test]
@@ -3158,8 +4288,13 @@ mod tests {
             .iter()
             .map(|triangle| triangle.material)
             .collect::<Vec<_>>();
-        let atlas = remap_raw_for_atlas(&mut raw, &textures, "lod_atlas").unwrap();
-        assert_eq!((atlas.width, atlas.height), (256, 256));
+        let atlases = remap_raw_for_atlases(&mut raw, &textures).unwrap().textures;
+        assert_eq!(atlases.len(), 1);
+        // Two 4x4 sources need no more than the smallest sheet.
+        assert_eq!(
+            (atlases[0].width, atlases[0].height),
+            (LOD_MIN_ATLAS_DIMENSION, LOD_MIN_ATLAS_DIMENSION)
+        );
         assert_eq!(
             raw.triangles
                 .iter()
@@ -3171,6 +4306,342 @@ mod tests {
             raw.uvs
                 .iter()
                 .all(|uv| (0.0..=1.0).contains(&uv.u) && (0.0..=1.0).contains(&uv.v))
+        );
+    }
+
+    #[test]
+    fn heavily_tiled_materials_stay_out_of_the_atlas() {
+        assert!(!lod_texture_is_tiled(None));
+        assert!(!lod_texture_is_tiled(Some((0.0, 0.0, 1.0, 1.0))));
+        // A mild repeat is cheap to bake at its real repeat count.
+        assert!(!lod_texture_is_tiled(Some((
+            0.0,
+            0.0,
+            LOD_ATLAS_MAX_BAKED_REPEATS,
+            1.0
+        ))));
+        assert!(lod_texture_is_tiled(Some((0.0, 0.0, 16.0, 1.0))));
+        assert!(lod_texture_is_tiled(Some((0.0, 0.0, 1.0, 9.0))));
+    }
+
+    #[test]
+    fn a_tiled_material_keeps_its_own_texture_and_wrapped_uvs() {
+        let mut raw = grid_mesh(2);
+        raw.material_textures.push("road".to_string());
+        // The first quad's two triangles are the only users of vertex 0.
+        raw.triangles[0].material = 1;
+        raw.triangles[1].material = 1;
+        // Send the tiled material far outside the unit square.
+        raw.uvs[0].u = 12.0;
+        let source_uvs = raw.uvs.clone();
+        let textures = vec![
+            DecodedLodTexture {
+                name: "grid".to_string(),
+                width: 8,
+                height: 8,
+                rgba: vec![255; 8 * 8 * 4],
+            },
+            DecodedLodTexture {
+                name: "road".to_string(),
+                width: 8,
+                height: 8,
+                rgba: vec![128; 8 * 8 * 4],
+            },
+        ];
+
+        let generated = remap_raw_for_atlases(&mut raw, &textures).unwrap();
+
+        // One atlas for the ordinary material, one standalone wrapped texture
+        // for the tiled one.
+        assert_eq!(generated.textures.len(), 2);
+        assert_eq!(generated.tiled.len(), 1);
+        let tiled_name = generated.tiled.iter().next().unwrap().clone();
+        assert_eq!(lower(&raw.material_textures[1]), tiled_name);
+        assert_ne!(lower(&raw.material_textures[0]), tiled_name);
+        // Its UVs must survive untouched, otherwise the tiling gets stretched
+        // across the surface instead of repeating.
+        let tiled_vertices = raw
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.material == 1)
+            .flat_map(|triangle| [triangle.a, triangle.b, triangle.c]);
+        assert!(
+            tiled_vertices
+                .map(|index| raw.uvs[index as usize])
+                .any(|uv| uv.u > 1.0),
+            "a wrapped UV must stay outside the unit square"
+        );
+        assert!(source_uvs.iter().any(|uv| uv.u == 12.0));
+    }
+
+    #[test]
+    fn the_shared_dictionary_stores_one_copy_of_a_repeated_atlas() {
+        let sheet = |name: &str, value: u8| DecodedLodTexture {
+            name: name.to_string(),
+            width: 8,
+            height: 8,
+            rgba: vec![value; 8 * 8 * 4],
+        };
+        // Two LODs of the same building generate the same sheet, so it carries
+        // the same content-addressed name both times.
+        let shared = build_texture_txd(&[sheet("wall_deadbeef", 70)], &BTreeSet::new()).unwrap();
+        let other = build_texture_txd(&[sheet("roof_feedface", 200)], &BTreeSet::new()).unwrap();
+
+        let world_lod = merge_generated_lod_txd(empty_lod_txd(), &shared).unwrap();
+        let after_repeat = merge_generated_lod_txd(world_lod.clone(), &shared).unwrap();
+        assert_eq!(
+            after_repeat, world_lod,
+            "a repeated sheet must not grow the dictionary"
+        );
+
+        let world_lod = merge_generated_lod_txd(after_repeat, &other).unwrap();
+        let contents = parse_txd_texture_contents(&world_lod).unwrap();
+        assert_eq!(
+            contents
+                .iter()
+                .map(|texture| texture.name.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["wall_deadbeef".to_string(), "roof_feedface".to_string()])
+        );
+    }
+
+    #[test]
+    fn identical_generated_textures_share_one_name() {
+        let pixels = |value: u8| vec![value; 32 * 32 * 4];
+
+        let first = lod_texture_content_name("beach_sand", 32, 32, &pixels(64));
+        let same = lod_texture_content_name("beach_sand", 32, 32, &pixels(64));
+        let other_pixels = lod_texture_content_name("beach_sand", 32, 32, &pixels(65));
+        let other_size = lod_texture_content_name("beach_sand", 32, 16, &pixels(64)[..32 * 16 * 4]);
+
+        assert_eq!(first, same, "identical content must produce one name");
+        assert_ne!(first, other_pixels);
+        assert_ne!(first, other_size);
+        assert!(first.starts_with("beach_sand_"), "{first}");
+        assert!(first.len() <= GTA_SA_TEXTURE_NAME_MAX, "{first}");
+        assert_eq!(
+            lod_texture_content_name("a_very_long_source_texture_name", 4, 4, &[0; 64]).len(),
+            GTA_SA_TEXTURE_NAME_MAX
+        );
+    }
+
+    #[test]
+    fn atlas_sheet_shrinks_to_the_crops_it_holds() {
+        let crop = |width: f32, height: f32| LodAtlasCrop {
+            u_min: 0.0,
+            v_min: 0.0,
+            u_span: 1.0,
+            v_span: 1.0,
+            texel_width: width,
+            texel_height: height,
+        };
+
+        let (width, height, placements) = choose_lod_atlas_size(&[crop(64.0, 64.0)], 2).unwrap();
+        // The gutter costs a few texels rather than the next sheet size up.
+        assert_eq!((width, height), (64, 64));
+        assert_eq!(placements[0], (2, 2, 60, 60));
+
+        // A single tall crop gets a tall sheet rather than a square one that
+        // would leave half of its texels unused.
+        let (width, height, _) = choose_lod_atlas_size(&[crop(32.0, 128.0)], 2).unwrap();
+        assert_eq!((width, height), (32, 128));
+
+        // Content that needs the full sheet still gets it.
+        let (width, height, _) = choose_lod_atlas_size(&[crop(500.0, 500.0)], 2).unwrap();
+        assert_eq!((width, height), (512, 512));
+    }
+
+    #[test]
+    fn atlas_packing_keeps_crop_aspect_instead_of_squashing_to_fit() {
+        let crop = LodAtlasCrop {
+            u_min: 0.0,
+            v_min: 0.0,
+            u_span: 1.0,
+            v_span: 1.0,
+            texel_width: 256.0,
+            texel_height: 64.0,
+        };
+
+        assert!(try_pack_lod_atlas_crops(&[crop], 64, 64, 2, 1.0).is_none());
+
+        let (scale, placements) =
+            pack_lod_atlas_crops_at_best_scale(&[crop], 64, 64, 2, 1.0).unwrap();
+        assert!(scale < 1.0);
+        let (_, _, width, height) = placements[0];
+        assert!(
+            (width as f32 / height as f32 - 4.0).abs() < 0.5,
+            "packed cell {width}x{height} must keep the 4:1 source aspect"
+        );
+    }
+
+    #[test]
+    fn a_truncated_shared_dictionary_keeps_the_textures_that_survived() {
+        let texture = |name: &str, value: u8| DecodedLodTexture {
+            name: name.to_string(),
+            width: 4,
+            height: 4,
+            rgba: vec![value; 4 * 4 * 4],
+        };
+        let full = build_texture_txd(
+            &[
+                texture("lod_first_atlas", 32),
+                texture("lod_second_atlas", 96),
+                texture("lod_third_atlas", 160),
+            ],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        // Cut the asset short the way a wrapped IMG entry size does: the header
+        // still advertises the full dictionary.
+        let mut cut = full.clone();
+        cut.truncate(full.len() * 2 / 3);
+        assert!(parse_txd_texture_contents(&cut).is_err());
+
+        let repaired = repair_truncated_lod_txd(cut);
+        let contents = parse_txd_texture_contents(&repaired).unwrap();
+
+        assert!(
+            !contents.is_empty() && contents.len() < 3,
+            "expected a partial but valid dictionary, found {} textures",
+            contents.len()
+        );
+        assert_eq!(contents[0].name, "lod_first_atlas");
+        // A healthy dictionary is returned untouched.
+        assert_eq!(repair_truncated_lod_txd(full.clone()), full);
+        // And the repaired dictionary can take new atlases again.
+        let merged = merge_generated_lod_txd(
+            repaired,
+            &build_texture_txd(&[texture("lod_fourth_atlas", 200)], &BTreeSet::new()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            parse_txd_texture_contents(&merged)
+                .unwrap()
+                .iter()
+                .any(|texture| texture.name == "lod_fourth_atlas")
+        );
+    }
+
+    #[test]
+    fn generated_lod_dictionaries_roll_over_by_name() {
+        assert_eq!(world_lod_txd_name(0), WORLD_LOD_TXD_NAME);
+        assert_eq!(world_lod_txd_name(1), "world_lod_2.txd");
+        assert_eq!(world_lod_txd_name(2), "world_lod_3.txd");
+        for index in [0usize, 1, 9, 99] {
+            assert!(world_lod_txd_name(index).len() <= IMG_RUNTIME_SAFE_ENTRY_NAME_BYTES);
+        }
+    }
+
+    #[test]
+    fn atlas_crop_uses_only_the_referenced_uv_footprint() {
+        let texture = DecodedLodTexture {
+            name: "facade".to_string(),
+            width: 256,
+            height: 128,
+            rgba: vec![255; 256 * 128 * 4],
+        };
+        let crop = lod_atlas_crop(&texture, Some((0.25, 0.50, 0.50, 0.75)));
+
+        assert_eq!(crop.u_min, 0.25);
+        assert_eq!(crop.v_min, 0.50);
+        assert_eq!(crop.u_span, 0.25);
+        assert_eq!(crop.v_span, 0.25);
+        assert_eq!(crop.texel_width, 64.0);
+        assert_eq!(crop.texel_height, 32.0);
+    }
+
+    #[test]
+    fn partial_texture_usage_receives_a_proportionally_smaller_atlas_region() {
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 3.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+            ],
+            uvs: vec![
+                V2 { u: 0.25, v: 0.25 },
+                V2 { u: 0.50, v: 0.25 },
+                V2 { u: 0.25, v: 0.50 },
+                V2 { u: 0.0, v: 0.0 },
+                V2 { u: 1.0, v: 0.0 },
+                V2 { u: 0.0, v: 1.0 },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 5,
+                    material: 1,
+                },
+            ],
+            material_textures: vec!["partial".to_string(), "full".to_string()],
+            ..RawMesh::default()
+        };
+        let textures = [
+            DecodedLodTexture {
+                name: "partial".to_string(),
+                width: 64,
+                height: 64,
+                rgba: vec![255; 64 * 64 * 4],
+            },
+            DecodedLodTexture {
+                name: "full".to_string(),
+                width: 64,
+                height: 64,
+                rgba: vec![255; 64 * 64 * 4],
+            },
+        ];
+
+        let atlases = remap_raw_for_atlases(&mut raw, &textures).unwrap().textures;
+        assert_eq!(atlases.len(), 1);
+        let uv_width = |triangle: &Tri| {
+            [triangle.a, triangle.b, triangle.c]
+                .into_iter()
+                .map(|index| raw.uvs[index as usize].u)
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), u| {
+                    (min.min(u), max.max(u))
+                })
+        };
+        let partial = uv_width(&raw.triangles[0]);
+        let full = uv_width(&raw.triangles[1]);
+        let partial_width = partial.1 - partial.0;
+        let full_width = full.1 - full.0;
+        assert!(
+            partial_width < full_width * 0.35,
+            "partial footprint {partial_width} should use much less atlas space than {full_width}"
         );
     }
 
@@ -3227,7 +4698,7 @@ mod tests {
         };
         let scales = HashMap::from([(2, (0.063, 0.0625))]);
 
-        validate_atlas_layout(&source, &atlased, &atlas, &scales).unwrap();
+        validate_atlas_layout(&source, &atlased, std::slice::from_ref(&atlas), &scales).unwrap();
     }
 
     #[test]
@@ -3250,7 +4721,8 @@ mod tests {
         };
         let scales = HashMap::from([(2, (0.25, 0.25))]);
 
-        let error = validate_atlas_layout(&source, &atlased, &atlas, &scales).unwrap_err();
+        let error = validate_atlas_layout(&source, &atlased, std::slice::from_ref(&atlas), &scales)
+            .unwrap_err();
         assert!(error.contains("collapsed, mirrored, or rotated"), "{error}");
     }
 
@@ -3265,21 +4737,65 @@ mod tests {
             rgba: vec![255; 16 * 8 * 4],
         };
         assert!(atlas_is_possible(&raw, std::slice::from_ref(&texture)));
-        let atlas = remap_raw_for_atlas(&mut raw, &[texture], "lod_single_atlas").unwrap();
-        assert_eq!((atlas.width, atlas.height), (256, 256));
-        assert_eq!(raw.material_textures, vec!["lod_single_atlas"]);
+        let atlases = remap_raw_for_atlases(&mut raw, &[texture])
+            .unwrap()
+            .textures;
+        assert_eq!(atlases.len(), 1);
+        assert_eq!(
+            (atlases[0].width, atlases[0].height),
+            (LOD_MIN_ATLAS_DIMENSION, LOD_MIN_ATLAS_DIMENSION)
+        );
+        assert_eq!(raw.material_textures, vec![atlases[0].name.clone()]);
+        assert!(
+            atlases[0].name.starts_with("grid_"),
+            "generated names stay browsable: {}",
+            atlases[0].name
+        );
         assert_ne!(raw.uvs, source_uvs);
-        let txd = build_texture_txd(&[atlas], true).unwrap();
+        assert!(
+            atlases[0].rgba.chunks_exact(4).all(|pixel| pixel[3] == 255),
+            "unused atlas pixels must not introduce synthetic transparency"
+        );
+        let txd = build_texture_txd(&atlases, &BTreeSet::new()).unwrap();
         let contents = parse_txd_texture_contents(&txd).unwrap();
         assert_eq!(contents.len(), 1);
-        assert_eq!((contents[0].width, contents[0].height), (256, 256));
+        assert_eq!(
+            (contents[0].width as u32, contents[0].height as u32),
+            (LOD_MIN_ATLAS_DIMENSION, LOD_MIN_ATLAS_DIMENSION)
+        );
+        assert!(!contents[0].has_alpha);
     }
 
     #[test]
-    fn differing_materials_round_trip_through_one_texture_atlas() {
+    fn shared_world_lod_txd_accumulates_each_generated_atlas() {
+        let texture = |name: &str, value: u8| DecodedLodTexture {
+            name: name.to_string(),
+            width: 4,
+            height: 4,
+            rgba: vec![value; 4 * 4 * 4],
+        };
+        let first = build_texture_txd(&[texture("lod_first_atlas", 64)], &BTreeSet::new()).unwrap();
+        let second =
+            build_texture_txd(&[texture("lod_second_atlas", 192)], &BTreeSet::new()).unwrap();
+
+        let world_lod = merge_generated_lod_txd(empty_lod_txd(), &first).unwrap();
+        let world_lod = merge_generated_lod_txd(world_lod, &second).unwrap();
+        let contents = parse_txd_texture_contents(&world_lod).unwrap();
+
+        assert_eq!(
+            contents
+                .iter()
+                .map(|texture| texture.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lod_first_atlas", "lod_second_atlas"]
+        );
+    }
+
+    #[test]
+    fn opaque_and_alpha_materials_use_separate_texture_atlases() {
         let mut raw = grid_mesh(2);
         raw.material_textures.push("second".to_string());
-        for triangle in raw.triangles.iter_mut().skip(4) {
+        for triangle in raw.triangles.iter_mut().take(4) {
             triangle.material = 1;
         }
         let textures = vec![
@@ -3297,26 +4813,66 @@ mod tests {
             },
         ];
         assert!(atlas_is_possible(&raw, &textures));
-        let atlas = remap_raw_for_atlas(&mut raw, &textures, "lod_atlas").unwrap();
-        assert_eq!((atlas.width, atlas.height), (256, 256));
-        assert_eq!(raw.material_textures, vec!["lod_atlas", "lod_atlas"]);
-        assert!(raw.triangles.iter().any(|triangle| triangle.material == 0));
-        assert!(raw.triangles.iter().any(|triangle| triangle.material == 1));
+        let atlases = remap_raw_for_atlases(&mut raw, &textures).unwrap().textures;
+        assert_eq!(atlases.len(), 2);
+        assert!(
+            atlases
+                .iter()
+                .all(|atlas| atlas.width <= LOD_MAX_ATLAS_DIMENSION
+                    && atlas.height <= LOD_MAX_ATLAS_DIMENSION)
+        );
+        assert_eq!(
+            raw.material_textures,
+            vec![atlases[0].name.clone(), atlases[1].name.clone()],
+            "the opaque sheet is emitted before the alpha one"
+        );
+        assert!(
+            raw.triangles[..4]
+                .iter()
+                .all(|triangle| triangle.material == 0)
+        );
+        assert!(
+            raw.triangles[4..]
+                .iter()
+                .all(|triangle| triangle.material == 1)
+        );
         assert!(
             raw.uvs
                 .iter()
                 .all(|uv| (0.0..=1.0).contains(&uv.u) && (0.0..=1.0).contains(&uv.v))
         );
 
-        let txd = build_texture_txd(&[atlas], true).unwrap();
+        let txd = build_texture_txd(&atlases, &BTreeSet::new()).unwrap();
         let contents = parse_txd_texture_contents(&txd).unwrap();
-        assert_eq!(contents.len(), 1);
-        assert_eq!(contents[0].name, "lod_atlas");
+        assert_eq!(contents.len(), 2);
+        assert!(
+            contents
+                .iter()
+                .any(|texture| texture.name == atlases[0].name && !texture.has_alpha)
+        );
+        assert!(
+            contents
+                .iter()
+                .any(|texture| texture.name == atlases[1].name && texture.has_alpha)
+        );
 
         let dff = write_normalized_dff(&raw, "lod_model").unwrap();
         let reparsed = parse_dff_mesh(&dff);
-        assert_eq!(reparsed.material_textures, vec!["lod_atlas", "lod_atlas"]);
+        assert_eq!(
+            reparsed.material_textures,
+            vec![atlases[0].name.clone(), atlases[1].name.clone()]
+        );
         assert_eq!(reparsed.triangles.len(), raw.triangles.len());
+        assert!(
+            reparsed.triangles[..4]
+                .iter()
+                .all(|triangle| triangle.material == 0)
+        );
+        assert!(
+            reparsed.triangles[4..]
+                .iter()
+                .all(|triangle| triangle.material == 1)
+        );
     }
 
     #[test]
@@ -3348,12 +4904,17 @@ mod tests {
             .collect::<BTreeSet<_>>();
         textures.retain(|texture| base_textures.contains(&lower(&texture.name)));
         assert!(atlas_is_possible(&lod, &textures));
-        let atlas = remap_raw_for_atlas(&mut lod, &textures, "lod_player_atlas").unwrap();
-        assert_eq!((atlas.width, atlas.height), (256, 256));
-        let lod_txd = build_texture_txd(&[atlas], true).unwrap();
+        let atlases = remap_raw_for_atlases(&mut lod, &textures).unwrap().textures;
+        assert!(atlases.len() <= 2);
+        assert!(
+            atlases
+                .iter()
+                .all(|atlas| atlas.width <= LOD_MAX_ATLAS_DIMENSION
+                    && atlas.height <= LOD_MAX_ATLAS_DIMENSION)
+        );
+        let lod_txd = build_texture_txd(&atlases, &BTreeSet::new()).unwrap();
         let contents = parse_txd_texture_contents(&lod_txd).unwrap();
-        assert_eq!(contents.len(), 1);
-        assert_eq!(contents[0].name, "lod_player_atlas");
+        assert_eq!(contents.len(), atlases.len());
         let lod_dff = write_normalized_dff(&lod, "lod_player_1").unwrap();
         let reparsed = parse_dff_mesh(&lod_dff);
         assert!(!reparsed.vertices.is_empty());
@@ -3390,6 +4951,7 @@ mod tests {
             env::temp_dir().join(format!("eagle_lod_batch_{}_{}", std::process::id(), nonce));
         let wip_root = wip_root_path(&project_root);
         fs::create_dir_all(&project_root).unwrap();
+        let reserved_stems = Arc::new(BTreeSet::new());
         let request = |placement_index| LodGenerationRequest {
             mesh_source: LodMeshSource::Raw(grid_mesh(5)),
             txd_source: None,
@@ -3402,12 +4964,30 @@ mod tests {
             replaced_lod_parent: None,
             replaced_lod_index: None,
             project_root: project_root.clone(),
-            reserved_stems: BTreeSet::new(),
+            reserved_stems: Arc::clone(&reserved_stems),
             wip_root: wip_root.clone(),
+            stem_preallocated: false,
         };
 
-        let first = generate_lod(request(3)).unwrap();
-        let second = generate_lod(request(7)).unwrap();
+        let mut requests = vec![request(3), request(7)];
+        assert!(Arc::ptr_eq(
+            &requests[0].reserved_stems,
+            &requests[1].reserved_stems
+        ));
+        reserve_batch_lod_stems(&mut requests);
+        assert!(Arc::ptr_eq(
+            &requests[0].reserved_stems,
+            &requests[1].reserved_stems
+        ));
+        assert_ne!(requests[0].output_stem, requests[1].output_stem);
+        let second_request = requests.pop().unwrap();
+        let first_request = requests.pop().unwrap();
+        let first_worker = thread::spawn(move || generate_lod(first_request));
+        let second_worker = thread::spawn(move || generate_lod(second_request));
+        let first = first_worker.join().unwrap().unwrap();
+        let second = second_worker.join().unwrap().unwrap();
+        write_lod_result_to_wip(&wip_root, &first).unwrap();
+        write_lod_result_to_wip(&wip_root, &second).unwrap();
         assert_ne!(first.stem, second.stem);
         assert!(first.dff_name.len() <= IMG_RUNTIME_SAFE_ENTRY_NAME_BYTES);
         assert!(second.dff_name.len() <= IMG_RUNTIME_SAFE_ENTRY_NAME_BYTES);
@@ -3428,5 +5008,37 @@ mod tests {
         )));
 
         fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[test]
+    fn large_batch_name_reservation_is_unique() {
+        let reserved_stems = Arc::new(BTreeSet::new());
+        let mut requests = (0..2_000usize)
+            .map(|index| LodGenerationRequest {
+                mesh_source: LodMeshSource::Raw(grid_mesh(2)),
+                txd_source: None,
+                output_stem: "lod_repeated_model".to_string(),
+                attach_to_placement: Some(index),
+                source_definition_id: None,
+                source_zone: String::new(),
+                source_dff_name: "repeated_model.dff".to_string(),
+                source_txd_name: None,
+                replaced_lod_parent: None,
+                replaced_lod_index: None,
+                project_root: PathBuf::new(),
+                reserved_stems: Arc::clone(&reserved_stems),
+                wip_root: PathBuf::new(),
+                stem_preallocated: false,
+            })
+            .collect::<Vec<_>>();
+
+        reserve_batch_lod_stems(&mut requests);
+
+        let names = requests
+            .iter()
+            .map(|request| request.output_stem.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(names.len(), requests.len());
+        assert!(requests.iter().all(|request| request.stem_preallocated));
     }
 }

@@ -567,6 +567,8 @@ fn vehicle_collision_copy_writer_conflict(app: &AppState) -> Option<&'static str
         Some("instance LOD removal")
     } else if app.water_texture_conversion_job.is_some() {
         Some("texture-to-water conversion")
+    } else if app.preview_world_uv_job.is_some() {
+        Some("world-scale UV processing")
     } else if app.vehicle_build_rx.is_some() {
         Some("vehicle build")
     } else if app.vehicle_browser.reload_rx.is_some() {
@@ -1110,10 +1112,10 @@ fn duplicate_vehicle_wheel_components(raw: &mut RawMesh) {
         }
         let vertex_end = raw.vertices.len();
         let tri_start = raw.triangles.len();
-        for tri in raw.triangles
-            [source.tri_start.min(raw.triangles.len())..source.tri_end.min(raw.triangles.len())]
-            .to_vec()
-        {
+        let source_tri_start = source.tri_start.min(raw.triangles.len());
+        let source_tri_end = source.tri_end.min(raw.triangles.len());
+        for source_tri_idx in source_tri_start..source_tri_end {
+            let tri = raw.triangles[source_tri_idx];
             let remap = |idx: u32| -> Option<u32> {
                 let idx = idx as usize;
                 if idx < source_start || idx >= source_end {
@@ -3235,6 +3237,7 @@ fn draw_vehicle_render_mesh(
             if photo_reflection_program != 0 {
                 draw_vehicle_photo_reflection_pass(
                     part,
+                    component_name,
                     world_matrix,
                     app.camera.pos,
                     photo_reflection_program,
@@ -3426,22 +3429,70 @@ pub(crate) fn draw_vehicle_reflection_pass(part: &RenderPart, world: Mat4, camer
     }
 }
 
-fn vehicle_photo_reflective_part(part: &RenderPart) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VehiclePhotoReflectionSurface {
+    Paint,
+    Glass,
+}
+
+fn vehicle_photo_glass_candidate(
+    transparency: TransparencyMode,
+    material_alpha: f32,
+    texture_name: &str,
+    component_name: &str,
+) -> bool {
+    let texture = lower(texture_name.trim());
+    let component = lower(component_name.trim());
+    let named_glass = ["glass", "window", "windscreen", "windshield"]
+        .iter()
+        .any(|marker| texture.contains(marker) || component.contains(marker));
+    if named_glass {
+        return true;
+    }
+
+    // Stock vehicles often use the shared vehicle-grunge texture for both
+    // paint and glass, so the window material's authored alpha is the useful
+    // discriminator. Do not treat texture-alpha decals and lamp lenses as
+    // windows merely because they also render in the blended queue.
+    transparency == TransparencyMode::Blend
+        && material_alpha < 0.98
+        && ![
+            "light", "lamp", "decal", "sticker", "logo", "shadow", "corona", "beam", "flare",
+            "glow", "halo",
+        ]
+        .iter()
+        .any(|marker| texture.contains(marker) || component.contains(marker))
+}
+
+fn vehicle_photo_reflection_surface(
+    part: &RenderPart,
+    component_name: &str,
+) -> Option<VehiclePhotoReflectionSurface> {
     if part.emissive
         || part.vehicle_material_role == Some(VehicleMaterialRole::Light)
-        || part.transparency == TransparencyMode::Blend
         || vehicle_part_kind(part) != "body"
     {
-        return false;
+        return None;
+    }
+    if vehicle_photo_glass_candidate(
+        part.transparency,
+        part.alpha,
+        &part.texture_name,
+        component_name,
+    ) {
+        return Some(VehiclePhotoReflectionSurface::Glass);
+    }
+    if part.transparency == TransparencyMode::Blend {
+        return None;
     }
     if matches!(
         part.vehicle_material_role,
         Some(VehicleMaterialRole::BodyA) | Some(VehicleMaterialRole::BodyB)
     ) {
-        return true;
+        return Some(VehiclePhotoReflectionSurface::Paint);
     }
     let texture = lower(part.texture_name.trim());
-    ![
+    (![
         "light",
         "lamp",
         "glass",
@@ -3470,7 +3521,8 @@ fn vehicle_photo_reflective_part(part: &RenderPart) -> bool {
         "halo",
     ]
     .iter()
-    .any(|marker| texture.contains(marker))
+    .any(|marker| texture.contains(marker)))
+    .then_some(VehiclePhotoReflectionSurface::Paint)
 }
 
 fn create_vehicle_photo_reflection_program() -> Result<u32, String> {
@@ -3496,6 +3548,7 @@ uniform int has_texture;
 uniform vec3 camera_position;
 uniform vec3 material_color;
 uniform float reflection_strength;
+uniform int surface_kind;
 varying vec3 world_position;
 varying vec3 world_normal;
 varying vec2 texture_uv;
@@ -3534,12 +3587,18 @@ void main() {
     vec3 paint = clamp(texel.rgb * material_color, 0.0, 1.0);
     float paint_luminance = dot(paint, vec3(0.299, 0.587, 0.114));
     float dark_paint_floor = mix(0.58, 1.0, smoothstep(0.06, 0.62, paint_luminance));
-    float coat = (0.12 + fresnel * 0.48) * dark_paint_floor;
+    bool glass = surface_kind == 1;
+    float coat = glass ? (0.20 + fresnel * 0.70)
+                       : (0.12 + fresnel * 0.48) * dark_paint_floor;
     vec3 reflection = environment * coat;
-    reflection += vec3(1.0, 0.96, 0.90) * key * 0.72;
-    reflection += vec3(0.72, 0.84, 1.0) * fill * 0.42;
-    reflection += vec3(0.82, 0.90, 1.0) * softbox * 0.10;
-    gl_FragColor = vec4(reflection * reflection_strength, alpha);
+    reflection += vec3(1.0, 0.96, 0.90) * key * (glass ? 0.88 : 0.72);
+    reflection += vec3(0.72, 0.84, 1.0) * fill * (glass ? 0.60 : 0.42);
+    reflection += vec3(0.82, 0.90, 1.0) * softbox * (glass ? 0.24 : 0.10);
+    // Glass is already translucent in the base pass. A square-root blend
+    // alpha keeps its reflected sky and soft boxes visible without flattening
+    // the cabin behind it.
+    float reflection_alpha = glass ? sqrt(alpha) : alpha;
+    gl_FragColor = vec4(reflection * reflection_strength, reflection_alpha);
 }
 "#;
 
@@ -3593,12 +3652,16 @@ fn ensure_vehicle_photo_reflection_program(browser: &mut VehicleBrowserState) ->
 
 fn draw_vehicle_photo_reflection_pass(
     part: &RenderPart,
+    component_name: &str,
     world: Mat4,
     camera_pos: Vec3,
     program: u32,
     show_textures: bool,
 ) {
-    if program == 0 || !vehicle_photo_reflective_part(part) {
+    let Some(surface) = vehicle_photo_reflection_surface(part, component_name) else {
+        return;
+    };
+    if program == 0 {
         return;
     }
     let uniform = |name: &str| {
@@ -3627,6 +3690,10 @@ fn draw_vehicle_photo_reflection_pass(
             part.material_color.z,
         );
         gl::Uniform1f(uniform("reflection_strength"), 1.0);
+        gl::Uniform1i(
+            uniform("surface_kind"),
+            i32::from(surface == VehiclePhotoReflectionSurface::Glass),
+        );
         gl::Uniform1i(uniform("diffuse_texture"), 0);
         let has_texture = show_textures && part.texture != 0;
         gl::Uniform1i(uniform("has_texture"), i32::from(has_texture));
@@ -7547,6 +7614,44 @@ mod tests {
     fn generated_vehicle_light_fx_use_positive_y_as_the_front() {
         assert!(vehicle_light_fx_is_front(3.0, 0.5));
         assert!(!vehicle_light_fx_is_front(-2.0, 0.5));
+    }
+
+    #[test]
+    fn photo_mode_recognizes_named_and_alpha_vehicle_glass() {
+        assert!(vehicle_photo_glass_candidate(
+            TransparencyMode::Blend,
+            1.0,
+            "car_window",
+            "door_lf_ok",
+        ));
+        assert!(vehicle_photo_glass_candidate(
+            TransparencyMode::Opaque,
+            1.0,
+            "vehiclegeneric256",
+            "windscreen",
+        ));
+        assert!(vehicle_photo_glass_candidate(
+            TransparencyMode::Blend,
+            0.55,
+            "vehiclegrunge256",
+            "door_rf_ok",
+        ));
+    }
+
+    #[test]
+    fn photo_mode_does_not_mistake_alpha_decals_or_lights_for_glass() {
+        assert!(!vehicle_photo_glass_candidate(
+            TransparencyMode::Blend,
+            1.0,
+            "sponsor_decal",
+            "chassis",
+        ));
+        assert!(!vehicle_photo_glass_candidate(
+            TransparencyMode::Blend,
+            0.6,
+            "vehiclelights128",
+            "headlight_l",
+        ));
     }
 
     #[test]

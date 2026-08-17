@@ -31,6 +31,15 @@ def copy_runtime_assets(destination: Path) -> None:
     shutil.copytree(source / "player_vehicle", assets / "player_vehicle", dirs_exist_ok=True)
 
 
+def package_blender_addon(destination: Path) -> None:
+    source = ROOT / "blender_addon" / "eagle_mta_toolkit"
+    archive = destination / "eagle_mta_toolkit.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
+        for path in sorted(source.rglob("*")):
+            if path.is_file() and "__pycache__" not in path.parts:
+                zipped.write(path, Path("eagle_mta_toolkit") / path.relative_to(source))
+
+
 def copy_mingw_runtime(destination: Path) -> None:
     """Bundle DLLs required by the GNU Windows cross-build, when applicable."""
     compiler = shutil.which("x86_64-w64-mingw32-g++")
@@ -59,6 +68,7 @@ def stage(platform: str, binary: Path, output: Path, version: str) -> Path:
     if not platform.startswith("windows"):
         target.chmod(target.stat().st_mode | 0o111)
     copy_runtime_assets(folder)
+    package_blender_addon(folder)
     shutil.copy2(ROOT / "RELEASE_README.md", folder / "README.md")
     shutil.copy2(ROOT / "LICENSE", folder / "LICENSE")
     shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", folder / "THIRD_PARTY_NOTICES.md")

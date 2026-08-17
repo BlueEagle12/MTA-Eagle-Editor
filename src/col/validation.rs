@@ -542,6 +542,25 @@ pub(crate) fn validate_col_for_game_load(entry_name: &str, bytes: &[u8]) -> Vec<
     issues
 }
 
+/// Returns whether the model that GTA binds to `target_name` uses COL2/3/4
+/// face groups. The 600-entry triangle-candidate overflow is specific to this
+/// path in `CCollision::ProcessColModels`; the flat triangle path stops once
+/// its candidate array is full.
+pub(crate) fn col_model_uses_face_groups(bytes: &[u8], target_name: &str) -> bool {
+    let target = asset_key(target_name, ".col");
+    let mut model_start = 0usize;
+    while model_start + 8 <= bytes.len() {
+        let Ok(header) = parse_header(bytes, model_start) else {
+            break;
+        };
+        if asset_key(&header.name, ".col") == target {
+            return header.flags & 8 != 0;
+        }
+        model_start = header.model_end;
+    }
+    false
+}
+
 pub(crate) fn col_validation_has_errors(issues: &[ColLoadIssue]) -> bool {
     issues
         .iter()
@@ -680,6 +699,19 @@ mod tests {
                 .iter()
                 .any(|issue| issue.message.contains("face-group section"))
         );
+    }
+
+    #[test]
+    fn face_group_detection_matches_the_bound_internal_model() {
+        let mut first = test_col3();
+        first[80..84].copy_from_slice(&8u32.to_le_bytes());
+        let mut second = test_col3();
+        second[8..12].copy_from_slice(b"safe");
+        first.extend_from_slice(&second);
+
+        assert!(col_model_uses_face_groups(&first, "test.col"));
+        assert!(!col_model_uses_face_groups(&first, "safe.col"));
+        assert!(!col_model_uses_face_groups(&first, "missing.col"));
     }
 
     #[test]

@@ -210,20 +210,30 @@ impl X11Display {
                         self.window,
                         p,
                     );
+                    let mut accepted = false;
                     if let Ok(filenames) = std::str::from_utf8(&bytes) {
                         let mut d = crate::native_display().try_lock().unwrap();
                         d.dropped_files = Default::default();
                         for filename in filenames.lines() {
-                            let path = std::path::PathBuf::from(filename);
+                            let Some(path) = crate::native::dropped_file_path_from_uri(filename) else {
+                                continue;
+                            };
                             if let Ok(bytes) = std::fs::read(&path) {
                                 d.dropped_files.paths.push(path);
                                 d.dropped_files.bytes.push(bytes);
+                                accepted = true;
                             }
                         }
                         // drop d since files_dropped_event is likely to need access to it
                         drop(d);
                         event_handler.files_dropped_event();
                     }
+                    self.drag_n_drop.finish(
+                        &mut self.libx11,
+                        self.display,
+                        self.window,
+                        accepted,
+                    );
                 }
                 _ => (),
             },

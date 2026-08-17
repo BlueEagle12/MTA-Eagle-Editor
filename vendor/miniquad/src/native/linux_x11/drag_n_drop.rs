@@ -36,6 +36,48 @@ impl super::X11Display {
 }
 
 impl X11DnD {
+    pub unsafe fn finish(
+        &mut self,
+        libx11: &mut LibX11,
+        display: *mut Display,
+        window: Window,
+        accepted: bool,
+    ) {
+        if self.source != 0 && self.version >= 2 {
+            let mut reply = XClientMessageEvent {
+                type_0: ClientMessage,
+                serial: 0,
+                send_event: true as _,
+                message_type: libx11.extensions.xdnd_finished,
+                window: self.source,
+                display,
+                format: 32,
+                data: ClientMessageData {
+                    l: [
+                        window as _,
+                        accepted as _,
+                        if accepted {
+                            libx11.extensions.xdnd_action_copy as _
+                        } else {
+                            0
+                        },
+                        0,
+                        0,
+                    ],
+                },
+            };
+            (libx11.XSendEvent)(
+                display,
+                self.source,
+                false as _,
+                NoEventMask,
+                &mut reply as *mut XClientMessageEvent as *mut _,
+            );
+            (libx11.XFlush)(display);
+        }
+        *self = Self::default();
+    }
+
     pub unsafe fn on_enter(
         &mut self,
         libx11: &mut LibX11,
@@ -67,9 +109,12 @@ impl X11DnD {
         };
 
         for format in formats {
-            if format == libx11.extensions.utf8_string {
+            if format == libx11.extensions.text_uri_list {
                 self.format = format;
                 break;
+            }
+            if format == libx11.extensions.utf8_string {
+                self.format = format;
             }
         }
     }
@@ -141,26 +186,7 @@ impl X11DnD {
                     time as Time,
                 );
             } else if self.version >= 2 {
-                let mut reply = XClientMessageEvent {
-                    type_0: ClientMessage,
-                    serial: 0,
-                    send_event: true as _,
-                    message_type: libx11.extensions.xdnd_finished,
-                    window: self.source,
-                    display,
-                    format: 32,
-                    data: ClientMessageData {
-                        l: [window as _, 0, 0, 0, 0],
-                    },
-                };
-                (libx11.XSendEvent)(
-                    display,
-                    self.source,
-                    false as _,
-                    NoEventMask,
-                    &mut reply as *mut XClientMessageEvent as *mut _,
-                );
-                (libx11.XFlush)(display);
+                self.finish(libx11, display, window, false);
             }
         }
     }

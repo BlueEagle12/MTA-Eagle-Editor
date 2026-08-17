@@ -53,8 +53,38 @@ pub(crate) fn save_msaa_samples_preference(samples: i32) {
     save_preferences(&values);
 }
 
+pub(crate) const MAX_DRAW_DISTANCE_PERCENT: u16 = 500;
+
 pub(crate) fn clamp_draw_distance_percent(value: u16) -> u16 {
-    value.clamp(25, 200)
+    value.min(MAX_DRAW_DISTANCE_PERCENT)
+}
+
+/// Zero disables distance culling, so use the full renderable viewport depth.
+pub(crate) fn draw_radius_for_percent(value: u16) -> f32 {
+    let percent = clamp_draw_distance_percent(value);
+    if percent == 0 {
+        VIEWPORT_FAR_CLIP
+    } else {
+        DEFAULT_DRAW * percent as f32 / 100.0
+    }
+}
+
+#[cfg(test)]
+mod draw_distance_preference_tests {
+    use super::*;
+
+    #[test]
+    fn draw_distance_accepts_disabled_through_five_hundred_percent() {
+        assert_eq!(clamp_draw_distance_percent(0), 0);
+        assert_eq!(clamp_draw_distance_percent(500), 500);
+        assert_eq!(clamp_draw_distance_percent(501), 500);
+    }
+
+    #[test]
+    fn disabled_draw_distance_uses_the_viewport_far_clip() {
+        assert_eq!(draw_radius_for_percent(0), VIEWPORT_FAR_CLIP);
+        assert_eq!(draw_radius_for_percent(500), DEFAULT_DRAW * 5.0);
+    }
 }
 
 pub(crate) fn load_draw_distance_percent_preference() -> u16 {
@@ -1451,6 +1481,25 @@ pub(crate) fn save_project_roots(roots: &[PathBuf]) {
             root.to_string_lossy().to_string(),
         );
     }
+    save_preferences(&values);
+}
+
+/// Parent folder used by the new-project wizard most recently. Keep this
+/// separate from the discovery roots: creating a project somewhere should not
+/// implicitly opt that entire folder into recursive project scanning.
+pub(crate) fn load_last_new_project_root() -> Option<PathBuf> {
+    load_preferences()
+        .get("last_new_project_root")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+}
+
+pub(crate) fn save_last_new_project_root(path: &Path) {
+    let mut values = load_preferences();
+    values.insert(
+        "last_new_project_root".to_string(),
+        path.to_string_lossy().to_string(),
+    );
     save_preferences(&values);
 }
 

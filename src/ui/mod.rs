@@ -1,4 +1,5 @@
 pub(crate) mod asset_browser;
+pub(crate) mod cull_panel;
 pub(crate) mod dialogs;
 pub(crate) mod editing_panel;
 pub(crate) mod lighting_panels;
@@ -15,6 +16,7 @@ pub(crate) mod vehicles;
 pub(crate) mod water_panel;
 
 pub(crate) use asset_browser::*;
+pub(crate) use cull_panel::*;
 pub(crate) use dialogs::*;
 pub(crate) use editing_panel::*;
 pub(crate) use lighting_panels::*;

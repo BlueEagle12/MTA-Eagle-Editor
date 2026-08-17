@@ -22,6 +22,7 @@ pub(crate) struct ValidationSummary {
     pub(crate) duplicate_dffs: Vec<String>,
     pub(crate) missing_col_attrs: Vec<String>,
     pub(crate) invalid_texture_formats: Vec<String>,
+    pub(crate) invalid_dff_material_counts: Vec<String>,
     pub(crate) invalid_col_loads: Vec<String>,
     pub(crate) breakable_warnings: Vec<String>,
 }
@@ -39,6 +40,7 @@ impl ValidationSummary {
             + self.duplicate_dffs.len()
             + self.missing_col_attrs.len()
             + self.invalid_texture_formats.len()
+            + self.invalid_dff_material_counts.len()
             + self.invalid_col_loads.len()
             + self.breakable_warnings.len()
     }
@@ -84,9 +86,23 @@ pub(crate) fn placement_mesh_key(
     definitions: &HashMap<String, Definition>,
 ) -> String {
     mesh_key_from_dff_txd(
-        &placement.dff,
+        &placement_dff_key(placement, definitions),
         definition_txd_name(definitions, &placement.id),
     )
+}
+
+/// Resolve a placed element's DFF exactly as resource validation does: an
+/// explicit definition `dff` wins, otherwise the definition ID is the asset
+/// stem. `Placement::dff` is only a cache and can be stale after definition
+/// edits/imports, so repair tools must not use it as their source of truth.
+pub(crate) fn placement_dff_key(
+    placement: &Placement,
+    definitions: &HashMap<String, Definition>,
+) -> String {
+    definitions
+        .get(&placement.id)
+        .map(|definition| asset_key_opt(definition.attrs.get("dff"), &definition.id, ".dff"))
+        .unwrap_or_else(|| asset_key(&placement.dff, ".dff"))
 }
 
 pub(crate) fn build_referenced_dff_queue(
@@ -97,7 +113,7 @@ pub(crate) fn build_referenced_dff_queue(
     let mut queued = HashSet::<String>::new();
     let mut queue = Vec::new();
     for placement in placements {
-        let dff_key = asset_key(&placement.dff, ".dff");
+        let dff_key = placement_dff_key(placement, definitions);
         let Some(entry) = dff_map.get(&dff_key) else {
             continue;
         };
@@ -573,9 +589,17 @@ pub(crate) fn is_power_of_two_dimension(value: u16) -> bool {
     value != 0 && value.is_power_of_two()
 }
 
+fn is_valid_compressed_texture_dimension(value: u16) -> bool {
+    value >= 4 && is_power_of_two_dimension(value)
+}
+
 pub(crate) fn next_power_of_two_dimension(value: u16) -> Option<u16> {
     let next = (value as u32).next_power_of_two();
     (next <= u16::MAX as u32).then_some(next as u16)
+}
+
+fn next_compressed_texture_dimension(value: u16) -> Option<u16> {
+    next_power_of_two_dimension(value).map(|dimension| dimension.max(4))
 }
 
 pub(crate) fn resize_rgba_to_power_of_two(
@@ -583,9 +607,9 @@ pub(crate) fn resize_rgba_to_power_of_two(
     width: u16,
     height: u16,
 ) -> Result<(Vec<u8>, u16, u16), String> {
-    let target_width = next_power_of_two_dimension(width)
+    let target_width = next_compressed_texture_dimension(width)
         .ok_or_else(|| format!("Could not resize {width}x{height}: width exceeds u16"))?;
-    let target_height = next_power_of_two_dimension(height)
+    let target_height = next_compressed_texture_dimension(height)
         .ok_or_else(|| format!("Could not resize {width}x{height}: height exceeds u16"))?;
     if target_width == width && target_height == height {
         return Ok((rgba.to_vec(), width, height));
@@ -780,13 +804,13 @@ pub(crate) fn optimize_txd_texture_formats(
                 Ok(header) => {
                     let raw_format =
                         matches!(header.format, Some(TxFormat::Bgra8888 | TxFormat::Bgr888));
-                    let npot_dimensions = !is_power_of_two_dimension(header.width)
-                        || !is_power_of_two_dimension(header.height);
+                    let invalid_dimensions = !is_valid_compressed_texture_dimension(header.width)
+                        || !is_valid_compressed_texture_dimension(header.height);
                     let compressed_header_fix = compressed_header_needs_repair(&header);
                     let missing_mipmapped_flag = header.format.is_some()
                         && header.mip_count > 1
                         && header.raster_format & 0x8000 == 0;
-                    if raw_format || npot_dimensions {
+                    if raw_format || invalid_dimensions {
                         if let Some(mut rgba) = txd_texture_rgba(&txd_bytes, &header) {
                             if !header.has_alpha {
                                 for pixel in rgba.chunks_exact_mut(4) {
@@ -1175,15 +1199,15 @@ pub(crate) fn validate_txd_texture_formats(txd_name: &str, txd_bytes: &[u8]) -> 
         if cid == 0x15 {
             match parse_txd_native_header(txd_bytes, chunk, ce) {
                 Ok(header) => {
-                    if !is_power_of_two_dimension(header.width)
-                        || !is_power_of_two_dimension(header.height)
+                    if !is_valid_compressed_texture_dimension(header.width)
+                        || !is_valid_compressed_texture_dimension(header.height)
                     {
                         let fixed_width =
-                            next_power_of_two_dimension(header.width).unwrap_or(header.width);
-                        let fixed_height =
-                            next_power_of_two_dimension(header.height).unwrap_or(header.height);
+                            next_compressed_texture_dimension(header.width).unwrap_or(header.width);
+                        let fixed_height = next_compressed_texture_dimension(header.height)
+                            .unwrap_or(header.height);
                         warnings.push(format!(
-                            "{txd_name}: {} is {}x{}, expected power-of-two size (Optimize -> {}x{})",
+                            "{txd_name}: {} is {}x{}, expected DXT-compatible power-of-two size of at least 4x4 (Optimize -> {}x{})",
                             header.name,
                             header.width,
                             header.height,
@@ -2012,7 +2036,7 @@ pub(crate) fn reindex_staged_txd(app: &mut AppState, txd_name: &str) {
 /// Rebuilding an IMG can move entries even when only one TXD changed. Keeping
 /// the old entries for the other TXDs would leave their native/data offsets
 /// pointing at unrelated bytes in the new archive.
-fn refresh_txd_archive_index(path: &Path, index: &mut TxdTextureIndex) {
+pub(crate) fn refresh_txd_archive_index(path: &Path, index: &mut TxdTextureIndex) {
     let entries = parse_img(path);
     remove_img_txd_dictionaries_from_index(index, &entries);
     index_txd_entries(path, &entries, index);
@@ -2196,6 +2220,53 @@ mod txd_import_tests {
         assert_eq!(depth, 16);
         assert_eq!(alpha, 8);
         assert_eq!(data_size, 32);
+    }
+
+    #[test]
+    fn imported_textures_enforce_minimum_dxt_block_dimensions() {
+        for (source_width, source_height, expected_width, expected_height) in
+            [(64, 2, 64, 4), (2, 64, 4, 64), (1, 1, 4, 4)]
+        {
+            let mut rgba = vec![255u8; source_width * source_height * 4];
+            rgba[3] = 128;
+            let path = write_test_png_sized(
+                &format!("small_dxt_{source_width}x{source_height}"),
+                &rgba,
+                source_width as u32,
+                source_height as u32,
+            );
+
+            let native = imported_image_texture_native(&path, "small_dxt").unwrap();
+            let _ = fs::remove_file(path);
+            let (d3d_format, _, width, height, _, _, _) = native_header(&native);
+
+            assert_eq!(d3d_format, b"DXT5");
+            assert_eq!((width, height), (expected_width, expected_height));
+        }
+    }
+
+    #[test]
+    fn optimize_repairs_compressed_textures_smaller_than_one_dxt_block() {
+        let mut rgba = vec![255u8; 64 * 2 * 4];
+        rgba[3] = 128;
+        let txd = one_texture_txd(texture_native_from_rgba(&rgba, 64, 2, "thin_alpha"));
+
+        let warnings = validate_txd_texture_formats("thin.txd", &txd);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("thin_alpha") && warning.contains("Optimize -> 64x4")
+        }));
+
+        let (updated, fixes, warnings) = optimize_txd_texture_formats(txd).unwrap();
+
+        assert!(warnings.is_empty());
+        assert!(
+            fixes
+                .iter()
+                .any(|fix| fix.contains("thin_alpha: DXT5 64x2 -> DXT5 64x4"))
+        );
+        assert!(validate_txd_texture_formats("thin.txd", &updated).is_empty());
+        let header = parse_txd_native_header(&updated, 26, updated.len()).unwrap();
+        assert_eq!((header.width, header.height), (64, 4));
     }
 
     #[test]
@@ -3349,6 +3420,116 @@ pub(crate) fn collect_resource_txd_entries(root: &Path) -> BTreeMap<String, ImgE
     entries
 }
 
+pub(crate) fn collect_resource_dff_entries(root: &Path) -> BTreeMap<String, ImgEntry> {
+    let wip_root = wip_root_path(root);
+    let mut entries = BTreeMap::new();
+    for path in collect_resource_img_files(root) {
+        let is_wip = path.starts_with(&wip_root);
+        for entry in parse_img(&path) {
+            if !lower(&entry.name).ends_with(".dff") {
+                continue;
+            }
+            let name = asset_key(&entry.name, ".dff");
+            if is_wip || !entries.contains_key(&name) {
+                entries.insert(name, entry);
+            }
+        }
+    }
+    for dir in ["imgs", "Imgs", "models", "Models"] {
+        let path = root.join(dir);
+        if !path.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file()
+                || !entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("dff"))
+            {
+                continue;
+            }
+            let Some(name) = entry.path().file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let key = asset_key(name, ".dff");
+            let is_wip = entry.path().starts_with(&wip_root);
+            if (is_wip || !entries.contains_key(&key))
+                && let Some(loose) = loose_txd_entry(entry.path())
+            {
+                entries.insert(key, loose);
+            }
+        }
+    }
+    entries
+}
+
+fn collect_dff_material_warnings(
+    app: &AppState,
+    entries: &BTreeMap<String, ImgEntry>,
+) -> Vec<String> {
+    let mut keys = entries.keys().cloned().collect::<BTreeSet<_>>();
+    keys.extend(
+        app.editing
+            .modified_entries
+            .keys()
+            .filter(|key| key.to_ascii_lowercase().ends_with(".dff"))
+            .cloned(),
+    );
+    keys.extend(
+        app.pending_replacement_assets
+            .keys()
+            .filter(|key| key.to_ascii_lowercase().ends_with(".dff"))
+            .cloned(),
+    );
+
+    let mut warnings = Vec::new();
+    for key in keys {
+        if app.pending_asset_deletes.contains(&key) || app.editing.deleted_entries.contains(&key) {
+            continue;
+        }
+        let bytes = app
+            .editing
+            .modified_entries
+            .get(&key)
+            .cloned()
+            .or_else(|| {
+                app.pending_replacement_assets
+                    .get(&key)
+                    .map(|(_, bytes)| bytes.clone())
+            })
+            .or_else(|| entries.get(&key).map(read_img_entry));
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        if let Ok(count) = max_dff_geometry_material_count(&bytes)
+            && count > GTA_DFF_MATERIAL_LIMIT
+        {
+            warnings.push(format!(
+                "DFF {key}: geometry has {count} materials; GTA:SA is limited to {GTA_DFF_MATERIAL_LIMIT} and may crash"
+            ));
+        }
+        if let Ok(count) = dff_redundant_bin_mesh_batch_count(&bytes)
+            && count != 0
+        {
+            warnings.push(format!(
+                "DFF {key}: BinMesh has {count} redundant material batch(es); run Repair DFFs → DFF Structure & Data"
+            ));
+        }
+        if let Ok(count) = dff_normal_less_lit_geometry_count(&bytes)
+            && count != 0
+        {
+            warnings.push(format!(
+                "DFF {key}: {count} normal-less geometry section(s) still request RenderWare lighting; run Repair DFFs → DFF Structure & Data"
+            ));
+        }
+    }
+    warnings.sort();
+    warnings.dedup();
+    warnings
+}
+
 pub(crate) fn collect_txd_format_warnings(root: &Path) -> Vec<String> {
     let mut warnings = Vec::new();
     for (txd_name, entry) in collect_resource_txd_entries(root) {
@@ -3430,6 +3611,375 @@ pub(crate) fn collect_col_load_warnings(root: &Path) -> Vec<String> {
     warnings
 }
 
+// GTA stores triangle candidates for CCollision::ProcessColModels in a fixed
+// 600-entry array. Its flat-triangle path stops before filling that array, but
+// its face-group path can continue with the next group and write a 601st
+// candidate. Eight metres conservatively covers ordinary cars and most large
+// road vehicles without treating an entire high-poly COL as one hotspot.
+const GTA_COL_TRIANGLE_CANDIDATE_CAPACITY: usize = 600;
+const COL_DENSITY_PROBE_RADIUS: f32 = 8.0;
+const COL_DENSITY_MAX_HOTSPOTS_PER_MESH: usize = 8;
+const COL_DENSITY_MAX_WARNINGS: usize = 128;
+const COL_DENSITY_MAX_GRID_CELLS_PER_TRIANGLE: usize = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CollisionDensityHotspot {
+    center: Vec3,
+    candidates: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CollisionDensityTriangle {
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+    min: Vec3,
+    max: Vec3,
+}
+
+fn collision_density_cell(point: Vec3, cell_size: f32) -> (i32, i32, i32) {
+    (
+        (point.x / cell_size).floor() as i32,
+        (point.y / cell_size).floor() as i32,
+        (point.z / cell_size).floor() as i32,
+    )
+}
+
+fn closest_point_on_density_triangle(point: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = point - a;
+    let d1 = ab.dot(ap);
+    let d2 = ac.dot(ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+
+    let bp = point - b;
+    let d3 = ab.dot(bp);
+    let d4 = ac.dot(bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return a + ab * (d1 / (d1 - d3));
+    }
+
+    let cp = point - c;
+    let d5 = ab.dot(cp);
+    let d6 = ac.dot(cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return a + ac * (d2 / (d2 - d6));
+    }
+
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 {
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+
+    let denominator = va + vb + vc;
+    if denominator.abs() <= f32::EPSILON {
+        return a;
+    }
+    let inverse = denominator.recip();
+    a + ab * (vb * inverse) + ac * (vc * inverse)
+}
+
+fn collision_triangle_hotspots(mesh: &CollisionMesh, radius: f32) -> Vec<CollisionDensityHotspot> {
+    if mesh.faces.len() <= GTA_COL_TRIANGLE_CANDIDATE_CAPACITY
+        || !radius.is_finite()
+        || radius <= 0.0
+    {
+        return Vec::new();
+    }
+
+    let cell_size = (radius * 0.5).max(0.125);
+    let mut triangles = Vec::with_capacity(mesh.faces.len());
+    let mut grid = HashMap::<(i32, i32, i32), Vec<usize>>::new();
+    let mut large_triangles = Vec::new();
+    let mut probes = BTreeSet::<(i32, i32, i32)>::new();
+
+    for face in &mesh.faces {
+        let Some(a) = mesh.vertices.get(face.a as usize).copied().map(to_mq) else {
+            continue;
+        };
+        let Some(b) = mesh.vertices.get(face.b as usize).copied().map(to_mq) else {
+            continue;
+        };
+        let Some(c) = mesh.vertices.get(face.c as usize).copied().map(to_mq) else {
+            continue;
+        };
+        if !a.is_finite() || !b.is_finite() || !c.is_finite() {
+            continue;
+        }
+        let min = a.min(b).min(c);
+        let max = a.max(b).max(c);
+        let index = triangles.len();
+        triangles.push(CollisionDensityTriangle { a, b, c, min, max });
+
+        for point in [a, b, c, (a + b + c) / 3.0] {
+            probes.insert(collision_density_cell(point, cell_size));
+        }
+
+        let min_cell = collision_density_cell(min, cell_size);
+        let max_cell = collision_density_cell(max, cell_size);
+        let spans = [
+            (max_cell.0 as i64 - min_cell.0 as i64 + 1).max(0) as usize,
+            (max_cell.1 as i64 - min_cell.1 as i64 + 1).max(0) as usize,
+            (max_cell.2 as i64 - min_cell.2 as i64 + 1).max(0) as usize,
+        ];
+        let cell_count = spans[0]
+            .checked_mul(spans[1])
+            .and_then(|value| value.checked_mul(spans[2]));
+        if cell_count.is_none_or(|count| count > COL_DENSITY_MAX_GRID_CELLS_PER_TRIANGLE) {
+            large_triangles.push(index);
+            continue;
+        }
+        for x in min_cell.0..=max_cell.0 {
+            for y in min_cell.1..=max_cell.1 {
+                for z in min_cell.2..=max_cell.2 {
+                    grid.entry((x, y, z)).or_default().push(index);
+                }
+            }
+        }
+    }
+
+    let radius_squared = radius * radius;
+    let cell_radius = (radius / cell_size).ceil() as i32;
+    let mut hotspots = Vec::new();
+    for probe in probes {
+        let center = vec3(
+            (probe.0 as f32 + 0.5) * cell_size,
+            (probe.1 as f32 + 0.5) * cell_size,
+            (probe.2 as f32 + 0.5) * cell_size,
+        );
+        let mut seen = HashSet::<usize>::new();
+        let mut candidates = 0usize;
+        let mut nearby = large_triangles.clone();
+        for x in -cell_radius..=cell_radius {
+            for y in -cell_radius..=cell_radius {
+                for z in -cell_radius..=cell_radius {
+                    if let Some(indices) = grid.get(&(probe.0 + x, probe.1 + y, probe.2 + z)) {
+                        nearby.extend_from_slice(indices);
+                    }
+                }
+            }
+        }
+
+        'candidate_scan: for index in nearby {
+            if !seen.insert(index) {
+                continue;
+            }
+            let triangle = triangles[index];
+            let sphere_min = center - Vec3::splat(radius);
+            let sphere_max = center + Vec3::splat(radius);
+            if triangle.min.x > sphere_max.x
+                || triangle.max.x < sphere_min.x
+                || triangle.min.y > sphere_max.y
+                || triangle.max.y < sphere_min.y
+                || triangle.min.z > sphere_max.z
+                || triangle.max.z < sphere_min.z
+            {
+                continue;
+            }
+            let closest =
+                closest_point_on_density_triangle(center, triangle.a, triangle.b, triangle.c);
+            if (closest - center).length_squared() <= radius_squared {
+                candidates += 1;
+                if candidates > GTA_COL_TRIANGLE_CANDIDATE_CAPACITY {
+                    break 'candidate_scan;
+                }
+            }
+        }
+
+        if candidates <= GTA_COL_TRIANGLE_CANDIDATE_CAPACITY {
+            continue;
+        }
+        if hotspots.iter().any(|hotspot: &CollisionDensityHotspot| {
+            (hotspot.center - center).length_squared() < radius_squared
+        }) {
+            continue;
+        }
+        hotspots.push(CollisionDensityHotspot { center, candidates });
+        if hotspots.len() >= COL_DENSITY_MAX_HOTSPOTS_PER_MESH {
+            break;
+        }
+    }
+    hotspots
+}
+
+fn live_col_bytes_for_validation(
+    app: &AppState,
+    entries: &BTreeMap<String, ImgEntry>,
+    key: &str,
+) -> Option<Vec<u8>> {
+    if app.pending_asset_deletes.contains(key) || app.editing.deleted_entries.contains(key) {
+        return None;
+    }
+    if let Some(bytes) = app.editing.modified_entries.get(key) {
+        return Some(bytes.clone());
+    }
+    if let Some((_, bytes)) = app.pending_replacement_assets.get(key) {
+        return Some(bytes.clone());
+    }
+    entries.get(key).map(read_col_entry_bytes)
+}
+
+fn collect_collision_density_warnings(
+    app: &AppState,
+    entries: &BTreeMap<String, ImgEntry>,
+) -> Vec<String> {
+    let mut used_keys = BTreeSet::new();
+    for (index, placement) in app.placements.iter().enumerate() {
+        if app
+            .element_states
+            .get(index)
+            .is_some_and(|state| state.deleted)
+            || placement_disable_collisions(placement, &app.definitions)
+        {
+            continue;
+        }
+        let key = placement_collision_key_cow(&app.definitions, placement).into_owned();
+        if app
+            .collisions
+            .get(&key)
+            .is_some_and(|mesh| mesh.faces.len() > GTA_COL_TRIANGLE_CANDIDATE_CAPACITY)
+        {
+            used_keys.insert(key);
+        }
+    }
+
+    let face_grouped = used_keys
+        .into_iter()
+        .filter(|key| {
+            live_col_bytes_for_validation(app, entries, key)
+                .is_some_and(|bytes| col_model_uses_face_groups(&bytes, key))
+        })
+        .collect::<HashSet<_>>();
+    let mut cache = HashMap::<(String, u32), Vec<CollisionDensityHotspot>>::new();
+    let mut warnings = Vec::new();
+    let mut omitted = 0usize;
+
+    for (index, placement) in app.placements.iter().enumerate() {
+        if app
+            .element_states
+            .get(index)
+            .is_some_and(|state| state.deleted)
+            || placement_disable_collisions(placement, &app.definitions)
+        {
+            continue;
+        }
+        let key = placement_collision_key_cow(&app.definitions, placement).into_owned();
+        if !face_grouped.contains(&key) {
+            continue;
+        }
+        let Some(mesh) = app.collisions.get(&key) else {
+            continue;
+        };
+        let scale = placement_scale(placement);
+        let hotspots = cache
+            .entry((key.clone(), scale.to_bits()))
+            .or_insert_with(|| collision_triangle_hotspots(mesh, COL_DENSITY_PROBE_RADIUS / scale));
+        let model = placement_matrix(placement);
+        for hotspot in hotspots {
+            if warnings.len() >= COL_DENSITY_MAX_WARNINGS {
+                omitted += 1;
+                continue;
+            }
+            let world = model.transform_point3(hotspot.center);
+            warnings.push(format!(
+                "WARN COL DENSITY {key}: placement {} (#{}), near ({:.1}, {:.1}, {:.1}), has at least {} triangle candidates inside an {:.0}m test sphere; GTA's face-group buffer holds {}",
+                placement.id,
+                index + 1,
+                world.x,
+                world.y,
+                world.z,
+                hotspot.candidates,
+                COL_DENSITY_PROBE_RADIUS,
+                GTA_COL_TRIANGLE_CANDIDATE_CAPACITY,
+            ));
+        }
+    }
+    if omitted != 0 {
+        warnings.push(format!(
+            "WARN COL DENSITY: {omitted} additional placed hotspot(s) omitted after the first {COL_DENSITY_MAX_WARNINGS}"
+        ));
+    }
+    warnings
+}
+
+#[cfg(test)]
+mod collision_density_tests {
+    use super::*;
+
+    fn repeated_triangle_mesh(count: usize, spacing: f32) -> CollisionMesh {
+        let mut vertices = Vec::with_capacity(count * 3);
+        let mut faces = Vec::with_capacity(count);
+        for index in 0..count {
+            let x = index as f32 * spacing;
+            let first = vertices.len() as u16;
+            vertices.extend([
+                V3 { x, y: 0.0, z: 0.0 },
+                V3 {
+                    x: x + 0.5,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 { x, y: 0.5, z: 0.0 },
+            ]);
+            faces.push(CollisionFace {
+                a: first,
+                b: first + 1,
+                c: first + 2,
+                material: 0,
+                light: 0,
+                img_path: PathBuf::new(),
+                material_file_offset: 0,
+                light_file_offset: 0,
+            });
+        }
+        let bounds = collision_mesh_bounds(&vertices, &[], &[]);
+        CollisionMesh {
+            name: "density_test".to_string(),
+            spheres: Vec::new(),
+            boxes: Vec::new(),
+            vertices,
+            faces,
+            bounds,
+            shadow_vertices: Vec::new(),
+            shadow_faces: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn density_scan_starts_after_the_native_candidate_capacity() {
+        let safe = repeated_triangle_mesh(GTA_COL_TRIANGLE_CANDIDATE_CAPACITY, 0.0);
+        let dangerous = repeated_triangle_mesh(GTA_COL_TRIANGLE_CANDIDATE_CAPACITY + 1, 0.0);
+
+        assert!(collision_triangle_hotspots(&safe, 8.0).is_empty());
+        let hotspots = collision_triangle_hotspots(&dangerous, 8.0);
+        assert!(!hotspots.is_empty());
+        assert_eq!(
+            hotspots[0].candidates,
+            GTA_COL_TRIANGLE_CANDIDATE_CAPACITY + 1
+        );
+    }
+
+    #[test]
+    fn density_scan_does_not_flag_spatially_separated_faces() {
+        let sparse = repeated_triangle_mesh(GTA_COL_TRIANGLE_CANDIDATE_CAPACITY + 1, 20.0);
+
+        assert!(collision_triangle_hotspots(&sparse, 8.0).is_empty());
+    }
+}
+
 fn col_entry_has_collision_shapes(entry: &ImgEntry) -> bool {
     let bytes = read_col_entry_bytes(entry);
     let local = ImgEntry {
@@ -3443,21 +3993,89 @@ fn col_entry_has_collision_shapes(entry: &ImgEntry) -> bool {
     })
 }
 
+fn active_placement_ids(
+    placements: &[Placement],
+    element_states: &[ElementState],
+) -> BTreeSet<String> {
+    placements
+        .iter()
+        .enumerate()
+        .filter(|(index, placement)| {
+            !placement.id.trim().is_empty()
+                && !element_states
+                    .get(*index)
+                    .is_some_and(|state| state.deleted)
+        })
+        .map(|(_, placement)| placement.id.to_ascii_lowercase())
+        .collect()
+}
+
+fn overlay_staged_asset_name(
+    name: &str,
+    dffs: &mut BTreeSet<String>,
+    cols: &mut BTreeSet<String>,
+    txds: &mut BTreeSet<String>,
+) {
+    let key = lower(name.trim());
+    if key.ends_with(".dff") {
+        dffs.insert(asset_key(&key, ".dff"));
+    } else if key.ends_with(".col") {
+        cols.insert(asset_key(&key, ".col"));
+    } else if key.ends_with(".txd") {
+        txds.insert(asset_key(&key, ".txd"));
+    }
+}
+
+fn implicit_col_key(dff_key: &str, definition_id: &str) -> String {
+    dff_key
+        .strip_suffix(".dff")
+        .map(|base| format!("{base}.col"))
+        .unwrap_or_else(|| asset_key(definition_id, ".col"))
+}
+
+#[cfg(test)]
+mod live_asset_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn staged_generated_col_is_in_live_asset_inventory() {
+        let mut dffs = BTreeSet::new();
+        let mut cols = BTreeSet::new();
+        let mut txds = BTreeSet::new();
+
+        overlay_staged_asset_name("Generated_Model.COL", &mut dffs, &mut cols, &mut txds);
+
+        assert_eq!(cols, BTreeSet::from(["generated_model.col".to_string()]));
+        assert!(dffs.is_empty());
+        assert!(txds.is_empty());
+    }
+
+    #[test]
+    fn implicit_collision_reference_follows_resolved_dff() {
+        assert_eq!(
+            implicit_col_key("shared_visual.dff", "definition_42"),
+            "shared_visual.col"
+        );
+    }
+}
+
 pub(crate) fn validation_summary(app: &AppState) -> ValidationSummary {
     let mut out = ValidationSummary::default();
-    let placement_ids: BTreeSet<String> = app
-        .placements
-        .iter()
-        .filter(|p| !p.id.trim().is_empty())
-        .map(|p| p.id.to_ascii_lowercase())
-        .collect();
+    let placement_ids = active_placement_ids(&app.placements, &app.element_states);
     let definition_ids: BTreeSet<String> = app
         .definitions
         .keys()
         .map(|id| id.to_ascii_lowercase())
         .collect();
 
-    for placement in &app.placements {
+    for (index, placement) in app.placements.iter().enumerate() {
+        if app
+            .element_states
+            .get(index)
+            .is_some_and(|state| state.deleted)
+        {
+            continue;
+        }
         if !definition_ids.contains(&placement.id.to_ascii_lowercase()) {
             out.missing_definition_ids.push(placement.id.clone());
         }
@@ -3487,28 +4105,29 @@ pub(crate) fn validation_summary(app: &AppState) -> ValidationSummary {
             ));
         }
     }
-    let used_definition_ids: HashSet<String> =
-        app.placements.iter().map(|p| p.id.clone()).collect();
     for def in app.definitions.values() {
         let readonly = app.readonly_definition_ids.contains(&def.id);
-        if readonly && !used_definition_ids.contains(&def.id) {
-            continue;
-        }
         if !placement_ids.contains(&def.id.to_ascii_lowercase()) {
-            out.unused_definitions.push(def.id.clone());
+            if !readonly {
+                out.unused_definitions.push(def.id.clone());
+            }
+            // Assets referenced only by an unused definition are unused too.
+            // Omitting those references lets a single purge remove the custom
+            // definition and its DFF/COL/TXD, releasing the definition ID.
+            continue;
         }
         let dff_key = asset_key_opt(def.attrs.get("dff"), &def.id, ".dff");
         out.referenced_dffs.insert(dff_key.clone());
         let col_value = def.attrs.get("col").map(|value| value.trim()).unwrap_or("");
         if col_value.is_empty() {
-            if readonly {
-                out.referenced_cols.insert(
-                    dff_key
-                        .strip_suffix(".dff")
-                        .map(|base| format!("{base}.col"))
-                        .unwrap_or_else(|| asset_key(&def.id, ".col")),
-                );
-            } else {
+            // The editor and collision generator both treat a missing explicit
+            // COL as the same-stem companion of the resolved DFF. Keep the
+            // authoring warning for writable definitions, but still count that
+            // implicit COL as referenced so a freshly generated asset is not
+            // offered to the unused-asset purge before the project is reloaded.
+            out.referenced_cols
+                .insert(implicit_col_key(&dff_key, &def.id));
+            if !readonly {
                 out.missing_col_attrs.push(def.id.clone());
             }
         } else {
@@ -3536,7 +4155,26 @@ pub(crate) fn validation_summary(app: &AppState) -> ValidationSummary {
         &mut out.loose_cols,
         &mut out.loose_txds,
     );
+    // In-memory replacements are already part of the live project. Validation
+    // must overlay them on the disk inventory just as Save does; otherwise new
+    // generated COLs (and other staged assets) appear missing or unused until
+    // a save/reload materializes them in an IMG archive.
+    for (key, (name, _)) in &app.pending_replacement_assets {
+        overlay_staged_asset_name(
+            if name.trim().is_empty() { key } else { name },
+            &mut out.img_dffs,
+            &mut out.img_cols,
+            &mut out.img_txds,
+        );
+    }
+    for key in app.editing.modified_entries.keys() {
+        if !app.editing.deleted_entries.contains(key) {
+            overlay_staged_asset_name(key, &mut out.img_dffs, &mut out.img_cols, &mut out.img_txds);
+        }
+    }
     out.invalid_texture_formats = collect_txd_format_warnings(&app.root);
+    let local_dff_entries = collect_resource_dff_entries(&app.root);
+    out.invalid_dff_material_counts = collect_dff_material_warnings(app, &local_dff_entries);
     out.invalid_col_loads = collect_col_load_warnings(&app.root);
     for key in &app.pending_asset_deletes {
         out.img_dffs.remove(key);
@@ -3592,7 +4230,13 @@ pub(crate) fn validation_summary(app: &AppState) -> ValidationSummary {
             }
         }
     }
-    for def in app.definitions.values() {
+    out.invalid_col_loads
+        .extend(collect_collision_density_warnings(app, &local_col_entries));
+    for def in app
+        .definitions
+        .values()
+        .filter(|def| placement_ids.contains(&def.id.to_ascii_lowercase()))
+    {
         if !definition_flag_enabled(def, "disable_collisions") {
             continue;
         }
@@ -3623,6 +4267,13 @@ pub(crate) fn validation_summary(app: &AppState) -> ValidationSummary {
         let referenced_roots = app
             .placements
             .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                !app.element_states
+                    .get(*index)
+                    .is_some_and(|state| state.deleted)
+            })
+            .map(|(_, placement)| placement)
             .filter(|placement| asset_key(&placement.dff, ".dff") == asset_key(&dff.name, ".dff"))
             .filter_map(|placement| {
                 physics_root_value_from_attrs(&placement.attrs).or_else(|| {
@@ -3681,6 +4332,8 @@ pub(crate) fn validation_summary(app: &AppState) -> ValidationSummary {
     out.missing_col_attrs.sort();
     out.invalid_col_loads.sort();
     out.invalid_col_loads.dedup();
+    out.invalid_dff_material_counts.sort();
+    out.invalid_dff_material_counts.dedup();
     out.breakable_warnings.sort();
     out.breakable_warnings.dedup();
     out
@@ -3926,6 +4579,78 @@ pub(crate) fn poll_duplicate_placement_scan(app: &mut AppState) {
         if disconnected && !finished {
             app.status_message = "Duplicate placement scan stopped unexpectedly".to_string();
         }
+    }
+}
+
+#[cfg(test)]
+mod unused_asset_tests {
+    use super::*;
+
+    fn placement(id: &str) -> Placement {
+        Placement {
+            id: id.to_string(),
+            dff: id.to_string(),
+            zone: "test".to_string(),
+            tag: "object".to_string(),
+            attrs: BTreeMap::new(),
+            pos: V3::default(),
+            rot: V3::default(),
+        }
+    }
+
+    #[test]
+    fn deleted_placements_do_not_keep_definition_ids_in_use() {
+        let placements = vec![placement("CustomModel"), placement("StillUsed")];
+        let states = vec![
+            ElementState {
+                deleted: true,
+                ..ElementState::default()
+            },
+            ElementState::default(),
+        ];
+
+        let ids = active_placement_ids(&placements, &states);
+
+        assert!(!ids.contains("custommodel"));
+        assert!(ids.contains("stillused"));
+    }
+
+    #[test]
+    fn placement_dff_key_uses_the_live_definition_instead_of_the_cached_name() {
+        let placement = Placement {
+            dff: "stale_import_name".to_string(),
+            ..placement("PlacedModel")
+        };
+        let definition = Definition {
+            id: "PlacedModel".to_string(),
+            zone: "test".to_string(),
+            attrs: BTreeMap::from([("dff".to_string(), "ActualMesh".to_string())]),
+        };
+        let definitions = HashMap::from([("PlacedModel".to_string(), definition)]);
+
+        assert_eq!(
+            placement_dff_key(&placement, &definitions),
+            "actualmesh.dff"
+        );
+    }
+
+    #[test]
+    fn placement_dff_key_uses_definition_id_when_dff_is_implicit() {
+        let placement = Placement {
+            dff: "stale_import_name".to_string(),
+            ..placement("PlacedModel")
+        };
+        let definition = Definition {
+            id: "PlacedModel".to_string(),
+            zone: "test".to_string(),
+            attrs: BTreeMap::new(),
+        };
+        let definitions = HashMap::from([("PlacedModel".to_string(), definition)]);
+
+        assert_eq!(
+            placement_dff_key(&placement, &definitions),
+            "placedmodel.dff"
+        );
     }
 }
 

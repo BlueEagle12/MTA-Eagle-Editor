@@ -22,13 +22,25 @@ pub(crate) fn lod_audit_client_rect() -> Rect {
     Rect::new(panel.x + panel.w - 188.0, panel.y + 54.0, 174.0, 30.0)
 }
 
+pub(crate) fn lod_audit_generate_lods_rect() -> Rect {
+    let panel = lod_audit_panel_rect();
+    let width = (panel.w - 34.0) * 0.5;
+    Rect::new(panel.x + 14.0, panel.y + 90.0, width, 30.0)
+}
+
+pub(crate) fn lod_audit_clear_lods_rect() -> Rect {
+    let panel = lod_audit_panel_rect();
+    let width = (panel.w - 34.0) * 0.5;
+    Rect::new(panel.x + 20.0 + width, panel.y + 90.0, width, 30.0)
+}
+
 pub(crate) fn lod_audit_filter_rect(slot: usize) -> Rect {
     let panel = lod_audit_panel_rect();
     let gap = 6.0;
     let width = (panel.w - 28.0 - gap * 4.0) / 5.0;
     Rect::new(
         panel.x + 14.0 + slot as f32 * (width + gap),
-        panel.y + 166.0,
+        panel.y + 204.0,
         width,
         28.0,
     )
@@ -36,26 +48,26 @@ pub(crate) fn lod_audit_filter_rect(slot: usize) -> Rect {
 
 pub(crate) fn lod_audit_small_minus_rect() -> Rect {
     let panel = lod_audit_panel_rect();
-    Rect::new(panel.x + 118.0, panel.y + 202.0, 34.0, 28.0)
+    Rect::new(panel.x + 118.0, panel.y + 240.0, 34.0, 28.0)
 }
 
 pub(crate) fn lod_audit_small_plus_rect() -> Rect {
     let panel = lod_audit_panel_rect();
-    Rect::new(panel.x + 224.0, panel.y + 202.0, 34.0, 28.0)
+    Rect::new(panel.x + 224.0, panel.y + 240.0, 34.0, 28.0)
 }
 
 pub(crate) fn lod_audit_small_sort_rect() -> Rect {
     let panel = lod_audit_panel_rect();
-    Rect::new(panel.x + panel.w - 126.0, panel.y + 202.0, 112.0, 28.0)
+    Rect::new(panel.x + panel.w - 126.0, panel.y + 240.0, 112.0, 28.0)
 }
 
 pub(crate) fn lod_audit_list_rect() -> Rect {
     let panel = lod_audit_panel_rect();
     Rect::new(
         panel.x + 10.0,
-        panel.y + 238.0,
+        panel.y + 276.0,
         panel.w - 20.0,
-        (panel.h - 250.0).max(80.0),
+        (panel.h - 288.0).max(80.0),
     )
 }
 
@@ -117,10 +129,30 @@ pub(crate) fn draw_lod_audit_panel(app: &AppState) {
         &format!("Client draw {}%", app.lod_audit.client_draw_percent),
         false,
     );
+    if app.lod_generation_job.is_some() {
+        text_button_busy(
+            &app.ui_font,
+            lod_audit_generate_lods_rect(),
+            "Generating LODs",
+        );
+    } else {
+        text_button(
+            &app.ui_font,
+            lod_audit_generate_lods_rect(),
+            "Generate LODs",
+            false,
+        );
+    }
+    text_button(
+        &app.ui_font,
+        lod_audit_clear_lods_rect(),
+        "Clear All LODs",
+        false,
+    );
 
     if app.lod_audit.result.is_some() {
         let gap = 8.0;
-        let card_y = panel.y + 94.0;
+        let card_y = panel.y + 132.0;
         let card_w = (panel.w - 28.0 - gap * 2.0) / 3.0;
         draw_summary_card(
             app,
@@ -152,7 +184,7 @@ pub(crate) fn draw_lod_audit_panel(app: &AppState) {
                 "Run the audit to build visibility and review data."
             },
             panel.x + 14.0,
-            panel.y + 122.0,
+            panel.y + 160.0,
             12,
             ui_dim(),
         );
@@ -170,12 +202,12 @@ pub(crate) fn draw_lod_audit_panel(app: &AppState) {
         &app.ui_font,
         "Small <=",
         panel.x + 14.0,
-        panel.y + 221.0,
+        panel.y + 259.0,
         12,
         ui_dim(),
     );
     text_button(&app.ui_font, lod_audit_small_minus_rect(), "-", false);
-    let threshold_rect = Rect::new(panel.x + 158.0, panel.y + 202.0, 60.0, 28.0);
+    let threshold_rect = Rect::new(panel.x + 158.0, panel.y + 240.0, 60.0, 28.0);
     draw_rrect_bordered(
         threshold_rect.x,
         threshold_rect.y,
@@ -375,6 +407,18 @@ pub(crate) fn handle_lod_audit_click(app: &mut AppState, mouse: Vec2) -> bool {
                 "LOD audit client draw-distance setting: {}%",
                 app.lod_audit.client_draw_percent
             );
+        }
+        return true;
+    }
+    if lod_audit_generate_lods_rect().contains(mouse) {
+        if is_mouse_button_pressed(MouseButton::Left) && app.lod_generation_job.is_none() {
+            request_scene_lod_generation(app);
+        }
+        return true;
+    }
+    if lod_audit_clear_lods_rect().contains(mouse) {
+        if is_mouse_button_pressed(MouseButton::Left) {
+            request_clear_all_lods(app);
         }
         return true;
     }

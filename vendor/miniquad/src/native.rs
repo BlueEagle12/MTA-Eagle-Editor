@@ -8,6 +8,64 @@ pub(crate) struct DroppedFiles {
     pub paths: Vec<std::path::PathBuf>,
     pub bytes: Vec<Vec<u8>>,
 }
+
+#[cfg(target_os = "linux")]
+pub(crate) fn dropped_file_path_from_uri(value: &str) -> Option<std::path::PathBuf> {
+    let value = value.trim().trim_end_matches('\r');
+    if value.is_empty() || value.starts_with('#') {
+        return None;
+    }
+    let encoded = if let Some(rest) = value.strip_prefix("file://") {
+        if let Some(rest) = rest.strip_prefix("localhost/") {
+            format!("/{rest}")
+        } else if rest.starts_with('/') {
+            rest.to_string()
+        } else {
+            return None;
+        }
+    } else {
+        value.to_string()
+    };
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                decoded.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).ok().map(std::path::PathBuf::from)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod dropped_file_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_linux_file_uri_lists() {
+        assert_eq!(
+            dropped_file_path_from_uri("file:///tmp/My%20Model.dff\r"),
+            Some(std::path::PathBuf::from("/tmp/My Model.dff"))
+        );
+        assert_eq!(
+            dropped_file_path_from_uri("file://localhost/tmp/model.dff"),
+            Some(std::path::PathBuf::from("/tmp/model.dff"))
+        );
+        assert_eq!(dropped_file_path_from_uri("# comment"), None);
+    }
+}
 pub(crate) struct NativeDisplayData {
     pub screen_width: i32,
     pub screen_height: i32,

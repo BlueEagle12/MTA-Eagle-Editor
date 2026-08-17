@@ -173,6 +173,28 @@ pub(crate) fn index_txd_file(path: &Path, map: &mut TxdTextureIndex) {
     index_txd_entries(path, &entries, map);
 }
 
+/// Replace every texture-index entry backed by one IMG with a freshly built
+/// snapshot of that archive.
+///
+/// Rewriting an IMG can move TXDs even when the dictionaries themselves were
+/// not edited. Removing by dictionary name alone is also insufficient when a
+/// TXD was deleted from the archive, because its old name is absent from the
+/// new directory. Match the backing path so moved and deleted entries are both
+/// discarded before the fresh snapshot is installed.
+pub(crate) fn install_txd_archive_index(
+    path: &Path,
+    fresh: TxdTextureIndex,
+    index: &mut TxdTextureIndex,
+) {
+    index.retain(|_, entries| {
+        entries.retain(|entry| entry.img_path != path);
+        !entries.is_empty()
+    });
+    for (texture_name, mut entries) in fresh {
+        index.entry(texture_name).or_default().append(&mut entries);
+    }
+}
+
 pub(crate) fn index_txd_entries(path: &Path, entries: &[ImgEntry], map: &mut TxdTextureIndex) {
     let txd_entries = entries
         .iter()
@@ -940,7 +962,6 @@ pub(crate) fn txd_name_from_folder(source_dir: &Path) -> Result<String, String> 
 /// Build the RenderWare TXD bytes shared by standalone and IMG destinations.
 pub(crate) fn build_txd_from_folder(source_dir: &Path) -> Result<(String, Vec<u8>), String> {
     let txd_name = txd_name_from_folder(source_dir)?;
-
     let mut images: Vec<PathBuf> = WalkDir::new(source_dir)
         .into_iter()
         .filter_map(Result::ok)
@@ -953,6 +974,18 @@ pub(crate) fn build_txd_from_folder(source_dir: &Path) -> Result<(String, Vec<u8
         })
         .collect();
     images.sort();
+    build_txd_from_paths(&txd_name, source_dir, &images)
+}
+
+/// Build a TXD from an explicit texture list. Importers use this to include
+/// exactly the images referenced by the DFFs assigned to a definition TXD,
+/// while retaining the same validation and native-texture encoding as the
+/// interactive folder generator.
+pub(crate) fn build_txd_from_paths(
+    txd_name: &str,
+    source_dir: &Path,
+    images: &[PathBuf],
+) -> Result<(String, Vec<u8>), String> {
     if images.is_empty() {
         return Err(format!(
             "{} does not contain any PNG textures",
@@ -961,8 +994,8 @@ pub(crate) fn build_txd_from_folder(source_dir: &Path) -> Result<(String, Vec<u8
     }
 
     let mut texture_paths: HashMap<String, PathBuf> = HashMap::new();
-    let mut txd = rw_chunk(0x16, rw_chunk(0x01, vec![0, 0, 0, 0]));
-    for path in &images {
+    let mut sources = Vec::with_capacity(images.len());
+    for path in images {
         let texture_name = texture_name_from_path(path);
         let texture_key = texture_name.to_ascii_lowercase();
         if let Some(first_path) = texture_paths.get(&texture_key) {
@@ -976,10 +1009,60 @@ pub(crate) fn build_txd_from_folder(source_dir: &Path) -> Result<(String, Vec<u8
             ));
         }
         texture_paths.insert(texture_key, path.clone());
-        let native = imported_image_texture_native(path, &texture_name)?;
-        txd = append_texture_native_to_txd(txd, &native, &texture_name)?;
+        sources.push((path.clone(), texture_name));
     }
-    Ok((txd_name, txd))
+
+    let worker_count = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(12)
+        .min(sources.len())
+        .max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let tx = tx.clone();
+            let sources = &sources;
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((path, texture_name)) = sources.get(index) else {
+                        break;
+                    };
+                    let result = imported_image_texture_native(path, texture_name);
+                    if tx.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    drop(tx);
+    let mut encoded = std::iter::repeat_with(|| None)
+        .take(sources.len())
+        .collect::<Vec<Option<Result<Vec<u8>, String>>>>();
+    for (index, result) in rx {
+        encoded[index] = Some(result);
+    }
+    let mut natives = Vec::with_capacity(encoded.len());
+    for (index, result) in encoded.into_iter().enumerate() {
+        natives.push(result.ok_or_else(|| {
+            format!(
+                "Texture worker stopped before encoding {}",
+                sources[index].0.display()
+            )
+        })??);
+    }
+    let count = u16::try_from(natives.len())
+        .map_err(|_| format!("{txd_name} contains more than {} textures", u16::MAX))?;
+    let mut dictionary = rw_chunk(0x01, [count.to_le_bytes().as_slice(), &[0, 0]].concat());
+    for native in natives {
+        dictionary.extend_from_slice(&native);
+    }
+    let txd = rw_chunk(0x16, dictionary);
+    Ok((txd_name.to_string(), txd))
 }
 
 /// Write a folder-built TXD as a loose file in the project's `textures/` dir.
@@ -1105,6 +1188,48 @@ mod generation_tests {
     }
 
     #[test]
+    fn explicit_texture_list_builds_only_dff_referenced_images() {
+        let root = test_dir("explicit_list");
+        let source = root.join("assorted");
+        fs::create_dir_all(&source).unwrap();
+        let road = source.join("road.png");
+        let unused = source.join("unused.png");
+        write_png(&road, [128, 128, 128, 255]);
+        write_png(&unused, [255, 0, 255, 255]);
+
+        let (_, bytes) =
+            build_txd_from_paths("roads.txd", &source, std::slice::from_ref(&road)).unwrap();
+        assert_eq!(txd_texture_count(&bytes, 12, bytes.len()), Some(1));
+        assert!(txd_contains_texture_native(&bytes, "road"));
+        assert!(!txd_contains_texture_native(&bytes, "unused"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parallel_txd_builder_is_byte_identical_to_incremental_assembly() {
+        let root = test_dir("parallel_identity");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let opaque = source.join("opaque.png");
+        let alpha = source.join("alpha.png");
+        write_png(&opaque, [25, 50, 75, 255]);
+        write_png(&alpha, [90, 120, 150, 128]);
+        let paths = vec![alpha, opaque];
+
+        let (_, parallel) = build_txd_from_paths("test.txd", &source, &paths).unwrap();
+        let mut incremental = rw_chunk(0x16, rw_chunk(0x01, vec![0, 0, 0, 0]));
+        for path in &paths {
+            let name = texture_name_from_path(path);
+            let native = imported_image_texture_native(path, &name).unwrap();
+            incremental = append_texture_native_to_txd(incremental, &native, &name).unwrap();
+        }
+
+        assert_eq!(parallel, incremental);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_duplicate_sanitized_texture_names() {
         let root = test_dir("duplicate");
         let source = root.join("duplicate_textures");
@@ -1172,5 +1297,53 @@ mod generation_tests {
         let remaining = index.get("road").unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].txd_name, "generic.txd");
+    }
+
+    #[test]
+    fn installing_archive_index_drops_stale_and_deleted_entries_only_for_that_archive() {
+        let texture = |txd_name: &str, path: &str, offset: u64| TxdTexture {
+            txd_name: txd_name.to_string(),
+            img_path: PathBuf::from(path),
+            native_offset: offset,
+            native_size: 128,
+            data_offset: offset + 64,
+            data_size: 64,
+            palette_offset: 0,
+            width: 4,
+            height: 4,
+            format: TxFormat::Dxt1,
+            has_alpha: false,
+            content_fingerprint: [offset, offset],
+        };
+        let archive = Path::new("edited.img");
+        let mut index = TxdTextureIndex::from([
+            (
+                "road".to_string(),
+                vec![
+                    texture("roads.txd", "edited.img", 2048),
+                    texture("generic.txd", "other.img", 4096),
+                ],
+            ),
+            (
+                "deleted".to_string(),
+                vec![texture("removed.txd", "edited.img", 6144)],
+            ),
+        ]);
+        let fresh = TxdTextureIndex::from([(
+            "road".to_string(),
+            vec![texture("roads.txd", "edited.img", 8192)],
+        )]);
+
+        install_txd_archive_index(archive, fresh, &mut index);
+
+        assert!(!index.contains_key("deleted"));
+        let road = &index["road"];
+        assert_eq!(road.len(), 2);
+        assert!(road.iter().any(|entry| {
+            entry.img_path == Path::new("edited.img") && entry.native_offset == 8192
+        }));
+        assert!(road.iter().any(|entry| {
+            entry.img_path == Path::new("other.img") && entry.native_offset == 4096
+        }));
     }
 }

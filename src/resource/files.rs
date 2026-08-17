@@ -1311,6 +1311,10 @@ fn material_emitters_from_json(json: &serde_json::Value) -> HashMap<String, Mate
             } else {
                 MaterialEmitterCastMode::Face
             },
+            casts_shadow: entry
+                .get("castsShadow")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
             max_grouping_size: entry
                 .get("maxGroupingSize")
                 .and_then(|v| v.as_f64())
@@ -1391,6 +1395,7 @@ pub(crate) fn material_emitters_section_value(
                     MaterialEmitterCastMode::Face => "face",
                     MaterialEmitterCastMode::Point => "point",
                 },
+                "castsShadow": emitter.casts_shadow,
                 "maxGroupingSize": emitter.max_grouping_size,
                 "pointUpStrength": emitter.point_up_strength,
                 "pointDownStrength": emitter.point_down_strength,
@@ -1575,6 +1580,7 @@ mod material_emitter_tests {
                 enabled: true,
                 emit_inversed: true,
                 cast_mode: MaterialEmitterCastMode::Point,
+                casts_shadow: true,
                 max_grouping_size: 3.5,
                 point_up_strength: 0.0,
                 point_down_strength: 2.0,
@@ -1599,6 +1605,7 @@ mod material_emitter_tests {
                 enabled: true,
                 emit_inversed: false,
                 cast_mode: MaterialEmitterCastMode::Face,
+                casts_shadow: false,
                 max_grouping_size: 2.0,
                 point_up_strength: 1.0,
                 point_down_strength: 1.0,
@@ -1619,6 +1626,7 @@ mod material_emitter_tests {
                 enabled: true,
                 emit_inversed: true,
                 cast_mode: MaterialEmitterCastMode::Face,
+                casts_shadow: true,
                 max_grouping_size: 2.0,
                 point_up_strength: 1.0,
                 point_down_strength: 1.0,
@@ -1639,6 +1647,7 @@ mod material_emitter_tests {
                 enabled: false,
                 emit_inversed: false,
                 cast_mode: MaterialEmitterCastMode::Point,
+                casts_shadow: false,
                 max_grouping_size: 12.0,
                 point_up_strength: 3.0,
                 point_down_strength: 0.0,
@@ -2215,7 +2224,7 @@ pub(crate) fn light_from_attrs(attrs: &BTreeMap<String, String>, index: usize) -
             .get("radius")
             .or_else(|| attrs.get("range"))
             .and_then(|value| value.parse::<f32>().ok())
-            .unwrap_or(50.0),
+            .unwrap_or(DEFAULT_EDITOR_LIGHT_RADIUS),
         casts_shadow: attr_bool(attrs, &["castsShadow", "casts_shadow", "shadow"], false),
         point_lobe: parse_point_light_lobe(
             attrs
@@ -2294,7 +2303,7 @@ fn editor_light_from_json(value: &serde_json::Value, index: usize) -> Option<Edi
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         intensity: finite_json_f32(value.get("intensity")).unwrap_or(1.0),
-        radius: finite_json_f32(value.get("radius")).unwrap_or(50.0),
+        radius: finite_json_f32(value.get("radius")).unwrap_or(DEFAULT_EDITOR_LIGHT_RADIUS),
         casts_shadow: value
             .get("castsShadow")
             .and_then(serde_json::Value::as_bool)
@@ -3273,17 +3282,79 @@ pub(crate) fn load_gta_sa_particle_effects(gta_sa_dir: &Path) -> Vec<ParticleEff
 pub(crate) fn parse_gta_sa_effects_fxp(text: &str) -> Vec<ParticleEffectDef> {
     let mut effects = Vec::new();
     let mut current: Option<ParticleEffectDef> = None;
+    let mut current_size_curve: Option<ParticleSizeCurve> = None;
+    let mut size_axis: Option<usize> = None;
+    let mut size_key_time: Option<f32> = None;
+
+    let finish_size_curve = |current: &mut Option<ParticleEffectDef>,
+                             curve: &mut Option<ParticleSizeCurve>| {
+        if let Some(curve) = curve
+            .take()
+            .filter(|curve| !curve.size_x.is_empty() || !curve.size_y.is_empty())
+            && let Some(effect) = current.as_mut()
+        {
+            effect.size_curves.push(curve);
+        }
+    };
     for raw_line in text.lines() {
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
         }
         if line == "FX_SYSTEM_DATA:" {
+            finish_size_curve(&mut current, &mut current_size_curve);
             if let Some(effect) = current.take().filter(|effect| !effect.name.is_empty()) {
                 effects.push(effect);
             }
             current = Some(ParticleEffectDef::default());
+            size_axis = None;
+            size_key_time = None;
             continue;
+        }
+        if line == "FX_INFO_SIZE_DATA:" {
+            finish_size_curve(&mut current, &mut current_size_curve);
+            current_size_curve = Some(ParticleSizeCurve::default());
+            size_axis = None;
+            size_key_time = None;
+            continue;
+        }
+        if line.starts_with("FX_INFO_") {
+            finish_size_curve(&mut current, &mut current_size_curve);
+            size_axis = None;
+            size_key_time = None;
+            continue;
+        }
+        if current_size_curve.is_some() {
+            match line {
+                "SIZEX:" => size_axis = Some(0),
+                "SIZEY:" => size_axis = Some(1),
+                // Bias is randomized per particle by SA. The deterministic
+                // editor preview uses the authored base dimensions.
+                "SIZEXBIAS:" | "SIZEYBIAS:" => size_axis = None,
+                _ => {
+                    if let Some((key, value)) = line.split_once(':') {
+                        match key.trim() {
+                            "TIME" => size_key_time = value.trim().parse::<f32>().ok(),
+                            "VAL" => {
+                                if let (Some(axis), Some(time), Ok(value)) =
+                                    (size_axis, size_key_time.take(), value.trim().parse::<f32>())
+                                    && time.is_finite()
+                                    && value.is_finite()
+                                    && let Some(curve) = current_size_curve.as_mut()
+                                {
+                                    let keys = if axis == 0 {
+                                        &mut curve.size_x
+                                    } else {
+                                        &mut curve.size_y
+                                    };
+                                    keys.push((time, value));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
         let Some((key, value)) = line.split_once(':') else {
             continue;
@@ -3314,6 +3385,7 @@ pub(crate) fn parse_gta_sa_effects_fxp(text: &str) -> Vec<ParticleEffectDef> {
             _ => {}
         }
     }
+    finish_size_curve(&mut current, &mut current_size_curve);
     if let Some(effect) = current.take().filter(|effect| !effect.name.is_empty()) {
         effects.push(effect);
     }
@@ -3792,6 +3864,54 @@ TEXTURE2: flame_core
         assert_eq!(effects[0].primitive_count, 1);
         assert_eq!(effects[1].name, "fire");
         assert_eq!(effects[1].textures, vec!["flame", "flame_core"]);
+    }
+
+    #[test]
+    fn parse_effects_fxp_extracts_particle_size_curves() {
+        let effects = parse_gta_sa_effects_fxp(
+            r#"
+FX_SYSTEM_DATA:
+NAME: smoke30m
+CULLDIST: 155.000
+FX_INFO_SIZE_DATA:
+TIMEMODEPRT: 1
+SIZEX:
+FX_INTERP_DATA:
+NUM_KEYS: 2
+FX_KEYFLOAT_DATA:
+TIME: 0.000
+VAL: 0.350
+FX_KEYFLOAT_DATA:
+TIME: 1.000
+VAL: 9.000
+SIZEY:
+FX_INTERP_DATA:
+NUM_KEYS: 2
+FX_KEYFLOAT_DATA:
+TIME: 0.000
+VAL: 0.500
+FX_KEYFLOAT_DATA:
+TIME: 1.000
+VAL: 8.000
+SIZEXBIAS:
+FX_INTERP_DATA:
+NUM_KEYS: 1
+FX_KEYFLOAT_DATA:
+TIME: 0.000
+VAL: 2.000
+FX_INFO_COLOUR_DATA:
+"#,
+        );
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].size_curves.len(), 1);
+        assert_eq!(
+            effects[0].size_curves[0].size_x,
+            vec![(0.0, 0.35), (1.0, 9.0)]
+        );
+        assert_eq!(
+            effects[0].size_curves[0].size_y,
+            vec![(0.0, 0.5), (1.0, 8.0)]
+        );
     }
 
     #[test]

@@ -28,10 +28,23 @@ fn validation_category_label(category: ValidationActionCategory) -> &'static str
 fn validation_category_actions(category: ValidationActionCategory) -> &'static [usize] {
     match category {
         ValidationActionCategory::Review => &[10, 0, 3, 5],
-        ValidationActionCategory::Repair => &[1, 4, 8],
-        ValidationActionCategory::Optimize => &[2, 9],
-        ValidationActionCategory::Collision => &[6, 7],
+        ValidationActionCategory::Repair => &[14, 1, 4, 11, 12, 15],
+        ValidationActionCategory::Optimize => &[13, 2, 9],
+        ValidationActionCategory::Collision => &[6, 7, 8],
     }
+}
+
+/// Slot an action occupies in its category row. Popup menus anchor through
+/// this so reordering a category cannot detach a menu from its button.
+fn validation_action_position(category: ValidationActionCategory, action: usize) -> usize {
+    validation_category_actions(category)
+        .iter()
+        .position(|candidate| *candidate == action)
+        .unwrap_or(0)
+}
+
+fn validation_action_anchor_rect(category: ValidationActionCategory, action: usize) -> Rect {
+    validation_action_button_rect(category, validation_action_position(category, action))
 }
 
 fn validation_category_tab_rect(slot: usize) -> Rect {
@@ -65,6 +78,59 @@ fn validation_action_button_rect(category: ValidationActionCategory, position: u
     let x = start_x + position.min(columns - 1) as f32 * (w + gap);
     let y = panel.y + if compact { 104.0 } else { 54.0 };
     Rect::new(x, y, w, 30.0)
+}
+
+fn validation_collision_material_dropdown_rect_for(panel: Rect, anchor: Rect) -> Rect {
+    let width = 360.0_f32.min(panel.w - 28.0);
+    let height = 340.0_f32.min(panel.y + panel.h - anchor.y - anchor.h - 20.0);
+    let x = (anchor.x + anchor.w - width).clamp(panel.x + 14.0, panel.x + panel.w - width - 14.0);
+    Rect::new(x, anchor.y + anchor.h + 6.0, width, height.max(220.0))
+}
+
+fn validation_collision_material_dropdown_rect() -> Rect {
+    validation_collision_material_dropdown_rect_for(
+        validation_panel_rect(),
+        validation_action_anchor_rect(ValidationActionCategory::Collision, 7),
+    )
+}
+
+fn validation_collision_material_search_rect() -> Rect {
+    let dropdown = validation_collision_material_dropdown_rect();
+    Rect::new(
+        dropdown.x + 14.0,
+        dropdown.y + 42.0,
+        dropdown.w - 28.0,
+        30.0,
+    )
+}
+
+fn validation_collision_material_list_rect() -> Rect {
+    let dropdown = validation_collision_material_dropdown_rect();
+    Rect::new(
+        dropdown.x + 14.0,
+        dropdown.y + 82.0,
+        dropdown.w - 28.0,
+        dropdown.h - 96.0,
+    )
+}
+
+fn filtered_validation_collision_materials(search: &str) -> Vec<(u8, &'static str)> {
+    let needle = search.trim().to_ascii_lowercase();
+    GTA_SA_COL_MATERIALS
+        .iter()
+        .copied()
+        .filter(|(id, name)| {
+            needle.is_empty()
+                || name.to_ascii_lowercase().contains(&needle)
+                || id.to_string().contains(&needle)
+        })
+        .collect()
+}
+
+fn close_validation_collision_material_dropdown(app: &mut AppState) {
+    app.validation_collision_material_dropdown_open = false;
+    app.validation_collision_material_search.clear();
+    app.validation_collision_material_scroll = 0.0;
 }
 
 fn validation_toolbar_bottom() -> f32 {
@@ -102,7 +168,7 @@ pub(crate) fn validation_optimization_menu_rect() -> Rect {
     let panel = validation_panel_rect();
     validation_optimization_menu_rect_for(
         panel,
-        validation_action_button_rect(ValidationActionCategory::Optimize, 0),
+        validation_action_anchor_rect(ValidationActionCategory::Optimize, 2),
     )
 }
 
@@ -129,7 +195,7 @@ pub(crate) fn validation_optimization_continue_rect() -> Rect {
 
 fn validation_dff_repair_menu_rect() -> Rect {
     let panel = validation_panel_rect();
-    let anchor = validation_action_button_rect(ValidationActionCategory::Repair, 1);
+    let anchor = validation_action_anchor_rect(ValidationActionCategory::Repair, 4);
     let width = 280.0;
     let height = 174.0;
     let x = (anchor.x + anchor.w - width).clamp(panel.x + 12.0, panel.x + panel.w - width - 12.0);
@@ -189,6 +255,7 @@ pub(crate) fn validation_list_count(
             summary.missing_col_attrs.len()
                 + summary.duplicate_dffs.len()
                 + summary.invalid_texture_formats.len()
+                + summary.invalid_dff_material_counts.len()
                 + summary.invalid_col_loads.len()
                 + summary.breakable_warnings.len()
         }
@@ -303,6 +370,21 @@ pub(crate) fn validation_list_item(
                     });
             }
             index -= summary.invalid_texture_formats.len();
+            if index < summary.invalid_dff_material_counts.len() {
+                return summary
+                    .invalid_dff_material_counts
+                    .get(index)
+                    .map(|warning| ValidationItem {
+                        kind: MissingAssetKind::Dff,
+                        key: warning
+                            .strip_prefix("DFF ")
+                            .and_then(|value| value.split(':').next())
+                            .unwrap_or(warning)
+                            .to_string(),
+                        label: warning.clone(),
+                    });
+            }
+            index -= summary.invalid_dff_material_counts.len();
             if index < summary.invalid_col_loads.len() {
                 return summary
                     .invalid_col_loads
@@ -581,12 +663,21 @@ fn validation_action_label(app: &AppState, action: usize) -> String {
             collision_generation_preset_label(app.collision_generation_preset)
         ),
         7 => format!(
-            "Fallback: {}",
+            "Default Override: {}",
             col_material_label(app.collision_generation_fallback_material)
         ),
         8 => "Rebuild All Collisions".to_string(),
         9 => "Fix & Organize IMG Archives".to_string(),
         10 => "Review Missing Textures".to_string(),
+        11 => "Fix Duplicate IMG Entries".to_string(),
+        12 => "Fix DFF Material Limits".to_string(),
+        13 => "Chunk Oversized Elements".to_string(),
+        14 => "Classify Elements".to_string(),
+        15 => app
+            .light_lod_job
+            .as_ref()
+            .map(LightLodJob::progress_label)
+            .unwrap_or_else(|| "Light LODs".to_string()),
         _ => "Unknown Action".to_string(),
     }
 }
@@ -600,10 +691,25 @@ fn validation_action_description(action: usize) -> &'static str {
         4 => "Choose DFF structure/data repairs and/or texture-name sanitation.",
         5 => "Review and repair missing or invalid LOD relationships.",
         6 => "Cycle the geometry detail used when rebuilding collisions.",
-        7 => "Cycle the material assigned when collision material detection fails.",
+        7 => "Choose the default material used when a source material has no collision properties.",
         8 => "Rebuild collision assets for the full project with the current setup.",
         9 => "Repair MTA-incompatible IMG names, then organize assets into balanced archives.",
         10 => "Flag non-SA scene models with unresolved material textures, including LODs.",
+        11 => {
+            "Find duplicate names across project IMG archives and repair them after confirmation."
+        }
+        12 => {
+            "Automatically compact or split every referenced DFF that exceeds GTA:SA's 152-material geometry limit."
+        }
+        13 => {
+            "Review placed DFFs larger than the chosen cell size, then spatially cut selected models into separate render elements."
+        }
+        14 => {
+            "Retag elements as object or building: physics elements always stay objects, everything else is decided by a size you choose."
+        }
+        15 => {
+            "Asynchronously transfer matching day and night vertex lighting from every detail model to its assigned LOD. Each unique LOD DFF is processed once."
+        }
         _ => "Validation action.",
     }
 }
@@ -615,9 +721,12 @@ fn validation_action_busy(app: &AppState, action: usize) -> bool {
         2 => app.asset_optimization_scan_rx.is_some() || app.asset_optimization_job.is_some(),
         3 => app.txd_cleanup_job.is_some(),
         4 => app.dff_repair_rx.is_some() || app.dff_repair_refresh.is_some(),
-        5..=7 | 10 => false,
+        5..=7 | 10 | 14 => false,
         8 => app.collision_generation_job.is_some() || app.shadow_mesh_generation_job.is_some(),
-        9 => app.img_archive_rebalance_job.is_some(),
+        9 | 11 => app.img_archive_rebalance_job.is_some(),
+        12 => app.dff_material_limit_repair_job.is_some(),
+        13 => app.oversized_chunk_job.is_some(),
+        15 => app.light_lod_job.is_some(),
         _ => false,
     }
 }
@@ -780,6 +889,7 @@ pub(crate) fn draw_validation_panel(app: &mut AppState) {
             if rect.contains(mouse)
                 && !app.asset_optimization_menu_open
                 && !app.dff_repair_menu_open
+                && !app.validation_collision_material_dropdown_open
             {
                 draw_text_tooltip(&app.ui_font, rect, validation_action_description(action));
             }
@@ -900,6 +1010,129 @@ pub(crate) fn draw_validation_panel(app: &mut AppState) {
             false,
         );
     }
+    if app.validation_collision_material_dropdown_open {
+        let dropdown = validation_collision_material_dropdown_rect();
+        draw_rectangle(
+            dropdown.x + 5.0,
+            dropdown.y + 6.0,
+            dropdown.w,
+            dropdown.h,
+            Color::new(0.0, 0.0, 0.0, 0.38),
+        );
+        draw_rrect_bordered(
+            dropdown.x,
+            dropdown.y,
+            dropdown.w,
+            dropdown.h,
+            8.0,
+            1.0,
+            Color::new(0.035, 0.043, 0.054, 0.99),
+            ui_accent(),
+        );
+        ui_text_bold(
+            "Default Collision Material",
+            dropdown.x + 14.0,
+            dropdown.y + 27.0,
+            16,
+            WHITE,
+        );
+        let search = validation_collision_material_search_rect();
+        draw_rrect_bordered(
+            search.x,
+            search.y,
+            search.w,
+            search.h,
+            6.0,
+            1.0,
+            Color::new(0.055, 0.064, 0.078, 1.0),
+            ui_accent(),
+        );
+        ui_text(
+            &app.ui_font,
+            if app.validation_collision_material_search.is_empty() {
+                "Search material name or ID..."
+            } else {
+                &app.validation_collision_material_search
+            },
+            search.x + 9.0,
+            search.y + 20.0,
+            if app.validation_collision_material_search.is_empty() {
+                ui_muted()
+            } else {
+                WHITE
+            },
+        );
+
+        let options =
+            filtered_validation_collision_materials(&app.validation_collision_material_search);
+        let list = validation_collision_material_list_rect();
+        let row_h = 26.0;
+        let visible = (list.h / row_h).floor().max(1.0) as usize;
+        let max_start = options.len().saturating_sub(visible);
+        let start = app
+            .validation_collision_material_scroll
+            .floor()
+            .max(0.0)
+            .min(max_start as f32) as usize;
+        begin_ui_clip(list);
+        for row in 0..visible {
+            let Some((id, name)) = options.get(start + row).copied() else {
+                break;
+            };
+            let rect = Rect::new(list.x, list.y + row as f32 * row_h, list.w, row_h - 2.0);
+            let selected = id == app.collision_generation_fallback_material;
+            if selected || rect.contains(mouse) {
+                draw_rrect(
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    rect.h,
+                    5.0,
+                    if selected {
+                        ui_surface_active()
+                    } else {
+                        ui_surface_hover()
+                    },
+                );
+            }
+            let swatch = collision_material_color(id, 1.0);
+            draw_rrect(
+                rect.x + 6.0,
+                rect.y + 5.0,
+                14.0,
+                14.0,
+                3.0,
+                Color::new(swatch[0], swatch[1], swatch[2], 1.0),
+            );
+            ui_text_size(
+                &app.ui_font,
+                &format!("{id}: {name}"),
+                rect.x + 28.0,
+                rect.y + 18.0,
+                14,
+                if selected { ui_accent() } else { LIGHTGRAY },
+            );
+        }
+        end_ui_clip();
+
+        if max_start > 0 {
+            let track = Rect::new(list.x + list.w - 8.0, list.y, 8.0, list.h);
+            if let Some(metrics) = scrollbar_metrics(
+                track,
+                visible as f32,
+                options.len() as f32,
+                24.0,
+                start as f32,
+            ) {
+                let state = if scrollbar_hit_area(track).contains(mouse) {
+                    ScrollbarVisualState::Hovered
+                } else {
+                    ScrollbarVisualState::Idle
+                };
+                draw_scrollbar(metrics, state);
+            }
+        }
+    }
 }
 
 pub(crate) fn validation_missing_item_at(
@@ -908,20 +1141,24 @@ pub(crate) fn validation_missing_item_at(
     mouse: Vec2,
 ) -> Option<ValidationItem> {
     let lists = validation_lists_rect();
-    let [missing, _, _] = validation_list_column_rects();
-    let x = missing.x + 8.0;
-    let y = lists.y + 64.0 - app.validation_list_scroll[ValidationListKind::Missing.slot()];
     let clip_top = lists.y + 54.0;
     let clip_bottom = lists.y + lists.h - 10.0;
-    let count = validation_list_count(summary, ValidationListKind::Missing);
-    if count == 0 {
-        return None;
-    }
-    for idx in 0..count {
-        let row_y = y + idx as f32 * 24.0;
-        let rect = Rect::new(x, row_y - 16.0, missing.w - 16.0, 22.0);
-        if row_y + 18.0 >= clip_top && row_y <= clip_bottom && rect.contains(mouse) {
-            return validation_list_item(summary, ValidationListKind::Missing, idx);
+    for (kind, column) in [
+        ValidationListKind::Missing,
+        ValidationListKind::Unused,
+        ValidationListKind::Warnings,
+    ]
+    .into_iter()
+    .zip(validation_list_column_rects())
+    {
+        let x = column.x + 8.0;
+        let y = lists.y + 64.0 - app.validation_list_scroll[kind.slot()];
+        for idx in 0..validation_list_count(summary, kind) {
+            let row_y = y + idx as f32 * 24.0;
+            let rect = Rect::new(x, row_y - 16.0, column.w - 16.0, 22.0);
+            if row_y + 18.0 >= clip_top && row_y <= clip_bottom && rect.contains(mouse) {
+                return validation_list_item(summary, kind, idx);
+            }
         }
     }
     None
@@ -973,12 +1210,129 @@ pub(crate) fn missing_item_target_index(app: &AppState, item: &ValidationItem) -
 pub(crate) fn snap_to_validation_missing_item(app: &mut AppState, item: ValidationItem) {
     if let Some(index) = missing_item_target_index(app, &item) {
         snap_to(app, index);
+        if item.kind == MissingAssetKind::Dff && item.label.contains("materials; GTA:SA is limited")
+        {
+            open_selected_dff_in_editing(app);
+            return;
+        }
         app.active_tab = AppTab::Preview;
         app.properties_scroll = 0.0;
         app.status_message = format!("Snapped to scene item referencing {}.", item.label);
     } else {
         app.status_message = format!("No scene item references {}.", item.label);
     }
+}
+
+pub(crate) fn handle_validation_collision_material_dropdown_input(
+    app: &mut AppState,
+    mouse: Vec2,
+    wheel: f32,
+) -> bool {
+    let active_context = app.active_tab == AppTab::Validation
+        && app.validation_action_category == ValidationActionCategory::Collision;
+    if !active_context {
+        close_validation_collision_material_dropdown(app);
+        return false;
+    }
+    if !app.validation_collision_material_dropdown_open {
+        return false;
+    }
+
+    if is_key_pressed(KeyCode::Escape) {
+        close_validation_collision_material_dropdown(app);
+        return true;
+    }
+    let mut search_changed = false;
+    if is_key_pressed(KeyCode::Backspace) {
+        app.validation_collision_material_search.pop();
+        search_changed = true;
+    }
+    while let Some(ch) = get_char_pressed() {
+        if !ch.is_control() && app.validation_collision_material_search.len() < 64 {
+            app.validation_collision_material_search.push(ch);
+            search_changed = true;
+        }
+    }
+    if search_changed {
+        app.validation_collision_material_scroll = 0.0;
+    }
+
+    let options =
+        filtered_validation_collision_materials(&app.validation_collision_material_search);
+    let list = validation_collision_material_list_rect();
+    let row_h = 26.0;
+    let visible = (list.h / row_h).floor().max(1.0) as usize;
+    let max_start = options.len().saturating_sub(visible);
+    if wheel.abs() > 0.0 && validation_collision_material_dropdown_rect().contains(mouse) {
+        app.validation_collision_material_scroll =
+            (app.validation_collision_material_scroll - wheel * 3.0).clamp(0.0, max_start as f32);
+        return true;
+    }
+    if is_key_pressed(KeyCode::Down) {
+        app.validation_collision_material_scroll =
+            (app.validation_collision_material_scroll + 1.0).min(max_start as f32);
+        return true;
+    }
+    if is_key_pressed(KeyCode::Up) {
+        app.validation_collision_material_scroll =
+            (app.validation_collision_material_scroll - 1.0).max(0.0);
+        return true;
+    }
+    if is_key_pressed(KeyCode::PageDown) {
+        app.validation_collision_material_scroll =
+            (app.validation_collision_material_scroll + visible as f32).min(max_start as f32);
+        return true;
+    }
+    if is_key_pressed(KeyCode::PageUp) {
+        app.validation_collision_material_scroll =
+            (app.validation_collision_material_scroll - visible as f32).max(0.0);
+        return true;
+    }
+
+    let start = app
+        .validation_collision_material_scroll
+        .floor()
+        .max(0.0)
+        .min(max_start as f32) as usize;
+    if is_key_pressed(KeyCode::Enter) {
+        if let Some((id, name)) = options.get(start).copied() {
+            app.collision_generation_fallback_material = id;
+            app.status_message = format!("Default collision material: {id}: {name}");
+            close_validation_collision_material_dropdown(app);
+        }
+        return true;
+    }
+
+    let track = Rect::new(list.x + list.w - 8.0, list.y, 8.0, list.h);
+    if is_mouse_button_down(MouseButton::Left) && track.contains(mouse) && max_start > 0 {
+        let ratio = ((mouse.y - track.y) / track.h).clamp(0.0, 1.0);
+        app.validation_collision_material_scroll = ratio * max_start as f32;
+        return true;
+    }
+    if !is_mouse_button_pressed(MouseButton::Left) {
+        return true;
+    }
+
+    let anchor = validation_action_button_rect(ValidationActionCategory::Collision, 1);
+    if anchor.contains(mouse) {
+        close_validation_collision_material_dropdown(app);
+        return true;
+    }
+    if list.contains(mouse) {
+        let row = ((mouse.y - list.y) / row_h).floor().max(0.0) as usize;
+        if let Some((id, name)) = options.get(start + row).copied() {
+            app.collision_generation_fallback_material = id;
+            app.status_message = format!("Default collision material: {id}: {name}");
+            close_validation_collision_material_dropdown(app);
+        }
+        return true;
+    }
+    if validation_collision_material_dropdown_rect().contains(mouse) {
+        return true;
+    }
+
+    close_validation_collision_material_dropdown(app);
+    false
 }
 
 pub(crate) fn handle_validation_scroll(app: &mut AppState, mouse: Vec2, wheel: f32) -> bool {
@@ -1100,7 +1454,7 @@ pub(crate) fn handle_validation_click(app: &mut AppState, mouse: Vec2) -> bool {
     }
     let left_clicked = is_mouse_button_pressed(MouseButton::Left);
     if app.dff_repair_menu_open && left_clicked {
-        if validation_action_button_rect(ValidationActionCategory::Repair, 1).contains(mouse) {
+        if validation_action_anchor_rect(ValidationActionCategory::Repair, 4).contains(mouse) {
             app.dff_repair_menu_open = false;
             return true;
         }
@@ -1132,7 +1486,7 @@ pub(crate) fn handle_validation_click(app: &mut AppState, mouse: Vec2) -> bool {
         return true;
     }
     if app.asset_optimization_menu_open && left_clicked {
-        if validation_action_button_rect(ValidationActionCategory::Optimize, 0).contains(mouse) {
+        if validation_action_anchor_rect(ValidationActionCategory::Optimize, 2).contains(mouse) {
             app.asset_optimization_menu_open = false;
             return true;
         }
@@ -1173,6 +1527,7 @@ pub(crate) fn handle_validation_click(app: &mut AppState, mouse: Vec2) -> bool {
                 app.validation_action_category = category;
                 app.asset_optimization_menu_open = false;
                 app.dff_repair_menu_open = false;
+                close_validation_collision_material_dropdown(app);
                 app.status_message =
                     format!("Validation tools: {}.", validation_category_label(category));
                 return true;
@@ -1199,25 +1554,23 @@ pub(crate) fn handle_validation_click(app: &mut AppState, mouse: Vec2) -> bool {
                     2 => {
                         app.asset_optimization_menu_open = true;
                         app.dff_repair_menu_open = false;
+                        close_validation_collision_material_dropdown(app);
                     }
                     3 => request_txd_cleanup(app),
                     4 => {
                         app.dff_repair_menu_open = true;
                         app.asset_optimization_menu_open = false;
+                        close_validation_collision_material_dropdown(app);
                     }
                     5 => request_fix_lods(app),
                     6 => cycle_collision_generation_preset(app),
                     7 => {
-                        let current = GTA_SA_COL_MATERIALS
-                            .iter()
-                            .position(|(id, _)| *id == app.collision_generation_fallback_material)
-                            .unwrap_or(0);
-                        let next = (current + 1) % GTA_SA_COL_MATERIALS.len();
-                        app.collision_generation_fallback_material = GTA_SA_COL_MATERIALS[next].0;
-                        app.status_message = format!(
-                            "Collision fallback material: {}",
-                            col_material_label(app.collision_generation_fallback_material)
-                        );
+                        app.validation_collision_material_dropdown_open = true;
+                        app.validation_collision_material_search.clear();
+                        app.validation_collision_material_scroll = 0.0;
+                        app.asset_optimization_menu_open = false;
+                        app.dff_repair_menu_open = false;
+                        drain_text_input();
                     }
                     8 => {
                         request_global_collision_generation(
@@ -1233,6 +1586,13 @@ pub(crate) fn handle_validation_click(app: &mut AppState, mouse: Vec2) -> bool {
                         if app.missing_texture_review.rx.is_none() {
                             request_missing_texture_review(app);
                         }
+                    }
+                    11 => request_img_duplicate_fix(app),
+                    12 => request_automatic_dff_material_limit_repair(app),
+                    13 => open_oversized_chunk_dialog(app),
+                    14 => open_classify_dialog(app),
+                    15 => {
+                        request_validation_light_lods(app);
                     }
                     _ => {}
                 }
@@ -1289,23 +1649,64 @@ mod tests {
             .collect::<Vec<_>>();
         actions.sort_unstable();
 
-        assert_eq!(actions, (0..11).collect::<Vec<_>>());
+        assert_eq!(actions, (0..16).collect::<Vec<_>>());
         assert_eq!(
             validation_category_actions(ValidationActionCategory::Review),
             &[10, 0, 3, 5]
         );
         assert_eq!(
             validation_category_actions(ValidationActionCategory::Repair),
-            &[1, 4, 8]
+            &[14, 1, 4, 11, 12, 15]
         );
         assert_eq!(
             validation_category_actions(ValidationActionCategory::Optimize),
-            &[2, 9]
+            &[13, 2, 9]
         );
         assert_eq!(
             validation_category_actions(ValidationActionCategory::Collision),
-            &[6, 7]
+            &[6, 7, 8]
         );
+    }
+
+    #[test]
+    fn popup_menus_anchor_to_the_button_that_opens_them() {
+        assert_eq!(
+            validation_action_position(ValidationActionCategory::Repair, 4),
+            2
+        );
+        assert_eq!(
+            validation_action_position(ValidationActionCategory::Optimize, 2),
+            1
+        );
+        assert_eq!(
+            validation_action_position(ValidationActionCategory::Collision, 7),
+            1
+        );
+    }
+
+    #[test]
+    fn collision_material_override_search_matches_names_and_ids() {
+        let metal = filtered_validation_collision_materials("metal");
+        assert!(metal.iter().any(|(id, _)| *id == 51));
+        assert!(metal.iter().any(|(id, _)| *id == 162));
+
+        let material_178 = filtered_validation_collision_materials("178");
+        assert_eq!(material_178, vec![(178, "Rail Track")]);
+
+        assert_eq!(
+            filtered_validation_collision_materials("default"),
+            vec![(0, "Default")]
+        );
+    }
+
+    #[test]
+    fn collision_material_dropdown_stays_inside_validation_panel() {
+        let panel = Rect::new(200.0, 80.0, 500.0, 480.0);
+        let anchor = Rect::new(360.0, 130.0, 140.0, 30.0);
+        let dropdown = validation_collision_material_dropdown_rect_for(panel, anchor);
+
+        assert!(rect_contains_rect(panel, dropdown));
+        assert_eq!(dropdown.y, anchor.y + anchor.h + 6.0);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::{
 };
 
 pub(crate) const MATERIAL_CLASSES_FILE: &str = "eagleMaterialClasses.json";
-const MATERIAL_CLASSES_VERSION: u64 = 2;
+const MATERIAL_CLASSES_VERSION: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MaterialClassSource {
@@ -42,6 +42,7 @@ pub(crate) struct TextureMaterialClasses {
     global_no_collision: BTreeSet<String>,
     by_txd_no_collision: BTreeSet<(String, String)>,
     by_content_no_collision: BTreeSet<TextureContentFingerprint>,
+    texture_categories: BTreeMap<(String, String), String>,
 }
 
 impl TextureMaterialClasses {
@@ -52,6 +53,48 @@ impl TextureMaterialClasses {
             + self.global_no_collision.len()
             + self.by_txd_no_collision.len()
             + self.by_content_no_collision.len()
+    }
+
+    pub(crate) fn texture_category(&self, txd: &str, texture: &str) -> Option<&str> {
+        let txd = normalize_txd_name(txd)?;
+        let texture = normalize_texture_name(texture)?;
+        self.texture_categories
+            .get(&(txd, texture))
+            .map(String::as_str)
+    }
+
+    /// Assigns an editor browsing category to one texture in one TXD.
+    /// An empty category clears the assignment.
+    pub(crate) fn set_texture_category(
+        &mut self,
+        txd: &str,
+        texture: &str,
+        category: Option<&str>,
+    ) -> bool {
+        let Some(txd) = normalize_txd_name(txd) else {
+            return false;
+        };
+        let Some(texture) = normalize_texture_name(texture) else {
+            return false;
+        };
+        let key = (txd, texture);
+        let category = category.map(str::trim).filter(|value| !value.is_empty());
+        match category {
+            Some(category) => {
+                let normalized = category.split_whitespace().collect::<Vec<_>>().join(" ");
+                if self.texture_categories.get(&key) == Some(&normalized) {
+                    false
+                } else {
+                    self.texture_categories.insert(key, normalized);
+                    true
+                }
+            }
+            None => self.texture_categories.remove(&key).is_some(),
+        }
+    }
+
+    pub(crate) fn texture_category_names(&self) -> BTreeSet<String> {
+        self.texture_categories.values().cloned().collect()
     }
 
     pub(crate) fn global_material(&self, texture: &str) -> Option<u8> {
@@ -443,6 +486,7 @@ pub(crate) fn migrate_name_assignments_to_content(
     for fingerprint in classes.content_no_collision_entries() {
         migrated.set_content_no_collision(fingerprint, true);
     }
+    migrated.texture_categories = classes.texture_categories.clone();
     (migrated, stats)
 }
 
@@ -515,8 +559,20 @@ pub(crate) fn material_classes_section_value(classes: &TextureMaterialClasses) -
     for fingerprint in classes.content_no_collision_entries() {
         entries.push(content_no_collision_entry(fingerprint));
     }
+    let categories = classes
+        .texture_categories
+        .iter()
+        .map(|((txd, texture), category)| {
+            serde_json::json!({
+                "txd": txd,
+                "texture": texture,
+                "category": category,
+            })
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "materials": entries,
+        "textureCategories": categories,
         "version": MATERIAL_CLASSES_VERSION,
     })
 }
@@ -573,7 +629,7 @@ fn parse_material_classes_value(json: &Value) -> MaterialClassesLoad {
 
     let mut result = MaterialClassesLoad::default();
     match object.get("version").and_then(Value::as_u64) {
-        Some(1 | MATERIAL_CLASSES_VERSION) => {}
+        Some(1 | 2 | MATERIAL_CLASSES_VERSION) => {}
         Some(version) => result.diagnostics.push(format!(
             "{MATERIAL_CLASSES_FILE} uses version {version}; reading compatible version-{MATERIAL_CLASSES_VERSION} fields."
         )),
@@ -590,6 +646,37 @@ fn parse_material_classes_value(json: &Value) -> MaterialClassesLoad {
 
     for (index, entry) in entries.iter().enumerate() {
         parse_material_entry(index, entry, &mut result);
+    }
+    if let Some(categories) = object.get("textureCategories").and_then(Value::as_array) {
+        for (index, entry) in categories.iter().enumerate() {
+            let Some(entry) = entry.as_object() else {
+                result.diagnostics.push(format!(
+                    "{MATERIAL_CLASSES_FILE} textureCategories[{index}] is not an object and was skipped."
+                ));
+                continue;
+            };
+            let Some(txd) = entry.get("txd").and_then(Value::as_str) else {
+                result.diagnostics.push(format!(
+                    "{MATERIAL_CLASSES_FILE} textureCategories[{index}] has no valid TXD and was skipped."
+                ));
+                continue;
+            };
+            let Some(texture) = entry.get("texture").and_then(Value::as_str) else {
+                result.diagnostics.push(format!(
+                    "{MATERIAL_CLASSES_FILE} textureCategories[{index}] has no valid texture and was skipped."
+                ));
+                continue;
+            };
+            let Some(category) = entry.get("category").and_then(Value::as_str) else {
+                result.diagnostics.push(format!(
+                    "{MATERIAL_CLASSES_FILE} textureCategories[{index}] has no valid category and was skipped."
+                ));
+                continue;
+            };
+            result
+                .classes
+                .set_texture_category(txd, texture, Some(category));
+        }
     }
     result
 }
@@ -1100,6 +1187,32 @@ mod tests {
 
         assert!(load_legacy_material_classes_section(&root).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn texture_categories_round_trip_with_exact_txd_scope() {
+        let mut classes = TextureMaterialClasses::default();
+        assert!(classes.set_texture_category("CITY.TXD", "Grass_Main", Some("Nature")));
+        assert!(classes.set_texture_category("country", "grass_main", Some("Ground")));
+        assert_eq!(
+            classes.texture_category("city", "GRASS_MAIN"),
+            Some("Nature")
+        );
+        assert_eq!(
+            classes.texture_category("country.txd", "grass_main"),
+            Some("Ground")
+        );
+
+        let value = material_classes_section_value(&classes);
+        let mut loaded = parse_material_classes_value(&value);
+        assert!(loaded.diagnostics.is_empty());
+        assert_eq!(loaded.classes, classes);
+        assert!(
+            loaded
+                .classes
+                .set_texture_category("city", "grass_main", None)
+        );
+        assert_eq!(loaded.classes.texture_category("city", "grass_main"), None);
     }
 
     /// Developer migration utility. Run with:

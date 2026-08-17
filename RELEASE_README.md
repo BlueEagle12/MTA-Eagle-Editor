@@ -96,20 +96,22 @@ Bulk generation, repair, optimization, and save jobs run in the background.
 Wait for the active job to finish before closing the editor or modifying the
 same resource with another tool.
 
-## Optional Blender integration
+## Native Blender map builder
 
-Importing a `.blend` scene requires **Blender 4.2 or newer** with these add-ons
-enabled in the Blender profile used by Eagle:
-
-- **[BlueEagle12/MTA-Tool-Kit](https://github.com/BlueEagle12/MTA-Tool-Kit)**
-  (`eagle_mta_toolkit`) — required for resource generation and Eagle scene
-  metadata.
-- **DragonFF** — required for DFF and COL export.
-- **RRW Material Tools** — optional advanced-material authoring tools.
+Importing a `.blend` scene requires **Blender 4.2 or newer**. Eagle now includes
+the MTA Tool Kit workflow and uses its own shared DFF/TXD code, so DragonFF and
+the separate Tool Kit add-on are not required. RRW Material Tools remains
+optional for advanced material authoring.
 
 Eagle checks `BLENDER_PATH` first, then `blender` on `PATH`, followed by common
 installation locations. If multiple Blender versions are installed, set
-`BLENDER_PATH` to the exact executable whose profile has the required add-ons.
+`BLENDER_PATH` to the exact executable.
+
+Drag a saved `.blend` file onto an open Eagle map, or use **Import Blender**.
+The setup prompt controls visual chunk size, mesh splitting, and origin
+centering. Blender evaluates the scene once; Eagle natively slices geometry,
+builds DFFs, follows each definition's TXD setting, builds TXDs/IMG archives,
+and writes the map. The import log is retained at `logs/blender-import.log`.
 
 ## Documentation
 
@@ -137,8 +139,8 @@ The complete documentation is maintained in the
   system OpenGL and X11 libraries are installed.
 - **Windows reports a missing DLL:** re-extract the complete archive and keep
   the executable beside the bundled DLL files.
-- **Blender import fails:** check `BLENDER_PATH`, the Blender version, and the
-  add-ons enabled in that exact Blender profile.
+- **Blender import fails:** check `BLENDER_PATH`, the Blender version, and
+  `logs/blender-import.log` in the project.
 
 Report reproducible problems on the
 [GitHub issue tracker](https://github.com/BlueEagle12/MTA-Eagle-Editor/issues)
