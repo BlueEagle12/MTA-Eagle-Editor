@@ -344,9 +344,9 @@ pub(crate) fn asset_browser_height(app: &AppState) -> f32 {
 pub(crate) fn asset_browser_rect(app: &AppState) -> Rect {
     let h = asset_browser_height(app);
     Rect::new(
-        PANEL_W + 12.0,
+        left_panel_width() + 12.0,
         screen_height() - STATUS_H - h - 8.0,
-        (screen_width() - PANEL_W - RIGHT_PANEL_W - 24.0).max(280.0),
+        (screen_width() - left_panel_width() - right_panel_width() - 24.0).max(280.0),
         h,
     )
 }

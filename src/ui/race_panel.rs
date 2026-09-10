@@ -31,11 +31,11 @@ const PREVIEW_MINIMAP_DOUBLE_CLICK_SECONDS: f64 = 0.4;
 const PREVIEW_MINIMAP_DOUBLE_CLICK_DISTANCE: f32 = 8.0;
 
 fn race_left_w() -> f32 {
-    PANEL_W - 20.0
+    left_panel_width() - 20.0
 }
 
 fn race_panel_x() -> f32 {
-    screen_width() - RIGHT_PANEL_W + 12.0
+    screen_width() - right_panel_width() + 12.0
 }
 
 /// Left-panel ("Races") button rect.
@@ -72,8 +72,8 @@ fn race_panel_tab_rect(col: usize) -> Rect {
 }
 
 fn race_panel_button_rect(y: f32, col: usize, cols: usize) -> Rect {
-    let px = screen_width() - RIGHT_PANEL_W + 22.0;
-    let total = RIGHT_PANEL_W - 44.0;
+    let px = screen_width() - right_panel_width() + 22.0;
+    let total = right_panel_width() - 44.0;
     let gap = 6.0;
     let w = (total - gap * (cols as f32 - 1.0)) / cols as f32;
     let x = px + col as f32 * (w + gap);
@@ -128,11 +128,11 @@ fn race_info_y() -> f32 {
 }
 
 fn race_list_rect() -> Rect {
-    let px = screen_width() - RIGHT_PANEL_W + 22.0;
+    let px = screen_width() - right_panel_width() + 22.0;
     // Below the grouped controls + 4 info lines.
     let y = race_info_y() + 4.0 * 18.0 + 10.0;
     let h = (screen_height() - STATUS_H - y - 12.0).max(120.0);
-    Rect::new(px, y, RIGHT_PANEL_W - 44.0, h)
+    Rect::new(px, y, right_panel_width() - 44.0, h)
 }
 
 fn race_visible_rows() -> usize {
@@ -142,13 +142,13 @@ fn race_visible_rows() -> usize {
 /// Small toggle button pinned to the top-left of the viewport in the Preview
 /// tab to switch the radar minimap overlay on/off.
 fn race_overlay_toggle_rect() -> Rect {
-    Rect::new(PANEL_W + 16.0, TOP_H + 12.0, 150.0, 26.0)
+    Rect::new(left_panel_width() + 16.0, TOP_H + 12.0, 150.0, 26.0)
 }
 
 fn race_preview_minimap_rect() -> Rect {
     let size = PREVIEW_MINIMAP_SIZE;
     Rect::new(
-        screen_width() - RIGHT_PANEL_W - size - 20.0,
+        screen_width() - right_panel_width() - size - 20.0,
         screen_height() - STATUS_H - size - 20.0,
         size,
         size,
@@ -1526,7 +1526,7 @@ fn draw_race_left_panel(app: &AppState) {
 fn draw_race_right_panel(app: &AppState) {
     let x = race_panel_x();
     let y = TOP_H + 12.0;
-    let w = RIGHT_PANEL_W - 24.0;
+    let w = right_panel_width() - 24.0;
     draw_panel_rect(
         &app.ui_font,
         Rect::new(x, y, w, (screen_height() - STATUS_H - y - 12.0).max(520.0)),
@@ -1824,7 +1824,7 @@ pub(crate) fn draw_race_panel(app: &AppState) {
 
 /// Toggle button pinned to the top-left of the central viewport in the Race tab.
 fn race_2d_toggle_rect() -> Rect {
-    Rect::new(PANEL_W + 16.0, TOP_H + 12.0, 160.0, 26.0)
+    Rect::new(left_panel_width() + 16.0, TOP_H + 12.0, 160.0, 26.0)
 }
 
 /// Square region within the central viewport where the radar image is drawn.

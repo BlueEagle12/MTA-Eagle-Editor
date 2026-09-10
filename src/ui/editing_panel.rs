@@ -18,7 +18,11 @@ const EDITING_ARCHIVE_MIN_SCREEN_W: f32 = 1200.0;
 const DFF_SCENE_CAMERA_TRANSFER_MAX_DISTANCE: f32 = 750.0;
 
 pub(crate) fn editing_archive_visible() -> bool {
-    screen_width() >= EDITING_ARCHIVE_MIN_SCREEN_W
+    editing_archive_visible_at_width(screen_width())
+}
+
+pub(crate) fn editing_archive_visible_at_width(width: f32) -> bool {
+    width >= EDITING_ARCHIVE_MIN_SCREEN_W
 }
 
 pub(crate) fn editing_panel_rect() -> Rect {
@@ -29,13 +33,13 @@ pub(crate) fn editing_archive_rect() -> Rect {
     Rect::new(
         14.0,
         TOP_H + 54.0,
-        390.0_f32.min(screen_width() * 0.28),
+        (left_panel_width() - 23.0).max(1.0),
         screen_height() - TOP_H - STATUS_H - 66.0,
     )
 }
 
 pub(crate) fn editing_asset_rect() -> Rect {
-    let w = 520.0_f32.min(screen_width() * 0.36).max(400.0);
+    let w = right_panel_width() - 23.0;
     Rect::new(
         screen_width() - w - 14.0,
         TOP_H + 54.0,

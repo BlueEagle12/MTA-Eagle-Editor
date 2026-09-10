@@ -13,7 +13,7 @@ pub(crate) fn vehicle_panel_rect() -> Rect {
     Rect::new(
         10.0,
         TOP_H + 12.0,
-        PANEL_W - 20.0,
+        left_panel_width() - 20.0,
         screen_height() - TOP_H - STATUS_H - 24.0,
     )
 }
@@ -25,10 +25,11 @@ pub(crate) fn vehicle_search_rect() -> Rect {
 
 pub(crate) fn vehicle_filter_rect(slot: usize) -> Rect {
     let rect = vehicle_panel_rect();
+    let step = (rect.w - 18.0) / 3.0;
     Rect::new(
-        rect.x + 14.0 + slot as f32 * 98.0,
+        rect.x + 14.0 + slot as f32 * step,
         rect.y + 102.0,
-        88.0,
+        step - 10.0,
         30.0,
     )
 }
@@ -250,9 +251,9 @@ fn vehicle_build_cancel_rect() -> Rect {
 
 pub(crate) fn vehicle_details_rect() -> Rect {
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 12.0,
+        screen_width() - right_panel_width() + 12.0,
         TOP_H + 12.0,
-        RIGHT_PANEL_W - 24.0,
+        right_panel_width() - 24.0,
         screen_height() - TOP_H - STATUS_H - 24.0,
     )
 }

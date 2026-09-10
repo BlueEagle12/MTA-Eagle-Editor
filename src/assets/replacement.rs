@@ -2766,19 +2766,19 @@ pub(crate) fn outliner_rows() -> usize {
 }
 
 pub(crate) fn outliner_search_rect() -> Rect {
-    Rect::new(20.0, TOP_H + 52.0, PANEL_W - 52.0, 34.0)
+    Rect::new(20.0, TOP_H + 52.0, left_panel_width() - 52.0, 34.0)
 }
 
 pub(crate) fn outliner_type_filter_rect(slot: usize) -> Rect {
     let x0 = 20.0;
     let gap = 8.0;
-    let w = (PANEL_W - 52.0 - gap * 2.0) / 3.0;
+    let w = (left_panel_width() - 52.0 - gap * 2.0) / 3.0;
     Rect::new(x0 + slot as f32 * (w + gap), TOP_H + 94.0, w, 26.0)
 }
 
 pub(crate) fn outliner_row_at(mouse: Vec2) -> Option<usize> {
     let list_top = outliner_list_top();
-    if mouse.x >= PANEL_W - 22.0
+    if mouse.x >= left_panel_width() - 22.0
         || mouse.y <= list_top
         || mouse.y >= screen_height() - STATUS_H - 14.0
     {
@@ -2794,7 +2794,7 @@ pub(crate) fn outliner_row_at(mouse: Vec2) -> Option<usize> {
 
 pub(crate) fn outliner_scrollbar_track() -> Rect {
     Rect::new(
-        PANEL_W - 22.0,
+        left_panel_width() - 22.0,
         outliner_list_top(),
         8.0,
         screen_height() - STATUS_H - 14.0 - outliner_list_top(),
@@ -3621,12 +3621,12 @@ pub(crate) fn handle_toolbar_click(app: &mut AppState, mouse: Vec2) -> bool {
 }
 
 pub(crate) fn sim_button_rect(slot: usize) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W + 26.0;
+    let x = screen_width() - right_panel_width() + 26.0;
     Rect::new(x + slot as f32 * 112.0, TOP_H + 74.0, 104.0, 34.0)
 }
 
 pub(crate) fn sim_action_rect(slot: usize) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W + 26.0;
+    let x = screen_width() - right_panel_width() + 26.0;
     Rect::new(x + slot as f32 * 112.0, TOP_H + 126.0, 104.0, 34.0)
 }
 

@@ -17,16 +17,21 @@ pub(crate) fn properties_tabs() -> [PropertiesTab; 3] {
 }
 
 pub(crate) fn properties_tab_rect(slot: usize) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W + 26.0;
-    let step = ((RIGHT_PANEL_W - 52.0) / 3.0).floor();
+    let x = screen_width() - right_panel_width() + 26.0;
+    let step = ((right_panel_width() - 52.0) / 3.0).floor();
     Rect::new(x + slot as f32 * step, TOP_H + 56.0, step - 8.0, 28.0)
 }
 
 pub(crate) fn right_panel_rect() -> Rect {
+    let width = if right_panel_width() == 0.0 {
+        screen_width() - left_panel_width()
+    } else {
+        right_panel_width()
+    };
     Rect::new(
-        screen_width() - RIGHT_PANEL_W,
+        screen_width() - width,
         TOP_H,
-        RIGHT_PANEL_W,
+        width,
         screen_height() - TOP_H - STATUS_H,
     )
 }
@@ -38,16 +43,12 @@ pub(crate) fn left_sidebar_visible() -> bool {
     screen_width() >= LEFT_SIDEBAR_MIN_SCREEN_W
 }
 
-pub(crate) fn left_panel_width() -> f32 {
-    if left_sidebar_visible() { PANEL_W } else { 0.0 }
-}
-
 pub(crate) fn editor_viewport_rect() -> Rect {
     let left = left_panel_width();
     Rect::new(
         left,
         TOP_H,
-        (screen_width() - left - RIGHT_PANEL_W).max(16.0),
+        (screen_width() - left - right_panel_width()).max(16.0),
         (screen_height() - TOP_H - STATUS_H).max(16.0),
     )
 }
@@ -60,9 +61,9 @@ pub(crate) fn properties_content_rect() -> Rect {
     let top = properties_content_top();
     let bottom = screen_height() - STATUS_H - 12.0;
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 12.0,
+        screen_width() - right_panel_width() + 12.0,
         top,
-        RIGHT_PANEL_W - 24.0,
+        right_panel_width() - 24.0,
         (bottom - top).max(1.0),
     )
 }
@@ -71,9 +72,9 @@ pub(crate) fn inspector_panel_content_rect() -> Rect {
     let top = TOP_H + 52.0;
     let bottom = screen_height() - STATUS_H - 12.0;
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 12.0,
+        screen_width() - right_panel_width() + 12.0,
         top,
-        RIGHT_PANEL_W - 24.0,
+        right_panel_width() - 24.0,
         (bottom - top).max(1.0),
     )
 }
@@ -1832,7 +1833,7 @@ pub(crate) fn set_placement_override_flag(placement: &mut Placement, flag: &str,
 
 pub(crate) fn collision_open_col_editor_rect(app: &AppState) -> Rect {
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 18.0,
+        screen_width() - right_panel_width() + 18.0,
         TOP_H + 148.0 - app.properties_scroll,
         150.0,
         30.0,
@@ -3059,9 +3060,9 @@ pub(crate) fn draw_physics_root_dropdown_popup(app: &AppState) {
 }
 
 pub(crate) fn draw_inspector(app: &AppState) {
-    let x = screen_width() - RIGHT_PANEL_W + 12.0;
+    let x = screen_width() - right_panel_width() + 12.0;
     let y = TOP_H + 12.0;
-    let w = RIGHT_PANEL_W - 24.0;
+    let w = right_panel_width() - 24.0;
     let rect = Rect::new(x, y, w, (screen_height() - STATUS_H - y - 12.0).max(480.0));
     draw_panel_rect(&app.ui_font, rect, Some("Properties"));
     begin_ui_clip(properties_content_rect());
@@ -3071,14 +3072,14 @@ pub(crate) fn draw_inspector(app: &AppState) {
         PropertiesTab::History => draw_properties_history(app, x, y),
     }
     end_ui_clip();
-    let right_x = screen_width() - RIGHT_PANEL_W;
+    let right_x = screen_width() - right_panel_width();
     let panel_bottom = rect.y + rect.h;
     let status_top = screen_height() - STATUS_H;
     if panel_bottom < status_top {
         draw_rectangle(
             right_x,
             panel_bottom,
-            RIGHT_PANEL_W,
+            right_panel_width(),
             status_top - panel_bottom,
             ui_canvas_bg(),
         );
@@ -3086,7 +3087,7 @@ pub(crate) fn draw_inspector(app: &AppState) {
     draw_rectangle(
         right_x,
         status_top,
-        RIGHT_PANEL_W,
+        right_panel_width(),
         STATUS_H,
         Color::new(0.025, 0.035, 0.049, 1.0),
     );
@@ -3129,7 +3130,7 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
     let layout = element_panel_layout(app);
     let info_y = layout.info_top;
     let x0 = layout.content.x + 6.0;
-    let content_w = RIGHT_PANEL_W - 52.0;
+    let content_w = right_panel_width() - 52.0;
     if let Some(p) = app.placements.get(app.selected) {
         ui_text(
             &app.ui_font,
@@ -4128,10 +4129,10 @@ pub(crate) fn draw_properties_history(app: &AppState, x: f32, y: f32) {
 }
 
 pub(crate) fn draw_collision_panel(app: &AppState) {
-    let x = screen_width() - RIGHT_PANEL_W + 12.0;
+    let x = screen_width() - right_panel_width() + 12.0;
     let panel_y = TOP_H + 12.0;
     let y = panel_y - app.properties_scroll;
-    let w = RIGHT_PANEL_W - 24.0;
+    let w = right_panel_width() - 24.0;
     draw_panel_rect(
         &app.ui_font,
         Rect::new(
@@ -4264,13 +4265,13 @@ pub(crate) fn draw_metric_row(
 }
 
 pub(crate) fn timecyc_weather_button_rect(app: &AppState, slot: usize) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W + 18.0;
+    let x = screen_width() - right_panel_width() + 18.0;
     let y = TOP_H + 730.0 - app.properties_scroll;
     Rect::new(x + slot as f32 * 168.0, y, 150.0, 28.0)
 }
 
 pub(crate) fn timecyc_phase_button_rect(app: &AppState, slot: usize) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W + 18.0;
+    let x = screen_width() - right_panel_width() + 18.0;
     let y = TOP_H + 780.0 - app.properties_scroll;
     let col = slot % 2;
     let row = slot / 2;
@@ -4278,16 +4279,16 @@ pub(crate) fn timecyc_phase_button_rect(app: &AppState, slot: usize) -> Rect {
 }
 
 pub(crate) fn fog_strength_button_rect(app: &AppState, slot: usize) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W + 18.0;
+    let x = screen_width() - right_panel_width() + 18.0;
     let y = TOP_H + 908.0 - app.properties_scroll;
     Rect::new(x + slot as f32 * 168.0, y, 150.0, 28.0)
 }
 
 pub(crate) fn find_duplicate_placements_button_rect(app: &AppState) -> Rect {
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 18.0,
+        screen_width() - right_panel_width() + 18.0,
         TOP_H + 421.0 - app.properties_scroll,
-        RIGHT_PANEL_W - 36.0,
+        right_panel_width() - 36.0,
         28.0,
     )
 }
@@ -4447,10 +4448,10 @@ pub(crate) fn handle_timecyc_click(app: &mut AppState, mouse: Vec2) -> bool {
 }
 
 pub(crate) fn draw_scene_panel(app: &AppState) {
-    let x = screen_width() - RIGHT_PANEL_W + 12.0;
+    let x = screen_width() - right_panel_width() + 12.0;
     let panel_y = TOP_H + 12.0;
     let y = panel_y - app.properties_scroll;
-    let w = RIGHT_PANEL_W - 24.0;
+    let w = right_panel_width() - 24.0;
     draw_panel_rect(
         &app.ui_font,
         Rect::new(
@@ -4651,9 +4652,9 @@ pub(crate) fn scene_panel_scroll_max() -> f32 {
 
 #[allow(dead_code)]
 pub(crate) fn draw_assets_panel(app: &AppState) {
-    let x = screen_width() - RIGHT_PANEL_W + 12.0;
+    let x = screen_width() - right_panel_width() + 12.0;
     let y = TOP_H + 12.0;
-    let w = RIGHT_PANEL_W - 24.0;
+    let w = right_panel_width() - 24.0;
     draw_panel_rect(
         &app.ui_font,
         Rect::new(x, y, w, (screen_height() - STATUS_H - y - 12.0).max(480.0)),

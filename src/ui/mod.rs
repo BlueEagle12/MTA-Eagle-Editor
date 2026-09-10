@@ -31,3 +31,6 @@ pub(crate) use scrollbar::*;
 pub(crate) use validation::*;
 pub(crate) use vehicles::*;
 pub(crate) use water_panel::*;
+
+pub(crate) mod panel_layout;
+pub(crate) use panel_layout::*;

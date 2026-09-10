@@ -2,9 +2,9 @@ use super::super::*;
 
 pub(crate) fn validation_panel_rect() -> Rect {
     Rect::new(
-        PANEL_W + 12.0,
+        left_panel_width() + 12.0,
         TOP_H + 12.0,
-        (screen_width() - PANEL_W - 24.0).max(480.0),
+        (screen_width() - left_panel_width() - 24.0).max(480.0),
         (screen_height() - STATUS_H - TOP_H - 24.0).max(480.0),
     )
 }

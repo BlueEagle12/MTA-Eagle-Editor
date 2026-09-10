@@ -1,12 +1,13 @@
 use super::super::*;
 
 pub(crate) fn water_button_rect(app: &AppState, slot: usize) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W + 18.0 + slot as f32 * 88.0;
-    Rect::new(x, TOP_H + 54.0 - app.properties_scroll, 82.0, 28.0)
+    let step = (right_panel_width() - 30.0) / 4.0;
+    let x = screen_width() - right_panel_width() + 18.0 + slot as f32 * step;
+    Rect::new(x, TOP_H + 54.0 - app.properties_scroll, step - 6.0, 28.0)
 }
 
 pub(crate) fn water_split_button_rect(app: &AppState, axis: WaterSplitAxis) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W
+    let x = screen_width() - right_panel_width()
         + match axis {
             WaterSplitAxis::X => 18.0,
             WaterSplitAxis::Y => 186.0,
@@ -16,7 +17,7 @@ pub(crate) fn water_split_button_rect(app: &AppState, axis: WaterSplitAxis) -> R
 
 pub(crate) fn water_edge_snap_toggle_rect(app: &AppState) -> Rect {
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 270.0,
+        screen_width() - 150.0,
         TOP_H + 432.0 - app.properties_scroll,
         126.0,
         28.0,
@@ -25,9 +26,9 @@ pub(crate) fn water_edge_snap_toggle_rect(app: &AppState) -> Rect {
 
 pub(crate) fn water_list_rect(app: &AppState) -> Rect {
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 22.0,
+        screen_width() - right_panel_width() + 22.0,
         TOP_H + 116.0 - app.properties_scroll,
-        RIGHT_PANEL_W - 44.0,
+        right_panel_width() - 44.0,
         304.0,
     )
 }
@@ -615,10 +616,10 @@ pub(crate) fn handle_water_click(app: &mut AppState, mouse: Vec2) -> bool {
 }
 
 pub(crate) fn draw_water_panel(app: &AppState) {
-    let x = screen_width() - RIGHT_PANEL_W + 12.0;
+    let x = screen_width() - right_panel_width() + 12.0;
     let panel_y = TOP_H + 12.0;
     let y = panel_y - app.properties_scroll;
-    let w = RIGHT_PANEL_W - 24.0;
+    let w = right_panel_width() - 24.0;
     draw_panel_rect(
         &app.ui_font,
         Rect::new(

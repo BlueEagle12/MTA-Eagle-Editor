@@ -238,12 +238,12 @@ pub(crate) fn rebuild_outliner_filter(app: &mut AppState) {
 }
 
 pub(crate) fn draw_history_panel(app: &AppState) {
-    let x = screen_width() - RIGHT_PANEL_W + 12.0;
+    let x = screen_width() - right_panel_width() + 12.0;
     let y = TOP_H + 900.0;
     if y + 120.0 > screen_height() - STATUS_H {
         return;
     }
-    let w = RIGHT_PANEL_W - 24.0;
+    let w = right_panel_width() - 24.0;
     let h = (screen_height() - STATUS_H - y - 12.0).max(154.0);
     draw_panel_rect(&app.ui_font, Rect::new(x, y, w, h), Some("History"));
     ui_text(&app.ui_font, "Undo Stack", x + 14.0, y + 58.0, ui_dim());
@@ -318,7 +318,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     };
     let sw = screen_width();
     let sh = screen_height();
-    let right_x = sw - RIGHT_PANEL_W;
+    let right_x = sw - right_panel_width();
     draw_rectangle(0.0, 0.0, sw, TOP_H, ui_shell_bg());
     draw_rectangle(0.0, 76.0, sw, 36.0, ui_canvas_bg());
     draw_rectangle(0.0, 112.0, sw, TOP_H - 112.0, ui_shell_bg());
@@ -326,12 +326,18 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     draw_line(0.0, 112.0, sw, 112.0, 1.0, ui_border());
     if app.active_tab != AppTab::Editing && app.active_tab != AppTab::Vehicles {
         if left_sidebar_visible() {
-            draw_rectangle(0.0, TOP_H, PANEL_W, sh - TOP_H - STATUS_H, ui_canvas_bg());
+            draw_rectangle(
+                0.0,
+                TOP_H,
+                left_panel_width(),
+                sh - TOP_H - STATUS_H,
+                ui_canvas_bg(),
+            );
         }
         draw_rectangle(
             right_x,
             TOP_H,
-            RIGHT_PANEL_W,
+            right_panel_width(),
             sh - TOP_H - STATUS_H,
             ui_canvas_bg(),
         );
@@ -347,7 +353,14 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
     draw_line(0.0, sh - STATUS_H, sw, sh - STATUS_H, 1.0, ui_border());
     if app.active_tab != AppTab::Editing && app.active_tab != AppTab::Vehicles {
         if left_sidebar_visible() {
-            draw_line(PANEL_W, TOP_H, PANEL_W, sh - STATUS_H, 1.0, ui_border());
+            draw_line(
+                left_panel_width(),
+                TOP_H,
+                left_panel_width(),
+                sh - STATUS_H,
+                1.0,
+                ui_border(),
+            );
         }
         draw_line(right_x, TOP_H, right_x, sh - STATUS_H, 1.0, ui_border());
     }
@@ -629,11 +642,16 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
         let out_y = TOP_H + 12.0;
         draw_panel_rect(
             &app.ui_font,
-            Rect::new(out_x, out_y, PANEL_W - 20.0, sh - TOP_H - STATUS_H - 24.0),
+            Rect::new(
+                out_x,
+                out_y,
+                left_panel_width() - 20.0,
+                sh - TOP_H - STATUS_H - 24.0,
+            ),
             Some("Elements"),
         );
         let row_h = OUTLINER_ROW_H;
-        let col_shift = (PANEL_W - 320.0) * 0.5;
+        let col_shift = (left_panel_width() - 320.0) * 0.5;
         let dff_col_x = out_x + 174.0 + col_shift;
         let rows = outliner_rows();
         let max_scroll = app.outliner_filter.len().saturating_sub(rows) as f32;
@@ -659,7 +677,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
                 app.placements.len()
             )
         };
-        let range_right = out_x + (PANEL_W - 20.0) - 8.0;
+        let range_right = out_x + (left_panel_width() - 20.0) - 8.0;
         let range_disp = ellipsize_width(&range_text, 16, 92.0);
         let range_w = ui_text_width(&range_disp, 16);
         ui_text(
@@ -760,7 +778,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
         draw_rrect_bordered(
             out_x + 10.0,
             out_y + 114.0,
-            PANEL_W - 40.0,
+            left_panel_width() - 40.0,
             32.0,
             8.0,
             1.0,
@@ -781,7 +799,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
                 break;
             };
             let y = outliner_list_top() + row as f32 * row_h + 19.0;
-            let row_rect = Rect::new(out_x + 10.0, y - 19.0, PANEL_W - 40.0, row_h);
+            let row_rect = Rect::new(out_x + 10.0, y - 19.0, left_panel_width() - 40.0, row_h);
             let row_selected = match &entry {
                 OutlinerEntry::Group(group) => {
                     app.selected_group.as_deref() == Some(group.as_str())
@@ -964,7 +982,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
                 ui_text(
                     &app.ui_font,
                     "DEL",
-                    PANEL_W - 52.0,
+                    left_panel_width() - 52.0,
                     y,
                     Color::new(0.72, 0.38, 0.38, 1.0),
                 );
@@ -972,7 +990,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
                 ui_text(
                     &app.ui_font,
                     "HIDDEN",
-                    PANEL_W - 70.0,
+                    left_panel_width() - 70.0,
                     y,
                     Color::new(0.54, 0.57, 0.62, 1.0),
                 );
@@ -995,7 +1013,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
         && app.active_tab != AppTab::Vehicles
         && left_sidebar_visible()
     {
-        PANEL_W
+        left_panel_width()
     } else {
         0.0
     };
@@ -1182,6 +1200,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
             }
         }
     }
+    draw_panel_resize_handles(app);
     draw_context_menu(app);
     if app.last_log.elapsed().as_secs_f32() >= 1.0 {
         let viewport_diagnostics = viewport_render_diagnostics();

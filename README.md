@@ -100,6 +100,9 @@ verifies it by checking for `models/gta3.img`. The selected path is stored in
 the user-local Eagle Editor preferences and can be changed later in the editor's
 Preferences dialog.
 
+Drag the divider beside a panel to adjust its width and the space available to
+the viewport. Each tab remembers its widths during the editor session.
+
 ## Build from source
 
 Eagle Editor requires Rust 1.85 or newer. Clone the repository, then build and

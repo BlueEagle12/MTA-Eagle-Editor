@@ -648,7 +648,7 @@ fn settings_layout_field_rect(
 }
 
 pub(crate) fn inspector_field_rect(app: &AppState, field: InspectorField) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W + 18.0;
+    let x = screen_width() - right_panel_width() + 18.0;
     match field {
         InspectorField::ElementId => element_layout_field_rect(app, |layout| layout.id),
         InspectorField::ElementPosX => {
@@ -959,7 +959,7 @@ pub(crate) fn inspector_field_rect(app: &AppState, field: InspectorField) -> Rec
 }
 
 pub(crate) fn inspector_copy_button_rect(app: &AppState, action: InspectorCopyAction) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W + 18.0;
+    let x = screen_width() - right_panel_width() + 18.0;
     match action {
         InspectorCopyAction::Field(field) => {
             let anchor = inspector_field_rect(app, field);
@@ -4821,7 +4821,9 @@ pub(crate) fn activity_console_clear_rect() -> Rect {
 
 pub(crate) fn status_log_rect() -> Rect {
     Rect::new(
-        (PANEL_W + 360.0).min(screen_width() - 94.0).max(16.0),
+        (left_panel_width() + 360.0)
+            .min(screen_width() - 94.0)
+            .max(16.0),
         screen_height() - STATUS_H + 3.0,
         82.0,
         STATUS_H - 6.0,
@@ -8749,6 +8751,9 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     if handle_open_editing_material_picker_input(app, mouse) {
         return;
     }
+    if update_panel_resize_input(app, mouse) {
+        return;
+    }
     if handle_viewport_render_mode_click(app, viewport, mouse) {
         return;
     }
@@ -9206,11 +9211,11 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
             scroll_race_2d(app, wheel, mouse);
             return;
         }
-        if wheel.abs() > 0.0 && mouse.x > screen_width() - RIGHT_PANEL_W {
+        if wheel.abs() > 0.0 && mouse.x > screen_width() - right_panel_width() {
             scroll_race_list(app, wheel);
             return;
         }
-        if wheel.abs() > 0.0 && mouse.x < PANEL_W && mouse.y > TOP_H {
+        if wheel.abs() > 0.0 && mouse.x < left_panel_width() && mouse.y > TOP_H {
             scroll_race_tracks(app, wheel);
             return;
         }
@@ -9240,7 +9245,7 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     if app.active_tab != AppTab::Editing
         && wheel.abs() > 0.0
         && left_sidebar_visible()
-        && mouse.x < PANEL_W
+        && mouse.x < left_panel_width()
         && mouse.y > TOP_H
     {
         app.scroll = (app.scroll - wheel * 7.0).max(0.0);
@@ -10423,6 +10428,9 @@ pub(crate) fn editor_text_input_active(app: &AppState) -> bool {
 }
 
 pub(crate) fn update_camera(app: &mut AppState, viewport: Rect) {
+    if panel_resize_owns_pointer() {
+        return;
+    }
     let viewport = if app.active_tab == AppTab::Vehicles {
         vehicle_preview_viewport_rect(app)
     } else {

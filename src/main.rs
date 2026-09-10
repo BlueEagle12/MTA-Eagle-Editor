@@ -46,8 +46,6 @@ unsafe extern "system" {
 }
 
 const BROWSE_ROOT: &str = ".";
-const PANEL_W: f32 = 384.0;
-const RIGHT_PANEL_W: f32 = 420.0;
 /// Keep the 3D workspace usable on laptop-sized displays. The inspector stays
 /// available because it is where most edits are committed; the outliner is
 /// automatically tucked away below this threshold instead of squeezing the
@@ -5530,6 +5528,7 @@ async fn main() {
                 }
             }
             RuntimeState::Editor(app) => {
+                begin_panel_layout_frame(app.active_tab);
                 let viewport = editor_viewport_rect();
                 {
                     thread_local!(static LAST_RENDER_SZ: std::cell::Cell<(f32, f32)> =
@@ -5653,6 +5652,8 @@ async fn main() {
                         let _ = update_save_log_input(app, mouse);
                     }
                 }
+                sync_panel_layout(app.active_tab);
+                let viewport = editor_viewport_rect();
                 update_simulation(app);
                 if let Some(root) = app.pending_load_root.take() {
                     let source = app.pending_load_source;

@@ -5,7 +5,7 @@ const LIGHT_TEMPERATURE_MIN: f32 = 1_000.0;
 const LIGHT_TEMPERATURE_MAX: f32 = 40_000.0;
 
 pub(crate) fn light_button_rect(app: &AppState, slot: usize) -> Rect {
-    let panel_x = screen_width() - RIGHT_PANEL_W;
+    let panel_x = screen_width() - right_panel_width();
     let (x, w) = match slot {
         0 => (panel_x + 24.0, 80.0),
         1 => (panel_x + 112.0, 80.0),
@@ -15,13 +15,13 @@ pub(crate) fn light_button_rect(app: &AppState, slot: usize) -> Rect {
 }
 
 pub(crate) fn light_list_rect(app: &AppState) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W + 22.0;
+    let x = screen_width() - right_panel_width() + 22.0;
     let y = TOP_H + 116.0 - app.properties_scroll;
     let row_h = 24.0;
     Rect::new(
         x,
         y,
-        RIGHT_PANEL_W - 44.0,
+        right_panel_width() - 44.0,
         row_h * LIGHT_LIST_VISIBLE_ROWS as f32,
     )
 }
@@ -62,7 +62,7 @@ fn reveal_selected_light(app: &mut AppState) {
 }
 
 pub(crate) fn light_color_bar_rect(app: &AppState, channel: usize) -> Rect {
-    let x = screen_width() - RIGHT_PANEL_W + 58.0;
+    let x = screen_width() - right_panel_width() + 58.0;
     Rect::new(
         x,
         TOP_H + 742.0 - app.properties_scroll + channel as f32 * 24.0,
@@ -73,7 +73,7 @@ pub(crate) fn light_color_bar_rect(app: &AppState, channel: usize) -> Rect {
 
 pub(crate) fn light_color_swatch_rect(app: &AppState) -> Rect {
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 286.0,
+        screen_width() - right_panel_width() + 286.0,
         TOP_H + 742.0 - app.properties_scroll,
         38.0,
         64.0,
@@ -82,7 +82,7 @@ pub(crate) fn light_color_swatch_rect(app: &AppState) -> Rect {
 
 pub(crate) fn light_use_temperature_rect(app: &AppState) -> Rect {
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 18.0,
+        screen_width() - right_panel_width() + 18.0,
         TOP_H + 704.0 - app.properties_scroll,
         170.0,
         22.0,
@@ -91,7 +91,7 @@ pub(crate) fn light_use_temperature_rect(app: &AppState) -> Rect {
 
 pub(crate) fn light_casts_shadow_rect(app: &AppState) -> Rect {
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 206.0,
+        screen_width() - right_panel_width() + 206.0,
         TOP_H + 704.0 - app.properties_scroll,
         150.0,
         22.0,
@@ -188,21 +188,25 @@ pub(crate) fn bake_panel_layout(app: &AppState) -> BakePanelLayout {
     const HEADER_GAP: f32 = 8.0;
     const HEADER_H: f32 = 22.0;
 
-    let panel_x = screen_width() - RIGHT_PANEL_W + 12.0;
+    let panel_x = screen_width() - right_panel_width() + 12.0;
     let panel_y = TOP_H + 12.0;
-    let panel_w = RIGHT_PANEL_W - 24.0;
+    let panel_w = right_panel_width() - 24.0;
     let left = panel_x + 14.0;
+    let column_scale = ((panel_w - 28.0) / 356.0).min(1.0);
+    let column_rect = |x: f32, y: f32, w: f32, h: f32| {
+        Rect::new(left + (x - left) * column_scale, y, w * column_scale, h)
+    };
     let two_col = |cy: f32| {
         (
-            Rect::new(left, cy, 150.0, INPUT_BOX),
-            Rect::new(left + 168.0, cy, 150.0, INPUT_BOX),
+            column_rect(left, cy, 150.0, INPUT_BOX),
+            column_rect(left + 168.0, cy, 150.0, INPUT_BOX),
         )
     };
     let three_col = |cy: f32| {
         [
-            Rect::new(left, cy, 108.0, INPUT_BOX),
-            Rect::new(left + 124.0, cy, 108.0, INPUT_BOX),
-            Rect::new(left + 248.0, cy, 108.0, INPUT_BOX),
+            column_rect(left, cy, 108.0, INPUT_BOX),
+            column_rect(left + 124.0, cy, 108.0, INPUT_BOX),
+            column_rect(left + 248.0, cy, 108.0, INPUT_BOX),
         ]
     };
 
@@ -211,34 +215,34 @@ pub(crate) fn bake_panel_layout(app: &AppState) -> BakePanelLayout {
     // --- Bake section ---
     let bake_header_y = cy + 14.0;
     cy += HEADER_H;
-    let bake_button = Rect::new(left, cy, 142.0, BTN_H);
-    let clear_button = Rect::new(left + 154.0, cy, 142.0, BTN_H);
+    let bake_button = column_rect(left, cy, 142.0, BTN_H);
+    let clear_button = column_rect(left + 154.0, cy, 142.0, BTN_H);
     cy += BTN_ROW;
     let info_y = cy + 12.0;
     cy += 20.0;
     let backend = [
-        Rect::new(left, cy, 142.0, BTN_H),
-        Rect::new(left + 154.0, cy, 142.0, BTN_H),
+        column_rect(left, cy, 142.0, BTN_H),
+        column_rect(left + 154.0, cy, 142.0, BTN_H),
     ];
     cy += BTN_ROW;
     let preset = [
-        Rect::new(left, cy, 108.0, BTN_H),
-        Rect::new(left + 124.0, cy, 108.0, BTN_H),
-        Rect::new(left + 248.0, cy, 108.0, BTN_H),
+        column_rect(left, cy, 108.0, BTN_H),
+        column_rect(left + 124.0, cy, 108.0, BTN_H),
+        column_rect(left + 248.0, cy, 108.0, BTN_H),
     ];
     cy += BTN_ROW;
     let light_mode = [
-        Rect::new(left, cy, 108.0, BTN_H),
-        Rect::new(left + 124.0, cy, 108.0, BTN_H),
-        Rect::new(left + 248.0, cy, 108.0, BTN_H),
+        column_rect(left, cy, 108.0, BTN_H),
+        column_rect(left + 124.0, cy, 108.0, BTN_H),
+        column_rect(left + 248.0, cy, 108.0, BTN_H),
     ];
     cy += BTN_ROW;
     let scope = [
-        Rect::new(left, cy, 142.0, BTN_H),
-        Rect::new(left + 154.0, cy, 142.0, BTN_H),
+        column_rect(left, cy, 142.0, BTN_H),
+        column_rect(left + 154.0, cy, 142.0, BTN_H),
     ];
     cy += BTN_ROW;
-    let face_emitters = Rect::new(left, cy, 220.0, BTN_H);
+    let face_emitters = column_rect(left, cy, 220.0, BTN_H);
     cy += BTN_ROW;
     let regenerate_coronas = Rect::new(left, cy, panel_w - 28.0, BTN_H);
     cy += BTN_ROW;
@@ -261,8 +265,8 @@ pub(crate) fn bake_panel_layout(app: &AppState) -> BakePanelLayout {
     cy += HEADER_GAP;
     let ao_header_y = cy + 14.0;
     cy += HEADER_H;
-    let ao_button = Rect::new(left, cy, 142.0, BTN_H);
-    let ao_hint = (left + 154.0, cy + 20.0);
+    let ao_button = column_rect(left, cy, 142.0, BTN_H);
+    let ao_hint = (left + 154.0 * column_scale, cy + 20.0);
     cy += BTN_ROW;
     cy += INPUT_LABEL;
     let [ao_samples, ao_radius, ao_strength] = three_col(cy);
@@ -272,28 +276,28 @@ pub(crate) fn bake_panel_layout(app: &AppState) -> BakePanelLayout {
     cy += HEADER_GAP;
     let editor_header_y = cy + 14.0;
     cy += HEADER_H;
-    let brush_toggle = Rect::new(left, cy, 81.0, BTN_H);
+    let brush_toggle = column_rect(left, cy, 81.0, BTN_H);
     let tools = [
-        Rect::new(left + 89.0, cy, 81.0, BTN_H),
-        Rect::new(left + 178.0, cy, 81.0, BTN_H),
+        column_rect(left + 89.0, cy, 81.0, BTN_H),
+        column_rect(left + 178.0, cy, 81.0, BTN_H),
     ];
-    let blend = Rect::new(left + 267.0, cy, 81.0, BTN_H);
+    let blend = column_rect(left + 267.0, cy, 81.0, BTN_H);
     cy += BTN_ROW;
-    let copy = Rect::new(left, cy, 94.0, BTN_H);
-    let paste = Rect::new(left + 102.0, cy, 94.0, BTN_H);
-    let import = Rect::new(left + 204.0, cy, 98.0, BTN_H);
+    let copy = column_rect(left, cy, 94.0, BTN_H);
+    let paste = column_rect(left + 102.0, cy, 94.0, BTN_H);
+    let import = column_rect(left + 204.0, cy, 98.0, BTN_H);
     cy += BTN_ROW;
-    let variant_merge = Rect::new(left, cy, 202.0, BTN_H);
-    let variant_tolerance = Rect::new(left + 234.0, cy, 68.0, INPUT_BOX);
+    let variant_merge = column_rect(left, cy, 202.0, BTN_H);
+    let variant_tolerance = column_rect(left + 234.0, cy, 68.0, INPUT_BOX);
     cy += BTN_ROW;
     let rgb_label_y = cy + 12.0;
     let bars_y = cy + 20.0;
     let color_bars = [
-        Rect::new(left + 32.0, bars_y, 206.0, 16.0),
-        Rect::new(left + 32.0, bars_y + 24.0, 206.0, 16.0),
-        Rect::new(left + 32.0, bars_y + 48.0, 206.0, 16.0),
+        column_rect(left + 32.0, bars_y, 206.0, 16.0),
+        column_rect(left + 32.0, bars_y + 24.0, 206.0, 16.0),
+        column_rect(left + 32.0, bars_y + 48.0, 206.0, 16.0),
     ];
-    let color_swatch = Rect::new(left + 254.0, bars_y, 38.0, 64.0);
+    let color_swatch = column_rect(left + 254.0, bars_y, 38.0, 64.0);
     cy += 20.0 + 72.0 + 8.0;
     cy += INPUT_LABEL;
     let [paint_temperature, paint_radius, paint_strength] = three_col(cy);
@@ -829,10 +833,10 @@ pub(crate) fn handle_bake_click(app: &mut AppState, mouse: Vec2) -> bool {
 }
 
 pub(crate) fn draw_lights_panel(app: &AppState) {
-    let x = screen_width() - RIGHT_PANEL_W + 12.0;
+    let x = screen_width() - right_panel_width() + 12.0;
     let panel_y = TOP_H + 12.0;
     let y = panel_y - app.properties_scroll;
-    let w = RIGHT_PANEL_W - 24.0;
+    let w = right_panel_width() - 24.0;
     draw_panel_rect(
         &app.ui_font,
         Rect::new(
@@ -1205,7 +1209,7 @@ pub(crate) fn draw_light_color_picker(app: &AppState) {
     ui_text(
         &app.ui_font,
         "Color",
-        screen_width() - RIGHT_PANEL_W + 18.0,
+        screen_width() - right_panel_width() + 18.0,
         TOP_H + 736.0 - app.properties_scroll,
         ui_dim(),
     );
@@ -1547,9 +1551,9 @@ pub(crate) fn bake_panel_scroll_max(app: &AppState) -> f32 {
 }
 
 pub(crate) fn draw_simulate_panel(app: &AppState) {
-    let x = screen_width() - RIGHT_PANEL_W + 16.0;
+    let x = screen_width() - right_panel_width() + 16.0;
     let y = TOP_H + 22.0;
-    let w = RIGHT_PANEL_W - 32.0;
+    let w = right_panel_width() - 32.0;
     draw_panel_rect(&app.ui_font, Rect::new(x, y, w, 330.0), Some("Simulate"));
     text_button(
         &app.ui_font,

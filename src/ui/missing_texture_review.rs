@@ -7,7 +7,7 @@ pub(crate) fn missing_texture_review_panel_rect() -> Rect {
     Rect::new(
         10.0,
         TOP_H + 12.0,
-        PANEL_W - 20.0,
+        left_panel_width() - 20.0,
         screen_height() - TOP_H - STATUS_H - 24.0,
     )
 }

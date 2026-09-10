@@ -14,12 +14,13 @@ pub(crate) fn lod_audit_panel_rect() -> Rect {
 
 pub(crate) fn lod_audit_run_rect() -> Rect {
     let panel = lod_audit_panel_rect();
-    Rect::new(panel.x + 14.0, panel.y + 54.0, 160.0, 30.0)
+    Rect::new(panel.x + 14.0, panel.y + 54.0, (panel.w - 36.0) * 0.5, 30.0)
 }
 
 pub(crate) fn lod_audit_client_rect() -> Rect {
     let panel = lod_audit_panel_rect();
-    Rect::new(panel.x + panel.w - 188.0, panel.y + 54.0, 174.0, 30.0)
+    let run = lod_audit_run_rect();
+    Rect::new(run.x + run.w + 8.0, panel.y + 54.0, run.w, 30.0)
 }
 
 pub(crate) fn lod_audit_generate_lods_rect() -> Rect {
@@ -48,17 +49,17 @@ pub(crate) fn lod_audit_filter_rect(slot: usize) -> Rect {
 
 pub(crate) fn lod_audit_small_minus_rect() -> Rect {
     let panel = lod_audit_panel_rect();
-    Rect::new(panel.x + 118.0, panel.y + 240.0, 34.0, 28.0)
+    Rect::new(panel.x + 90.0, panel.y + 240.0, 28.0, 28.0)
 }
 
 pub(crate) fn lod_audit_small_plus_rect() -> Rect {
     let panel = lod_audit_panel_rect();
-    Rect::new(panel.x + 224.0, panel.y + 240.0, 34.0, 28.0)
+    Rect::new(panel.x + 190.0, panel.y + 240.0, 28.0, 28.0)
 }
 
 pub(crate) fn lod_audit_small_sort_rect() -> Rect {
     let panel = lod_audit_panel_rect();
-    Rect::new(panel.x + panel.w - 126.0, panel.y + 240.0, 112.0, 28.0)
+    Rect::new(panel.x + 226.0, panel.y + 240.0, panel.w - 240.0, 28.0)
 }
 
 pub(crate) fn lod_audit_list_rect() -> Rect {
@@ -207,7 +208,7 @@ pub(crate) fn draw_lod_audit_panel(app: &AppState) {
         ui_dim(),
     );
     text_button(&app.ui_font, lod_audit_small_minus_rect(), "-", false);
-    let threshold_rect = Rect::new(panel.x + 158.0, panel.y + 240.0, 60.0, 28.0);
+    let threshold_rect = Rect::new(panel.x + 124.0, panel.y + 240.0, 60.0, 28.0);
     draw_rrect_bordered(
         threshold_rect.x,
         threshold_rect.y,

@@ -1,19 +1,20 @@
 use super::super::*;
 
 fn button_rect(app: &AppState, slot: usize) -> Rect {
+    let step = (right_panel_width() - 30.0) / 4.0;
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 18.0 + slot as f32 * 95.0,
+        screen_width() - right_panel_width() + 18.0 + slot as f32 * step,
         TOP_H + 54.0 - app.properties_scroll,
-        89.0,
+        step - 6.0,
         28.0,
     )
 }
 
 pub(crate) fn cull_list_rect(app: &AppState) -> Rect {
     Rect::new(
-        screen_width() - RIGHT_PANEL_W + 22.0,
+        screen_width() - right_panel_width() + 22.0,
         TOP_H + 116.0 - app.properties_scroll,
-        RIGHT_PANEL_W - 44.0,
+        right_panel_width() - 44.0,
         304.0,
     )
 }
@@ -303,7 +304,7 @@ pub(crate) fn handle_cull_viewport_click(app: &mut AppState, viewport: Rect, mou
 }
 
 pub(crate) fn draw_cull_panel(app: &AppState) {
-    let x = screen_width() - RIGHT_PANEL_W + 12.0;
+    let x = screen_width() - right_panel_width() + 12.0;
     let panel_y = TOP_H + 12.0;
     let y = panel_y - app.properties_scroll;
     draw_panel_rect(
@@ -311,7 +312,7 @@ pub(crate) fn draw_cull_panel(app: &AppState) {
         Rect::new(
             x,
             panel_y,
-            RIGHT_PANEL_W - 24.0,
+            right_panel_width() - 24.0,
             (screen_height() - STATUS_H - panel_y - 12.0).max(1.0),
         ),
         Some("CULL — Water Hide Zones"),
