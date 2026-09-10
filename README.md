@@ -2,7 +2,7 @@
 
 **A native 3D world and asset editor for Multi Theft Auto: San Andreas.**
 
-[![Release](https://img.shields.io/badge/release-v0.1.6-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.7-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-4b5563)](#download)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green)](LICENSE)
 
@@ -11,25 +11,9 @@ the complete map, inspect and edit RenderWare assets, build LODs, repair common
 asset problems, configure lighting and physics, and save the result back to the
 resource without moving between several separate tools.
 
-## What’s new in 0.1.6
+## What’s new in 0.1.7
 
-- **Native Blender map builder:** import evaluated Blender scenes without
-  DragonFF, then let Eagle slice geometry and build DFF, TXD, IMG, definition,
-  and placement output with per-definition texture settings.
-- **Water cull authoring:** create, duplicate, move, resize, and save water-hide
-  volumes from the new CULL workspace, including the generated client runtime.
-- **Expanded mesh editing:** author and reshape DFF/COL geometry with primitives,
-  boolean cutters, pivots, UV tools, material assignment, and stronger
-  validation while preserving multi-geometry assets.
-- **Safer large-map output:** classify objects and buildings by size, rebalance
-  archives, generate more reliable LODs and collisions, and detect material or
-  texture limits before game load.
-- **Broader texture workflows:** import JPEG, BMP, and TGA sources in addition
-  to PNG/GIF, improve TXD repair and optimization, and keep staged archive
-  indexes synchronized after writes.
-- **Improved editing and preview controls:** refined selection, transforms,
-  undo/redo, rendering, lighting, validation navigation, and asset workflows
-  across dense projects.
+- Added resizable side panels across all tabs, with widths remembered per tab during the session.
 
 > [!IMPORTANT]
 > Eagle Editor is an early public release. Keep a backup or use version control for
@@ -82,8 +66,8 @@ code-signed. Verify the archive checksum below before choosing **Run anyway**.
 The Linux build requires an x86-64 desktop with X11 and OpenGL drivers.
 
 ```bash
-tar -xzf EagleEditor-v0.1.6-linux-x86_64.tar.gz
-cd EagleEditor-v0.1.6-linux-x86_64
+tar -xzf EagleEditor-v0.1.7-linux-x86_64.tar.gz
+cd EagleEditor-v0.1.7-linux-x86_64
 chmod +x EagleEditor
 ./EagleEditor
 ```
