@@ -1,5 +1,13 @@
 use super::super::*;
 
+fn should_show_more_tooltip(hovered: bool, navigation_menu_open: bool) -> bool {
+    hovered && !navigation_menu_open
+}
+
+fn should_show_top_telemetry(compact_actions: bool, toolbar_right: f32, text_x: f32) -> bool {
+    !compact_actions && text_x >= toolbar_right + 12.0
+}
+
 pub(crate) fn current_rss_mb() -> f32 {
     static RSS_SAMPLE: OnceLock<Mutex<Option<(Instant, f32)>>> = OnceLock::new();
 
@@ -388,7 +396,11 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
 
     draw_rrect(12.0, 10.0, 3.0, 38.0, 1.5, ui_accent());
     ui_text_bold("MTA:SA Eagle Edit", 24.0, 24.0, 19, WHITE);
-    let path = app.root.to_string_lossy();
+    let path = if app.options.launch_mode == LaunchMode::DefaultMap {
+        std::borrow::Cow::Borrowed("Default SA Map — temporary edits")
+    } else {
+        app.root.to_string_lossy()
+    };
     let path_size = ui_text_size_to_fit(&path, 16, (snap_mode_rect().x - 34.0).max(1.0));
     ui_text_size(&app.ui_font, &path, 24.0, 46.0, path_size, ui_dim());
     for tab in primary_app_tabs_for_mode(app.options.launch_mode) {
@@ -468,7 +480,7 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
         96.0,
         if more_active { WHITE } else { ui_dim() },
     );
-    if more_hovered {
+    if should_show_more_tooltip(more_hovered, app.navigation_menu_open) {
         draw_text_tooltip(
             &app.ui_font,
             more_rect,
@@ -584,39 +596,65 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
         );
     }
     toolbar_primary_button(&app.ui_font, file_save_rect(), "Save");
-    text_button(&app.ui_font, load_resource_rect(), "Load", false);
-    text_button(&app.ui_font, save_as_rect(), "Save As", false);
-    if app.manual_save_job.is_some() {
-        text_button_busy(&app.ui_font, save_wip_rect(), "Saving");
-    } else {
-        text_button(&app.ui_font, save_wip_rect(), "Save WIP", false);
-    }
-    text_button(&app.ui_font, generate_txd_button_rect(), "Build TXD", false);
-    if SHOW_BLENDER_IMPORT {
-        if app.blender_import_rx.is_some() || app.blender_import_setup.is_some() {
-            text_button_busy(&app.ui_font, import_blender_button_rect(), "Import Blender");
-        } else {
-            text_button(
+    if compact_file_actions() {
+        let rect = file_actions_overflow_rect();
+        text_button(
+            &app.ui_font,
+            rect,
+            if app.manual_save_job.is_some() {
+                "File actions •"
+            } else {
+                "File actions"
+            },
+            app.file_actions_menu_open,
+        );
+        if rect.contains(mouse_position().into()) && !app.file_actions_menu_open {
+            draw_text_tooltip(
                 &app.ui_font,
-                import_blender_button_rect(),
-                "Import Blender",
-                false,
+                rect,
+                "Load, Save As, Save WIP, Build TXD, Import Blender, Preferences, and Import",
             );
         }
+    } else {
+        text_button(&app.ui_font, load_resource_rect(), "Load", false);
+        text_button(&app.ui_font, save_as_rect(), "Save As", false);
+        if app.manual_save_job.is_some() {
+            text_button_busy(&app.ui_font, save_wip_rect(), "Saving");
+        } else {
+            text_button(&app.ui_font, save_wip_rect(), "Save WIP", false);
+        }
+        text_button(&app.ui_font, generate_txd_button_rect(), "Build TXD", false);
+        if SHOW_BLENDER_IMPORT {
+            if app.blender_import_rx.is_some() || app.blender_import_setup.is_some() {
+                text_button_busy(&app.ui_font, import_blender_button_rect(), "Import Blender");
+            } else {
+                text_button(
+                    &app.ui_font,
+                    import_blender_button_rect(),
+                    "Import Blender",
+                    false,
+                );
+            }
+        }
+        text_button(
+            &app.ui_font,
+            preferences_button_rect(),
+            "Preferences",
+            app.preferences_dialog.is_some(),
+        );
+        text_button(
+            &app.ui_font,
+            import_asset_button_rect(),
+            "Import new asset",
+            app.import_asset_dialog.is_some(),
+        );
     }
-    text_button(
-        &app.ui_font,
-        preferences_button_rect(),
-        "Preferences",
-        app.preferences_dialog.is_some(),
-    );
-    text_button(
-        &app.ui_font,
-        import_asset_button_rect(),
-        "Import new asset",
-        app.import_asset_dialog.is_some(),
-    );
-    let hint_x = import_asset_button_rect().x + import_asset_button_rect().w + 12.0;
+    let last_file_action = if compact_file_actions() {
+        file_actions_overflow_rect()
+    } else {
+        import_asset_button_rect()
+    };
+    let hint_x = last_file_action.x + last_file_action.w + 12.0;
     let hint_w = (sw - hint_x - 12.0).max(0.0);
     if hint_w > 160.0 {
         ui_text(
@@ -1083,20 +1121,34 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
             ui_muted(),
         );
     }
-    ui_text(
-        &app.ui_font,
-        &format!("Aliases {}", app.texture_alias_count),
-        screen_width() - 206.0,
-        28.0,
-        LIGHTGRAY,
-    );
-    ui_text(
-        &app.ui_font,
-        &format!("FPS {}", app.fps_display),
-        screen_width() - 86.0,
-        28.0,
-        GREEN,
-    );
+    let compact_actions = compact_file_actions();
+    let file_actions_right = if compact_actions {
+        let rect = file_actions_overflow_rect();
+        rect.x + rect.w
+    } else {
+        let rect = import_asset_button_rect();
+        rect.x + rect.w
+    };
+    let aliases_x = screen_width() - 206.0;
+    if should_show_top_telemetry(compact_actions, file_actions_right, aliases_x) {
+        ui_text(
+            &app.ui_font,
+            &format!("Aliases {}", app.texture_alias_count),
+            aliases_x,
+            28.0,
+            LIGHTGRAY,
+        );
+    }
+    let fps_x = screen_width() - 86.0;
+    if should_show_top_telemetry(compact_actions, file_actions_right, fps_x) {
+        ui_text(
+            &app.ui_font,
+            &format!("FPS {}", app.fps_display),
+            fps_x,
+            28.0,
+            GREEN,
+        );
+    }
     match app.active_tab {
         AppTab::Preview => {
             draw_inspector(app);
@@ -1198,6 +1250,41 @@ pub(crate) fn draw_panel(app: &mut AppState, viewport: Rect) {
             if hovered {
                 draw_text_tooltip(&app.ui_font, rect, app_tab_tooltip(tab));
             }
+        }
+    }
+    if compact_file_actions() && app.file_actions_menu_open {
+        let bounds = file_actions_menu_bounds();
+        draw_rrect(
+            bounds.x + 2.0,
+            bounds.y + 3.0,
+            bounds.w,
+            bounds.h,
+            9.0,
+            Color::new(0.0, 0.0, 0.0, 0.32),
+        );
+        draw_rrect_bordered(
+            bounds.x,
+            bounds.y,
+            bounds.w,
+            bounds.h,
+            9.0,
+            1.0,
+            Color::new(0.045, 0.058, 0.078, 0.99),
+            ui_border(),
+        );
+        for (row, label) in FILE_ACTION_MENU_LABELS.iter().enumerate() {
+            let rect = file_action_menu_row_rect(row);
+            let hovered = rect.contains(mouse_position().into());
+            if hovered {
+                draw_rrect(rect.x, rect.y, rect.w, rect.h, 6.0, ui_surface_hover());
+            }
+            ui_text(
+                &app.ui_font,
+                label,
+                rect.x + 11.0,
+                rect.y + 20.0,
+                Color::new(0.80, 0.86, 0.93, 1.0),
+            );
         }
     }
     draw_panel_resize_handles(app);
@@ -1320,5 +1407,24 @@ fn draw_viewport_render_mode_control(app: &AppState, viewport: Rect) {
             14,
             WHITE,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_show_more_tooltip, should_show_top_telemetry};
+
+    #[test]
+    fn more_tooltip_is_hidden_while_navigation_menu_is_open() {
+        assert!(should_show_more_tooltip(true, false));
+        assert!(!should_show_more_tooltip(true, true));
+        assert!(!should_show_more_tooltip(false, false));
+    }
+
+    #[test]
+    fn top_telemetry_yields_to_file_actions() {
+        assert!(!should_show_top_telemetry(true, 622.0, 434.0));
+        assert!(!should_show_top_telemetry(false, 1176.0, 1108.0));
+        assert!(should_show_top_telemetry(false, 1176.0, 1194.0));
     }
 }

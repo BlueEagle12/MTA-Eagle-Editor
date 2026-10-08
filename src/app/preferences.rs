@@ -484,7 +484,7 @@ pub(crate) fn save_preferences(values: &BTreeMap<String, String>) {
     let _ = save_preferences_checked(values);
 }
 
-fn save_preferences_checked(values: &BTreeMap<String, String>) -> std::io::Result<()> {
+pub(crate) fn save_preferences_checked(values: &BTreeMap<String, String>) -> std::io::Result<()> {
     let path = preferences_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -908,6 +908,227 @@ pub(crate) fn save_gta_sa_dir_preference(path: &Path) {
         path.to_string_lossy().trim().to_string(),
     );
     save_preferences(&values);
+}
+
+pub(crate) fn load_blender_install_dir_preference() -> Option<PathBuf> {
+    load_preferences()
+        .get("blender_install_dir")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+pub(crate) fn blender_executable_in_install_dir(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    if !path.is_dir() {
+        return None;
+    }
+    let candidates = [
+        path.join("blender.exe"),
+        path.join("blender"),
+        path.join("Contents").join("MacOS").join("Blender"),
+    ];
+    if let Some(candidate) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+        return Some(candidate);
+    }
+    let mut nested = fs::read_dir(path)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .flat_map(|entry| {
+            let path = entry.path();
+            [
+                path.join("blender.exe"),
+                path.join("blender"),
+                path.join("Contents").join("MacOS").join("Blender"),
+            ]
+        })
+        .filter(|candidate| candidate.is_file())
+        .collect::<Vec<_>>();
+    nested.sort();
+    nested.pop()
+}
+
+pub(crate) fn common_blender_executable_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/usr/bin/blender"),
+        PathBuf::from("/usr/local/bin/blender"),
+        PathBuf::from("/opt/blender/blender"),
+        PathBuf::from("/snap/bin/blender"),
+        PathBuf::from("/Applications/Blender.app/Contents/MacOS/Blender"),
+    ];
+    #[cfg(windows)]
+    for base in [
+        env::var_os("ProgramFiles"),
+        env::var_os("ProgramFiles(x86)"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(PathBuf::from)
+    {
+        if let Ok(entries) = fs::read_dir(base) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.to_ascii_lowercase().starts_with("blender foundation")
+                        })
+                    && let Ok(versions) = fs::read_dir(path)
+                {
+                    for version in versions.filter_map(Result::ok) {
+                        candidates.push(version.path().join("blender.exe"));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(user_home) = env::var_os("HOME").map(PathBuf::from) {
+        for base in [
+            user_home.join("Utilities"),
+            user_home.join("Applications"),
+            user_home.join(".local/bin"),
+        ] {
+            if let Ok(entries) = fs::read_dir(base) {
+                for entry in entries.filter_map(Result::ok) {
+                    let path = entry.path();
+                    if path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.to_ascii_lowercase().starts_with("blender"))
+                    {
+                        candidates.push(if path.is_dir() {
+                            let macos = path.join("Contents").join("MacOS").join("Blender");
+                            if macos.is_file() {
+                                macos
+                            } else {
+                                path.join("blender")
+                            }
+                        } else {
+                            path
+                        });
+                    }
+                }
+            }
+        }
+    }
+    candidates.retain(|path| path.is_file());
+    candidates.sort();
+    candidates.dedup();
+    candidates.reverse();
+    candidates
+}
+
+fn blender_install_dir_for_executable(executable: &Path) -> Option<PathBuf> {
+    let parent = executable.parent()?;
+    if parent.file_name().and_then(|name| name.to_str()) == Some("MacOS")
+        && parent.parent()?.file_name().and_then(|name| name.to_str()) == Some("Contents")
+    {
+        parent.parent()?.parent().map(Path::to_path_buf)
+    } else {
+        Some(parent.to_path_buf())
+    }
+}
+
+pub(crate) fn search_common_blender_install_dirs() -> Vec<PathBuf> {
+    let mut installs = common_blender_executable_candidates()
+        .iter()
+        .filter_map(|path| blender_install_dir_for_executable(path))
+        .collect::<Vec<_>>();
+    installs.sort();
+    installs.dedup();
+    installs.reverse();
+    installs
+}
+
+pub(crate) fn validate_blender_install_dir(path: &Path) -> Result<(), String> {
+    if blender_executable_in_install_dir(path).is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "This is not a Blender install directory: no Blender executable was found in {}",
+            path.display()
+        ))
+    }
+}
+
+pub(crate) fn save_blender_install_dir_preference(path: Option<&Path>) {
+    let mut values = load_preferences();
+    if let Some(path) = path {
+        values.insert(
+            "blender_install_dir".to_string(),
+            path.to_string_lossy().trim().to_string(),
+        );
+    } else {
+        values.remove("blender_install_dir");
+    }
+    save_preferences(&values);
+}
+
+#[cfg(test)]
+mod blender_install_dir_tests {
+    use super::*;
+
+    fn test_dir(label: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "eagle_editor_blender_dir_{label}_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn blender_install_directory_resolves_direct_and_versioned_executables() {
+        let root = test_dir("resolve");
+        let version = root.join("Blender 4.5");
+        fs::create_dir_all(&version).unwrap();
+        let executable = version.join("blender");
+        fs::write(&executable, b"").unwrap();
+
+        assert_eq!(
+            blender_executable_in_install_dir(&version),
+            Some(executable.clone())
+        );
+        assert_eq!(blender_executable_in_install_dir(&root), Some(executable));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn blender_install_directory_rejects_a_folder_without_an_executable() {
+        let root = test_dir("reject");
+        fs::create_dir_all(&root).unwrap();
+
+        assert!(blender_executable_in_install_dir(&root).is_none());
+        assert!(validate_blender_install_dir(&root).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn executable_paths_map_back_to_the_install_directory() {
+        assert_eq!(
+            blender_install_dir_for_executable(Path::new(
+                "/Applications/Blender.app/Contents/MacOS/Blender"
+            )),
+            Some(PathBuf::from("/Applications/Blender.app"))
+        );
+        assert_eq!(
+            blender_install_dir_for_executable(Path::new(
+                "C:/Program Files/Blender Foundation/Blender 4.5/blender.exe"
+            )),
+            Some(PathBuf::from(
+                "C:/Program Files/Blender Foundation/Blender 4.5"
+            ))
+        );
+    }
 }
 
 pub(crate) fn save_gta_sa_setup_bypassed() {
@@ -1403,7 +1624,10 @@ pub(crate) fn save_vertex_paint_settings_preference(settings: VertexPaintSetting
 }
 
 pub(crate) fn is_eagle_resource(path: &Path) -> bool {
-    path.is_dir() && path.join("eagleZones.txt").is_file() && path.join("zones").is_dir()
+    path.is_dir()
+        && ((path.join("eagleZones.txt").is_file() && path.join("zones").is_dir())
+            || path.join("meta.xml").is_file()
+            || path.join(crate::resource::mta_maps::REGISTRY).is_file())
 }
 
 /// Empty working folder used when the editor is launched with no project (the

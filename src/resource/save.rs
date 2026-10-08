@@ -209,6 +209,7 @@ fn canonicalize_definition_asset_attrs(
 
 fn write_scene_files_data(
     zones_source: &[String],
+    map_documents: &[crate::resource::mta_maps::MapDocument],
     eagle_zone_offsets: EagleZoneOffsets,
     placements: &[Placement],
     definitions: &HashMap<String, Definition>,
@@ -216,16 +217,45 @@ fn write_scene_files_data(
     element_states: &[ElementState],
     root: &Path,
 ) -> Result<(), Vec<String>> {
-    let mut zones = zones_source.to_vec();
+    let mut owned_definitions = definitions.clone();
+    crate::resource::zones::rehome_definitions(
+        &mut owned_definitions,
+        readonly_definition_ids,
+        placements,
+        element_states,
+    );
+    let definitions = &owned_definitions;
+    let mut zones: Vec<_> = zones_source
+        .iter()
+        .filter(|z| crate::resource::mta_maps::map_path(z).is_none())
+        .filter(|z| {
+            !placements
+                .iter()
+                .any(|p| p.zone == **z && is_default_world_placement(p))
+                || placements
+                    .iter()
+                    .any(|p| p.zone == **z && !is_default_world_placement(p))
+        })
+        .cloned()
+        .collect();
     let mut known_zones: HashSet<String> = zones.iter().cloned().collect();
     for placement in placements {
-        if known_zones.insert(placement.zone.clone()) {
+        if !is_default_world_placement(placement)
+            && crate::resource::mta_maps::map_path(&placement.zone).is_none()
+            && known_zones.insert(placement.zone.clone())
+        {
             zones.push(placement.zone.clone());
         }
     }
     for def in definitions.values() {
         if readonly_definition_ids.contains(&def.id) {
             continue;
+        }
+        if crate::resource::mta_maps::map_path(&def.zone).is_some() {
+            return Err(vec![format!(
+                "Custom model definition {} needs an Eagle zone",
+                def.id
+            )]);
         }
         if known_zones.insert(def.zone.clone()) {
             zones.push(def.zone.clone());
@@ -247,6 +277,17 @@ fn write_scene_files_data(
             })
             .collect());
     }
+    for p in placements {
+        if let Some(path) = crate::resource::mta_maps::map_path(&p.zone) {
+            if !map_documents.iter().any(|d| d.path == path) {
+                return Err(vec![format!(
+                    "Placement destination {path} is not registered"
+                )]);
+            }
+        }
+    }
+    fs::create_dir_all(root).map_err(|e| vec![e.to_string()])?;
+    crate::resource::mta_maps::save_documents(root, map_documents, placements, element_states)?;
     let asset_case_index = AssetCaseIndex::build(root);
 
     // Build these indexes once. Monaco-sized resources can contain many zones;
@@ -254,6 +295,9 @@ fn write_scene_files_data(
     // quadratic in practice.
     let mut placements_by_zone: HashMap<&str, Vec<(usize, &Placement)>> = HashMap::new();
     for (idx, placement) in placements.iter().enumerate() {
+        if is_default_world_placement(placement) {
+            continue;
+        }
         placements_by_zone
             .entry(placement.zone.as_str())
             .or_default()
@@ -288,6 +332,7 @@ fn write_scene_files_data(
                 continue;
             }
             let mut attrs = placement.attrs.clone();
+            attrs.retain(|key, _| !key.starts_with("__map"));
             attrs.insert("id".to_string(), placement.id.clone());
             map.push_str(&write_tag(&placement.tag, &attrs));
         }
@@ -306,6 +351,7 @@ fn write_scene_files_data(
         for def in zone_defs {
             let mut attrs = def.attrs.clone();
             attrs.insert("id".to_string(), def.id.clone());
+            attrs.insert("zone".to_string(), def.zone.clone());
             if is_override_definition(def) {
                 let explicit_keys: Vec<String> = attrs
                     .get("__overrideAttrs")
@@ -368,6 +414,7 @@ fn write_scene_files_data(
 pub(crate) fn write_scene_files(app: &AppState, root: &Path) -> Result<(), Vec<String>> {
     write_scene_files_data(
         &app.zones,
+        &app.map_documents,
         app.eagle_zone_offsets,
         &app.placements,
         &app.definitions,
@@ -480,6 +527,181 @@ mod tests {
     }
 
     #[test]
+    fn scene_save_moves_definition_to_majority_zone_and_clears_previous_file() {
+        let root = temp_resource_root("definition_majority");
+        let zones = vec!["test".to_string(), "other".to_string()];
+        let definition = Definition {
+            id: "lamp".into(),
+            zone: "test".into(),
+            attrs: BTreeMap::from([
+                ("id".into(), "lamp".into()),
+                ("zone".into(), "test".into()),
+                ("dff".into(), "lamp".into()),
+            ]),
+        };
+        let definitions = HashMap::from([("lamp".into(), definition)]);
+        let placements: Vec<_> = ["test", "other", "other"]
+            .into_iter()
+            .map(|zone| Placement {
+                id: "lamp".into(),
+                dff: "lamp".into(),
+                zone: zone.into(),
+                tag: "object".into(),
+                attrs: BTreeMap::from([("id".into(), "lamp".into())]),
+                pos: V3::default(),
+                rot: V3::default(),
+            })
+            .collect();
+        write_scene_files_data(
+            &zones,
+            &[],
+            EagleZoneOffsets::default(),
+            &placements,
+            &definitions,
+            &HashSet::new(),
+            &[],
+            &root,
+        )
+        .unwrap();
+        let old = root.join("zones/test/test.definition");
+        let new = root.join("zones/other/other.definition");
+        assert!(!fs::read_to_string(&old).unwrap().contains("id=\"lamp\""));
+        let text = fs::read_to_string(&new).unwrap();
+        assert_eq!(text.matches("<definition ").count(), 1);
+        assert!(text.contains("zone=\"other\""));
+        let attrs = Regex::new(r#"([A-Za-z_][A-Za-z0-9_]*)="([^"]*)""#).unwrap();
+        let loaded = parse_definitions(&root, &zones, &attrs);
+        assert_eq!(loaded["lamp"].zone, "other");
+        let states = vec![
+            ElementState::default(),
+            ElementState {
+                deleted: true,
+                hidden: false,
+            },
+            ElementState {
+                deleted: true,
+                hidden: false,
+            },
+        ];
+        write_scene_files_data(
+            &zones,
+            &[],
+            EagleZoneOffsets::default(),
+            &placements,
+            &loaded,
+            &HashSet::new(),
+            &states,
+            &root,
+        )
+        .unwrap();
+        assert!(fs::read_to_string(old).unwrap().contains("zone=\"test\""));
+        assert!(!fs::read_to_string(new).unwrap().contains("id=\"lamp\""));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn standard_maps_save_separately_and_restore_deleted_only_wip() {
+        use crate::resource::mta_maps::{MapDocument, map_zone, placements as map_placements};
+        let root = temp_resource_root("standard_maps");
+        let doc = MapDocument {
+            path: "maps/main.map".into(),
+            text:
+                "<map><object id=\"lamp\" model=\"1337\" posX=\"1\"/><vehicle model=\"411\"/></map>"
+                    .into(),
+        };
+        let placements = map_placements(&doc, &HashMap::new());
+        let zones = vec!["test".to_string(), map_zone(&doc.path)];
+        write_scene_files_data(
+            &zones,
+            std::slice::from_ref(&doc),
+            EagleZoneOffsets::default(),
+            &placements,
+            &HashMap::new(),
+            &HashSet::new(),
+            &[],
+            &root,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("eagleZones.txt")).unwrap(),
+            "test\n"
+        );
+        assert!(root.join("maps/main.map").is_file());
+        assert!(root.join("zones/test/test.map").is_file());
+        let wip = wip_root_path(&root);
+        write_scene_files_data(
+            &[map_zone(&doc.path)],
+            std::slice::from_ref(&doc),
+            EagleZoneOffsets::default(),
+            &placements,
+            &HashMap::new(),
+            &HashSet::new(),
+            &[ElementState {
+                deleted: true,
+                hidden: false,
+            }],
+            &wip,
+        )
+        .unwrap();
+        assert!(!wip.join("zones").exists());
+        let attrs = Regex::new(r#"([A-Za-z_][A-Za-z0-9_]*)="([^"]*)""#).unwrap();
+        let (loaded_zones, _, _, loaded, _, _, loaded_wip) =
+            load_scene_source_with_source(&root, &attrs, LoadSceneSource::Saved);
+        assert!(loaded_wip);
+        assert_eq!(loaded_zones, vec![map_zone(&doc.path)]);
+        assert!(loaded.is_empty());
+        assert!(
+            fs::read_to_string(wip.join(&doc.path))
+                .unwrap()
+                .contains("<vehicle")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn standard_map_save_as_keeps_meta_declarations_and_dimensions() {
+        let root = temp_resource_root("standard_map_meta");
+        let meta = "<meta><info type=\"map\" gamemodes=\"race\"/><map src=\"maps/main.map\" dimension=\"7\"/><script src=\"loader.lua\" type=\"server\"/></meta>";
+        fs::write(root.join("meta.xml"), meta).unwrap();
+        fs::write(
+            root.join(crate::resource::mta_maps::REGISTRY),
+            "[\"maps/main.map\"]",
+        )
+        .unwrap();
+        update_save_as_meta_root(&root).unwrap();
+        assert_eq!(fs::read_to_string(root.join("meta.xml")).unwrap(), meta);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsaved_changes_prompt_requires_resource_save_for_pending_col_writes() {
+        let dialog =
+            unsaved_changes_dialog(ConfirmAction::Quit, UnsavedChangesDestination::Exit, true);
+
+        assert_eq!(dialog.primary_label, "Save");
+        assert_eq!(dialog.body, "Save the resource before exiting?");
+        assert!(dialog.detail.contains("pending COL byte edits"));
+        assert!(matches!(dialog.action, ConfirmAction::Quit));
+    }
+
+    #[test]
+    fn unsaved_changes_prompt_keeps_wip_option_without_pending_col_writes() {
+        let target = PathBuf::from("another-resource");
+        let dialog = unsaved_changes_dialog(
+            ConfirmAction::Load(target.clone()),
+            UnsavedChangesDestination::LoadAnotherResource,
+            false,
+        );
+
+        assert_eq!(dialog.primary_label, "Save WIP");
+        assert_eq!(
+            dialog.body,
+            "Save a WIP snapshot before loading another resource?"
+        );
+        assert!(matches!(dialog.action, ConfirmAction::Load(path) if path == target));
+    }
+
+    #[test]
     fn img_write_refuses_an_entry_that_overflows_the_directory_size_field() {
         let root = temp_resource_root("img_entry_overflow");
         let path = root.join("imgs").join("txd.img");
@@ -502,6 +724,7 @@ mod tests {
             mode: ManualSaveMode::Resource,
             source_root: root,
             zones: vec!["test".to_string()],
+            map_documents: Vec::new(),
             eagle_zone_offsets: EagleZoneOffsets::default(),
             placements: Vec::new(),
             definitions: HashMap::new(),
@@ -699,6 +922,7 @@ mod tests {
 
         write_scene_files_data(
             &zones,
+            &[],
             offsets,
             &[],
             &HashMap::new(),
@@ -723,6 +947,7 @@ mod tests {
 
         let errors = write_scene_files_data(
             &["../escaped".to_string()],
+            &[],
             EagleZoneOffsets::default(),
             &[],
             &HashMap::new(),
@@ -780,6 +1005,7 @@ mod tests {
 
         write_scene_files_data(
             &["test".to_string()],
+            &[],
             EagleZoneOffsets::default(),
             &[placement],
             &definitions,
@@ -5590,6 +5816,7 @@ struct ManualSaveWriteSnapshot {
     mode: ManualSaveMode,
     source_root: PathBuf,
     zones: Vec<String>,
+    map_documents: Vec<crate::resource::mta_maps::MapDocument>,
     eagle_zone_offsets: EagleZoneOffsets,
     placements: Vec<Placement>,
     definitions: HashMap<String, Definition>,
@@ -5734,6 +5961,7 @@ fn capture_manual_save(
         mode: mode.clone(),
         source_root: app.root.clone(),
         zones: app.zones.clone(),
+        map_documents: app.map_documents.clone(),
         eagle_zone_offsets: app.eagle_zone_offsets,
         placements: app.placements.clone(),
         definitions: app.definitions.clone(),
@@ -5923,6 +6151,7 @@ fn write_manual_scene_documents(
 ) -> bool {
     if let Err(mut scene_errors) = write_scene_files_data(
         &snapshot.zones,
+        &snapshot.map_documents,
         snapshot.eagle_zone_offsets,
         &snapshot.placements,
         &snapshot.definitions,
@@ -6451,7 +6680,19 @@ fn primary_save_writer_conflict(
     }
 }
 
+fn block_default_map_save(app: &mut AppState) -> bool {
+    if app.options.launch_mode != LaunchMode::DefaultMap {
+        return false;
+    }
+    app.status_message =
+        "Default SA map changes are temporary; saving is not supported yet.".to_string();
+    true
+}
+
 fn start_manual_save(app: &mut AppState, mode: ManualSaveMode) -> bool {
+    if block_default_map_save(app) {
+        return false;
+    }
     let label = mode.label();
     if let Some(job) = active_conflicting_save_job(app) {
         app.status_message = format!("Wait for the background {job} to finish before {label}.");
@@ -6849,6 +7090,7 @@ struct AutosaveSnapshot {
     root: PathBuf,
     captured_at: SystemTime,
     zones: Vec<String>,
+    map_documents: Vec<crate::resource::mta_maps::MapDocument>,
     eagle_zone_offsets: EagleZoneOffsets,
     placements: Vec<Placement>,
     definitions: HashMap<String, Definition>,
@@ -6912,6 +7154,7 @@ fn capture_autosave_snapshot(app: &AppState) -> AutosaveSnapshot {
         root: app.root.clone(),
         captured_at: SystemTime::now(),
         zones: app.zones.clone(),
+        map_documents: app.map_documents.clone(),
         eagle_zone_offsets: app.eagle_zone_offsets,
         placements: app.placements.clone(),
         definitions: app.definitions.clone(),
@@ -7043,6 +7286,7 @@ fn write_autosave_snapshot(mut snapshot: AutosaveSnapshot) -> AutosaveResult {
     }
     if let Err(mut scene_errors) = write_scene_files_data(
         &snapshot.zones,
+        &snapshot.map_documents,
         snapshot.eagle_zone_offsets,
         &snapshot.placements,
         &snapshot.definitions,
@@ -7393,6 +7637,9 @@ pub(crate) fn maybe_prompt_autosave_restore(app: &mut AppState) {
 }
 
 pub(crate) fn update_autosave(app: &mut AppState) {
+    if app.options.launch_mode == LaunchMode::DefaultMap {
+        return;
+    }
     // Player and vehicle preview meshes are bundled runtime assets, not project
     // DFFs. Older bake paths could queue them and keep autosave permanently dirty.
     app.pending_vertex_light_meshes
@@ -7554,6 +7801,11 @@ pub(crate) fn copy_resource_shell(src_root: &Path, dst_root: &Path) -> Result<()
 
 fn update_save_as_meta_root(root: &Path) -> Result<(), String> {
     let meta_path = root.join("meta.xml");
+    // Map resources may carry gamemode declarations and map dimensions.
+    // Keep their metadata intact, including alternative loading scripts.
+    if !crate::resource::mta_maps::registered_paths(root).is_empty() && meta_path.is_file() {
+        return Ok(());
+    }
     let meta = fs::read_to_string(&meta_path).unwrap_or_default();
     let mut info_lines = Vec::new();
     let mut file_lines = Vec::new();
@@ -12119,6 +12371,9 @@ pub(crate) fn default_save_as_path(app: &AppState) -> PathBuf {
 }
 
 pub(crate) fn open_save_as_dialog(app: &mut AppState) {
+    if block_default_map_save(app) {
+        return;
+    }
     drain_text_input();
     let path = default_save_as_path(app).to_string_lossy().to_string();
     app.save_as_dialog = Some(SaveAsDialog {
@@ -12145,10 +12400,26 @@ pub(crate) fn open_load_dialog(app: &mut AppState) {
 pub(crate) fn open_preferences_dialog(app: &mut AppState) {
     drain_text_input();
     let gta_sa_dir = app.gta_sa_dir.to_string_lossy().to_string();
+    let blender_install_dir = load_blender_install_dir_preference()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let plugins = discover_material_plugins();
+    let selected_plugin = (!plugins.is_empty()).then_some(0);
     app.preferences_dialog = Some(PreferencesDialog {
+        tab: PreferencesTab::General,
+        plugins,
+        selected_plugin,
+        plugin_scroll: 0.0,
+        plugin_details_scroll: 0.0,
+        error: None,
         cursor: gta_sa_dir.len(),
         selection_anchor: None,
         gta_sa_dir,
+        blender_install_dir,
+        blender_install_candidates: Vec::new(),
+        blender_candidate_scroll: 0,
+        blender_search_message: None,
+        active_path_field: PreferencesPathField::GtaSa,
         gizmo_scale: clamp_gizmo_scale(app.gizmo_scale),
         camera_speed: clamp_camera_speed(app.camera_speed),
         vehicle_camera_speed: clamp_detail_camera_speed(app.vehicle_camera_speed),
@@ -12159,6 +12430,7 @@ pub(crate) fn open_preferences_dialog(app: &mut AppState) {
         msaa_samples: load_msaa_samples_preference(),
         msaa_samples_saved: load_msaa_samples_preference(),
         draw_distance_percent: app.options.draw_distance_percent,
+        viewport_scroll: 0.0,
     });
 }
 
@@ -13937,6 +14209,72 @@ pub(crate) fn start_load_resource_checked(
     start_load_resource_from_source(app, path, LoadSceneSource::Saved, confirm_unsaved);
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum UnsavedChangesDestination {
+    Exit,
+    LoadAnotherResource,
+}
+
+pub(crate) fn scene_unsaved_changes_dialog(
+    app: &AppState,
+    action: ConfirmAction,
+    destination: UnsavedChangesDestination,
+) -> ConfirmDialog {
+    if app.options.launch_mode == LaunchMode::DefaultMap {
+        return ConfirmDialog {
+            action,
+            title: "Discard SA Map Changes?".to_string(),
+            body: "Changes to the default SA map are temporary.".to_string(),
+            detail: "Saving is not supported yet. Continue and discard these changes?".to_string(),
+            primary_label: "Discard".to_string(),
+            secondary_label: None,
+            secondary_action: None,
+        };
+    }
+    unsaved_changes_dialog(action, destination, !app.pending_col_writes.is_empty())
+}
+
+pub(crate) fn unsaved_changes_dialog(
+    action: ConfirmAction,
+    destination: UnsavedChangesDestination,
+    has_pending_col_writes: bool,
+) -> ConfirmDialog {
+    let (body, detail, primary_label) = if has_pending_col_writes {
+        let body = match destination {
+            UnsavedChangesDestination::Exit => "Save the resource before exiting?",
+            UnsavedChangesDestination::LoadAnotherResource => {
+                "Save the resource before loading another resource?"
+            }
+        };
+        (
+            body,
+            "Resource Save applies pending COL byte edits along with the other unsaved changes.",
+            "Save",
+        )
+    } else {
+        let body = match destination {
+            UnsavedChangesDestination::Exit => "Save a WIP snapshot before exiting?",
+            UnsavedChangesDestination::LoadAnotherResource => {
+                "Save a WIP snapshot before loading another resource?"
+            }
+        };
+        (
+            body,
+            "Save WIP keeps map/light XML outside the resource.",
+            "Save WIP",
+        )
+    };
+    ConfirmDialog {
+        action,
+        title: "Unsaved Changes".to_string(),
+        body: body.to_string(),
+        detail: detail.to_string(),
+        primary_label: primary_label.to_string(),
+        secondary_label: Some("Discard".to_string()),
+        secondary_action: None,
+    }
+}
+
 pub(crate) fn start_load_resource_from_source(
     app: &mut AppState,
     path: PathBuf,
@@ -13969,17 +14307,11 @@ pub(crate) fn start_load_resource_from_source(
         return;
     }
     if confirm_unsaved && has_unsaved_changes(app) {
-        app.confirm_dialog = Some(ConfirmDialog {
-            action: ConfirmAction::Load(path),
-            title: "Unsaved Changes".to_string(),
-            body: "Save a WIP snapshot before loading another resource?".to_string(),
-            detail:
-                "Save WIP keeps map/light XML outside the resource; COL byte edits need resource Save."
-                    .to_string(),
-            primary_label: "Save WIP".to_string(),
-            secondary_label: Some("Discard".to_string()),
-            secondary_action: None,
-        });
+        app.confirm_dialog = Some(scene_unsaved_changes_dialog(
+            app,
+            ConfirmAction::Load(path),
+            UnsavedChangesDestination::LoadAnotherResource,
+        ));
         return;
     }
     app.pending_load_source = source;
@@ -14398,4 +14730,46 @@ pub(crate) fn rw_string(value: &str) -> Vec<u8> {
         bytes.push(0);
     }
     bytes
+}
+
+#[cfg(test)]
+mod default_world_save_tests {
+    use super::*;
+    #[test]
+    fn untouched_world_instances_are_not_exported_as_placements() {
+        let root = std::env::temp_dir().join(format!(
+            "eagle_default_world_save_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let p = Placement {
+            id: "1337".into(),
+            dff: "bin".into(),
+            zone: "sa_zone".into(),
+            tag: "building".into(),
+            attrs: BTreeMap::from([
+                ("saIpl".into(), "sa_zone".into()),
+                ("saInstance".into(), "0".into()),
+            ]),
+            pos: V3::default(),
+            rot: V3::default(),
+        };
+        write_scene_files_data(
+            &["sa_zone".into()],
+            &[],
+            EagleZoneOffsets::default(),
+            &[p],
+            &HashMap::new(),
+            &HashSet::new(),
+            &[],
+            &root,
+        )
+        .unwrap();
+        assert!(!root.join("zones/sa_zone/sa_zone.map").exists());
+        assert_eq!(fs::read_to_string(root.join("eagleZones.txt")).unwrap(), "");
+        fs::remove_dir_all(root).unwrap();
+    }
 }

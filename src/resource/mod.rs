@@ -8,7 +8,11 @@ pub(crate) mod loading;
 pub(crate) mod lod_audit;
 pub(crate) mod material_classes;
 pub(crate) mod missing_texture_review;
+pub(crate) mod mta_maps;
 pub(crate) mod race;
+pub(crate) mod sa_map;
 pub(crate) mod save;
 pub(crate) mod validation;
 pub(crate) mod water;
+
+pub(crate) mod zones;

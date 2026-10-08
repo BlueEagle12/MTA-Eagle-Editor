@@ -215,6 +215,7 @@ pub(crate) fn model_flag_bit_name(bit: u32) -> Option<&'static str> {
         21 => Some("disable_backface_culling"),
         22 => Some("is_breakable_statue"),
         50 => Some("disable_collisions"),
+        51 => Some("follow_camera"),
         _ => None,
     }
 }
@@ -258,6 +259,52 @@ pub(crate) fn flag_token_matches(token: &str, flag: &str) -> bool {
             model_flag_bit_name(value as u32).is_some_and(|name| name == flag)
                 || model_flag_decimal_name(value).is_some_and(|name| name == flag)
         })
+}
+
+pub(crate) fn camera_follow_override(attrs: &BTreeMap<String, String>) -> Option<bool> {
+    for key in [
+        "followCamera",
+        "followcamera",
+        "follow_camera",
+        "follow-camera",
+    ] {
+        if let Some(value) = attrs.get(key) {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" | "enabled" => return Some(true),
+                "false" | "0" | "no" | "off" | "disabled" => return Some(false),
+                _ => {}
+            }
+        }
+    }
+    for key in ["flags", "overrideFlags", "overrideflags", "override_flags"] {
+        if attrs.get(key).is_some_and(|flags| {
+            flags
+                .split(|ch| ch == ',' || ch == ';' || ch == '|')
+                .any(|token| {
+                    matches!(
+                        token.trim().to_ascii_lowercase().replace('-', "_").as_str(),
+                        "51" | "follow_camera" | "followcamera" | "follow camera"
+                    )
+                })
+        }) {
+            return Some(true);
+        }
+    }
+    None
+}
+
+pub(crate) fn placement_follows_camera(
+    placement: &Placement,
+    definitions: &HashMap<String, Definition>,
+) -> bool {
+    matches!(placement.tag.as_str(), "object" | "building" | "scenery")
+        && camera_follow_override(&placement.attrs)
+            .or_else(|| {
+                definitions
+                    .get(&placement.id)
+                    .and_then(|definition| camera_follow_override(&definition.attrs))
+            })
+            .unwrap_or(false)
 }
 
 pub(crate) fn placement_disable_backface_culling(
@@ -306,23 +353,40 @@ pub(crate) fn placement_definition_disable_backface_culling(
         .is_some_and(|def| definition_flag_enabled(def, "disable_backface_culling"))
 }
 
-pub(crate) fn definition_flag_enabled(def: &Definition, flag: &str) -> bool {
+pub(crate) fn native_definition_flag_enabled(def: &Definition, flag: &str) -> bool {
+    // Unlike Eagle's flag-token lists, gtaFlags is one IDE bitmask. A value of
+    // 0 means no flags, 1 means bit 0, and combined values must test each bit.
+    let Some(bit) = (0..32).find(|bit| model_flag_bit_name(*bit) == Some(flag)) else {
+        return false;
+    };
     def.attrs
-        .get(flag)
-        .is_some_and(|value| value != "false" && value != "0")
-        || def.attrs.get("flags").is_some_and(|flags| {
-            split_flags(flags)
-                .iter()
-                .any(|value| flag_token_matches(value, flag))
-        })
-        || def.attrs.get("gtaFlags").is_some_and(|flags| {
-            split_flags(flags)
-                .iter()
-                .any(|value| flag_token_matches(value, flag))
-        })
+        .get("gtaFlags")
+        .and_then(|value| parse_model_flag_number(value))
+        .is_some_and(|mask| mask & (1u64 << bit) != 0)
+}
+
+pub(crate) fn definition_flag_enabled(def: &Definition, flag: &str) -> bool {
+    if flag == "follow_camera" {
+        return camera_follow_override(&def.attrs).unwrap_or(false);
+    }
+    // An explicit per-flag override can turn an inherited SA bit off as well
+    // as on. Preserve Eagle's existing named/bit-index token interpretation.
+    if let Some(value) = def.attrs.get(flag) {
+        return !matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0");
+    }
+    def.attrs.get("flags").is_some_and(|flags| {
+        split_flags(flags)
+            .iter()
+            .any(|value| flag_token_matches(value, flag))
+    }) || native_definition_flag_enabled(def, flag)
 }
 
 pub(crate) fn set_definition_flag(def: &mut Definition, flag: &str, enabled: bool) {
+    if flag == "follow_camera" {
+        for key in placement_direct_override_keys(flag) {
+            def.attrs.remove(*key);
+        }
+    }
     let mut flags = def
         .attrs
         .get("flags")
@@ -332,10 +396,14 @@ pub(crate) fn set_definition_flag(def: &mut Definition, flag: &str, enabled: boo
     if enabled {
         flags.push(flag.to_string());
         def.attrs.insert(flag.to_string(), "true".to_string());
+    } else if native_definition_flag_enabled(def, flag) {
+        def.attrs.insert(flag.to_string(), "false".to_string());
     } else {
         def.attrs.remove(flag);
     }
     def.attrs.insert("flags".to_string(), flags.join(","));
+    mark_definition_override_attr(def, "flags");
+    mark_definition_override_attr(def, flag);
 }
 
 pub(crate) fn set_optional_attr(attrs: &mut BTreeMap<String, String>, key: &str, value: String) {
@@ -782,6 +850,10 @@ pub(crate) fn element_panel_layout(app: &AppState) -> ElementPanelLayout {
 
     let mut y = content.y + 6.0 - app.properties_scroll;
     layout.info_top = y;
+    if selection_has_default_world(app) {
+        layout.content_height = 446.0;
+        return layout;
+    }
     y += 120.0;
 
     // Section 0: Element (type + identity).
@@ -1535,6 +1607,7 @@ fn placement_override_flag_aliases(flag: &str) -> &'static [&'static str] {
         "unbreakable" => &["unbreakable"],
         "frozen" => &["frozen"],
         "no_stream" => &["no_stream"],
+        "follow_camera" => &["follow_camera", "followcamera", "follow camera", "51"],
         _ => &[],
     }
 }
@@ -1577,6 +1650,12 @@ fn placement_override_has_token(placement: &Placement, flag: &str) -> bool {
 
 fn placement_direct_override_keys(flag: &str) -> &'static [&'static str] {
     match flag {
+        "follow_camera" => &[
+            "followCamera",
+            "followcamera",
+            "follow_camera",
+            "follow-camera",
+        ],
         "double_sided" => &[
             "doubleSided",
             "double_sided",
@@ -1631,12 +1710,16 @@ pub(crate) fn placement_override_flag_label(flag: &str) -> &str {
         "unbreakable" => "Unbreakable",
         "frozen" => "Frozen",
         "no_stream" => "No Stream",
+        "follow_camera" => "Follow Camera",
         _ => flag,
     }
 }
 
 pub(crate) fn definition_flag_tooltip(flag: &str) -> &'static str {
     match flag {
+        "follow_camera" => {
+            "Translates this model’s placements with the camera; their position becomes a camera offset."
+        }
         "is_road" => "Marks this model as road geometry.",
         "draw_last" => {
             "Draws this model after normal world geometry; useful for surfaces that must appear on top."
@@ -1681,6 +1764,9 @@ pub(crate) fn definition_flag_tooltip(flag: &str) -> &'static str {
 
 pub(crate) fn placement_override_flag_tooltip(flag: &str) -> &'static str {
     match flag {
+        "follow_camera" => {
+            "Moves this placement with the camera, preserving its position as an offset and keeping its authored rotation."
+        }
         "double_sided" => {
             "Draws both sides of polygons for this placement, overriding the model's normal backface culling."
         }
@@ -1701,6 +1787,7 @@ fn draw_property_tooltip(font: &Font, rect: Rect, description: &str) {
 
 pub(crate) fn placement_override_flag_enabled(placement: &Placement, flag: &str) -> bool {
     match flag {
+        "follow_camera" => camera_follow_override(&placement.attrs).unwrap_or(false),
         "double_sided" => placement_override_bool(
             placement,
             &[
@@ -1785,6 +1872,9 @@ pub(crate) fn placement_override_flag_enabled(placement: &Placement, flag: &str)
 }
 
 pub(crate) fn set_placement_override_flag(placement: &mut Placement, flag: &str, enabled: bool) {
+    if is_default_world_placement(placement) {
+        return;
+    }
     let aliases = placement_override_flag_aliases(flag);
     let mut remove_aliases: Vec<&str> = aliases.to_vec();
     if flag == "breakable" {
@@ -1823,6 +1913,11 @@ pub(crate) fn set_placement_override_flag(placement: &mut Placement, flag: &str,
     }
     if enabled {
         override_flags.push(flag.to_string());
+    }
+    if flag == "follow_camera" && !enabled {
+        placement
+            .attrs
+            .insert("followCamera".into(), "false".into());
     }
     if !override_flags.is_empty() {
         placement
@@ -3126,11 +3221,86 @@ pub(crate) fn draw_inspector(app: &AppState) {
     }
 }
 
+pub(crate) fn world_copy_id_rect(app: &AppState) -> Rect {
+    let layout = element_panel_layout(app);
+    Rect::new(
+        layout.content.x + 6.0,
+        layout.info_top + 72.0,
+        right_panel_width() - 52.0,
+        28.0,
+    )
+}
+
 pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
     let layout = element_panel_layout(app);
     let info_y = layout.info_top;
     let x0 = layout.content.x + 6.0;
     let content_w = right_panel_width() - 52.0;
+    if selection_has_default_world(app) {
+        ui_text(
+            &app.ui_font,
+            "Default SA world element (locked)",
+            x0,
+            info_y + 24.0,
+            ui_dim(),
+        );
+        if let Some(p) = app.placements.get(app.selected) {
+            draw_metric_row(&app.ui_font, "Model ID", &p.id, x0, info_y + 52.0);
+            text_button(&app.ui_font, world_copy_id_rect(app), "Copy ID", false);
+            ui_text(
+                &app.ui_font,
+                "Position (read only)",
+                x0,
+                info_y + 136.0,
+                ui_dim(),
+            );
+            for (slot, (axis, value)) in [("X", p.pos.x), ("Y", p.pos.y), ("Z", p.pos.z)]
+                .into_iter()
+                .enumerate()
+            {
+                draw_metric_row(
+                    &app.ui_font,
+                    axis,
+                    fmt_f32(value, 6),
+                    x0,
+                    info_y + 164.0 + slot as f32 * 26.0,
+                );
+            }
+            ui_text(
+                &app.ui_font,
+                "Rotation (degrees, read only)",
+                x0,
+                info_y + 256.0,
+                ui_dim(),
+            );
+            for (slot, (axis, value)) in [("X", p.rot.x), ("Y", p.rot.y), ("Z", p.rot.z)]
+                .into_iter()
+                .enumerate()
+            {
+                draw_metric_row(
+                    &app.ui_font,
+                    axis,
+                    fmt_f32(value, 6),
+                    x0,
+                    info_y + 284.0 + slot as f32 * 26.0,
+                );
+            }
+        }
+        text_button(
+            &app.ui_font,
+            world_conversion_rect(app),
+            "Turn into placement",
+            false,
+        );
+        ui_text(
+            &app.ui_font,
+            "Delete removes the world original.",
+            x0,
+            info_y + 420.0,
+            ui_dim(),
+        );
+        return;
+    }
     if let Some(p) = app.placements.get(app.selected) {
         ui_text(
             &app.ui_font,
@@ -3170,18 +3340,24 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
                 ui_accent(),
             );
         }
-        let zone_line = format!("Zone {}", p.zone);
-        ui_text(
-            &app.ui_font,
-            &format!(
-                "{}   DFF {}",
-                zone_line,
-                ellipsize_width(&p.dff, 16, content_w - ui_text_width(&zone_line, 16) - 52.0)
-            ),
-            x0,
-            info_y + 64.0,
-            LIGHTGRAY,
+        let destination = format!(
+            "{}   DFF {}  ▾",
+            crate::resource::mta_maps::destination_label(&p.zone),
+            p.dff,
         );
+        text_button(
+            &app.ui_font,
+            element_destination_rect(app),
+            &ellipsize_width(&destination, 16, content_w - 20.0),
+            false,
+        );
+        if element_destination_rect(app).contains(mouse_position().into()) {
+            draw_text_tooltip(
+                &app.ui_font,
+                element_destination_rect(app),
+                "Change selected elements' zone or map file",
+            );
+        }
         ui_text(
             &app.ui_font,
             &format!("Position  {:.2}, {:.2}, {:.2}", p.pos.x, p.pos.y, p.pos.z),
@@ -3900,9 +4076,13 @@ pub(crate) fn draw_element_properties(app: &AppState, x: f32, _y: f32) {
                 rect,
                 placement_override_flag_label(flag),
                 selected.iter().all(|idx| {
-                    app.placements
-                        .get(*idx)
-                        .is_some_and(|p| placement_override_flag_enabled(p, flag))
+                    app.placements.get(*idx).is_some_and(|p| {
+                        if *flag == "follow_camera" {
+                            placement_follows_camera(p, &app.definitions)
+                        } else {
+                            placement_override_flag_enabled(p, flag)
+                        }
+                    })
                 }),
             );
             draw_property_tooltip(&app.ui_font, rect, placement_override_flag_tooltip(flag));
@@ -4486,15 +4666,20 @@ pub(crate) fn draw_scene_panel(app: &AppState) {
     let objects = app.placements.iter().filter(|p| p.tag == "object").count();
     let scenery = app.placements.iter().filter(|p| p.tag == "scenery").count();
     let missing_col = missing_col_count(app);
-    ui_text_size(
+    ui_text_size(&app.ui_font, "", x + 14.0, y + 64.0, 18, WHITE);
+    text_button(
         &app.ui_font,
-        "Resource Overview",
-        x + 14.0,
-        y + 64.0,
-        18,
-        WHITE,
+        map_files_button_rect(app),
+        "Placement files...",
+        false,
     );
-    draw_metric_row(&app.ui_font, "Zones", app.zones.len(), x + 14.0, y + 100.0);
+    draw_metric_row(
+        &app.ui_font,
+        "Zones / Maps",
+        app.zones.len(),
+        x + 14.0,
+        y + 100.0,
+    );
     draw_metric_row(
         &app.ui_font,
         "Placements",
@@ -4554,8 +4739,8 @@ pub(crate) fn draw_scene_panel(app: &AppState) {
         draw_metric_row(&app.ui_font, "Type", &p.tag, x + 14.0, y + 534.0);
         draw_metric_row(
             &app.ui_font,
-            "Zone",
-            ellipsize(&p.zone, 20),
+            "File",
+            ellipsize(&crate::resource::mta_maps::destination_label(&p.zone), 20),
             x + 14.0,
             y + 560.0,
         );
@@ -4784,6 +4969,50 @@ mod placement_override_tests {
             pos: V3::default(),
             rot: V3::default(),
         }
+    }
+
+    #[test]
+    fn follow_camera_matches_loader_aliases_defaults_and_disable() {
+        for (key, value) in [
+            ("flags", "51"),
+            ("flags", "follow_camera"),
+            ("overrideFlags", "Follow Camera"),
+            ("override_flags", "follow-camera"),
+            ("followCamera", "true"),
+            ("followcamera", "yes"),
+            ("follow_camera", "1"),
+        ] {
+            let placement = placement_with_attrs(&[(key, value)]);
+            assert!(
+                placement_override_flag_enabled(&placement, "follow_camera"),
+                "{key}={value}"
+            );
+            assert!(placement_follows_camera(&placement, &HashMap::new()));
+        }
+        let definition = Definition {
+            id: "test".into(),
+            zone: "test".into(),
+            attrs: BTreeMap::from([("flags".into(), "51".into())]),
+        };
+        let mut definitions = HashMap::from([("test".into(), definition)]);
+        let mut placement = placement_with_attrs(&[]);
+        assert!(placement_follows_camera(&placement, &definitions));
+        set_placement_override_flag(&mut placement, "follow_camera", false);
+        assert!(!placement_follows_camera(&placement, &definitions));
+        assert_eq!(placement.attrs["followCamera"], "false");
+        set_placement_override_flag(&mut placement, "follow_camera", true);
+        assert!(placement_follows_camera(&placement, &definitions));
+        assert_eq!(placement.attrs["overrideFlags"], "follow_camera");
+        let def = definitions.get_mut("test").unwrap();
+        def.attrs.insert("followCamera".into(), "true".into());
+        set_definition_flag(def, "follow_camera", false);
+        assert!(!definition_flag_enabled(def, "follow_camera"));
+        assert!(!placement_follows_camera(
+            &placement_with_attrs(&[]),
+            &definitions
+        ));
+        let disabled = placement_with_attrs(&[("flags", "51"), ("followCamera", "false")]);
+        assert!(!placement_follows_camera(&disabled, &definitions));
     }
 
     #[test]

@@ -528,6 +528,11 @@ fn validate_blender_archive_names(
 }
 
 fn find_blender_executable() -> Result<PathBuf, String> {
+    if let Some(install_dir) = load_blender_install_dir_preference()
+        && let Some(executable) = blender_executable_in_install_dir(&install_dir)
+    {
+        return Ok(executable);
+    }
     if let Some(path) = env::var_os("BLENDER_PATH").map(PathBuf::from) {
         if path.is_file() {
             return Ok(path);
@@ -540,72 +545,11 @@ fn find_blender_executable() -> Result<PathBuf, String> {
     {
         return Ok(PathBuf::from("blender"));
     }
-    let mut candidates = vec![
-        PathBuf::from("/usr/bin/blender"),
-        PathBuf::from("/usr/local/bin/blender"),
-        PathBuf::from("/opt/blender/blender"),
-    ];
-    #[cfg(windows)]
-    for base in [
-        env::var_os("ProgramFiles"),
-        env::var_os("ProgramFiles(x86)"),
-    ]
-    .into_iter()
-    .flatten()
-    .map(PathBuf::from)
-    {
-        if let Ok(entries) = fs::read_dir(base) {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.is_dir()
-                    && path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            name.to_ascii_lowercase().starts_with("blender foundation")
-                        })
-                {
-                    if let Ok(versions) = fs::read_dir(path) {
-                        for version in versions.filter_map(Result::ok) {
-                            candidates.push(version.path().join("blender.exe"));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-        for base in [
-            home.join("Utilities"),
-            home.join("Applications"),
-            home.join(".local/bin"),
-        ] {
-            if let Ok(entries) = fs::read_dir(base) {
-                for entry in entries.filter_map(Result::ok) {
-                    let path = entry.path();
-                    if path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.to_ascii_lowercase().starts_with("blender"))
-                    {
-                        candidates.push(if path.is_dir() {
-                            path.join("blender")
-                        } else {
-                            path
-                        });
-                    }
-                }
-            }
-        }
-    }
-    candidates.sort();
-    candidates.reverse();
-    candidates
+    common_blender_executable_candidates()
         .into_iter()
-        .find(|path| path.is_file())
+        .next()
         .ok_or_else(|| {
-            "Blender was not found. Install Blender or set BLENDER_PATH to its executable."
-                .to_string()
+            "Blender was not found. Set its install directory in Preferences or set BLENDER_PATH to its executable.".to_string()
         })
 }
 

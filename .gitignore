@@ -10,3 +10,6 @@ __pycache__/
 .idea/
 .vscode/
 build-linux-dev.sh
+
+# Local material plugin; excluded from public source and release packages.
+/plugins/halo-ce-materials/

@@ -390,7 +390,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "eagle-editor"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "arboard",
  "fontdue",
@@ -398,6 +398,7 @@ dependencies = [
  "image 0.25.8",
  "macroquad",
  "meshopt",
+ "quick-xml",
  "regex",
  "rfd",
  "serde_json",

@@ -73,6 +73,9 @@ pub(crate) fn apply_global_transform(app: &mut AppState) {
 
     if transform.transform_elements {
         for placement in &mut app.placements {
+            if is_default_world_placement(placement) {
+                continue;
+            }
             placement.pos = transform_v3(matrix, placement.pos);
             let local_rotation = Mat4::from_rotation_z(placement.rot.z.to_radians())
                 * Mat4::from_rotation_y(placement.rot.y.to_radians())
@@ -166,6 +169,7 @@ pub(crate) fn delete_app_gl_resources(app: &mut AppState) {
     delete_render_cells(&app.scene_cells, &app.world_cells);
     delete_render_cells(&app.lod_scene_cells, &app.lod_world_cells);
     clear_collision_render_cache(app);
+    clear_material_plugins();
     unsafe {
         for mesh in app.meshes.values() {
             for part in &mesh.parts {
@@ -254,6 +258,9 @@ pub(crate) fn release_loaded_resource(app: &mut AppState) {
     app.placements = Vec::new();
     app.definitions = HashMap::new();
     app.zones = Vec::new();
+    app.map_documents.clear();
+    app.placement_destination = None;
+    app.map_dialog = None;
     app.meshes = HashMap::new();
     app.collisions = HashMap::new();
     app.collision_render_cache.clear();
@@ -335,34 +342,14 @@ pub(crate) fn rebuild_placement_2dfx_index(app: &mut AppState) {
     app.placement_2dfx_index_placement_count = app.placements.len();
 }
 
-/// Rebuilds only the complete fast-VBO cells touched by an in-place placement
-/// transform. Both the old and current origin keys are included so crossing a
-/// cell boundary removes the placement from its former cell and inserts it in
-/// its new one without disturbing unrelated GPU buffers.
-pub(crate) fn rebuild_render_cells_for_placement_transforms(
-    app: &mut AppState,
-    before: &PlacementTransformHistorySnapshot,
-) {
-    if !app.options.fast_vbo || app.options.vbo_selected_only {
-        rebuild_render_cells(app);
-        return;
-    }
-
-    let mut dirty_keys = HashSet::with_capacity(before.placements.len() * 2);
-    for (index, old_placement) in &before.placements {
-        dirty_keys.insert(world_cell_key(old_placement.pos));
-        if let Some(current) = app.placements.get(*index) {
-            dirty_keys.insert(world_cell_key(current.pos));
-        }
-    }
-    if dirty_keys.is_empty() {
-        return;
-    }
-
-    invalidate_lod_audit(app);
-    invalidate_missing_texture_review(app);
+fn placement_cell_rebuild_source(
+    placements: &[Placement],
+    states: &[ElementState],
+    keys: &HashSet<WorldCellKey>,
+) -> (Vec<Placement>, HashSet<String>) {
+    let mut affected = Vec::new();
     let mut lod_ids = HashSet::new();
-    for (placement, state) in app.placements.iter().zip(&app.element_states) {
+    for (placement, state) in placements.iter().zip(states) {
         if state.deleted || state.hidden {
             continue;
         }
@@ -372,42 +359,99 @@ pub(crate) fn rebuild_render_cells_for_placement_transforms(
                 lod_ids.insert(parent.to_ascii_lowercase());
             }
         }
+        if keys.contains(&world_cell_key(placement.pos)) {
+            affected.push(placement.clone());
+        }
     }
-    app.lod_ids = collect_lod_ids(&app.placements);
+    (affected, lod_ids)
+}
+
+fn placement_requires_cell_rebuild(old: &Placement, new: &Placement) -> bool {
+    old.pos != new.pos
+        || old.rot != new.rot
+        || old.id != new.id
+        || old.dff != new.dff
+        || old.tag != new.tag
+        || placement_scale(old) != placement_scale(new)
+        || placement_alpha(old) != placement_alpha(new)
+        || old.attrs.get("lodParent") != new.attrs.get("lodParent")
+        || placement_override_flag_enabled(old, "double_sided")
+            != placement_override_flag_enabled(new, "double_sided")
+        || camera_follow_override(&old.attrs) != camera_follow_override(&new.attrs)
+        || placement_is_background_scenery(old) != placement_is_background_scenery(new)
+}
+
+/// Rebuilds only the complete fast-VBO cells touched by an in-place placement
+/// transform. Both the old and current origin keys are included so crossing a
+/// cell boundary removes the placement from its former cell and inserts it in
+/// its new one without disturbing unrelated GPU buffers.
+pub(crate) fn rebuild_render_cells_for_placement_transforms(
+    app: &mut AppState,
+    before: &PlacementTransformHistorySnapshot,
+) {
+    let mut dirty_keys = HashSet::with_capacity(before.placements.len() * 2);
+    for (index, old_placement) in &before.placements {
+        if app
+            .placements
+            .get(*index)
+            .is_some_and(|current| !placement_requires_cell_rebuild(old_placement, current))
+        {
+            continue;
+        }
+        dirty_keys.insert(world_cell_key(old_placement.pos));
+        if let Some(current) = app.placements.get(*index) {
+            dirty_keys.insert(world_cell_key(current.pos));
+        }
+    }
+    rebuild_render_cells_for_keys(app, &dirty_keys);
+}
+
+pub(crate) fn rebuild_render_cells_for_keys(
+    app: &mut AppState,
+    dirty_keys: &HashSet<WorldCellKey>,
+) {
+    if dirty_keys.is_empty() {
+        return;
+    }
+    if (!app.options.fast_vbo && !has_material_previews()) || app.options.vbo_selected_only {
+        rebuild_render_cells(app);
+        return;
+    }
+
+    invalidate_lod_audit(app);
+    invalidate_missing_texture_review(app);
+    // Scan the map once, then pack and validate only affected active cells.
+    // Keep the global active LOD references: a parent may live in another cell.
+    let (affected, lod_ids) =
+        placement_cell_rebuild_source(&app.placements, &app.element_states, dirty_keys);
     let ambient_lift = scene_ambient_lift_from_timecyc(&app.timecyc);
 
     // Build replacements before releasing currently drawable cells. Runtime
     // residency uploads them on demand from their compact CPU payload.
-    let replacement_world_cells = build_world_cells_for_keys(
-        &app.placements,
-        Some(&app.element_states),
+    let replacement_world_cells = build_world_cells(
+        &affected,
         &app.definitions,
         &app.meshes,
         app.options.vbo_immediate,
         &lod_ids,
         false,
         ambient_lift,
-        Some(&dirty_keys),
     );
-    let replacement_lod_world_cells = build_world_cells_for_keys(
-        &app.placements,
-        Some(&app.element_states),
+    let replacement_lod_world_cells = build_world_cells(
+        &affected,
         &app.definitions,
         &app.meshes,
         app.options.vbo_immediate,
         &lod_ids,
         true,
         ambient_lift,
-        Some(&dirty_keys),
     );
     let expected_buckets = |want_lod| {
-        app.placements
+        affected
             .iter()
-            .zip(&app.element_states)
-            .filter(|(_, state)| !state.deleted && !state.hidden)
-            .map(|(placement, _)| placement)
             .filter(|placement| {
-                dirty_keys.contains(&world_cell_key(placement.pos))
+                !placement_is_background_scenery(placement)
+                    && !placement_follows_camera(placement, &app.definitions)
                     && placement_is_lod(placement, &lod_ids) == want_lod
                     && app
                         .meshes
@@ -491,7 +535,7 @@ pub(crate) fn rebuild_render_cells_with_mesh_lift(app: &mut AppState, refresh_me
     }
     rebuild_placement_2dfx_index(app);
     // Only build the cell set the active render path will draw (see finish()).
-    if app.options.fast_vbo {
+    if app.options.fast_vbo || has_material_previews() {
         app.scene_cells = Vec::new();
         app.lod_scene_cells = Vec::new();
         app.world_cells = build_world_cells(
@@ -553,6 +597,8 @@ pub(crate) fn rebuild_render_cells_with_mesh_lift(app: &mut AppState, refresh_me
 
 pub(crate) fn saved_content_snapshot(app: &AppState) -> SavedContentSnapshot {
     SavedContentSnapshot {
+        zones: app.zones.clone(),
+        map_documents: app.map_documents.clone(),
         placements: app.placements.clone(),
         definitions: app.definitions.clone(),
         readonly_definition_ids: app.readonly_definition_ids.clone(),
@@ -612,6 +658,8 @@ pub(crate) fn race_history_snapshot(app: &AppState) -> RaceHistorySnapshot {
 
 pub(crate) fn world_history_snapshot(app: &AppState) -> WorldHistorySnapshot {
     WorldHistorySnapshot {
+        zones: app.zones.clone(),
+        map_documents: app.map_documents.clone(),
         placements: app.placements.clone(),
         definitions: app.definitions.clone(),
         readonly_definition_ids: app.readonly_definition_ids.clone(),
@@ -642,6 +690,335 @@ where
             })
             .collect(),
     }
+}
+
+fn active_lod_ids(placements: &[Placement], states: &[ElementState]) -> HashSet<String> {
+    placements
+        .iter()
+        .zip(states)
+        .filter(|(_, state)| !state.deleted && !state.hidden)
+        .filter_map(|(placement, _)| placement.attrs.get("lodParent"))
+        .map(|parent| parent.trim())
+        .filter(|parent| !parent.is_empty() && !parent.eq_ignore_ascii_case("self"))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+pub(crate) fn local_world_history_snapshot(
+    app: &AppState,
+    indices: impl IntoIterator<Item = usize>,
+    definition_ids: impl IntoIterator<Item = String>,
+) -> LocalWorldHistorySnapshot {
+    LocalWorldHistorySnapshot {
+        placement_count: app.placements.len(),
+        placements: placement_transform_history_snapshot(app, indices).placements,
+        element_states: app.element_states.clone(),
+        definitions: definition_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|id| {
+                let definition = app.definitions.get(&id).cloned();
+                let readonly = app.readonly_definition_ids.contains(&id);
+                (id, definition, readonly)
+            })
+            .collect(),
+        zones: app.zones.clone(),
+        world_edits_document: app
+            .map_documents
+            .iter()
+            .find(|document| document.path == "maps/world_edits.map")
+            .cloned(),
+        active_lod_ids: active_lod_ids(&app.placements, &app.element_states),
+        selection: selection_history_snapshot(app),
+        selected_col_face: app.selected_col_face,
+        selected_col_vertex: app.selected_col_vertex,
+    }
+}
+
+fn local_world_snapshot_after(
+    app: &AppState,
+    before: &LocalWorldHistorySnapshot,
+) -> LocalWorldHistorySnapshot {
+    local_world_history_snapshot(
+        app,
+        before
+            .placements
+            .iter()
+            .map(|(index, _)| *index)
+            .chain(before.placement_count..app.placements.len()),
+        before.definitions.iter().map(|(id, _, _)| id.clone()),
+    )
+}
+
+fn definition_requires_cell_rebuild(old: Option<&Definition>, new: Option<&Definition>) -> bool {
+    match (old, new) {
+        (Some(old), Some(new)) => {
+            old.id != new.id
+                || definition_flag_enabled(old, "disable_backface_culling")
+                    != definition_flag_enabled(new, "disable_backface_culling")
+                || [
+                    "dff",
+                    "txd",
+                    "flags",
+                    "overrideFlags",
+                    "overrideflags",
+                    "override_flags",
+                    "followCamera",
+                    "followcamera",
+                    "follow_camera",
+                    "follow-camera",
+                    "lodDistance",
+                    "drawDistance",
+                    "timeIn",
+                    "timeOut",
+                ]
+                .iter()
+                .any(|key| old.attrs.get(*key) != new.attrs.get(*key))
+        }
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+/// State changes and additions affect their cells. A changed LOD relationship
+/// can also reclassify parents elsewhere; include those cells in the update.
+fn local_world_dirty_keys(
+    placements: &[Placement],
+    states: &[ElementState],
+    definitions: &HashMap<String, Definition>,
+    before: &LocalWorldHistorySnapshot,
+    lod_ids: &HashSet<String>,
+) -> HashSet<WorldCellKey> {
+    let mut keys = HashSet::new();
+    for (index, old) in &before.placements {
+        if placements
+            .get(*index)
+            .is_none_or(|current| placement_requires_cell_rebuild(old, current))
+        {
+            keys.insert(world_cell_key(old.pos));
+            if let Some(current) = placements.get(*index) {
+                keys.insert(world_cell_key(current.pos));
+            }
+        }
+    }
+    let changed_definitions: HashSet<_> = before
+        .definitions
+        .iter()
+        .filter(|(id, old, _)| definition_requires_cell_rebuild(old.as_ref(), definitions.get(id)))
+        .map(|(id, _, _)| id.as_str())
+        .collect();
+    let lod_changed = before.active_lod_ids != *lod_ids;
+    for (index, placement) in placements.iter().enumerate() {
+        if index >= before.placement_count
+            || states.get(index) != before.element_states.get(index)
+            || changed_definitions.contains(placement.id.as_str())
+            || (lod_changed
+                && placement_is_lod(placement, &before.active_lod_ids)
+                    != placement_is_lod(placement, lod_ids))
+        {
+            keys.insert(world_cell_key(placement.pos));
+        }
+    }
+    keys
+}
+
+fn refresh_local_placement_2dfx_index(app: &mut AppState, before: &LocalWorldHistorySnapshot) {
+    update_local_placement_2dfx_index(
+        &mut app.placement_2dfx_indices,
+        &mut app.placement_2dfx_index_placement_count,
+        &app.placements,
+        &app.definitions,
+        &app.meshes,
+        before,
+    );
+}
+
+fn update_local_placement_2dfx_index(
+    indices: &mut Vec<usize>,
+    indexed_count: &mut usize,
+    placements: &[Placement],
+    definitions: &HashMap<String, Definition>,
+    meshes: &HashMap<String, RenderMesh>,
+    before: &LocalWorldHistorySnapshot,
+) {
+    if *indexed_count != before.placement_count && *indexed_count != placements.len() {
+        *indices = build_placement_2dfx_indices(placements, definitions, meshes);
+        *indexed_count = placements.len();
+        return;
+    }
+    let mut changed: BTreeSet<_> = before
+        .placements
+        .iter()
+        .filter(|(index, old)| {
+            placements
+                .get(*index)
+                .is_none_or(|p| p.id != old.id || p.dff != old.dff)
+        })
+        .map(|(index, _)| *index)
+        .chain(before.placement_count..placements.len())
+        .collect();
+    let mesh_changed: HashSet<_> = before
+        .definitions
+        .iter()
+        .filter(|(id, old, _)| {
+            let new = definitions.get(id);
+            match (old.as_ref(), new) {
+                (Some(old), Some(new)) => {
+                    old.id != new.id
+                        || old.attrs.get("dff") != new.attrs.get("dff")
+                        || old.attrs.get("txd") != new.attrs.get("txd")
+                }
+                (None, None) => false,
+                _ => true,
+            }
+        })
+        .map(|(id, _, _)| id.as_str())
+        .collect();
+    if !mesh_changed.is_empty() {
+        changed.extend(
+            placements
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| mesh_changed.contains(p.id.as_str()))
+                .map(|(index, _)| index),
+        );
+    }
+    indices.retain(|index| *index < placements.len() && !changed.contains(index));
+    for index in changed {
+        if let Some(placement) = placements.get(index) {
+            if meshes
+                .get(&placement_mesh_key(placement, definitions))
+                .is_some_and(|mesh| !mesh.effects_2dfx.is_empty())
+            {
+                indices.push(index);
+            }
+        }
+    }
+    indices.sort_unstable();
+    *indexed_count = placements.len();
+}
+
+fn refresh_local_world_edit(app: &mut AppState, before: &LocalWorldHistorySnapshot) {
+    let lod_ids = active_lod_ids(&app.placements, &app.element_states);
+    let keys = local_world_dirty_keys(
+        &app.placements,
+        &app.element_states,
+        &app.definitions,
+        before,
+        &lod_ids,
+    );
+    app.lod_ids = collect_lod_ids(&app.placements);
+    refresh_local_placement_2dfx_index(app, before);
+    app.outliner_labels.resize(app.placements.len(), None);
+    for (index, old) in &before.placements {
+        if app
+            .placements
+            .get(*index)
+            .is_none_or(|p| p.id != old.id || p.dff != old.dff)
+        {
+            invalidate_outliner_label(app, *index);
+        }
+    }
+    // Structural edits and type/LOD/group edits change the outliner. Visibility
+    // bits and transforms do not change its entries or cached labels.
+    if app.placements.len() != before.placement_count
+        || lod_ids != before.active_lod_ids
+        || before.placements.iter().any(|(index, old)| {
+            app.placements.get(*index).is_none_or(|p| {
+                p.id != old.id
+                    || p.dff != old.dff
+                    || p.tag != old.tag
+                    || placement_group(p) != placement_group(old)
+            })
+        })
+    {
+        rebuild_outliner_filter(app);
+    }
+    rebuild_render_cells_for_keys(app, &keys);
+    invalidate_validation_cache(app);
+}
+
+pub(crate) fn commit_local_world_history(
+    app: &mut AppState,
+    label: impl Into<String>,
+    before: LocalWorldHistorySnapshot,
+) {
+    let after = local_world_snapshot_after(app, &before);
+    if before != after {
+        refresh_local_world_edit(app, &before);
+        push_scoped_history(
+            app,
+            label,
+            UndoState::LocalWorld(before),
+            UndoState::LocalWorld(after),
+        );
+    }
+}
+
+fn restore_local_placements(placements: &mut Vec<Placement>, snapshot: &LocalWorldHistorySnapshot) {
+    placements.truncate(snapshot.placement_count);
+    for (index, placement) in &snapshot.placements {
+        if let Some(current) = placements.get_mut(*index) {
+            *current = placement.clone();
+        } else {
+            // Appended records are stored in ascending index order for redo.
+            assert_eq!(*index, placements.len());
+            placements.push(placement.clone());
+        }
+    }
+}
+
+fn restore_world_edits_document(
+    documents: &mut Vec<crate::resource::mta_maps::MapDocument>,
+    saved: Option<&crate::resource::mta_maps::MapDocument>,
+) {
+    if let Some(document) = saved {
+        if let Some(current) = documents.iter_mut().find(|d| d.path == document.path) {
+            current.clone_from(document);
+        } else {
+            documents.push(document.clone());
+        }
+    } else {
+        documents.retain(|d| d.path != "maps/world_edits.map");
+    }
+}
+
+fn apply_local_world_history_snapshot(app: &mut AppState, snapshot: &LocalWorldHistorySnapshot) {
+    // Capture removed tail records before truncating, so undo vacates every
+    // cell touched by a placement/duplicate (including an Alt-drag copy).
+    let before = local_world_history_snapshot(
+        app,
+        snapshot
+            .placements
+            .iter()
+            .map(|(index, _)| *index)
+            .chain(snapshot.placement_count..app.placements.len()),
+        snapshot.definitions.iter().map(|(id, _, _)| id.clone()),
+    );
+    restore_local_placements(&mut app.placements, snapshot);
+    app.element_states.clone_from(&snapshot.element_states);
+    app.zones.clone_from(&snapshot.zones);
+    for (id, definition, readonly) in &snapshot.definitions {
+        if let Some(definition) = definition {
+            app.definitions.insert(id.clone(), definition.clone());
+        } else {
+            app.definitions.remove(id);
+        }
+        if *readonly {
+            app.readonly_definition_ids.insert(id.clone());
+        } else {
+            app.readonly_definition_ids.remove(id);
+        }
+    }
+    restore_world_edits_document(
+        &mut app.map_documents,
+        snapshot.world_edits_document.as_ref(),
+    );
+    apply_selection_history_snapshot(app, snapshot.selection.clone());
+    app.selected_col_face = snapshot.selected_col_face;
+    app.selected_col_vertex = snapshot.selected_col_vertex;
+    refresh_local_world_edit(app, &before);
 }
 
 pub(crate) fn selection_history_snapshot(app: &AppState) -> SelectionHistorySnapshot {
@@ -786,6 +1163,7 @@ fn editing_dff_open_models_equal(a: &EditingDffState, b: &EditingDffState) -> bo
                 && a.raw == b.raw
                 && a.txd_context == b.txd_context
                 && a.txd_source_label == b.txd_source_label
+                && a.vehicle_collision_override == b.vehicle_collision_override
                 && a.dirty == b.dirty
                 && a.selected_face == b.selected_face
                 && a.selected_faces == b.selected_faces
@@ -815,6 +1193,7 @@ fn editing_assets_equal(a: &Option<EditingAsset>, b: &Option<EditingAsset>) -> b
                 && a.dirty == b.dirty
                 && a.normalized_warning == b.normalized_warning
                 && a.normalized_rewrite_confirmed == b.normalized_rewrite_confirmed
+                && a.vehicle_collision_override == b.vehicle_collision_override
                 && editing_dff_open_models_equal(a, b)
         }
         (Some(EditingAsset::Col(a)), Some(EditingAsset::Col(b))) => {
@@ -853,6 +1232,7 @@ fn editing_asset_content_equal(a: &Option<EditingAsset>, b: &Option<EditingAsset
                 && a.raw == b.raw
                 && a.txd_context == b.txd_context
                 && a.txd_source_label == b.txd_source_label
+                && a.vehicle_collision_override == b.vehicle_collision_override
                 && a.open_models.len() == b.open_models.len()
                 && a.open_models.iter().zip(&b.open_models).all(|(a, b)| {
                     a.name == b.name
@@ -861,6 +1241,7 @@ fn editing_asset_content_equal(a: &Option<EditingAsset>, b: &Option<EditingAsset
                         && a.raw == b.raw
                         && a.txd_context == b.txd_context
                         && a.txd_source_label == b.txd_source_label
+                        && a.vehicle_collision_override == b.vehicle_collision_override
                 })
         }
         (Some(EditingAsset::Col(a)), Some(EditingAsset::Col(b))) => {
@@ -871,7 +1252,9 @@ fn editing_asset_content_equal(a: &Option<EditingAsset>, b: &Option<EditingAsset
 }
 
 fn app_has_content_changes_from_snapshot(app: &AppState, snapshot: &SavedContentSnapshot) -> bool {
-    snapshot.placements != app.placements
+    snapshot.zones != app.zones
+        || snapshot.map_documents != app.map_documents
+        || snapshot.placements != app.placements
         || snapshot.definitions != app.definitions
         || snapshot.readonly_definition_ids != app.readonly_definition_ids
         || snapshot.element_states != app.element_states
@@ -1115,6 +1498,15 @@ fn apply_race_history_snapshot(app: &mut AppState, snapshot: RaceHistorySnapshot
 }
 
 fn apply_world_history_snapshot(app: &mut AppState, snapshot: WorldHistorySnapshot) {
+    app.zones = snapshot.zones;
+    app.map_documents = snapshot.map_documents;
+    if app
+        .placement_destination
+        .as_ref()
+        .is_some_and(|d| !app.zones.contains(d))
+    {
+        app.placement_destination = None;
+    }
     app.placements = snapshot.placements;
     app.definitions = snapshot.definitions;
     app.readonly_definition_ids = snapshot.readonly_definition_ids;
@@ -1146,8 +1538,6 @@ fn apply_placement_transform_history_snapshot(
             *current = placement;
         }
     }
-    invalidate_outliner_labels(app);
-    rebuild_outliner_filter(app);
     rebuild_render_cells_for_placement_transforms(app, &before);
     invalidate_validation_cache(app);
 }
@@ -1165,6 +1555,7 @@ pub(crate) fn apply_selection_history_snapshot(
 
 fn apply_collision_history_snapshot(app: &mut AppState, snapshot: CollisionHistorySnapshot) {
     clear_collision_render_cache(app);
+    clear_material_plugins();
     app.collisions = snapshot.collisions;
     app.selected_col_face = snapshot.selected_col_face;
     app.selected_col_vertex = snapshot.selected_col_vertex;
@@ -1286,6 +1677,7 @@ fn apply_undo_state(app: &mut AppState, state: &UndoState) {
         UndoState::Lights(snapshot) => apply_light_history_snapshot(app, snapshot.clone()),
         UndoState::Race(snapshot) => apply_race_history_snapshot(app, snapshot.clone()),
         UndoState::World(snapshot) => apply_world_history_snapshot(app, snapshot.clone()),
+        UndoState::LocalWorld(snapshot) => apply_local_world_history_snapshot(app, snapshot),
         UndoState::PlacementTransforms(snapshot) => {
             apply_placement_transform_history_snapshot(app, snapshot.clone());
         }
@@ -1457,6 +1849,7 @@ pub(crate) fn commit_world_history(
     label: impl Into<String>,
     before: WorldHistorySnapshot,
 ) {
+    crate::resource::zones::reconcile_definition_zones(app);
     let after = world_history_snapshot(app);
     if before != after {
         push_scoped_history(
@@ -1652,6 +2045,9 @@ pub(crate) fn commit_scoped_history(
         ScopedHistorySnapshot::Lights(snapshot) => commit_light_history(app, label, snapshot),
         ScopedHistorySnapshot::Race(snapshot) => commit_race_history(app, label, snapshot),
         ScopedHistorySnapshot::World(snapshot) => commit_world_history(app, label, snapshot),
+        ScopedHistorySnapshot::LocalWorld(snapshot) => {
+            commit_local_world_history(app, label, snapshot)
+        }
         ScopedHistorySnapshot::PlacementTransforms(snapshot) => {
             commit_placement_transform_history(app, label, snapshot);
         }
@@ -1776,6 +2172,421 @@ mod selection_history_tests {
                 .collect(),
             components: Vec::new(),
             component_pivots: Vec::new(),
+        }
+    }
+
+    fn local_test_snapshot(
+        placements: &[Placement],
+        states: &[ElementState],
+    ) -> LocalWorldHistorySnapshot {
+        LocalWorldHistorySnapshot {
+            placement_count: placements.len(),
+            placements: Vec::new(),
+            element_states: states.to_vec(),
+            definitions: Vec::new(),
+            zones: Vec::new(),
+            world_edits_document: None,
+            active_lod_ids: active_lod_ids(placements, states),
+            selection: SelectionHistorySnapshot {
+                selected: NO_SELECTION,
+                selected_elements: BTreeSet::new(),
+                selected_element_order: Vec::new(),
+                selected_group: None,
+            },
+            selected_col_face: None,
+            selected_col_vertex: 0,
+        }
+    }
+
+    #[test]
+    fn local_history_undo_redo_restores_appended_copies_and_vacates_their_cells() {
+        let original = vec![test_placement("existing")];
+        let original_states = vec![ElementState::default()];
+        let before = local_test_snapshot(&original, &original_states);
+        let mut appended = test_placement("copy");
+        appended.pos.x = 800.0;
+        let mut placements = vec![original[0].clone(), appended.clone()];
+        let states = vec![ElementState::default(); 2];
+        let mut after = local_test_snapshot(&placements, &states);
+        after.placements.push((1, appended.clone()));
+        assert!(
+            local_world_dirty_keys(
+                &placements,
+                &states,
+                &HashMap::new(),
+                &before,
+                &HashSet::new()
+            ) == HashSet::from([world_cell_key(appended.pos)])
+        );
+        restore_local_placements(&mut placements, &before);
+        assert!(placements == original);
+        assert!(
+            local_world_dirty_keys(
+                &placements,
+                &original_states,
+                &HashMap::new(),
+                &after,
+                &HashSet::new()
+            ) == HashSet::from([world_cell_key(appended.pos)])
+        );
+        restore_local_placements(&mut placements, &after);
+        assert!(placements == vec![original[0].clone(), appended]);
+    }
+
+    #[test]
+    fn local_delete_and_hide_rebuild_remote_lod_cells_when_classification_changes() {
+        let mut child = test_placement("child");
+        child.attrs.insert("lodParent".into(), "parent".into());
+        let mut parent = test_placement("parent");
+        parent.id = "parent".into();
+        parent.pos.x = 4096.0;
+        let placements = vec![child.clone(), parent.clone(), test_placement("unrelated")];
+        let initial = vec![ElementState::default(); 3];
+        let before = local_test_snapshot(&placements, &initial);
+        for changed in [
+            ElementState {
+                hidden: false,
+                deleted: true,
+            },
+            ElementState {
+                hidden: true,
+                deleted: false,
+            },
+        ] {
+            let states = vec![changed, initial[1], initial[2]];
+            let new_lods = active_lod_ids(&placements, &states);
+            let keys =
+                local_world_dirty_keys(&placements, &states, &HashMap::new(), &before, &new_lods);
+            assert!(keys == HashSet::from([world_cell_key(child.pos), world_cell_key(parent.pos)]));
+            let (affected, _) = placement_cell_rebuild_source(&placements, &states, &keys);
+            assert!(affected == vec![parent.clone(), placements[2].clone()]);
+        }
+    }
+
+    #[test]
+    fn local_definition_edit_rebuilds_all_instances_of_that_model_only() {
+        let mut second = test_placement("shared");
+        second.pos.x = 4096.0;
+        let mut unrelated = test_placement("other");
+        unrelated.pos.x = 8192.0;
+        let mut first = test_placement("shared");
+        first.id = "shared".into();
+        second.id = first.id.clone();
+        unrelated.id = "other".into();
+        let placements = vec![first.clone(), second.clone(), unrelated];
+        let states = vec![ElementState::default(); 3];
+        let mut before = local_test_snapshot(&placements, &states);
+        let old = Definition {
+            id: "shared".into(),
+            zone: String::new(),
+            attrs: BTreeMap::new(),
+        };
+        before
+            .definitions
+            .push(("shared".into(), Some(old.clone()), true));
+        let mut updated = old;
+        updated
+            .attrs
+            .insert("flags".into(), "disable_backface_culling".into());
+        let definitions = HashMap::from([("shared".into(), updated)]);
+        assert!(
+            local_world_dirty_keys(&placements, &states, &definitions, &before, &HashSet::new())
+                == HashSet::from([world_cell_key(first.pos), world_cell_key(second.pos)])
+        );
+    }
+
+    #[test]
+    fn placing_readonly_model_with_zone_override_does_not_repack_existing_instances() {
+        let mut existing = test_placement("1337");
+        existing.id = "1337".into();
+        let old = Definition {
+            id: "1337".into(),
+            zone: "SA".into(),
+            attrs: BTreeMap::from([("dff".into(), "bin".into()), ("source".into(), "SA".into())]),
+        };
+        let original_states = vec![ElementState::default()];
+        let mut before = local_test_snapshot(&[existing.clone()], &original_states);
+        before
+            .definitions
+            .push((old.id.clone(), Some(old.clone()), true));
+        let mut updated = old;
+        updated.zone = "custom".into();
+        updated.attrs.insert("zone".into(), "custom".into());
+        updated.attrs.remove("source");
+        let definitions = HashMap::from([("1337".into(), updated)]);
+        let mut added = existing.clone();
+        added.pos.x = 8192.0;
+        let placements = vec![existing, added.clone()];
+        let states = vec![ElementState::default(); 2];
+        assert!(
+            local_world_dirty_keys(&placements, &states, &definitions, &before, &HashSet::new())
+                == HashSet::from([world_cell_key(added.pos)])
+        );
+    }
+
+    #[test]
+    fn inherited_sa_backface_flag_override_requires_repacking() {
+        let old = Definition {
+            id: "1337".into(),
+            zone: "SA".into(),
+            attrs: BTreeMap::from([("gtaFlags".into(), (1u64 << 21).to_string())]),
+        };
+        let mut new = old.clone();
+        new.attrs
+            .insert("disable_backface_culling".into(), "false".into());
+        assert!(definition_requires_cell_rebuild(Some(&old), Some(&new)));
+    }
+
+    #[test]
+    fn group_and_physics_metadata_edits_do_not_repack_geometry() {
+        let original = test_placement("road");
+        let mut changed = original.clone();
+        changed
+            .attrs
+            .insert(EDITOR_GROUP_ATTR.into(), "Group 1".into());
+        changed.attrs.insert("mass".into(), "100".into());
+        changed.attrs.insert("uniqueID".into(), "123".into());
+        assert!(!placement_requires_cell_rebuild(&original, &changed));
+        changed.attrs.insert("scale".into(), "2".into());
+        assert!(placement_requires_cell_rebuild(&original, &changed));
+    }
+
+    #[test]
+    fn local_history_restores_sa_removal_document_without_copying_other_maps() {
+        use crate::resource::mta_maps::MapDocument;
+        let unrelated = MapDocument {
+            path: "maps/track.map".into(),
+            text: "<map>track</map>".into(),
+        };
+        let removed = MapDocument {
+            path: "maps/world_edits.map".into(),
+            text: "<map><removeWorldObject/></map>".into(),
+        };
+        let mut documents = vec![unrelated.clone(), removed.clone()];
+        restore_world_edits_document(&mut documents, None);
+        assert!(documents == vec![unrelated.clone()]);
+        restore_world_edits_document(&mut documents, Some(&removed));
+        assert!(documents == vec![unrelated, removed]);
+    }
+
+    #[test]
+    fn local_2dfx_index_tracks_added_replaced_and_removed_placements() {
+        let mut placements = vec![test_placement("lamp"), test_placement("road")];
+        let states = vec![ElementState::default(); 2];
+        let mut before = local_test_snapshot(&placements, &states);
+        before.placements.push((1, placements[1].clone()));
+        let definitions = HashMap::new();
+        let meshes = HashMap::from([
+            (
+                placement_mesh_key(&placements[0], &definitions),
+                test_render_mesh(true),
+            ),
+            (
+                placement_mesh_key(&placements[1], &definitions),
+                test_render_mesh(false),
+            ),
+        ]);
+        let mut indices = vec![0];
+        let mut count = 2;
+        placements[1].dff = "lamp".into();
+        placements.push(test_placement("lamp"));
+        update_local_placement_2dfx_index(
+            &mut indices,
+            &mut count,
+            &placements,
+            &definitions,
+            &meshes,
+            &before,
+        );
+        assert_eq!(indices, vec![0, 1, 2]);
+        let mut after = local_test_snapshot(&placements, &vec![ElementState::default(); 3]);
+        after.placements = vec![(1, placements[1].clone()), (2, placements[2].clone())];
+        restore_local_placements(&mut placements, &before);
+        update_local_placement_2dfx_index(
+            &mut indices,
+            &mut count,
+            &placements,
+            &definitions,
+            &meshes,
+            &after,
+        );
+        assert_eq!(indices, vec![0]);
+        assert_eq!(count, 2);
+        // An inconsistent external index still recovers with a full scan.
+        count = 99;
+        indices = vec![100];
+        update_local_placement_2dfx_index(
+            &mut indices,
+            &mut count,
+            &placements,
+            &definitions,
+            &meshes,
+            &before,
+        );
+        assert_eq!(indices, vec![0]);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn placement_cell_source_keeps_neighbors_and_remote_lod_references() {
+        let mut moved = test_placement("edited");
+        moved.pos.x = 256.0;
+        let neighbor = test_placement("neighbor");
+        let mut remote = test_placement("detail");
+        remote.pos.x = 4096.0;
+        remote
+            .attrs
+            .insert("lodParent".into(), " RemoteLOD ".into());
+        let mut hidden = test_placement("hidden");
+        hidden.attrs.insert("lodParent".into(), "HiddenLOD".into());
+        let deleted = test_placement("deleted");
+        let placements = vec![moved.clone(), neighbor.clone(), remote, hidden, deleted];
+        let states = vec![
+            ElementState::default(),
+            ElementState::default(),
+            ElementState::default(),
+            ElementState {
+                hidden: true,
+                deleted: false,
+            },
+            ElementState {
+                hidden: false,
+                deleted: true,
+            },
+        ];
+        let keys = HashSet::from([WorldCellKey { x: 0, y: 0 }, WorldCellKey { x: 1, y: 0 }]);
+        let (affected, lod_ids) = placement_cell_rebuild_source(&placements, &states, &keys);
+        assert!(affected == vec![moved, neighbor]);
+        assert_eq!(lod_ids, HashSet::from(["remotelod".to_string()]));
+    }
+
+    #[test]
+    fn placement_cell_source_does_not_clone_a_heavy_map() {
+        let mut placements = vec![test_placement("road"); 50_000];
+        for (index, placement) in placements.iter_mut().enumerate() {
+            placement.pos.x = index as f32 * 256.0;
+        }
+        let states = vec![ElementState::default(); placements.len()];
+        let keys = HashSet::from([WorldCellKey { x: 25_000, y: 0 }]);
+        let (affected, _) = placement_cell_rebuild_source(&placements, &states, &keys);
+        assert_eq!(affected.len(), 1);
+        assert!(affected[0] == placements[25_000]);
+        let empty_keys = HashSet::from([WorldCellKey { x: -1, y: 0 }]);
+        assert!(
+            placement_cell_rebuild_source(&placements, &states, &empty_keys)
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn local_cell_packing_matches_full_rebuild_after_transform_and_alpha_edit() {
+        let mut placements = vec![test_placement("road"); 10_000];
+        for (index, placement) in placements.iter_mut().enumerate() {
+            placement.pos.x = (index % 100) as f32 * 256.0;
+            placement.pos.y = (index / 100) as f32 * 256.0;
+        }
+        // Move across a cell boundary into an occupied cell, rotate, scale and
+        // change transparency. The vacated origin cell must stay empty.
+        placements[0].pos.x = 260.0;
+        placements[0].rot.z = 45.0;
+        placements[0].attrs.insert("scale".into(), "2".into());
+        placements[0].attrs.insert("alpha".into(), "128".into());
+        let states = vec![ElementState::default(); placements.len()];
+        let keys = HashSet::from([WorldCellKey { x: 0, y: 0 }, WorldCellKey { x: 1, y: 0 }]);
+        let white = V3 {
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        };
+        let mut mesh = test_render_mesh(false);
+        mesh.parts.push(RenderPart {
+            list: 0,
+            vbo: 0,
+            vertices: 3,
+            material_index: 0,
+            component: 0,
+            texture: 0,
+            lightmap_texture: 0,
+            texture_width: 0,
+            texture_height: 0,
+            texture_name: String::new(),
+            texture_fingerprint: None,
+            texture_missing: false,
+            transparency: TransparencyMode::Opaque,
+            alpha: 1.0,
+            material_color: white,
+            material_ambient: 1.0,
+            use_lighting: false,
+            vehicle_material_role: None,
+            emissive: false,
+            face_indices: vec![0],
+            cpu_vertices: [
+                V3::default(),
+                V3 {
+                    x: 1.0,
+                    ..V3::default()
+                },
+                V3 {
+                    y: 1.0,
+                    ..V3::default()
+                },
+            ]
+            .into_iter()
+            .map(|pos| Vertex {
+                pos,
+                normal: V3 {
+                    z: 1.0,
+                    ..V3::default()
+                },
+                uv: V2::default(),
+                lightmap_uv: V2::default(),
+                color: white,
+                day_color: white,
+                night_color: white,
+                base_day_color: white,
+                base_night_color: white,
+                day_alpha: 1.0,
+                night_alpha: 1.0,
+                alpha: 1.0,
+            })
+            .collect(),
+        });
+        let definitions = HashMap::new();
+        let meshes = HashMap::from([(placement_mesh_key(&placements[0], &definitions), mesh)]);
+        let (affected, lod_ids) = placement_cell_rebuild_source(&placements, &states, &keys);
+        assert_eq!(affected.len(), 2);
+        let local = build_world_cells(
+            &affected,
+            &definitions,
+            &meshes,
+            false,
+            &lod_ids,
+            false,
+            V3::default(),
+        );
+        let full = build_world_cells(
+            &placements,
+            &definitions,
+            &meshes,
+            false,
+            &lod_ids,
+            false,
+            V3::default(),
+        );
+        assert_eq!(local.len(), 1);
+        assert_eq!(full.len(), 9_999);
+        let actual = &local[0];
+        let expected = full.iter().find(|cell| cell.key == actual.key).unwrap();
+        assert!(actual.key == WorldCellKey { x: 1, y: 0 });
+        assert_eq!(actual.placements, expected.placements);
+        assert_eq!(actual.vertices, expected.vertices);
+        assert_eq!(actual.min, expected.min);
+        assert_eq!(actual.max, expected.max);
+        assert_eq!(actual.batches.len(), expected.batches.len());
+        for (a, b) in actual.batches.iter().zip(&expected.batches) {
+            assert_eq!(a.data, b.data);
+            assert!(a.transparency == b.transparency);
         }
     }
 

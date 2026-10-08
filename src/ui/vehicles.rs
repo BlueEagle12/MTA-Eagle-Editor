@@ -1233,7 +1233,7 @@ fn find_embedded_vehicle_collision(bytes: &[u8]) -> Option<EmbeddedVehicleCollis
     find_embedded_vehicle_collision_in(bytes, 0, bytes.len(), &mut Vec::new())
 }
 
-fn parse_embedded_vehicle_collision(
+pub(crate) fn parse_embedded_vehicle_collision(
     dff_bytes: &[u8],
     dff_name: &str,
 ) -> Option<(CollisionMesh, Vec<u8>)> {
@@ -1246,6 +1246,253 @@ fn parse_embedded_vehicle_collision(
         size: payload.len().min(u32::MAX as usize) as u32,
     };
     parse_col_mesh(&payload, &entry).map(|mesh| (mesh, payload))
+}
+
+/// Install or replace a complete COL payload in a vehicle DFF. Normalized DFF
+/// rewrites do not otherwise know about Rockstar's collision plug-in, so this
+/// also supports adding the plug-in to the clump extension after a hierarchy
+/// or material edit.
+pub(crate) fn upsert_embedded_vehicle_collision(
+    dff_bytes: &[u8],
+    collision_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    if find_embedded_vehicle_collision(dff_bytes).is_some() {
+        return replace_embedded_vehicle_collision(dff_bytes, collision_bytes);
+    }
+    if collision_bytes.len() > u32::MAX as usize {
+        return Err("Embedded collision is too large for a RenderWare chunk".to_string());
+    }
+    let mut cursor = 0usize;
+    let mut clump = None;
+    while cursor + 12 <= dff_bytes.len() {
+        let id = rd32(dff_bytes, cursor);
+        let size = rd32(dff_bytes, cursor + 4) as usize;
+        let end = cursor.saturating_add(12).saturating_add(size);
+        if end > dff_bytes.len() {
+            break;
+        }
+        if id == 0x10 {
+            clump = Some((cursor, cursor + 12, end));
+            break;
+        }
+        cursor = end;
+    }
+    let Some((clump_header, clump_start, clump_end)) = clump else {
+        return Err("Vehicle DFF has no RenderWare clump".to_string());
+    };
+    let mut child = clump_start;
+    let mut extension = None;
+    while child + 12 <= clump_end {
+        let id = rd32(dff_bytes, child);
+        let size = rd32(dff_bytes, child + 4) as usize;
+        let end = child.saturating_add(12).saturating_add(size);
+        if end > clump_end {
+            break;
+        }
+        if id == 0x03 {
+            extension = Some((child, child + 12, end));
+        }
+        child = end;
+    }
+    let Some((extension_header, _, extension_end)) = extension else {
+        return Err("Vehicle DFF clump has no extension chunk".to_string());
+    };
+    let plugin_len = 12usize
+        .checked_add(collision_bytes.len())
+        .ok_or_else(|| "Embedded collision size overflow".to_string())?;
+    let mut plugin = Vec::with_capacity(plugin_len);
+    plugin.extend_from_slice(&RW_COLLISION_MODEL_ID.to_le_bytes());
+    plugin.extend_from_slice(&(collision_bytes.len() as u32).to_le_bytes());
+    plugin.extend_from_slice(&rd32(dff_bytes, extension_header + 8).to_le_bytes());
+    plugin.extend_from_slice(collision_bytes);
+    let mut out = Vec::with_capacity(dff_bytes.len() + plugin_len);
+    out.extend_from_slice(&dff_bytes[..extension_end]);
+    out.extend_from_slice(&plugin);
+    out.extend_from_slice(&dff_bytes[extension_end..]);
+    for header in [extension_header, clump_header] {
+        let new_size = rd32(dff_bytes, header + 4) as usize + plugin_len;
+        if new_size > u32::MAX as usize {
+            return Err("Embedded collision container size overflow".to_string());
+        }
+        out[header + 4..header + 8].copy_from_slice(&(new_size as u32).to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn stock_vehicle_collision_vertices(raw: &RawMesh) -> Vec<V3> {
+    let mut out = Vec::new();
+    for component in &raw.components {
+        let name = lower(component.name.trim());
+        if name.contains("wheel")
+            || name.ends_with("_dam")
+            || name.contains("_vlo")
+            || name.starts_with("ug_")
+        {
+            continue;
+        }
+        let start = component.vertex_start.min(raw.vertices.len());
+        let end = component.vertex_end.min(raw.vertices.len()).max(start);
+        out.extend_from_slice(&raw.vertices[start..end]);
+    }
+    if out.len() < 16 {
+        out = raw.vertices.clone();
+    }
+    out
+}
+
+fn vehicle_collision_surface(flags: u8) -> CollisionSurface {
+    CollisionSurface {
+        material: 63,
+        flags,
+        brightness: 187,
+        light: 0,
+    }
+}
+
+fn vehicle_collision_flag(y_fraction: f32, right: bool) -> u8 {
+    if y_fraction >= 0.88 {
+        3 // front bumper
+    } else if y_fraction <= 0.12 {
+        4 // rear bumper
+    } else if y_fraction >= 0.56 {
+        if right { 6 } else { 5 } // front doors
+    } else if y_fraction <= 0.44 {
+        if right { 8 } else { 7 } // rear doors
+    } else {
+        0 // body
+    }
+}
+
+/// Fit the stock SA vehicle collision style: a sparse curved lower shell plus
+/// overlapping component-marked spheres. This matches Rockstar's default car
+/// assets more closely than the building-oriented collision generator.
+pub(crate) fn generate_stock_vehicle_collision(
+    raw: &RawMesh,
+    name: &str,
+) -> Result<CollisionMesh, String> {
+    let vertices = stock_vehicle_collision_vertices(raw);
+    if vertices.len() < 3 {
+        return Err("Vehicle needs at least three usable body vertices".to_string());
+    }
+    let bounds = bounds_from_vertices(&vertices);
+    let width = (bounds.max.x - bounds.min.x).abs();
+    let length = (bounds.max.y - bounds.min.y).abs();
+    let height = (bounds.max.z - bounds.min.z).abs();
+    if width < 0.1 || length < 0.1 || height < 0.05 {
+        return Err("Vehicle body bounds are too small for collision fitting".to_string());
+    }
+    let rows = ((length / (width * 0.62).max(0.25)).ceil() as usize).clamp(5, 12);
+    let row_step = length / (rows - 1) as f32;
+    let mut spheres = Vec::with_capacity(rows * 2 + 2);
+    let mut cross_sections = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let fraction = row as f32 / (rows - 1) as f32;
+        let y = bounds.min.y + length * fraction;
+        let band = row_step * 0.72;
+        let local = vertices
+            .iter()
+            .copied()
+            .filter(|vertex| (vertex.y - y).abs() <= band)
+            .collect::<Vec<_>>();
+        let sample = if local.len() >= 6 {
+            local.as_slice()
+        } else {
+            vertices.as_slice()
+        };
+        let section = bounds_from_vertices(sample);
+        cross_sections.push((y, section));
+        let local_width = (section.max.x - section.min.x).abs().max(width * 0.45);
+        let radius = (local_width * 0.36)
+            .clamp(width * 0.17, width * 0.43)
+            .min(height * 0.72)
+            .max(0.12);
+        let z = (section.min.z + radius * 0.72)
+            .clamp(bounds.min.z + radius * 0.35, bounds.max.z - radius * 0.2);
+        for right in [false, true] {
+            let x = if right {
+                section.max.x - radius * 0.72
+            } else {
+                section.min.x + radius * 0.72
+            };
+            spheres.push(CollisionSphere {
+                center: V3 { x, y, z },
+                radius,
+                surface: vehicle_collision_surface(vehicle_collision_flag(fraction, right)),
+            });
+        }
+        if (row == 0 || row + 1 == rows) && local_width > radius * 2.1 {
+            spheres.push(CollisionSphere {
+                center: V3 {
+                    x: (section.min.x + section.max.x) * 0.5,
+                    y,
+                    z,
+                },
+                radius: radius * 0.92,
+                surface: vehicle_collision_surface(if row == 0 { 4 } else { 3 }),
+            });
+        }
+    }
+
+    let shell_rows = 5usize;
+    let mut shell_vertices = Vec::with_capacity(shell_rows * 3);
+    for row in 0..shell_rows {
+        let fraction = row as f32 / (shell_rows - 1) as f32;
+        let source = ((rows - 1) as f32 * fraction).round() as usize;
+        let (y, section) = cross_sections[source.min(cross_sections.len() - 1)];
+        let inset = width * 0.08;
+        let left = (section.min.x + inset).min(section.max.x);
+        let right = (section.max.x - inset).max(section.min.x);
+        let z = section.min.z + height * 0.10;
+        shell_vertices.extend_from_slice(&[
+            V3 { x: left, y, z },
+            V3 {
+                x: (left + right) * 0.5,
+                y,
+                z: z + height * 0.035,
+            },
+            V3 { x: right, y, z },
+        ]);
+    }
+    let mut faces = Vec::with_capacity((shell_rows - 1) * 4);
+    for row in 0..shell_rows - 1 {
+        for column in 0..2usize {
+            let a = (row * 3 + column) as u16;
+            let b = (row * 3 + column + 1) as u16;
+            let c = ((row + 1) * 3 + column) as u16;
+            let d = ((row + 1) * 3 + column + 1) as u16;
+            let material = 63;
+            faces.push(CollisionFace {
+                a,
+                b: d,
+                c,
+                material,
+                light: 0,
+                img_path: PathBuf::new(),
+                material_file_offset: 0,
+                light_file_offset: 0,
+            });
+            faces.push(CollisionFace {
+                a,
+                b,
+                c: d,
+                material,
+                light: 0,
+                img_path: PathBuf::new(),
+                material_file_offset: 0,
+                light_file_offset: 0,
+            });
+        }
+    }
+    Ok(CollisionMesh {
+        name: name.to_string(),
+        spheres,
+        boxes: Vec::new(),
+        vertices: shell_vertices,
+        faces,
+        bounds,
+        shadow_vertices: Vec::new(),
+        shadow_faces: Vec::new(),
+    })
 }
 
 /// Replace the complete COL payload in a vehicle's Rockstar collision plug-in
@@ -8086,6 +8333,80 @@ mod tests {
         assert_eq!(rd32(&replaced, 16), old_extension_size + 8);
         assert_eq!(rd32(&replaced, 28), replacement_col.len() as u32);
         assert_eq!(&replaced[36..36 + replacement_col.len()], replacement_col);
+    }
+
+    #[test]
+    fn embedded_vehicle_collision_upsert_adds_missing_plugin() {
+        fn chunk(id: u32, payload: Vec<u8>) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&0x1803ffffu32.to_le_bytes());
+            out.extend(payload);
+            out
+        }
+
+        let dff = chunk(0x10, chunk(0x03, Vec::new()));
+        let collision = minimal_col2_template("testcar");
+        let updated =
+            upsert_embedded_vehicle_collision(&dff, &collision).expect("insert collision");
+        let (_, embedded) =
+            parse_embedded_vehicle_collision(&updated, "testcar").expect("embedded collision");
+
+        assert_eq!(embedded, collision);
+        assert_eq!(rd32(&updated, 4) as usize, updated.len() - 12);
+        assert_eq!(rd32(&updated, 16) as usize, updated.len() - 24);
+    }
+
+    #[test]
+    fn generated_vehicle_collision_matches_stock_shell_and_sphere_style() {
+        let mut vertices = Vec::new();
+        for y in [-2.4, -1.2, 0.0, 1.2, 2.4] {
+            for x in [-1.0, 0.0, 1.0] {
+                vertices.push(V3 {
+                    x,
+                    y,
+                    z: if x == 0.0 { 1.4 } else { 0.25 },
+                });
+            }
+        }
+        let raw = RawMesh {
+            components: vec![RawMeshComponent {
+                name: "chassis".to_string(),
+                frame_index: None,
+                vertex_start: 0,
+                vertex_end: vertices.len(),
+                tri_start: 0,
+                tri_end: 0,
+                breakable: None,
+            }],
+            vertices,
+            ..RawMesh::default()
+        };
+
+        let mesh = generate_stock_vehicle_collision(&raw, "testcar").expect("collision fit");
+        let flags = mesh
+            .spheres
+            .iter()
+            .map(|sphere| sphere.surface.flags)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(mesh.name, "testcar");
+        assert!(mesh.spheres.len() >= 10);
+        assert_eq!(mesh.vertices.len(), 15);
+        assert_eq!(mesh.faces.len(), 16);
+        assert!(mesh.boxes.is_empty());
+        assert!(
+            mesh.spheres.iter().all(|sphere| {
+                sphere.surface.material == 63 && sphere.surface.brightness == 187
+            })
+        );
+        for expected in [3, 4, 5, 6, 7, 8] {
+            assert!(
+                flags.contains(&expected),
+                "missing component flag {expected}"
+            );
+        }
     }
 
     #[test]

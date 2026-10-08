@@ -15,10 +15,10 @@ pub(crate) const PICK_HERO_Y: f32 = 56.0;
 pub(crate) const PICK_HERO_H: f32 = 140.0;
 pub(crate) const PICK_BROWSE_Y: f32 = PICK_HERO_Y + PICK_HERO_H + 26.0; // 222
 pub(crate) const PICK_BROWSE_H: f32 = 42.0;
-pub(crate) const PICK_STATUS_Y: f32 = PICK_BROWSE_Y + PICK_BROWSE_H + 22.0; // 286
-pub(crate) const PICK_FILTER_Y: f32 = PICK_STATUS_Y + 22.0; // 308
-pub(crate) const PICK_HEADER_Y: f32 = PICK_FILTER_Y + 48.0; // 356
-pub(crate) const PICK_GRID_Y: f32 = PICK_HEADER_Y + 30.0; // 386
+pub(crate) const PICK_STATUS_Y: f32 = PICK_BROWSE_Y + PICK_BROWSE_H * 2.0 + 40.0;
+pub(crate) const PICK_FILTER_Y: f32 = PICK_STATUS_Y + 22.0;
+pub(crate) const PICK_HEADER_Y: f32 = PICK_FILTER_Y + 48.0;
+pub(crate) const PICK_GRID_Y: f32 = PICK_HEADER_Y + 30.0;
 
 // The launcher shows project creation, browse, and editor-only actions together.
 const LAUNCH_BTN_GAP: f32 = 18.0;
@@ -26,6 +26,9 @@ const SHOW_NEW_PROJECT: bool = true;
 // The full project path may wrap to three lines below the preview.
 const PROJECT_CARD_H: f32 = 190.0;
 const PROJECT_CARD_GAP: f32 = 22.0;
+const LAUNCH_ACTION_COUNT: usize = 5;
+const LAUNCH_FILTER_FOCUS: usize = LAUNCH_ACTION_COUNT;
+const LAUNCH_PROJECT_FOCUS_START: usize = LAUNCH_FILTER_FOCUS + 1;
 
 #[derive(Default)]
 struct ProjectFilter {
@@ -66,6 +69,34 @@ fn filtered_project_paths(picker: &ProjectPicker) -> Vec<PathBuf> {
         })
         .cloned()
         .collect()
+}
+
+fn launcher_focus_count(project_count: usize) -> usize {
+    LAUNCH_PROJECT_FOCUS_START + project_count
+}
+
+fn cycle_launcher_focus(current: usize, project_count: usize, reverse: bool) -> usize {
+    let count = launcher_focus_count(project_count);
+    if reverse {
+        current.checked_sub(1).unwrap_or(count - 1).min(count - 1)
+    } else {
+        (current.min(count - 1) + 1) % count
+    }
+}
+
+fn reveal_launcher_focus(picker: &mut ProjectPicker, project_count: usize) {
+    if picker.launcher_focus < LAUNCH_PROJECT_FOCUS_START || project_count == 0 {
+        return;
+    }
+    let project_index =
+        (picker.launcher_focus - LAUNCH_PROJECT_FOCUS_START).min(project_count.saturating_sub(1));
+    let row = project_index / project_grid_cols();
+    let visible_rows = project_visible_rows().max(1);
+    if row < picker.project_scroll_row {
+        picker.project_scroll_row = row;
+    } else if row >= picker.project_scroll_row + visible_rows {
+        picker.project_scroll_row = row + 1 - visible_rows;
+    }
 }
 
 fn project_source_label(picker: &ProjectPicker, path: &Path) -> String {
@@ -248,6 +279,40 @@ pub(crate) fn project_open_editor_rect() -> Rect {
     )
 }
 
+fn project_default_map_rect() -> Rect {
+    Rect::new(
+        (screen_width() - 240.0) * 0.5,
+        PICK_BROWSE_Y + PICK_BROWSE_H + 12.0,
+        240.0,
+        PICK_BROWSE_H,
+    )
+}
+
+fn project_picker_launch_default_map(picker: &mut ProjectPicker) -> Option<LoadJob> {
+    let mut options = picker.options.clone();
+    // Keep all editor scratch writes outside the game installation.
+    options.root = env::temp_dir().join(format!(
+        "eagle_default_sa_map_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    if let Err(err) = fs::create_dir_all(&options.root) {
+        picker.status = format!("Could not create SA map workspace: {err}");
+        return None;
+    }
+    options.launch_mode = LaunchMode::DefaultMap;
+    match LoadJob::new_default_map(options, picker.icons.clone()) {
+        Ok(job) => Some(job),
+        Err(err) => {
+            picker.status = err;
+            None
+        }
+    }
+}
+
 pub(crate) fn project_thumb_color(path: &Path) -> Color {
     let mut hash = 0u32;
     for byte in path.to_string_lossy().bytes() {
@@ -276,6 +341,7 @@ pub(crate) fn new_project_picker(options: Options, ui_font: Font, icons: IconSet
         project_roots_dialog: false,
         project_scroll_row: 0,
         project_scroll_drag: false,
+        launcher_focus: 0,
         status: "Create a project, choose a recent one, browse, or open the editor.".to_string(),
     };
     start_project_discovery(&mut picker);
@@ -839,6 +905,7 @@ fn update_project_filter(picker: &mut ProjectPicker, mouse: Vec2) {
     if is_mouse_button_pressed(MouseButton::Left) {
         filter.focused = rect.contains(mouse);
         if filter.focused {
+            picker.launcher_focus = LAUNCH_FILTER_FOCUS;
             filter.cursor = filter.query.len();
             filter.selection_anchor = None;
             drain_text_input();
@@ -846,6 +913,7 @@ fn update_project_filter(picker: &mut ProjectPicker, mouse: Vec2) {
     }
     if ctrl && is_key_pressed(KeyCode::F) {
         filter.focused = true;
+        picker.launcher_focus = LAUNCH_FILTER_FOCUS;
         filter.cursor = filter.query.len();
         filter.selection_anchor = None;
         drain_text_input();
@@ -1023,6 +1091,21 @@ pub(crate) fn update_project_picker(picker: &mut ProjectPicker) -> Option<LoadJo
     let mouse: Vec2 = mouse_position().into();
     update_project_filter(picker, mouse);
     let filtered_projects = filtered_project_paths(picker);
+    let focus_count = launcher_focus_count(filtered_projects.len());
+    picker.launcher_focus = picker.launcher_focus.min(focus_count - 1);
+    if is_key_pressed(KeyCode::Tab) {
+        let reverse = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+        picker.launcher_focus =
+            cycle_launcher_focus(picker.launcher_focus, filtered_projects.len(), reverse);
+        let mut filter = project_filter();
+        filter.focused = picker.launcher_focus == LAUNCH_FILTER_FOCUS;
+        if filter.focused {
+            filter.cursor = filter.query.len();
+            filter.selection_anchor = None;
+        }
+        drop(filter);
+        reveal_launcher_focus(picker, filtered_projects.len());
+    }
     picker.project_scroll_row = picker
         .project_scroll_row
         .min(project_max_scroll_row(filtered_projects.len()));
@@ -1072,19 +1155,56 @@ pub(crate) fn update_project_picker(picker: &mut ProjectPicker) -> Option<LoadJo
         picker.project_scroll_row = (picker.project_scroll_row + page_rows)
             .min(project_max_scroll_row(filtered_projects.len()));
     }
+    let activate_focused = picker.launcher_focus != LAUNCH_FILTER_FOCUS
+        && (is_key_pressed(KeyCode::Enter)
+            || is_key_pressed(KeyCode::KpEnter)
+            || is_key_pressed(KeyCode::Space));
+    if activate_focused {
+        match picker.launcher_focus {
+            0 if SHOW_NEW_PROJECT => {
+                project_picker_open_new_dialog(picker);
+                return None;
+            }
+            1 => {
+                project_picker_open_browser(picker);
+                return None;
+            }
+            2 => {
+                project_picker_open_roots_dialog(picker);
+                return None;
+            }
+            3 => return project_picker_launch_editor(picker),
+            4 => return project_picker_launch_default_map(picker),
+            focus if focus >= LAUNCH_PROJECT_FOCUS_START => {
+                let index = focus - LAUNCH_PROJECT_FOCUS_START;
+                if let Some(path) = filtered_projects.get(index).cloned() {
+                    return project_picker_start_load(picker, path);
+                }
+            }
+            _ => {}
+        }
+    }
     if is_mouse_button_pressed(MouseButton::Left) {
         if SHOW_NEW_PROJECT && project_new_rect().contains(mouse) {
+            picker.launcher_focus = 0;
             project_picker_open_new_dialog(picker);
             return None;
         }
+        if project_default_map_rect().contains(mouse) {
+            picker.launcher_focus = 4;
+            return project_picker_launch_default_map(picker);
+        }
         if project_open_editor_rect().contains(mouse) {
+            picker.launcher_focus = 3;
             return project_picker_launch_editor(picker);
         }
         if project_browse_rect().contains(mouse) {
+            picker.launcher_focus = 1;
             project_picker_open_browser(picker);
             return None;
         }
         if project_roots_rect().contains(mouse) {
+            picker.launcher_focus = 2;
             project_picker_open_roots_dialog(picker);
             return None;
         }
@@ -1100,13 +1220,14 @@ pub(crate) fn update_project_picker(picker: &mut ProjectPicker) -> Option<LoadJo
         let first = picker.project_scroll_row * cols;
         let visible_count = project_visible_rows() * cols;
         for (slot, path) in filtered_projects
-            .into_iter()
+            .iter()
             .skip(first)
             .take(visible_count)
             .enumerate()
         {
             if project_visible_card_rect(slot).contains(mouse) {
-                return project_picker_start_load(picker, path);
+                picker.launcher_focus = LAUNCH_PROJECT_FOCUS_START + first + slot;
+                return project_picker_start_load(picker, path.clone());
             }
         }
     }
@@ -1346,28 +1467,48 @@ pub(crate) fn draw_project_picker(picker: &mut ProjectPicker) {
     );
 
     if SHOW_NEW_PROJECT {
-        text_button(&picker.ui_font, project_new_rect(), "New Project", false);
+        text_button(
+            &picker.ui_font,
+            project_new_rect(),
+            "New Project",
+            picker.launcher_focus == 0,
+        );
     }
     text_button(
         &picker.ui_font,
         project_browse_rect(),
         "Browse Project",
-        false,
+        picker.launcher_focus == 1,
     );
     text_button(
         &picker.ui_font,
         project_roots_rect(),
         "Project Roots",
-        false,
+        picker.launcher_focus == 2,
     );
     text_button(
         &picker.ui_font,
         project_open_editor_rect(),
         "External Asset Editor",
-        false,
+        picker.launcher_focus == 3,
     );
 
-    // Status line, centered under the button.
+    text_button(
+        &picker.ui_font,
+        project_default_map_rect(),
+        "Default SA Map",
+        picker.launcher_focus == 4,
+    );
+
+    if project_default_map_rect().contains(mouse_position().into()) {
+        draw_text_tooltip(
+            &picker.ui_font,
+            project_default_map_rect(),
+            "Load the original SA world. Changes are temporary; saving is coming later.",
+        );
+    }
+
+    // Status line, centered under the buttons.
     let status = ellipsize_width(&picker.status, 14, screen_width() - 72.0);
     let status_w = ui_text_width(&status, 14);
     ui_text_size(
@@ -1381,7 +1522,7 @@ pub(crate) fn draw_project_picker(picker: &mut ProjectPicker) {
 
     let filter_rect = project_filter_rect();
     let filter = project_filter();
-    let filter_border = if filter.focused {
+    let filter_border = if filter.focused || picker.launcher_focus == LAUNCH_FILTER_FOCUS {
         ui_accent()
     } else {
         ui_border()
@@ -1470,12 +1611,17 @@ pub(crate) fn draw_project_picker(picker: &mut ProjectPicker) {
     {
         let rect = project_visible_card_rect(slot);
         let hovered = rect.contains(mouse_position().into());
-        let bg = if hovered {
+        let focused = picker.launcher_focus == LAUNCH_PROJECT_FOCUS_START + first + slot;
+        let bg = if hovered || focused {
             ui_surface_hover()
         } else {
             ui_panel_bg()
         };
-        let border = if hovered { ui_accent() } else { ui_border() };
+        let border = if hovered || focused {
+            ui_accent()
+        } else {
+            ui_border()
+        };
         draw_rrect(
             rect.x + 2.0,
             rect.y + 4.0,
@@ -1485,7 +1631,7 @@ pub(crate) fn draw_project_picker(picker: &mut ProjectPicker) {
             ui_shadow(),
         );
         draw_rrect_bordered(rect.x, rect.y, rect.w, rect.h, 14.0, 1.0, bg, border);
-        if hovered {
+        if hovered || focused {
             draw_rrect(rect.x + 14.0, rect.y, rect.w - 28.0, 3.0, 1.5, ui_accent());
         }
 
@@ -1727,6 +1873,27 @@ pub(crate) fn draw_new_project_dialog(picker: &ProjectPicker) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launcher_focus_cycles_through_actions_filter_and_projects() {
+        let project_count = 2;
+        let last = launcher_focus_count(project_count) - 1;
+
+        assert_eq!(cycle_launcher_focus(0, project_count, false), 1);
+        assert_eq!(cycle_launcher_focus(last, project_count, false), 0);
+        assert_eq!(cycle_launcher_focus(0, project_count, true), last);
+        assert_eq!(
+            cycle_launcher_focus(LAUNCH_FILTER_FOCUS, project_count, false),
+            LAUNCH_PROJECT_FOCUS_START
+        );
+    }
+
+    #[test]
+    fn launcher_focus_still_reaches_filter_without_projects() {
+        let last = launcher_focus_count(0) - 1;
+        assert_eq!(last, LAUNCH_FILTER_FOCUS);
+        assert_eq!(cycle_launcher_focus(last, 0, false), 0);
+    }
 
     #[test]
     fn creates_minimal_loadable_eagle_project() {

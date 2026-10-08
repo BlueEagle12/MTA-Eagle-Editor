@@ -711,10 +711,97 @@ fn decode_txd_rgba(
     Some((w as u32, h as u32, rgba))
 }
 
+// Straight-alpha filtering must not mix black transparent texels into foliage
+// colors. Extend visible RGB into empty texels, leaving every alpha untouched.
+// Wrap neighbors to match the repeat sampler used by these textures.
+fn bleed_transparent_rgb(width: u32, height: u32, rgba: &mut [u8]) {
+    let w = width as usize;
+    let h = height as usize;
+    let neighbors = |i: usize| {
+        let x = i % w;
+        let y = i / w;
+        [
+            y * w + (x + w - 1) % w,
+            y * w + (x + 1) % w,
+            ((y + h - 1) % h) * w + x,
+            ((y + 1) % h) * w + x,
+        ]
+    };
+    let mut filled: Vec<bool> = rgba.chunks_exact(4).map(|p| p[3] != 0).collect();
+    let mut pending = std::collections::VecDeque::new();
+    // Queue only the transparent boundary, rather than all opaque texels.
+    for i in 0..w * h {
+        if rgba[i * 4 + 3] != 0 {
+            continue;
+        }
+        if let Some(source) = neighbors(i).into_iter().find(|&j| rgba[j * 4 + 3] != 0) {
+            for channel in 0..3 {
+                rgba[i * 4 + channel] = rgba[source * 4 + channel];
+            }
+            filled[i] = true;
+            pending.push_back(i);
+        }
+    }
+    while let Some(source) = pending.pop_front() {
+        for i in neighbors(source) {
+            if filled[i] {
+                continue;
+            }
+            for channel in 0..3 {
+                rgba[i * 4 + channel] = rgba[source * 4 + channel];
+            }
+            filled[i] = true;
+            pending.push_back(i);
+        }
+    }
+}
+
+fn downsample_alpha_texture(width: u32, height: u32, rgba: &[u8]) -> (u32, u32, Vec<u8>) {
+    let next_w = (width / 2).max(1);
+    let next_h = (height / 2).max(1);
+    let mut output = vec![0; next_w as usize * next_h as usize * 4];
+    for y in 0..next_h {
+        for x in 0..next_w {
+            let mut rgb = [0u64; 3];
+            let mut alpha = 0u64;
+            let mut count = 0u64;
+            // Include the final row/column for non-power-of-two images too.
+            for sy in y * height / next_h..(y + 1) * height / next_h {
+                for sx in x * width / next_w..(x + 1) * width / next_w {
+                    let i = (sy as usize * width as usize + sx as usize) * 4;
+                    let a = u64::from(rgba[i + 3]);
+                    for channel in 0..3 {
+                        rgb[channel] += u64::from(rgba[i + channel]) * a;
+                    }
+                    alpha += a;
+                    count += 1;
+                }
+            }
+            let i = (y as usize * next_w as usize + x as usize) * 4;
+            if alpha != 0 {
+                for channel in 0..3 {
+                    output[i + channel] = ((rgb[channel] + alpha / 2) / alpha) as u8;
+                }
+            }
+            output[i + 3] = ((alpha + count / 2) / count) as u8;
+        }
+    }
+    bleed_transparent_rgb(next_w, next_h, &mut output);
+    (next_w, next_h, output)
+}
+
 /// Upload an RGBA buffer as a GL texture and return its id (0 on failure).
 pub(crate) fn upload_rgba_texture(width: u32, height: u32, rgba: &[u8]) -> u32 {
     if width == 0 || height == 0 || rgba.len() < (width * height * 4) as usize {
         return 0;
+    }
+    let rgba = &rgba[..width as usize * height as usize * 4];
+    let mut alpha_pixels = rgba
+        .chunks_exact(4)
+        .any(|p| p[3] < 255)
+        .then(|| rgba.to_vec());
+    if let Some(pixels) = alpha_pixels.as_mut() {
+        bleed_transparent_rgb(width, height, pixels);
     }
     let mut texture_id = 0u32;
     unsafe {
@@ -732,9 +819,32 @@ pub(crate) fn upload_rgba_texture(width: u32, height: u32, rgba: &[u8]) -> u32 {
             0,
             gl::RGBA,
             gl::UNSIGNED_BYTE,
-            rgba.as_ptr().cast(),
+            alpha_pixels.as_deref().unwrap_or(rgba).as_ptr().cast(),
         );
-        if gl::GenerateMipmap::is_loaded() {
+        if let Some(mut pixels) = alpha_pixels {
+            let (mut w, mut h) = (width, height);
+            let mut level = 0;
+            while w > 1 || h > 1 {
+                (w, h, pixels) = downsample_alpha_texture(w, h, &pixels);
+                level += 1;
+                gl::TexImage2D(
+                    gl::TEXTURE_2D,
+                    level,
+                    gl::RGBA as i32,
+                    w as i32,
+                    h as i32,
+                    0,
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    pixels.as_ptr().cast(),
+                );
+            }
+            gl::TexParameteri(
+                gl::TEXTURE_2D,
+                gl::TEXTURE_MIN_FILTER,
+                gl::LINEAR_MIPMAP_LINEAR as i32,
+            );
+        } else if gl::GenerateMipmap::is_loaded() {
             gl::GenerateMipmap(gl::TEXTURE_2D);
             gl::TexParameteri(
                 gl::TEXTURE_2D,
@@ -1141,6 +1251,42 @@ mod generation_tests {
     fn native_alpha_bit_distinguishes_opaque_and_alpha_textures() {
         assert!(!native_alpha_enabled(8));
         assert!(native_alpha_enabled(9));
+    }
+
+    #[test]
+    fn alpha_mips_keep_foliage_color_instead_of_transparent_black() {
+        let mut pixels = vec![0; 4 * 4 * 4];
+        pixels[..4].copy_from_slice(&[40, 180, 60, 255]);
+        let original_alpha: Vec<_> = pixels.chunks_exact(4).map(|p| p[3]).collect();
+        bleed_transparent_rgb(4, 4, &mut pixels);
+        assert!(pixels.chunks_exact(4).all(|p| p[..3] == [40, 180, 60]));
+        assert_eq!(
+            pixels.chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>(),
+            original_alpha
+        );
+        let (w, h, mip) = downsample_alpha_texture(4, 4, &pixels);
+        assert_eq!((w, h), (2, 2));
+        assert!(mip.chunks_exact(4).all(|p| p[..3] == [40, 180, 60]));
+        let (_, _, last) = downsample_alpha_texture(w, h, &mip);
+        assert_eq!(last, [40, 180, 60, 16]);
+    }
+
+    #[test]
+    fn alpha_mips_weight_translucent_colors_and_include_odd_edges() {
+        let pixels = [200, 0, 0, 255, 0, 100, 0, 85, 0, 0, 200, 0];
+        let (w, h, mip) = downsample_alpha_texture(3, 1, &pixels);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(mip, [150, 25, 0, 113]);
+        let (_, _, empty) = downsample_alpha_texture(1, 3, &[0; 12]);
+        assert_eq!(empty, [0; 4]);
+    }
+
+    #[test]
+    fn transparent_rgb_bleed_wraps_repeating_texture_edges() {
+        let mut pixels = vec![200, 0, 0, 255, 0, 100, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0];
+        bleed_transparent_rgb(4, 1, &mut pixels);
+        assert_eq!(&pixels[8..12], &[0, 100, 0, 0]);
+        assert_eq!(&pixels[12..16], &[200, 0, 0, 0]);
     }
 
     #[test]

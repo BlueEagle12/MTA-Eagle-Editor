@@ -2068,6 +2068,7 @@ pub(crate) fn invalidate_cached_txd_textures(
                 .is_some_and(|missing_texture| *missing_texture == texture);
             if texture != 0 && !is_shared_missing_texture {
                 unsafe {
+                    forget_material_preview(texture);
                     gl::DeleteTextures(1, &texture);
                 }
             }
@@ -3469,6 +3470,20 @@ fn collect_dff_material_warnings(
     app: &AppState,
     entries: &BTreeMap<String, ImgEntry>,
 ) -> Vec<String> {
+    let lod_ids = collect_lod_ids(&app.placements);
+    let lod_dff_keys = app
+        .placements
+        .iter()
+        .enumerate()
+        .filter(|(index, placement)| {
+            !app.element_states
+                .get(*index)
+                .is_some_and(|state| state.deleted)
+                && (lod_ids.contains(&lower(&placement.id))
+                    || is_lod_name(&placement.id, &placement.dff))
+        })
+        .map(|(_, placement)| placement_dff_key(placement, &app.definitions))
+        .collect::<BTreeSet<_>>();
     let mut keys = entries.keys().cloned().collect::<BTreeSet<_>>();
     keys.extend(
         app.editing
@@ -3522,6 +3537,21 @@ fn collect_dff_material_warnings(
         {
             warnings.push(format!(
                 "DFF {key}: {count} normal-less geometry section(s) still request RenderWare lighting; run Repair DFFs → DFF Structure & Data"
+            ));
+        }
+        let raw = parse_dff_mesh(&bytes);
+        let repeated_textures = lod_dff_keys
+            .contains(&key)
+            .then(|| dff_repeated_texture_material_count(&raw))
+            .unwrap_or(0);
+        let duplicate_materials = dff_duplicate_material_count(&raw);
+        if repeated_textures != 0 {
+            warnings.push(format!(
+                "DFF {key}: LOD has {repeated_textures} redundant material slot(s) referencing an already-used packed texture; regenerate the LOD"
+            ));
+        } else if duplicate_materials != 0 {
+            warnings.push(format!(
+                "DFF {key}: {duplicate_materials} redundant material slot(s) repeat the same texture and properties; merge duplicate materials in DFF optimization"
             ));
         }
     }

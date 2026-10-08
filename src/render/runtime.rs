@@ -16,10 +16,37 @@ pub(crate) fn fmt_f32(value: f32, decimals: usize) -> String {
     format!("{value:.decimals$}")
 }
 
+/// Return the equivalent Euler angle in the range used by MTA map rotations.
+/// Keeping this at the placement/attribute boundary means every editor path
+/// that changes an object's transform produces game-safe positive rotations.
+fn positive_rotation_degrees(value: f32) -> f32 {
+    if !value.is_finite() {
+        return value;
+    }
+
+    let normalized = value.rem_euclid(360.0);
+    // Very small negative values can round up to exactly 360 in f32. Both that
+    // and negative zero should be written as the canonical zero rotation.
+    if normalized >= 360.0 || normalized == 0.0 {
+        0.0
+    } else {
+        normalized
+    }
+}
+
+fn normalize_placement_rotation(placement: &mut Placement) {
+    placement.rot.x = positive_rotation_degrees(placement.rot.x);
+    placement.rot.y = positive_rotation_degrees(placement.rot.y);
+    placement.rot.z = positive_rotation_degrees(placement.rot.z);
+}
+
 pub(crate) fn sync_placement_attrs(placement: &mut Placement) {
-    placement
-        .attrs
-        .insert("id".to_string(), placement.id.clone());
+    normalize_placement_rotation(placement);
+    if crate::resource::mta_maps::map_path(&placement.zone).is_some() {
+        placement.attrs.insert("model".into(), placement.id.clone());
+    } else {
+        placement.attrs.insert("id".into(), placement.id.clone());
+    }
     placement
         .attrs
         .insert("posX".to_string(), fmt_f32(placement.pos.x, 6));
@@ -174,6 +201,8 @@ fn raw_gl_proc_address(_name: *const u8) -> *const c_void {
 }
 
 pub(crate) fn reset_gl_for_ui() {
+    reset_material_preview();
+    set_lightmap_texture(0);
     let ui_viewport = (
         0,
         0,
@@ -183,6 +212,9 @@ pub(crate) fn reset_gl_for_ui() {
     unsafe {
         gl::UseProgram(0);
         gl::ActiveTexture(gl::TEXTURE0);
+        gl::ClientActiveTexture(gl::TEXTURE1);
+        gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::ClientActiveTexture(gl::TEXTURE0);
         gl::BindBuffer(gl::ARRAY_BUFFER, 0);
         gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
         gl::BindTexture(gl::TEXTURE_2D, 0);
@@ -905,6 +937,53 @@ pub(crate) fn draw_transform_gizmo(app: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_rotations_use_equivalent_positive_angles() {
+        assert_eq!(positive_rotation_degrees(-30.0), 330.0);
+        assert_eq!(positive_rotation_degrees(-390.0), 330.0);
+        assert_eq!(positive_rotation_degrees(390.0), 30.0);
+        assert_eq!(positive_rotation_degrees(-360.0), 0.0);
+        assert_eq!(positive_rotation_degrees(360.0), 0.0);
+        assert_eq!(positive_rotation_degrees(-0.0).to_bits(), 0.0_f32.to_bits());
+
+        let mut placement = Placement {
+            id: "rotation_test".to_string(),
+            dff: "rotation_test".to_string(),
+            zone: "test".to_string(),
+            tag: "object".to_string(),
+            attrs: BTreeMap::new(),
+            pos: V3::default(),
+            rot: V3 {
+                x: -30.0,
+                y: 390.0,
+                z: -720.0,
+            },
+        };
+
+        sync_placement_attrs(&mut placement);
+
+        assert_eq!(
+            placement.rot,
+            V3 {
+                x: 330.0,
+                y: 30.0,
+                z: 0.0
+            }
+        );
+        assert_eq!(
+            placement.attrs.get("rotX").map(String::as_str),
+            Some("330.000")
+        );
+        assert_eq!(
+            placement.attrs.get("rotY").map(String::as_str),
+            Some("30.000")
+        );
+        assert_eq!(
+            placement.attrs.get("rotZ").map(String::as_str),
+            Some("0.000")
+        );
+    }
 
     #[test]
     fn bounds_outline_corners_expand_all_axes() {

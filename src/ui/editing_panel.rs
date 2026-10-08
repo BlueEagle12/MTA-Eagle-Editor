@@ -17,6 +17,43 @@ const EDITING_ARCHIVE_MIN_SCREEN_W: f32 = 1200.0;
 /// useful starting points for detail work in the standalone DFF editor.
 const DFF_SCENE_CAMERA_TRANSFER_MAX_DISTANCE: f32 = 750.0;
 
+fn editing_vehicle_preset_dialog_rect() -> Rect {
+    let width = 900.0_f32.min(screen_width() - 60.0).max(540.0);
+    let height = 590.0_f32.min(screen_height() - 60.0).max(420.0);
+    Rect::new(
+        (screen_width() - width) * 0.5,
+        (screen_height() - height) * 0.5,
+        width,
+        height,
+    )
+}
+
+fn editing_vehicle_preset_option_rect(index: usize, count: usize) -> Rect {
+    let dialog = editing_vehicle_preset_dialog_rect();
+    let columns = 3usize;
+    let rows = count.div_ceil(columns).max(1);
+    let column = index / rows;
+    let row = index % rows;
+    let gap = 10.0;
+    let width = (dialog.w - 48.0 - gap * (columns - 1) as f32) / columns as f32;
+    Rect::new(
+        dialog.x + 24.0 + column as f32 * (width + gap),
+        dialog.y + 58.0 + row as f32 * 27.0,
+        width,
+        24.0,
+    )
+}
+
+fn editing_vehicle_preset_close_rect() -> Rect {
+    let dialog = editing_vehicle_preset_dialog_rect();
+    Rect::new(
+        dialog.x + dialog.w - 112.0,
+        dialog.y + dialog.h - 44.0,
+        88.0,
+        30.0,
+    )
+}
+
 pub(crate) fn editing_archive_visible() -> bool {
     editing_archive_visible_at_width(screen_width())
 }
@@ -488,10 +525,11 @@ fn dff_ctl_x2(right: Rect) -> f32 {
 // testing always matches what is on screen.
 // ---------------------------------------------------------------------------
 
-pub(crate) const DFF_SECTION_COUNT: usize = 11;
-pub(crate) const DFF_TAB_COUNT: usize = 5;
+pub(crate) const DFF_SECTION_COUNT: usize = 12;
+pub(crate) const DFF_TAB_COUNT: usize = 6;
 
-const DFF_TAB_TITLES: [&str; DFF_TAB_COUNT] = ["Asset", "Material", "UV", "Mesh", "Tools"];
+const DFF_TAB_TITLES: [&str; DFF_TAB_COUNT] =
+    ["Asset", "Material", "UV", "Mesh", "Tools", "Vehicle"];
 const DFF_TAB_RAIL_W: f32 = 48.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -499,20 +537,22 @@ pub(crate) enum DffSection {
     Effects = 0,
     Lighting = 1,
     Fractures = 2,
-    Materials = 3,
-    FaceTexture = 4,
-    MaterialAnim = 5,
-    UvTools = 6,
-    Mesh = 7,
-    Cutter = 8,
-    Lod = 9,
-    Optimize = 10,
+    VehicleSetup = 3,
+    Materials = 4,
+    FaceTexture = 5,
+    MaterialAnim = 6,
+    UvTools = 7,
+    Mesh = 8,
+    Cutter = 9,
+    Lod = 10,
+    Optimize = 11,
 }
 
 pub(crate) const DFF_SECTIONS: [DffSection; DFF_SECTION_COUNT] = [
     DffSection::Effects,
     DffSection::Lighting,
     DffSection::Fractures,
+    DffSection::VehicleSetup,
     DffSection::Materials,
     DffSection::FaceTexture,
     DffSection::MaterialAnim,
@@ -529,6 +569,7 @@ impl DffSection {
             DffSection::Effects => "2DFX Effects",
             DffSection::Lighting => "Face Lighting",
             DffSection::Fractures => "Breakable Fracture Zones",
+            DffSection::VehicleSetup => "Vehicle Dummies & Collision",
             DffSection::Materials => "Materials",
             DffSection::FaceTexture => "Face Texture",
             DffSection::MaterialAnim => "Material Animation",
@@ -547,6 +588,7 @@ impl DffSection {
             Self::UvTools => 2,
             Self::Mesh | Self::Cutter => 3,
             Self::Lod | Self::Optimize => 4,
+            Self::VehicleSetup => 5,
         }
     }
 }
@@ -610,7 +652,20 @@ pub(crate) struct DffPanelLayout {
     pub(crate) fracture_origin: Option<Rect>,
     pub(crate) clear_fractures: Option<Rect>,
     pub(crate) simulate_fractures: Option<Rect>,
+    pub(crate) vehicle_frame_list: Option<Rect>,
+    pub(crate) vehicle_frame_visible: usize,
+    pub(crate) vehicle_convert: Option<Rect>,
+    pub(crate) vehicle_validate: Option<Rect>,
+    pub(crate) vehicle_validation_rows: Vec<Rect>,
+    pub(crate) vehicle_add_dummy: Option<Rect>,
+    pub(crate) vehicle_parent_component: Option<Rect>,
+    pub(crate) vehicle_position_dummy: Option<Rect>,
+    pub(crate) vehicle_generate_collision: Option<Rect>,
+    pub(crate) vehicle_generate_vlo: Option<Rect>,
     pub(crate) material_list: Option<Rect>,
+    pub(crate) vehicle_preview_colors: Option<[[Rect; 3]; 2]>,
+    pub(crate) vehicle_preview_lights: Option<Rect>,
+    pub(crate) vehicle_material_preset: Option<Rect>,
     pub(crate) material_visible: usize,
     pub(crate) select_material_faces: Option<Rect>,
     pub(crate) view_texture: Option<Rect>,
@@ -688,6 +743,14 @@ pub(crate) struct DffPanelLayout {
     pub(crate) show_normals: Option<Rect>,
     pub(crate) duplicate_material: Option<Rect>,
     pub(crate) separate_faces: Option<Rect>,
+    pub(crate) internal_component_list: Option<Rect>,
+    pub(crate) internal_component_visible: usize,
+    pub(crate) separate_internal_element: Option<Rect>,
+    pub(crate) select_internal_element: Option<Rect>,
+    pub(crate) internal_pivot_selection: Option<Rect>,
+    pub(crate) internal_pivot_bounds: Option<Rect>,
+    pub(crate) internal_pivot_origin: Option<Rect>,
+    pub(crate) internal_pivot_rotate: Option<[Rect; 6]>,
     pub(crate) split_material_limits: Option<Rect>,
     pub(crate) pivot_to_selection: Option<Rect>,
     pub(crate) pivot_to_bounds: Option<Rect>,
@@ -771,7 +834,20 @@ pub(crate) fn dff_panel_layout(
         fracture_origin: None,
         clear_fractures: None,
         simulate_fractures: None,
+        vehicle_frame_list: None,
+        vehicle_frame_visible: 0,
+        vehicle_convert: None,
+        vehicle_validate: None,
+        vehicle_validation_rows: Vec::new(),
+        vehicle_add_dummy: None,
+        vehicle_parent_component: None,
+        vehicle_position_dummy: None,
+        vehicle_generate_collision: None,
+        vehicle_generate_vlo: None,
         material_list: None,
+        vehicle_preview_colors: None,
+        vehicle_preview_lights: None,
+        vehicle_material_preset: None,
         material_visible: 0,
         select_material_faces: None,
         view_texture: None,
@@ -849,6 +925,14 @@ pub(crate) fn dff_panel_layout(
         show_normals: None,
         duplicate_material: None,
         separate_faces: None,
+        internal_component_list: None,
+        internal_component_visible: 0,
+        separate_internal_element: None,
+        select_internal_element: None,
+        internal_pivot_selection: None,
+        internal_pivot_bounds: None,
+        internal_pivot_origin: None,
+        internal_pivot_rotate: None,
         split_material_limits: None,
         pivot_to_selection: None,
         pivot_to_bounds: None,
@@ -951,6 +1035,50 @@ pub(crate) fn dff_panel_layout(
                 layout.clear_fractures = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
                 y += DFF_BTN_H + 6.0;
                 layout.simulate_fractures = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + gap;
+            }
+            DffSection::VehicleSetup => {
+                if !dff_looks_like_vehicle(&dff.raw) {
+                    layout.vehicle_convert = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                    y += DFF_BTN_H + gap;
+                    continue;
+                }
+                layout.vehicle_validate = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + DFF_ROW_GAP;
+                for _ in vehicle_validation_issues(&dff.raw).iter().take(8) {
+                    layout
+                        .vehicle_validation_rows
+                        .push(Rect::new(x0, y, fullw, DFF_LIGHT_ROW_H));
+                    y += DFF_LIGHT_ROW_H;
+                }
+                y += DFF_ROW_GAP;
+                let visible = dff.raw.frames.len().max(1).min(8);
+                layout.vehicle_frame_visible = visible;
+                layout.vehicle_frame_list =
+                    Some(Rect::new(x0, y, fullw, visible as f32 * DFF_LIGHT_ROW_H));
+                y += visible as f32 * DFF_LIGHT_ROW_H + DFF_ROW_GAP;
+                layout.vehicle_add_dummy = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                layout.vehicle_parent_component = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                y += DFF_BTN_H + DFF_ROW_GAP;
+                layout.vehicle_position_dummy = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + DFF_ROW_GAP;
+                layout.vehicle_generate_collision = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + DFF_ROW_GAP;
+                layout.vehicle_generate_vlo = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + DFF_ROW_GAP;
+                let mut colors = [[zero; 3]; 2];
+                for slot in 0..2 {
+                    y += DFF_FIELD_LABEL_H;
+                    for channel in 0..3 {
+                        colors[slot][channel] = Rect::new(x0, y, fullw, DFF_COLOR_BAR_H);
+                        y += DFF_COLOR_BAR_H + 7.0;
+                    }
+                    y += 5.0;
+                }
+                layout.vehicle_preview_colors = Some(colors);
+                layout.vehicle_preview_lights = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + DFF_ROW_GAP;
+                layout.vehicle_material_preset = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
                 y += DFF_BTN_H + gap;
             }
             DffSection::Materials => {
@@ -1186,6 +1314,31 @@ pub(crate) fn dff_panel_layout(
                 y += DFF_BTN_H + 9.0;
 
                 category(&mut layout, 5, &mut y);
+                let visible = dff.raw.components.len().max(1).min(6);
+                layout.internal_component_visible = visible;
+                layout.internal_component_list =
+                    Some(Rect::new(x0, y, fullw, visible as f32 * DFF_LIGHT_ROW_H));
+                y += visible as f32 * DFF_LIGHT_ROW_H + 6.0;
+                layout.select_internal_element = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                layout.separate_internal_element = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                layout.internal_pivot_selection = Some(Rect::new(x0, y, halfw, DFF_BTN_H));
+                layout.internal_pivot_bounds = Some(Rect::new(x2, y, halfw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                layout.internal_pivot_origin = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
+                y += DFF_BTN_H + 6.0;
+                let rotate_w = (fullw - 5.0 * 6.0) / 6.0;
+                let mut rotate = [zero; 6];
+                for (index, rect) in rotate.iter_mut().enumerate() {
+                    *rect = Rect::new(
+                        x0 + index as f32 * (rotate_w + 6.0),
+                        y,
+                        rotate_w,
+                        DFF_SMALL_BTN_H,
+                    );
+                }
+                layout.internal_pivot_rotate = Some(rotate);
+                y += DFF_SMALL_BTN_H + 9.0;
                 layout.separate_faces = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
                 y += DFF_BTN_H + 6.0;
                 layout.split_material_limits = Some(Rect::new(x0, y, fullw, DFF_BTN_H));
@@ -2273,13 +2426,14 @@ fn build_editing_dff_preview(
     app: &mut AppState,
     raw: &RawMesh,
     txd_context: Option<&str>,
+    vehicle_preview: Option<VehicleMaterialPreview>,
 ) -> Option<RenderMesh> {
     let ambient_lift = scene_ambient_lift_from_timecyc(&app.timecyc);
     compile_render_mesh(
         raw.clone(),
         txd_context,
         None,
-        None,
+        vehicle_preview,
         &app.texture_files,
         &app.txd_textures,
         &mut app.textures,
@@ -2287,6 +2441,800 @@ fn build_editing_dff_preview(
         app.options.textures,
         ambient_lift,
     )
+}
+
+fn dff_looks_like_vehicle(raw: &RawMesh) -> bool {
+    raw.materials
+        .iter()
+        .copied()
+        .any(|material| vehicle_material_role(material).is_some())
+        || raw.frames.iter().any(|frame| {
+            let name = lower(frame.name.trim());
+            name == "chassis_dummy"
+                || name == "engine"
+                || name.starts_with("wheel_")
+                || name.starts_with("door_")
+                || name.starts_with("bump_")
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VehicleValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VehicleValidationIssue {
+    severity: VehicleValidationSeverity,
+    message: String,
+}
+
+fn vehicle_frame_index(raw: &RawMesh, name: &str) -> Option<usize> {
+    raw.frames
+        .iter()
+        .position(|frame| frame.name.eq_ignore_ascii_case(name))
+}
+
+fn vehicle_frame_is_descendant_of(raw: &RawMesh, frame: usize, ancestor: usize) -> bool {
+    let mut current = Some(frame);
+    let mut visited = BTreeSet::new();
+    while let Some(index) = current {
+        if index == ancestor {
+            return true;
+        }
+        if !visited.insert(index) {
+            return false;
+        }
+        current = raw
+            .frames
+            .get(index)
+            .and_then(|frame| (frame.parent >= 0).then_some(frame.parent as usize));
+    }
+    false
+}
+
+fn vehicle_material_rgb(material: RawMaterial) -> [u8; 3] {
+    [material.color.x, material.color.y, material.color.z]
+        .map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+fn vehicle_validation_issues(raw: &RawMesh) -> Vec<VehicleValidationIssue> {
+    let mut issues = Vec::new();
+    let mut push = |severity, message: String| {
+        issues.push(VehicleValidationIssue { severity, message });
+    };
+    if raw.vertices.is_empty() || raw.triangles.is_empty() {
+        push(
+            VehicleValidationSeverity::Error,
+            "Vehicle has no renderable geometry".to_string(),
+        );
+    }
+    let chassis_dummy = vehicle_frame_index(raw, "chassis_dummy");
+    if chassis_dummy.is_none() {
+        push(
+            VehicleValidationSeverity::Error,
+            "Missing chassis_dummy".to_string(),
+        );
+    }
+    let chassis = raw.components.iter().find(|component| {
+        let name = lower(component.name.trim());
+        name == "chassis" || (name.starts_with("chassis") && !name.contains("_vlo"))
+    });
+    if chassis.is_none() {
+        push(
+            VehicleValidationSeverity::Error,
+            "Missing high-detail chassis component".to_string(),
+        );
+    } else if let (Some(dummy), Some(frame)) = (
+        chassis_dummy,
+        chassis.and_then(|component| component.frame_index),
+    ) && !vehicle_frame_is_descendant_of(raw, frame, dummy)
+    {
+        push(
+            VehicleValidationSeverity::Warning,
+            "Chassis geometry is not parented below chassis_dummy".to_string(),
+        );
+    }
+    let car_wheels = [
+        "wheel_lf_dummy",
+        "wheel_rf_dummy",
+        "wheel_lb_dummy",
+        "wheel_rb_dummy",
+    ];
+    let bike_wheels = ["wheel_front", "wheel_rear"];
+    if car_wheels
+        .iter()
+        .any(|name| vehicle_frame_index(raw, name).is_some())
+    {
+        for name in car_wheels {
+            if vehicle_frame_index(raw, name).is_none() {
+                push(VehicleValidationSeverity::Error, format!("Missing {name}"));
+            }
+        }
+    } else if bike_wheels
+        .iter()
+        .any(|name| vehicle_frame_index(raw, name).is_some())
+    {
+        for name in bike_wheels {
+            if vehicle_frame_index(raw, name).is_none() {
+                push(VehicleValidationSeverity::Error, format!("Missing {name}"));
+            }
+        }
+    } else {
+        push(
+            VehicleValidationSeverity::Warning,
+            "No recognized car or bike wheel dummy layout".to_string(),
+        );
+    }
+    for (index, frame) in raw.frames.iter().enumerate() {
+        let name = lower(frame.name.trim());
+        let expects_geometry = name.starts_with("wheel_")
+            || name.starts_with("door_")
+            || name.starts_with("bump_")
+            || matches!(
+                name.as_str(),
+                "bonnet_dummy" | "boot_dummy" | "windscreen_dummy"
+            );
+        if expects_geometry
+            && name.ends_with("_dummy")
+            && !raw.components.iter().any(|component| {
+                component.frame_index.is_some_and(|component_frame| {
+                    vehicle_frame_is_descendant_of(raw, component_frame, index)
+                })
+            })
+        {
+            push(
+                VehicleValidationSeverity::Warning,
+                format!("{} has no child geometry", frame.name),
+            );
+        }
+    }
+    if !raw.components.iter().any(|component| {
+        let name = lower(component.name.trim());
+        name == "chassis_vlo" || name.ends_with("_vlo")
+    }) {
+        push(
+            VehicleValidationSeverity::Warning,
+            "Missing chassis_vlo vehicle low-detail model".to_string(),
+        );
+    }
+    for (index, frame) in raw.frames.iter().enumerate() {
+        if frame.parent >= raw.frames.len() as i32 {
+            push(
+                VehicleValidationSeverity::Error,
+                format!("Frame {} has an invalid parent", frame.name),
+            );
+        } else if frame.parent >= 0
+            && vehicle_frame_is_descendant_of(raw, frame.parent as usize, index)
+        {
+            push(
+                VehicleValidationSeverity::Error,
+                format!("Frame hierarchy cycle includes {}", frame.name),
+            );
+        }
+    }
+    if raw
+        .components
+        .iter()
+        .any(|component| component.frame_index.is_none())
+    {
+        push(
+            VehicleValidationSeverity::Warning,
+            "One or more geometry components have no frame".to_string(),
+        );
+    }
+    let markers = raw
+        .materials
+        .iter()
+        .copied()
+        .map(vehicle_material_rgb)
+        .collect::<BTreeSet<_>>();
+    if !markers.contains(&[60, 255, 0]) {
+        push(
+            VehicleValidationSeverity::Warning,
+            "No primary vehicle paint material marker".to_string(),
+        );
+    }
+    for (left, right, label) in [
+        ([255, 175, 0], [0, 255, 200], "headlight"),
+        ([185, 255, 0], [255, 60, 0], "taillight"),
+    ] {
+        if markers.contains(&left) != markers.contains(&right) {
+            push(
+                VehicleValidationSeverity::Warning,
+                format!("{label} marker has only one side assigned"),
+            );
+        }
+    }
+    issues
+}
+
+fn apply_editing_vehicle_body_color(app: &mut AppState, slot: usize) {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return;
+    };
+    let (role, color) = if slot == 0 {
+        (VehicleMaterialRole::BodyA, dff.vehicle_preview.body_a)
+    } else {
+        (VehicleMaterialRole::BodyB, dff.vehicle_preview.body_b)
+    };
+    let apply = |mesh: &mut RenderMesh| {
+        for part in &mut mesh.parts {
+            if part.vehicle_material_role != Some(role) {
+                continue;
+            }
+            for vertex in &mut part.cpu_vertices {
+                vertex.day_color = V3 {
+                    x: vertex.base_day_color.x * color.x,
+                    y: vertex.base_day_color.y * color.y,
+                    z: vertex.base_day_color.z * color.z,
+                };
+                vertex.night_color = V3 {
+                    x: vertex.base_night_color.x * color.x,
+                    y: vertex.base_night_color.y * color.y,
+                    z: vertex.base_night_color.z * color.z,
+                };
+                vertex.color = vertex.day_color;
+            }
+        }
+    };
+    if let Some(mesh) = dff.preview_mesh.as_mut() {
+        apply(mesh);
+    }
+    for model in &mut dff.open_models {
+        if let Some(mesh) = model.preview_mesh.as_mut() {
+            apply(mesh);
+        }
+    }
+}
+
+fn selected_vehicle_component_index(dff: &EditingDffState) -> Option<usize> {
+    let face = dff
+        .selected_face
+        .or_else(|| dff.selected_faces.iter().next().copied())?;
+    dff.raw.components.iter().position(|component| {
+        face >= component.tri_start && face < component.tri_end.min(dff.raw.triangles.len())
+    })
+}
+
+fn identity_vehicle_frame(name: String, parent: i32, pos: V3) -> RawMeshFrame {
+    RawMeshFrame {
+        name,
+        parent,
+        right: V3 {
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        up: V3 {
+            x: 0.0,
+            y: 1.0,
+            z: 0.0,
+        },
+        at: V3 {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        },
+        pos,
+    }
+}
+
+fn vehicle_component_pivot(raw: &RawMesh, component: &RawMeshComponent) -> V3 {
+    let start = component.vertex_start.min(raw.vertices.len());
+    let end = component.vertex_end.min(raw.vertices.len()).max(start);
+    if start == end {
+        return V3::default();
+    }
+    let bounds = bounds_from_vertices(&raw.vertices[start..end]);
+    from_mq((bounds.min + bounds.max) * 0.5)
+}
+
+fn ensure_vehicle_root_frame(dff: &mut EditingDffState) -> usize {
+    if let Some(index) = dff.raw.frames.iter().position(|frame| frame.parent < 0) {
+        return index;
+    }
+    let name = Path::new(&dff.name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("vehicle")
+        .to_string();
+    dff.raw
+        .frames
+        .push(identity_vehicle_frame(name, -1, V3::default()));
+    dff.raw.frames.len() - 1
+}
+
+fn vehicle_dummy_uses_chassis_parent(name: &str) -> bool {
+    name.ends_with("_dummy") && name != "chassis_dummy" && !name.starts_with("wheel_")
+}
+
+fn add_vehicle_dummy_preset(app: &mut AppState, preset: VehicleDummyPreset) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if let Some(index) = dff
+        .raw
+        .frames
+        .iter()
+        .position(|frame| frame.name.eq_ignore_ascii_case(preset.name))
+    {
+        dff.selected_vehicle_frame = index;
+        app.status_message = format!("Selected existing vehicle dummy {}", preset.name);
+        return false;
+    }
+    let root = ensure_vehicle_root_frame(dff);
+    let parent = if vehicle_dummy_uses_chassis_parent(preset.name) {
+        dff.raw
+            .frames
+            .iter()
+            .position(|frame| frame.name.eq_ignore_ascii_case("chassis_dummy"))
+            .unwrap_or(root)
+    } else {
+        root
+    };
+    let pivot = selected_dff_geometry_pivot(dff).unwrap_or_else(|| {
+        if dff.raw.vertices.is_empty() {
+            V3::default()
+        } else {
+            let bounds = bounds_from_vertices(&dff.raw.vertices);
+            from_mq((bounds.min + bounds.max) * 0.5)
+        }
+    });
+    dff.raw.frames.push(identity_vehicle_frame(
+        preset.name.to_string(),
+        parent as i32,
+        pivot,
+    ));
+    dff.selected_vehicle_frame = dff.raw.frames.len() - 1;
+    dff.vehicle_frame_scroll = dff.raw.frames.len().saturating_sub(8) as f32;
+    dff.dirty = true;
+    app.status_message = format!(
+        "Added vehicle dummy {} at the current selection",
+        preset.name
+    );
+    true
+}
+
+fn parent_selected_component_to_vehicle_dummy(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let Some(component_index) = selected_vehicle_component_index(dff) else {
+        app.status_message = "Select a face on the component to parent first".to_string();
+        return false;
+    };
+    let dummy_index = dff.selected_vehicle_frame;
+    if dummy_index >= dff.raw.frames.len() {
+        app.status_message = "Select a vehicle dummy first".to_string();
+        return false;
+    }
+    let component_frame = dff.raw.components[component_index]
+        .frame_index
+        .filter(|index| *index < dff.raw.frames.len());
+    let frame_index = if let Some(frame_index) = component_frame {
+        frame_index
+    } else {
+        let component = &dff.raw.components[component_index];
+        let name = if component.name.trim().is_empty() {
+            format!("component_{component_index}")
+        } else {
+            component.name.clone()
+        };
+        let pos = vehicle_component_pivot(&dff.raw, component);
+        dff.raw
+            .frames
+            .push(identity_vehicle_frame(name, dummy_index as i32, pos));
+        let index = dff.raw.frames.len() - 1;
+        dff.raw.components[component_index].frame_index = Some(index);
+        index
+    };
+    if frame_index == dummy_index {
+        app.status_message = "A component frame cannot be parented to itself".to_string();
+        return false;
+    }
+    let mut ancestor = Some(dummy_index);
+    while let Some(index) = ancestor {
+        if index == frame_index {
+            app.status_message = "That parenting would create a frame cycle".to_string();
+            return false;
+        }
+        ancestor = dff
+            .raw
+            .frames
+            .get(index)
+            .and_then(|frame| (frame.parent >= 0).then_some(frame.parent as usize));
+    }
+    dff.raw.frames[frame_index].parent = dummy_index as i32;
+    dff.dirty = true;
+    app.status_message = format!(
+        "Parented component {} to {}",
+        dff.raw.components[component_index].name, dff.raw.frames[dummy_index].name
+    );
+    true
+}
+
+fn position_selected_vehicle_dummy_from_selection(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let Some(pivot) = selected_dff_geometry_pivot(dff) else {
+        app.status_message = "Select vehicle geometry to position the dummy".to_string();
+        return false;
+    };
+    let Some(frame) = dff.raw.frames.get_mut(dff.selected_vehicle_frame) else {
+        app.status_message = "Select a vehicle dummy first".to_string();
+        return false;
+    };
+    frame.pos = pivot;
+    dff.dirty = true;
+    app.status_message = format!("Moved {} to the selection center", frame.name);
+    true
+}
+
+fn convert_editing_dff_to_vehicle(app: &mut AppState) -> bool {
+    let before = editing_history_snapshot(app);
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    if dff_looks_like_vehicle(&dff.raw) {
+        app.status_message = "This DFF is already configured as a vehicle".to_string();
+        return false;
+    }
+    let root = ensure_vehicle_root_frame(dff);
+    let center = if dff.raw.vertices.is_empty() {
+        V3::default()
+    } else {
+        from_mq({
+            let bounds = bounds_from_vertices(&dff.raw.vertices);
+            (bounds.min + bounds.max) * 0.5
+        })
+    };
+    let chassis_dummy = dff.raw.frames.len();
+    dff.raw.frames.push(identity_vehicle_frame(
+        "chassis_dummy".to_string(),
+        root as i32,
+        V3::default(),
+    ));
+    if let Some((component_index, _)) = dff
+        .raw
+        .components
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, component)| component.tri_end.saturating_sub(component.tri_start))
+    {
+        let chassis_frame = dff.raw.frames.len();
+        dff.raw.frames.push(identity_vehicle_frame(
+            "chassis".to_string(),
+            chassis_dummy as i32,
+            center,
+        ));
+        dff.raw.components[component_index].name = "chassis".to_string();
+        dff.raw.components[component_index].frame_index = Some(chassis_frame);
+    }
+    if !dff.raw.vertices.is_empty() {
+        let bounds = bounds_from_vertices(&dff.raw.vertices);
+        let z = bounds.min.z + (bounds.max.z - bounds.min.z) * 0.24;
+        for (name, x, y) in [
+            ("wheel_lf_dummy", bounds.max.x, bounds.max.y),
+            ("wheel_rf_dummy", bounds.min.x, bounds.max.y),
+            ("wheel_lb_dummy", bounds.max.x, bounds.min.y),
+            ("wheel_rb_dummy", bounds.min.x, bounds.min.y),
+        ] {
+            dff.raw.frames.push(identity_vehicle_frame(
+                name.to_string(),
+                root as i32,
+                V3 { x, y, z },
+            ));
+        }
+    }
+    dff.selected_vehicle_frame = chassis_dummy;
+    dff.dirty = true;
+    dff.panel_tab = 5;
+    dff.panel_scroll = 0.0;
+    app.status_message =
+        "Converted DFF to a vehicle scaffold; review wheel positions and validator warnings"
+            .to_string();
+    commit_editing_history(app, "Convert DFF to Vehicle", before);
+    refresh_editing_dff_preview(app);
+    true
+}
+
+fn remove_vehicle_components_matching(
+    raw: &mut RawMesh,
+    mut remove_component: impl FnMut(&str) -> bool,
+) {
+    let removed_ranges = raw
+        .components
+        .iter()
+        .filter(|component| remove_component(&lower(component.name.trim())))
+        .map(|component| {
+            (
+                component.tri_start.min(raw.triangles.len()),
+                component.tri_end.min(raw.triangles.len()),
+            )
+        })
+        .collect::<Vec<_>>();
+    if removed_ranges.is_empty() {
+        return;
+    }
+    let removed = (0..raw.triangles.len())
+        .map(|face| {
+            removed_ranges
+                .iter()
+                .any(|(start, end)| face >= *start && face < *end)
+        })
+        .collect::<Vec<_>>();
+    let removed_before = |position: usize| {
+        removed
+            .iter()
+            .take(position.min(removed.len()))
+            .filter(|remove| **remove)
+            .count()
+    };
+    raw.triangles = raw
+        .triangles
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, triangle)| (!removed[index]).then_some(triangle))
+        .collect();
+    raw.components.retain_mut(|component| {
+        if remove_component(&lower(component.name.trim())) {
+            return false;
+        }
+        let old_start = component.tri_start;
+        let old_end = component.tri_end;
+        component.tri_start = old_start.saturating_sub(removed_before(old_start));
+        component.tri_end = old_end.saturating_sub(removed_before(old_end));
+        true
+    });
+    compact_raw_vertices(raw);
+    for component in &mut raw.components {
+        let vertices = raw.triangles[component.tri_start.min(raw.triangles.len())
+            ..component.tri_end.min(raw.triangles.len())]
+            .iter()
+            .flat_map(|triangle| [triangle.a, triangle.b, triangle.c])
+            .map(|index| index as usize)
+            .collect::<Vec<_>>();
+        component.vertex_start = vertices.iter().copied().min().unwrap_or(0);
+        component.vertex_end = vertices
+            .iter()
+            .copied()
+            .max()
+            .map(|index| index + 1)
+            .unwrap_or(component.vertex_start);
+    }
+}
+
+fn remove_existing_vehicle_vlo(raw: &mut RawMesh) {
+    remove_vehicle_components_matching(raw, |name| name.contains("_vlo"));
+}
+
+fn append_vehicle_vlo_streams(raw: &mut RawMesh, vlo: &RawMesh) {
+    let base_vertices = raw.vertices.len();
+    let vlo_vertices = vlo.vertices.len();
+    let append_v3 = |target: &mut Vec<V3>, source: &[V3], fallback: V3| {
+        if target.len() == base_vertices {
+            if source.len() == vlo_vertices {
+                target.extend_from_slice(source);
+            } else {
+                target.resize(base_vertices + vlo_vertices, fallback);
+            }
+        }
+    };
+    append_v3(
+        &mut raw.normals,
+        &vlo.normals,
+        V3 {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        },
+    );
+    append_v3(&mut raw.prelit_colors, &vlo.prelit_colors, V3::default());
+    append_v3(
+        &mut raw.night_prelit_colors,
+        &vlo.night_prelit_colors,
+        V3::default(),
+    );
+    let append_f32 = |target: &mut Vec<f32>, source: &[f32], fallback: f32| {
+        if target.len() == base_vertices {
+            if source.len() == vlo_vertices {
+                target.extend_from_slice(source);
+            } else {
+                target.resize(base_vertices + vlo_vertices, fallback);
+            }
+        }
+    };
+    append_f32(&mut raw.prelit_alphas, &vlo.prelit_alphas, 1.0);
+    append_f32(&mut raw.night_prelit_alphas, &vlo.night_prelit_alphas, 1.0);
+    if raw.uvs.len() == base_vertices {
+        if vlo.uvs.len() == vlo_vertices {
+            raw.uvs.extend_from_slice(&vlo.uvs);
+        } else {
+            raw.uvs.resize(base_vertices + vlo_vertices, V2::default());
+        }
+    }
+    for (index, target) in raw.secondary_uvs.iter_mut().enumerate() {
+        if target.len() != base_vertices {
+            continue;
+        }
+        if let Some(source) = vlo.secondary_uvs.get(index)
+            && source.len() == vlo_vertices
+        {
+            target.extend_from_slice(source);
+        } else {
+            target.resize(base_vertices + vlo_vertices, V2::default());
+        }
+    }
+    if raw.light_flags.len() == base_vertices {
+        if vlo.light_flags.len() == vlo_vertices {
+            raw.light_flags.extend_from_slice(&vlo.light_flags);
+        } else {
+            raw.light_flags.resize(base_vertices + vlo_vertices, false);
+        }
+    }
+    raw.vertices.extend_from_slice(&vlo.vertices);
+}
+
+fn install_vehicle_vlo(raw: &mut RawMesh, vlo: &RawMesh) -> usize {
+    let root = raw
+        .frames
+        .iter()
+        .position(|frame| frame.parent < 0)
+        .unwrap_or_else(|| {
+            raw.frames.push(identity_vehicle_frame(
+                "vehicle".to_string(),
+                -1,
+                V3::default(),
+            ));
+            raw.frames.len() - 1
+        });
+    let frame_index = vehicle_frame_index(raw, "chassis_vlo").unwrap_or_else(|| {
+        raw.frames.push(identity_vehicle_frame(
+            "chassis_vlo".to_string(),
+            root as i32,
+            V3::default(),
+        ));
+        raw.frames.len() - 1
+    });
+    let vertex_start = raw.vertices.len();
+    let tri_start = raw.triangles.len();
+    append_vehicle_vlo_streams(raw, vlo);
+    raw.triangles
+        .extend(vlo.triangles.iter().map(|triangle| Tri {
+            a: triangle.a + vertex_start as u32,
+            b: triangle.b + vertex_start as u32,
+            c: triangle.c + vertex_start as u32,
+            material: triangle.material,
+        }));
+    raw.components.push(RawMeshComponent {
+        name: "chassis_vlo".to_string(),
+        frame_index: Some(frame_index),
+        vertex_start,
+        vertex_end: raw.vertices.len(),
+        tri_start,
+        tri_end: raw.triangles.len(),
+        breakable: None,
+    });
+    frame_index
+}
+
+fn generate_editing_vehicle_vlo(app: &mut AppState) -> bool {
+    let before = editing_history_snapshot(app);
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let mut base = dff.raw.clone();
+    remove_existing_vehicle_vlo(&mut base);
+    let mut source = base.clone();
+    remove_vehicle_components_matching(&mut source, |name| {
+        name.ends_with("_dam") || name.starts_with("ug_")
+    });
+    source.components.clear();
+    source.frames.clear();
+    let vlo = match simplify_vehicle_vlo_mesh(&source) {
+        Ok(vlo) => vlo,
+        Err(error) => {
+            app.status_message = format!("Could not generate chassis_vlo: {error}");
+            return false;
+        }
+    };
+    dff.raw = base;
+    let frame_index = install_vehicle_vlo(&mut dff.raw, &vlo);
+    dff.selected_vehicle_frame = frame_index;
+    dff.dirty = true;
+    app.status_message = format!(
+        "Generated chassis_vlo with {} faces from {} high-detail faces",
+        vlo.triangles.len(),
+        source.triangles.len()
+    );
+    commit_editing_history(app, "Generate Vehicle chassis_vlo", before);
+    refresh_editing_dff_preview(app);
+    true
+}
+
+fn editing_dff_source_bytes(app: &AppState, name: &str) -> Option<Vec<u8>> {
+    let key = editing_key(name);
+    app.editing.modified_entries.get(&key).cloned().or_else(|| {
+        app.editing
+            .rows
+            .iter()
+            .find(|row| editing_key(&row.entry.name) == key)
+            .map(|row| {
+                read_img_entry(&row.entry)[..row.logical_size.min(row.entry.size as usize)].to_vec()
+            })
+    })
+}
+
+fn generate_editing_vehicle_collision(app: &mut AppState) -> bool {
+    let before = editing_history_snapshot(app);
+    let Some((name, raw, pending_collision)) = app.editing.asset.as_ref().and_then(|asset| {
+        let EditingAsset::Dff(dff) = asset else {
+            return None;
+        };
+        Some((
+            dff.name.clone(),
+            dff.raw.clone(),
+            dff.vehicle_collision_override.clone(),
+        ))
+    }) else {
+        return false;
+    };
+    let stem = Path::new(&name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("vehicle");
+    let mesh = match generate_stock_vehicle_collision(&raw, stem) {
+        Ok(mesh) => mesh,
+        Err(error) => {
+            app.status_message = format!("Could not generate vehicle collision: {error}");
+            return false;
+        }
+    };
+    let existing = pending_collision.or_else(|| {
+        editing_dff_source_bytes(app, &name)
+            .and_then(|bytes| parse_embedded_vehicle_collision(&bytes, &name).map(|(_, col)| col))
+    });
+    let collision_bytes = if let Some(existing) = existing {
+        if let Some(identity) = col_model_ranges(&existing)
+            .first()
+            .map(|range| range.identity.clone())
+        {
+            write_col_mesh_replacing_model(&existing, &identity, &mesh)
+        } else {
+            write_col_mesh_from_template(&minimal_col2_template(stem), &mesh)
+        }
+    } else {
+        write_col_mesh_from_template(&minimal_col2_template(stem), &mesh)
+    };
+    let collision_bytes = match collision_bytes {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            app.status_message = format!("Could not serialize vehicle collision: {error}");
+            return false;
+        }
+    };
+    if let Some(issue) = validate_col_for_game_load(&with_ext(&name, ".col"), &collision_bytes)
+        .into_iter()
+        .find(|issue| issue.severity == ColLoadIssueSeverity::Error)
+    {
+        app.status_message = format!("Generated vehicle collision is invalid: {}", issue.message);
+        return false;
+    }
+    if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+        dff.vehicle_collision_override = Some(collision_bytes);
+        dff.dirty = true;
+    }
+    app.status_message = format!(
+        "Generated stock-style vehicle collision: {} spheres and {} shell faces",
+        mesh.spheres.len(),
+        mesh.faces.len()
+    );
+    commit_editing_history(app, "Generate Vehicle Collision", before);
+    true
 }
 
 fn build_editing_dff_overlay_from_entry(
@@ -2299,7 +3247,7 @@ fn build_editing_dff_overlay_from_entry(
         return None;
     }
     let (txd_context, _) = resolve_editing_dff_txd_context(app, &entry.name);
-    build_editing_dff_preview(app, &raw, txd_context.as_deref())
+    build_editing_dff_preview(app, &raw, txd_context.as_deref(), None)
 }
 
 fn editing_set_col_dff_overlay_from_entry(app: &mut AppState, entry: ImgEntry) -> bool {
@@ -2358,11 +3306,12 @@ pub(crate) fn refresh_editing_dff_preview(app: &mut AppState) {
     if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
         sync_active_open_dff_model(dff);
     }
-    let Some((raw, txd_context, active_model, open_models)) =
+    let Some((raw, txd_context, vehicle_preview, active_model, open_models)) =
         app.editing.asset.as_ref().and_then(|asset| match asset {
             EditingAsset::Dff(dff) => Some((
                 dff.raw.clone(),
                 dff.txd_context.clone(),
+                dff.vehicle_preview,
                 dff.active_open_model,
                 dff.open_models
                     .iter()
@@ -2377,10 +3326,22 @@ pub(crate) fn refresh_editing_dff_preview(app: &mut AppState) {
     let thumbnails = editing_dff_material_thumbnails(app, &raw, txd_context.as_deref());
     let mut model_previews = open_models
         .iter()
-        .map(|(raw, txd)| build_editing_dff_preview(app, raw, txd.as_deref()))
+        .map(|(raw, txd)| {
+            build_editing_dff_preview(
+                app,
+                raw,
+                txd.as_deref(),
+                dff_looks_like_vehicle(raw).then_some(vehicle_preview),
+            )
+        })
         .collect::<Vec<_>>();
     let preview_mesh = if model_previews.is_empty() {
-        build_editing_dff_preview(app, &raw, txd_context.as_deref())
+        build_editing_dff_preview(
+            app,
+            &raw,
+            txd_context.as_deref(),
+            dff_looks_like_vehicle(&raw).then_some(vehicle_preview),
+        )
     } else {
         model_previews.get(active_model).cloned().flatten()
     };
@@ -2434,6 +3395,7 @@ fn activate_open_dff_model(app: &mut AppState, index: usize) -> bool {
         current.preview_mesh = dff.preview_mesh.clone();
         current.txd_context = dff.txd_context.clone();
         current.txd_source_label = dff.txd_source_label.clone();
+        current.vehicle_collision_override = dff.vehicle_collision_override.clone();
         current.dirty |= dff.dirty;
         current.selected_face = dff.selected_face;
         current.selected_faces = dff.selected_faces.clone();
@@ -2448,6 +3410,7 @@ fn activate_open_dff_model(app: &mut AppState, index: usize) -> bool {
     dff.preview_mesh = next.preview_mesh;
     dff.txd_context = next.txd_context;
     dff.txd_source_label = next.txd_source_label;
+    dff.vehicle_collision_override = next.vehicle_collision_override;
     dff.dirty = next.dirty;
     dff.selected_face = next.selected_face;
     dff.selected_faces = next.selected_faces;
@@ -2461,6 +3424,10 @@ fn activate_open_dff_model(app: &mut AppState, index: usize) -> bool {
     dff.uv_editor.selected.clear();
     dff.uv_editor.hovered = None;
     dff.selected_material = 0;
+    dff.selected_vehicle_frame = 0;
+    dff.vehicle_frame_scroll = 0.0;
+    dff.selected_internal_component = 0;
+    dff.internal_component_scroll = 0.0;
     app.status_message = format!("Editing {} in the multi-model workspace", dff.name);
     true
 }
@@ -2473,6 +3440,7 @@ pub(crate) fn sync_active_open_dff_model(dff: &mut EditingDffState) {
     model.preview_mesh = dff.preview_mesh.clone();
     model.txd_context = dff.txd_context.clone();
     model.txd_source_label = dff.txd_source_label.clone();
+    model.vehicle_collision_override = dff.vehicle_collision_override.clone();
     model.dirty |= dff.dirty;
     model.selected_face = dff.selected_face;
     model.selected_faces = dff.selected_faces.clone();
@@ -4708,6 +5676,14 @@ pub(crate) fn create_empty_dff_at_path(app: &mut AppState, mut path: PathBuf) ->
         txd_context: None,
         txd_source_label: "No TXD paired".to_string(),
         material_thumbnails: vec![None],
+        vehicle_preview: VehicleMaterialPreview::default(),
+        vehicle_material_preset_picker_open: false,
+        vehicle_dummy_preset_picker_open: false,
+        selected_vehicle_frame: 0,
+        vehicle_frame_scroll: 0.0,
+        selected_internal_component: 0,
+        internal_component_scroll: 0.0,
+        vehicle_collision_override: None,
         uv_editor: DffUvEditorState::default(),
         selected_material: 0,
         selected_breakable_group: 0,
@@ -4746,6 +5722,7 @@ pub(crate) fn create_empty_dff_at_path(app: &mut AppState, mut path: PathBuf) ->
         dff_2dfx_type_picker_open: false,
         dff_2dfx_type_picker_search: String::new(),
         dff_2dfx_type_picker_scroll: 0.0,
+        dff_2dfx_pending_add_position: None,
         dff_2dfx_corona_preset_picker_open: false,
         dff_2dfx_payload_editor_open: false,
         dff_2dfx_payload_hex: String::new(),
@@ -4920,7 +5897,13 @@ pub(crate) fn editing_open_asset_row(app: &mut AppState, row: EditingImgRow) {
         let (txd_context, txd_source_label) = resolve_editing_dff_txd_context(app, &row.entry.name);
         let material_thumbnails =
             editing_dff_material_thumbnails(app, &raw, txd_context.as_deref());
-        let preview_mesh = build_editing_dff_preview(app, &raw, txd_context.as_deref());
+        let vehicle_preview = VehicleMaterialPreview::default();
+        let preview_mesh = build_editing_dff_preview(
+            app,
+            &raw,
+            txd_context.as_deref(),
+            dff_looks_like_vehicle(&raw).then_some(vehicle_preview),
+        );
         let collision_material_picker_scope = if txd_context.is_some() {
             CollisionMaterialAssignmentScope::ExactTxd
         } else {
@@ -4935,6 +5918,14 @@ pub(crate) fn editing_open_asset_row(app: &mut AppState, row: EditingImgRow) {
             txd_context,
             txd_source_label,
             material_thumbnails,
+            vehicle_preview,
+            vehicle_material_preset_picker_open: false,
+            vehicle_dummy_preset_picker_open: false,
+            selected_vehicle_frame: 0,
+            vehicle_frame_scroll: 0.0,
+            selected_internal_component: 0,
+            internal_component_scroll: 0.0,
+            vehicle_collision_override: None,
             uv_editor: DffUvEditorState::default(),
             selected_material: 0,
             selected_breakable_group: 0,
@@ -4973,6 +5964,7 @@ pub(crate) fn editing_open_asset_row(app: &mut AppState, row: EditingImgRow) {
             dff_2dfx_type_picker_open: false,
             dff_2dfx_type_picker_search: String::new(),
             dff_2dfx_type_picker_scroll: 0.0,
+            dff_2dfx_pending_add_position: None,
             dff_2dfx_corona_preset_picker_open: false,
             dff_2dfx_payload_editor_open: false,
             dff_2dfx_payload_hex: String::new(),
@@ -9534,6 +10526,320 @@ const DFF_MATERIAL_COLOR_PRESETS: [V3; 9] = [
 ];
 const DFF_MATERIAL_ALPHA_PRESETS: [f32; 5] = [1.0, 0.75, 0.5, 0.25, 0.0];
 
+#[derive(Clone, Copy)]
+struct VehicleMaterialPreset {
+    label: &'static str,
+    rgb: [u8; 3],
+}
+
+const VEHICLE_MATERIAL_PRESETS: &[VehicleMaterialPreset] = &[
+    VehicleMaterialPreset {
+        label: "Primary Paint",
+        rgb: [60, 255, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Secondary Paint",
+        rgb: [255, 0, 175],
+    },
+    VehicleMaterialPreset {
+        label: "Tertiary Paint",
+        rgb: [0, 255, 255],
+    },
+    VehicleMaterialPreset {
+        label: "Quaternary Paint",
+        rgb: [255, 0, 255],
+    },
+    VehicleMaterialPreset {
+        label: "Headlight Front Left",
+        rgb: [255, 175, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Headlight Front Right",
+        rgb: [0, 255, 200],
+    },
+    VehicleMaterialPreset {
+        label: "Taillight Rear Left",
+        rgb: [185, 255, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Taillight Rear Right",
+        rgb: [255, 60, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Brake Left",
+        rgb: [184, 255, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Brake Right",
+        rgb: [255, 59, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Brake Left (NA)",
+        rgb: [255, 200, 5],
+    },
+    VehicleMaterialPreset {
+        label: "Brake Right (NA)",
+        rgb: [255, 200, 6],
+    },
+    VehicleMaterialPreset {
+        label: "Reverse Left",
+        rgb: [255, 173, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Reverse Right",
+        rgb: [0, 255, 198],
+    },
+    VehicleMaterialPreset {
+        label: "Foglight Left",
+        rgb: [255, 174, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Foglight Right",
+        rgb: [0, 255, 199],
+    },
+    VehicleMaterialPreset {
+        label: "Side Light Left",
+        rgb: [255, 200, 1],
+    },
+    VehicleMaterialPreset {
+        label: "Side Light Right",
+        rgb: [255, 200, 2],
+    },
+    VehicleMaterialPreset {
+        label: "Stop/Tail/Turn Left",
+        rgb: [255, 200, 3],
+    },
+    VehicleMaterialPreset {
+        label: "Stop/Tail/Turn Right",
+        rgb: [255, 200, 4],
+    },
+    VehicleMaterialPreset {
+        label: "Indicator Front Left",
+        rgb: [183, 255, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Indicator Front Right",
+        rgb: [255, 58, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Indicator Middle Left",
+        rgb: [182, 255, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Indicator Middle Right",
+        rgb: [255, 57, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Indicator Rear Left",
+        rgb: [181, 255, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Indicator Rear Right",
+        rgb: [255, 56, 0],
+    },
+    VehicleMaterialPreset {
+        label: "Spotlight",
+        rgb: [255, 200, 7],
+    },
+    VehicleMaterialPreset {
+        label: "Always On Light",
+        rgb: [0, 18, 255],
+    },
+    VehicleMaterialPreset {
+        label: "Day Only Light",
+        rgb: [0, 17, 255],
+    },
+    VehicleMaterialPreset {
+        label: "Night Only Light",
+        rgb: [0, 16, 255],
+    },
+    VehicleMaterialPreset {
+        label: "Strobe 1",
+        rgb: [255, 199, 1],
+    },
+    VehicleMaterialPreset {
+        label: "Strobe 2",
+        rgb: [255, 199, 2],
+    },
+    VehicleMaterialPreset {
+        label: "Strobe 3",
+        rgb: [255, 199, 3],
+    },
+    VehicleMaterialPreset {
+        label: "Strobe 4",
+        rgb: [255, 199, 4],
+    },
+    VehicleMaterialPreset {
+        label: "Strobe 5",
+        rgb: [255, 199, 5],
+    },
+    VehicleMaterialPreset {
+        label: "Strobe 6",
+        rgb: [255, 199, 6],
+    },
+    VehicleMaterialPreset {
+        label: "Strobe 7",
+        rgb: [255, 199, 7],
+    },
+    VehicleMaterialPreset {
+        label: "Strobe 8",
+        rgb: [255, 199, 8],
+    },
+];
+
+#[derive(Clone, Copy)]
+struct VehicleDummyPreset {
+    label: &'static str,
+    name: &'static str,
+}
+
+const VEHICLE_DUMMY_PRESETS: &[VehicleDummyPreset] = &[
+    VehicleDummyPreset {
+        label: "Chassis",
+        name: "chassis_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Wheel Front Left",
+        name: "wheel_lf_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Wheel Front Right",
+        name: "wheel_rf_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Wheel Rear Left",
+        name: "wheel_lb_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Wheel Rear Right",
+        name: "wheel_rb_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Wheel Middle Left",
+        name: "wheel_lm_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Wheel Middle Right",
+        name: "wheel_rm_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Door Front Left",
+        name: "door_lf_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Door Front Right",
+        name: "door_rf_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Door Rear Left",
+        name: "door_lr_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Door Rear Right",
+        name: "door_rr_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Front Bumper",
+        name: "bump_front_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Rear Bumper",
+        name: "bump_rear_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Bonnet / Hood",
+        name: "bonnet_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Boot / Trunk",
+        name: "boot_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Windscreen",
+        name: "windscreen_dummy",
+    },
+    VehicleDummyPreset {
+        label: "Engine Marker",
+        name: "engine",
+    },
+    VehicleDummyPreset {
+        label: "Exhaust",
+        name: "exhaust",
+    },
+    VehicleDummyPreset {
+        label: "Headlights",
+        name: "headlights",
+    },
+    VehicleDummyPreset {
+        label: "Headlights 2",
+        name: "headlights2",
+    },
+    VehicleDummyPreset {
+        label: "Taillights",
+        name: "taillights",
+    },
+    VehicleDummyPreset {
+        label: "Taillights 2",
+        name: "taillights2",
+    },
+    VehicleDummyPreset {
+        label: "Front Seat",
+        name: "ped_frontseat",
+    },
+    VehicleDummyPreset {
+        label: "Rear Seat",
+        name: "ped_backseat",
+    },
+    VehicleDummyPreset {
+        label: "Driver Arm",
+        name: "ped_arm",
+    },
+    VehicleDummyPreset {
+        label: "Petrol Cap",
+        name: "petrolcap",
+    },
+    VehicleDummyPreset {
+        label: "Nitro Upgrade",
+        name: "ug_nitro",
+    },
+    VehicleDummyPreset {
+        label: "Spoiler Upgrade",
+        name: "ug_spoiler",
+    },
+    VehicleDummyPreset {
+        label: "Roof Upgrade",
+        name: "ug_roof",
+    },
+    VehicleDummyPreset {
+        label: "Light Upgrade",
+        name: "ug_lights",
+    },
+    VehicleDummyPreset {
+        label: "Bike Front Fork",
+        name: "forks_front",
+    },
+    VehicleDummyPreset {
+        label: "Bike Rear Fork",
+        name: "forks_rear",
+    },
+    VehicleDummyPreset {
+        label: "Bike Handlebars",
+        name: "handlebars",
+    },
+    VehicleDummyPreset {
+        label: "Bike Front Wheel",
+        name: "wheel_front",
+    },
+    VehicleDummyPreset {
+        label: "Bike Rear Wheel",
+        name: "wheel_rear",
+    },
+    VehicleDummyPreset {
+        label: "Trailer Attach",
+        name: "trailer_attach",
+    },
+];
+
 pub(crate) fn dff_material_slot_count(raw: &RawMesh) -> usize {
     let referenced = raw
         .triangles
@@ -10974,6 +12280,7 @@ pub(crate) fn update_dff_uv_anim_picker_text_input(app: &mut AppState) -> bool {
     if is_key_pressed(KeyCode::Escape) {
         dff.uv_anim_picker_open = false;
         dff.dff_2dfx_type_picker_open = false;
+        dff.dff_2dfx_pending_add_position = None;
         dff.dff_2dfx_corona_preset_picker_open = false;
         dff.dff_2dfx_payload_editor_open = false;
         return true;
@@ -14353,6 +15660,401 @@ fn compensated_dff_pivot_placement(placement: &Placement, pivot: DffFreeformPivo
     (from_mq(position), rotation)
 }
 
+fn dff_component_face_range(raw: &RawMesh, index: usize) -> Option<std::ops::Range<usize>> {
+    let component = raw.components.get(index)?;
+    let start = component.tri_start.min(raw.triangles.len());
+    let end = component.tri_end.min(raw.triangles.len());
+    (start < end).then_some(start..end)
+}
+
+fn selected_dff_internal_component(dff: &EditingDffState) -> Option<usize> {
+    selected_vehicle_component_index(dff).or_else(|| {
+        (dff.selected_internal_component < dff.raw.components.len())
+            .then_some(dff.selected_internal_component)
+    })
+}
+
+fn dff_internal_component_pivot(raw: &RawMesh, index: usize) -> Option<V3> {
+    let range = dff_component_face_range(raw, index)?;
+    let vertices = raw.triangles[range]
+        .iter()
+        .flat_map(|triangle| [triangle.a, triangle.b, triangle.c])
+        .filter_map(|vertex| raw.vertices.get(vertex as usize).copied())
+        .collect::<Vec<_>>();
+    (!vertices.is_empty()).then(|| {
+        let bounds = bounds_from_vertices(&vertices);
+        from_mq((bounds.min + bounds.max) * 0.5)
+    })
+}
+
+fn ensure_dff_internal_component_frame(dff: &mut EditingDffState, index: usize) -> Option<usize> {
+    if let Some(frame) = dff
+        .raw
+        .components
+        .get(index)
+        .and_then(|component| component.frame_index)
+        .filter(|frame| *frame < dff.raw.frames.len())
+    {
+        return Some(frame);
+    }
+    let root = ensure_vehicle_root_frame(dff);
+    let component = dff.raw.components.get(index)?;
+    let name = if component.name.trim().is_empty() {
+        format!("element_{:02}", index + 1)
+    } else {
+        component.name.clone()
+    };
+    let pivot = dff_internal_component_pivot(&dff.raw, index).unwrap_or_default();
+    dff.raw
+        .frames
+        .push(identity_vehicle_frame(name, root as i32, pivot));
+    let frame = dff.raw.frames.len() - 1;
+    dff.raw.components[index].frame_index = Some(frame);
+    Some(frame)
+}
+
+fn sanitize_internal_element_name(value: &str) -> String {
+    let mut out = String::new();
+    for character in value.trim().chars() {
+        let next = if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+            character
+        } else if character.is_whitespace() {
+            '_'
+        } else {
+            continue;
+        };
+        if out.len() + next.len_utf8() > 23 {
+            break;
+        }
+        out.push(next);
+    }
+    out
+}
+
+struct InternalElementSeparation {
+    component_index: usize,
+    frame_index: usize,
+    faces: std::ops::Range<usize>,
+}
+
+fn separate_raw_internal_element(
+    raw: &mut RawMesh,
+    selected: &BTreeSet<usize>,
+    name: &str,
+    root_name: &str,
+) -> Result<InternalElementSeparation, String> {
+    if selected.is_empty() {
+        return Err("Select faces to separate into an internal element".to_string());
+    }
+    if raw.components.is_empty() && !raw.triangles.is_empty() {
+        let root = raw
+            .frames
+            .iter()
+            .position(|frame| frame.parent < 0)
+            .unwrap_or_else(|| {
+                raw.frames.push(identity_vehicle_frame(
+                    root_name.to_string(),
+                    -1,
+                    V3::default(),
+                ));
+                raw.frames.len() - 1
+            });
+        raw.components.push(RawMeshComponent {
+            name: root_name.to_string(),
+            frame_index: Some(root),
+            vertex_start: 0,
+            vertex_end: raw.vertices.len(),
+            tri_start: 0,
+            tri_end: raw.triangles.len(),
+            breakable: None,
+        });
+    }
+    if raw
+        .components
+        .iter()
+        .any(|component| component.name.eq_ignore_ascii_case(name))
+        || raw
+            .frames
+            .iter()
+            .any(|frame| frame.name.eq_ignore_ascii_case(name))
+    {
+        return Err(format!("An internal element named {name} already exists"));
+    }
+    let Some(component_index) = raw.components.iter().position(|component| {
+        let start = component.tri_start.min(raw.triangles.len());
+        let end = component.tri_end.min(raw.triangles.len());
+        selected.iter().all(|face| *face >= start && *face < end)
+    }) else {
+        return Err("Selected faces must belong to one existing internal element".to_string());
+    };
+    let range = dff_component_face_range(raw, component_index).unwrap();
+    if selected.len() >= range.len() {
+        return Err("Leave at least one face in the source internal element".to_string());
+    }
+    let pivot_vertices = selected
+        .iter()
+        .filter_map(|face| raw.triangles.get(*face))
+        .flat_map(|triangle| [triangle.a, triangle.b, triangle.c])
+        .filter_map(|vertex| raw.vertices.get(vertex as usize).copied())
+        .collect::<Vec<_>>();
+    let pivot = if pivot_vertices.is_empty() {
+        V3::default()
+    } else {
+        let bounds = bounds_from_vertices(&pivot_vertices);
+        from_mq((bounds.min + bounds.max) * 0.5)
+    };
+    let source_frame = raw.components[component_index]
+        .frame_index
+        .filter(|frame| *frame < raw.frames.len());
+    let parent = source_frame
+        .map(|frame| frame as i32)
+        .or_else(|| {
+            raw.frames
+                .iter()
+                .position(|frame| frame.parent < 0)
+                .map(|root| root as i32)
+        })
+        .unwrap_or(-1);
+    let mut remaining = Vec::with_capacity(range.len() - selected.len());
+    let mut separated = Vec::with_capacity(selected.len());
+    for face in range.clone() {
+        if selected.contains(&face) {
+            separated.push(raw.triangles[face]);
+        } else {
+            remaining.push(raw.triangles[face]);
+        }
+    }
+    let internal_start = range.start + remaining.len();
+    let internal_end = internal_start + separated.len();
+    raw.triangles
+        .splice(range, remaining.into_iter().chain(separated));
+    raw.components[component_index].tri_end = internal_start;
+    let source_vertices = raw.triangles[raw.components[component_index]
+        .tri_start
+        .min(raw.triangles.len())..internal_start]
+        .iter()
+        .flat_map(|triangle| [triangle.a, triangle.b, triangle.c])
+        .map(|vertex| vertex as usize)
+        .collect::<Vec<_>>();
+    raw.components[component_index].vertex_start =
+        source_vertices.iter().copied().min().unwrap_or(0);
+    raw.components[component_index].vertex_end = source_vertices
+        .iter()
+        .copied()
+        .max()
+        .map(|vertex| vertex + 1)
+        .unwrap_or(0);
+    if let Some(breakable) = raw.components[component_index].breakable.as_mut() {
+        breakable.stale = true;
+    }
+    raw.frames
+        .push(identity_vehicle_frame(name.to_string(), parent, pivot));
+    let frame_index = raw.frames.len() - 1;
+    let vertices = raw.triangles[internal_start..internal_end]
+        .iter()
+        .flat_map(|triangle| [triangle.a, triangle.b, triangle.c])
+        .map(|vertex| vertex as usize)
+        .collect::<Vec<_>>();
+    raw.components.insert(
+        component_index + 1,
+        RawMeshComponent {
+            name: name.to_string(),
+            frame_index: Some(frame_index),
+            vertex_start: vertices.iter().copied().min().unwrap_or(0),
+            vertex_end: vertices
+                .iter()
+                .copied()
+                .max()
+                .map(|vertex| vertex + 1)
+                .unwrap_or(0),
+            tri_start: internal_start,
+            tri_end: internal_end,
+            breakable: None,
+        },
+    );
+    Ok(InternalElementSeparation {
+        component_index: component_index + 1,
+        frame_index,
+        faces: internal_start..internal_end,
+    })
+}
+
+pub(crate) fn separate_selected_dff_internal_element(app: &mut AppState, name: &str) -> bool {
+    let name = sanitize_internal_element_name(name);
+    if name.is_empty() {
+        app.status_message = "Enter a valid internal element name".to_string();
+        return false;
+    }
+    let before = editing_history_snapshot(app);
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let selected = dff_selected_face_set(dff);
+    let root_name = dff_name_stem(&dff.name).to_string();
+    let separation = match separate_raw_internal_element(&mut dff.raw, &selected, &name, &root_name)
+    {
+        Ok(separation) => separation,
+        Err(error) => {
+            app.status_message = error;
+            return false;
+        }
+    };
+    dff.selected_internal_component = separation.component_index;
+    dff.internal_component_scroll = dff.raw.components.len().saturating_sub(6) as f32;
+    dff.selected_vehicle_frame = separation.frame_index;
+    dff.selected_faces = separation.faces.collect();
+    dff.selected_face = dff.selected_faces.iter().next_back().copied();
+    dff.selected_edges.clear();
+    dff.selected_vertex = None;
+    dff.selected_vertices.clear();
+    dff.dirty = true;
+    app.status_message = format!(
+        "Separated {} face{} into internal element {name}",
+        selected.len(),
+        if selected.len() == 1 { "" } else { "s" }
+    );
+    commit_editing_history(app, "Separate Internal Element", before);
+    refresh_editing_dff_preview(app);
+    true
+}
+
+pub(crate) fn open_dff_internal_element_dialog(app: &mut AppState) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_ref() else {
+        return false;
+    };
+    if dff_selected_face_set(dff).is_empty() {
+        app.status_message = "Select faces to separate into an internal element".to_string();
+        return false;
+    }
+    let source = dff.name.clone();
+    let base = format!("element_{:02}", dff.raw.components.len() + 1);
+    drain_text_input();
+    app.dff_texture_duplicate_dialog = Some(DffTextureDuplicateDialog {
+        action: DffTextureNameAction::SeparateInternalElement,
+        material: 0,
+        source_texture: source,
+        cursor: base.len(),
+        selection_anchor: Some(0),
+        buffer: base,
+    });
+    true
+}
+
+fn select_dff_internal_component(app: &mut AppState, index: usize) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let Some(range) = dff_component_face_range(&dff.raw, index) else {
+        return false;
+    };
+    dff.selected_internal_component = index;
+    dff.select_mode = EditingSelectMode::Face;
+    dff.selected_faces = range.collect();
+    dff.selected_face = dff.selected_faces.iter().next_back().copied();
+    dff.selected_edges.clear();
+    dff.selected_vertex = None;
+    dff.selected_vertices.clear();
+    dff.selected_2dfx = None;
+    app.status_message = format!(
+        "Selected internal element {}",
+        dff.raw.components[index].name
+    );
+    true
+}
+
+#[derive(Clone, Copy)]
+enum InternalPivotTarget {
+    Selection,
+    Bounds,
+    Origin,
+}
+
+fn set_dff_internal_pivot(app: &mut AppState, target: InternalPivotTarget) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let Some(component) = selected_dff_internal_component(dff) else {
+        app.status_message = "Select an internal element first".to_string();
+        return false;
+    };
+    let position = match target {
+        InternalPivotTarget::Selection => selected_dff_geometry_pivot(dff),
+        InternalPivotTarget::Bounds => dff_internal_component_pivot(&dff.raw, component),
+        InternalPivotTarget::Origin => Some(V3::default()),
+    };
+    let Some(position) = position else {
+        app.status_message = "The internal element has no geometry for a pivot".to_string();
+        return false;
+    };
+    let Some(frame) = ensure_dff_internal_component_frame(dff, component) else {
+        return false;
+    };
+    dff.raw.frames[frame].pos = position;
+    dff.selected_vehicle_frame = frame;
+    dff.dirty = true;
+    app.status_message = format!(
+        "Moved {} pivot to {:.3}, {:.3}, {:.3} without moving its geometry",
+        dff.raw.components[component].name, position.x, position.y, position.z
+    );
+    true
+}
+
+fn rotate_dff_internal_pivot(app: &mut AppState, axis: usize, positive: bool) -> bool {
+    let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
+        return false;
+    };
+    let Some(component) = selected_dff_internal_component(dff) else {
+        app.status_message = "Select an internal element first".to_string();
+        return false;
+    };
+    let Some(frame_index) = ensure_dff_internal_component_frame(dff, component) else {
+        return false;
+    };
+    let frame = &mut dff.raw.frames[frame_index];
+    let (right, up, at) = (frame.right, frame.up, frame.at);
+    let neg = |value: V3| V3 {
+        x: -value.x,
+        y: -value.y,
+        z: -value.z,
+    };
+    match (axis, positive) {
+        (0, true) => {
+            frame.up = at;
+            frame.at = neg(up);
+        }
+        (0, false) => {
+            frame.up = neg(at);
+            frame.at = up;
+        }
+        (1, true) => {
+            frame.right = neg(at);
+            frame.at = right;
+        }
+        (1, false) => {
+            frame.right = at;
+            frame.at = neg(right);
+        }
+        (2, true) => {
+            frame.right = up;
+            frame.up = neg(right);
+        }
+        (2, false) => {
+            frame.right = neg(up);
+            frame.up = right;
+        }
+        _ => return false,
+    }
+    dff.selected_vehicle_frame = frame_index;
+    dff.dirty = true;
+    app.status_message = format!(
+        "Rotated {} pivot {}90° around {} without moving its geometry",
+        dff.raw.components[component].name,
+        if positive { "+" } else { "-" },
+        ["X", "Y", "Z"][axis]
+    );
+    true
+}
+
 fn split_raw_mesh_faces(
     source: &RawMesh,
     selected_faces: &BTreeSet<usize>,
@@ -15334,6 +17036,7 @@ fn start_multi_dff_separation(app: &mut AppState, new_name: String, new_stem: St
             preview_mesh: None,
             txd_context: anchor_model.txd_context.clone(),
             txd_source_label: anchor_model.txd_source_label.clone(),
+            vehicle_collision_override: None,
             dirty: false,
             selected_face: None,
             selected_faces: BTreeSet::new(),
@@ -15348,6 +17051,7 @@ fn start_multi_dff_separation(app: &mut AppState, new_name: String, new_stem: St
         dff.preview_mesh = None;
         dff.txd_context = anchor_model.txd_context;
         dff.txd_source_label = anchor_model.txd_source_label;
+        dff.vehicle_collision_override = None;
         dff.dirty = false;
         dff.selected_face = None;
         dff.selected_faces.clear();
@@ -17011,12 +18715,15 @@ pub(crate) fn add_dff_2dfx_corona_preset(app: &mut AppState, preset_index: usize
     let Some(preset) = DFF_CORONA_PRESETS.get(preset_index).copied() else {
         return false;
     };
-    let (dff_name, used_selected_face) = {
+    let (dff_name, used_selected_effect, used_selected_face) = {
         let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
             return false;
         };
+        let used_selected_effect = dff
+            .selected_2dfx
+            .is_some_and(|idx| dff.raw.effects_2dfx.get(idx).is_some());
         let position = dff_2dfx_default_position(dff);
-        let used_selected_face = dff.selected_face.is_some();
+        let used_selected_face = !used_selected_effect && dff.selected_face.is_some();
         dff.raw.effects_2dfx.push(Dff2dEffect {
             position,
             effect_id: 0,
@@ -17025,9 +18732,11 @@ pub(crate) fn add_dff_2dfx_corona_preset(app: &mut AppState, preset_index: usize
         dff.selected_2dfx = dff.raw.effects_2dfx.len().checked_sub(1);
         dff.dff_2dfx_corona_preset_picker_open = false;
         dff.dirty = true;
-        (dff.name.clone(), used_selected_face)
+        (dff.name.clone(), used_selected_effect, used_selected_face)
     };
-    let placement = if used_selected_face {
+    let placement = if used_selected_effect {
+        "selected 2DFX"
+    } else if used_selected_face {
         "selected face"
     } else {
         "model center"
@@ -20593,25 +22302,34 @@ pub(crate) fn set_selected_dff_2dfx_type(app: &mut AppState, effect_id: u32) -> 
     true
 }
 
-fn dff_2dfx_default_position(dff: &EditingDffState) -> V3 {
-    dff.selected_face
-        .and_then(|face| raw_triangle_indices(&dff.raw, face))
-        .map(|indices| {
-            let mut center = V3::default();
-            for idx in indices {
-                if let Some(vertex) = dff.raw.vertices.get(idx) {
-                    center.x += vertex.x;
-                    center.y += vertex.y;
-                    center.z += vertex.z;
-                }
-            }
-            center.x /= 3.0;
-            center.y /= 3.0;
-            center.z /= 3.0;
-            center
+fn dff_2dfx_spawn_position(
+    raw: &RawMesh,
+    selected_2dfx: Option<usize>,
+    selected_face: Option<usize>,
+) -> V3 {
+    selected_2dfx
+        .and_then(|idx| raw.effects_2dfx.get(idx))
+        .map(|effect| effect.position)
+        .or_else(|| {
+            selected_face
+                .and_then(|face| raw_triangle_indices(raw, face))
+                .map(|indices| {
+                    let mut center = V3::default();
+                    for idx in indices {
+                        if let Some(vertex) = raw.vertices.get(idx) {
+                            center.x += vertex.x;
+                            center.y += vertex.y;
+                            center.z += vertex.z;
+                        }
+                    }
+                    center.x /= 3.0;
+                    center.y /= 3.0;
+                    center.z /= 3.0;
+                    center
+                })
         })
         .unwrap_or_else(|| {
-            let bounds = bounds_from_vertices(&dff.raw.vertices);
+            let bounds = bounds_from_vertices(&raw.vertices);
             V3 {
                 x: (bounds.min.x + bounds.max.x) * 0.5,
                 y: (bounds.min.y + bounds.max.y) * 0.5,
@@ -20620,11 +22338,16 @@ fn dff_2dfx_default_position(dff: &EditingDffState) -> V3 {
         })
 }
 
+fn dff_2dfx_default_position(dff: &EditingDffState) -> V3 {
+    dff_2dfx_spawn_position(&dff.raw, dff.selected_2dfx, dff.selected_face)
+}
+
 pub(crate) fn add_dff_2dfx_of_type(app: &mut AppState, effect_id: u32) -> bool {
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return false;
     };
-    let position = dff_2dfx_default_position(dff);
+    let pending_add_position = dff.dff_2dfx_pending_add_position.take();
+    let position = pending_add_position.unwrap_or_else(|| dff_2dfx_default_position(dff));
     dff.raw.effects_2dfx.push(Dff2dEffect {
         position,
         effect_id,
@@ -20946,7 +22669,28 @@ pub(crate) fn editing_stage_dff_asset(app: &mut AppState) -> bool {
                 return false;
             }
             match write_normalized_dff(&local_raw, frame) {
-                Ok(bytes) => staged.push((model.name.clone(), bytes)),
+                Ok(mut bytes) => {
+                    if let Some(collision) =
+                        model.vehicle_collision_override.clone().or_else(|| {
+                            editing_dff_source_bytes(app, &model.name).and_then(|source| {
+                                parse_embedded_vehicle_collision(&source, &model.name)
+                                    .map(|(_, col)| col)
+                            })
+                        })
+                    {
+                        match upsert_embedded_vehicle_collision(&bytes, &collision) {
+                            Ok(updated) => bytes = updated,
+                            Err(error) => {
+                                app.status_message = format!(
+                                    "Could not preserve embedded collision for {}: {error}",
+                                    model.name
+                                );
+                                return false;
+                            }
+                        }
+                    }
+                    staged.push((model.name.clone(), bytes));
+                }
                 Err(error) => {
                     app.status_message = format!("Could not write DFF {}: {error}", model.name);
                     return false;
@@ -20959,6 +22703,7 @@ pub(crate) fn editing_stage_dff_asset(app: &mut AppState) -> bool {
         if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
             for model in &mut dff.open_models {
                 model.dirty = false;
+                model.vehicle_collision_override = None;
             }
             dff.dirty = false;
             dff.normalized_warning = false;
@@ -20987,17 +22732,7 @@ pub(crate) fn editing_stage_dff_asset(app: &mut AppState) -> bool {
         let EditingAsset::Dff(dff) = asset else {
             return None;
         };
-        let key = editing_key(&dff.name);
-        app.editing.modified_entries.get(&key).cloned().or_else(|| {
-            app.editing
-                .rows
-                .iter()
-                .find(|row| editing_key(&row.entry.name) == key)
-                .map(|row| {
-                    read_img_entry(&row.entry)[..row.logical_size.min(row.entry.size as usize)]
-                        .to_vec()
-                })
-        })
+        editing_dff_source_bytes(app, &dff.name)
     });
     let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() else {
         return false;
@@ -21039,8 +22774,23 @@ pub(crate) fn editing_stage_dff_asset(app: &mut AppState) -> bool {
         return false;
     }
     let raw = dff.raw.clone();
+    let collision_payload = dff.vehicle_collision_override.clone().or_else(|| {
+        source_bytes.as_deref().and_then(|source| {
+            parse_embedded_vehicle_collision(source, &dff.name).map(|(_, collision)| collision)
+        })
+    });
     match write_normalized_dff(&raw, frame) {
-        Ok(bytes) => {
+        Ok(mut bytes) => {
+            if let Some(collision) = collision_payload {
+                bytes = match upsert_embedded_vehicle_collision(&bytes, &collision) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        app.status_message =
+                            format!("Could not embed vehicle collision in {}: {error}", dff.name);
+                        return false;
+                    }
+                };
+            }
             let refresh_name = dff.name.clone();
             let refresh_bytes = bytes.clone();
             app.editing
@@ -21049,6 +22799,7 @@ pub(crate) fn editing_stage_dff_asset(app: &mut AppState) -> bool {
             dff.dirty = false;
             dff.normalized_warning = false;
             dff.normalized_rewrite_confirmed = true;
+            dff.vehicle_collision_override = None;
             app.status_message = format!("Staged normalized DFF {}", dff.name);
             refresh_live_asset_from_editing_entry(app, &refresh_name, &refresh_bytes);
             if let Some(dff_name) = traffic_dff_name.as_deref() {
@@ -26727,7 +28478,12 @@ pub(crate) fn open_scene_dffs_in_editing_unchecked(
         let mut workspace_raw = raw;
         transform_editor_raw_mesh(&mut workspace_raw, to_workspace);
         let (txd_context, txd_source_label) = resolve_editing_dff_txd_context(app, &name);
-        let preview_mesh = build_editing_dff_preview(app, &workspace_raw, txd_context.as_deref());
+        let preview_mesh = build_editing_dff_preview(
+            app,
+            &workspace_raw,
+            txd_context.as_deref(),
+            dff_looks_like_vehicle(&workspace_raw).then_some(VehicleMaterialPreview::default()),
+        );
         open_models.push(EditingDffOpenModel {
             name,
             placement_index,
@@ -26736,6 +28492,7 @@ pub(crate) fn open_scene_dffs_in_editing_unchecked(
             preview_mesh,
             txd_context,
             txd_source_label,
+            vehicle_collision_override: None,
             dirty: false,
             selected_face: None,
             selected_faces: BTreeSet::new(),
@@ -26750,6 +28507,7 @@ pub(crate) fn open_scene_dffs_in_editing_unchecked(
             dff.preview_mesh = anchor.preview_mesh;
             dff.txd_context = anchor.txd_context;
             dff.txd_source_label = anchor.txd_source_label;
+            dff.vehicle_collision_override = anchor.vehicle_collision_override;
         }
         dff.open_models = open_models;
         dff.active_open_model = 0;
@@ -28818,6 +30576,76 @@ fn handle_editing_2dfx_modal_click(app: &mut AppState, mouse: Vec2) -> bool {
     if !is_mouse_button_pressed(MouseButton::Left) {
         return false;
     }
+    let vehicle_material_open = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.vehicle_material_preset_picker_open
+    );
+    if vehicle_material_open {
+        if editing_vehicle_preset_close_rect().contains(mouse) {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.vehicle_material_preset_picker_open = false;
+            }
+            return true;
+        }
+        for (index, preset) in VEHICLE_MATERIAL_PRESETS.iter().copied().enumerate() {
+            if editing_vehicle_preset_option_rect(index, VEHICLE_MATERIAL_PRESETS.len())
+                .contains(mouse)
+            {
+                let before = editing_history_snapshot(app);
+                let color = V3 {
+                    x: preset.rgb[0] as f32 / 255.0,
+                    y: preset.rgb[1] as f32 / 255.0,
+                    z: preset.rgb[2] as f32 / 255.0,
+                };
+                if editing_apply_dff_material_preset(app, Some(color), Some(1.0)) {
+                    commit_editing_history(app, "Set Vehicle Material Preset", before);
+                }
+                if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                    dff.vehicle_material_preset_picker_open = false;
+                }
+                app.status_message = format!("Applied vehicle material preset {}", preset.label);
+                return true;
+            }
+        }
+        if !editing_vehicle_preset_dialog_rect().contains(mouse)
+            && let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+        {
+            dff.vehicle_material_preset_picker_open = false;
+        }
+        return true;
+    }
+    let vehicle_dummy_open = matches!(
+        app.editing.asset.as_ref(),
+        Some(EditingAsset::Dff(dff)) if dff.vehicle_dummy_preset_picker_open
+    );
+    if vehicle_dummy_open {
+        if editing_vehicle_preset_close_rect().contains(mouse) {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                dff.vehicle_dummy_preset_picker_open = false;
+            }
+            return true;
+        }
+        for (index, preset) in VEHICLE_DUMMY_PRESETS.iter().copied().enumerate() {
+            if editing_vehicle_preset_option_rect(index, VEHICLE_DUMMY_PRESETS.len())
+                .contains(mouse)
+            {
+                let before = editing_history_snapshot(app);
+                if add_vehicle_dummy_preset(app, preset) {
+                    commit_editing_history(app, "Add Vehicle Dummy", before);
+                }
+                if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                    dff.vehicle_dummy_preset_picker_open = false;
+                }
+                return true;
+            }
+        }
+        if !editing_vehicle_preset_dialog_rect().contains(mouse)
+            && let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
+        {
+            dff.vehicle_dummy_preset_picker_open = false;
+        }
+        return true;
+    }
     let corona_open = matches!(
         app.editing.asset.as_ref(),
         Some(EditingAsset::Dff(dff)) if dff.dff_2dfx_corona_preset_picker_open
@@ -28856,6 +30684,7 @@ fn handle_editing_2dfx_modal_click(app: &mut AppState, mouse: Vec2) -> bool {
         if editing_dff_2dfx_type_picker_close_rect().contains(mouse) {
             if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
                 dff.dff_2dfx_type_picker_open = false;
+                dff.dff_2dfx_pending_add_position = None;
             }
             return true;
         }
@@ -28903,6 +30732,7 @@ fn handle_editing_2dfx_modal_click(app: &mut AppState, mouse: Vec2) -> bool {
             && let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut()
         {
             dff.dff_2dfx_type_picker_open = false;
+            dff.dff_2dfx_pending_add_position = None;
         }
         return true;
     }
@@ -29385,6 +31215,34 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 app.editing.nested_scroll_focus == Some(EditingNestedScrollFocus::DffMaterials);
             if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
                 let layout = dff_panel_layout(dff, emitter, lighting_entry_count);
+                if layout
+                    .internal_component_list
+                    .is_some_and(|list| list.contains(mouse))
+                {
+                    let max_scroll = dff
+                        .raw
+                        .components
+                        .len()
+                        .saturating_sub(layout.internal_component_visible.max(1))
+                        as f32;
+                    dff.internal_component_scroll =
+                        (dff.internal_component_scroll - wheel_y * 3.0).clamp(0.0, max_scroll);
+                    return true;
+                }
+                if layout
+                    .vehicle_frame_list
+                    .is_some_and(|list| list.contains(mouse))
+                {
+                    let max_scroll = dff
+                        .raw
+                        .frames
+                        .len()
+                        .saturating_sub(layout.vehicle_frame_visible.max(1))
+                        as f32;
+                    dff.vehicle_frame_scroll =
+                        (dff.vehicle_frame_scroll - wheel_y * 3.0).clamp(0.0, max_scroll);
+                    return true;
+                }
                 if material_list_focused
                     && layout
                         .material_list
@@ -29457,6 +31315,44 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
     {
         let emitter = selected_material_emitter(app);
         let layout = dff_panel_layout(dff, emitter, dff_face_emitter_entries(app, &dff.name).len());
+        let vehicle_color_drag = layout.vehicle_preview_colors.and_then(|colors| {
+            colors.iter().enumerate().find_map(|(slot, bars)| {
+                bars.iter().enumerate().find_map(|(channel, rect)| {
+                    if !rect.contains(mouse) {
+                        return None;
+                    }
+                    let slider_x = rect.x + 22.0;
+                    let slider_w = (rect.w - 66.0).max(1.0);
+                    Some((
+                        slot,
+                        channel,
+                        ((mouse.x - slider_x) / slider_w).clamp(0.0, 1.0),
+                    ))
+                })
+            })
+        });
+        if let Some((slot, channel, value)) = vehicle_color_drag {
+            if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                let color = if slot == 0 {
+                    &mut dff.vehicle_preview.body_a
+                } else {
+                    &mut dff.vehicle_preview.body_b
+                };
+                match channel {
+                    0 => color.x = value,
+                    1 => color.y = value,
+                    _ => color.z = value,
+                }
+            }
+            apply_editing_vehicle_body_color(app, slot);
+            app.status_message = format!(
+                "Vehicle Body {} {} {:.0}",
+                if slot == 0 { "A" } else { "B" },
+                ["red", "green", "blue"][channel],
+                value * 255.0
+            );
+            return true;
+        }
         // Resolve the drag against the material colour bars while `dff` is still
         // borrowed, then release it before touching `app` mutably below.
         let material_color_drag = layout.material_color.and_then(|bars| {
@@ -30154,6 +32050,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         if editing_dff_2dfx_type_picker_close_rect().contains(mouse) {
             if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
                 dff.dff_2dfx_type_picker_open = false;
+                dff.dff_2dfx_pending_add_position = None;
             }
             return true;
         }
@@ -30203,6 +32100,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
         if !popup.contains(mouse) {
             if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
                 dff.dff_2dfx_type_picker_open = false;
+                dff.dff_2dfx_pending_add_position = None;
             }
         }
         return true;
@@ -30406,6 +32304,10 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             }
             if layout.add_2dfx.is_some_and(|rect| rect.contains(mouse)) {
                 if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                    dff.dff_2dfx_pending_add_position = dff
+                        .selected_2dfx
+                        .and_then(|idx| dff.raw.effects_2dfx.get(idx))
+                        .map(|effect| effect.position);
                     dff.selected_2dfx = None;
                     dff.dff_2dfx_type_picker_open = true;
                     dff.dff_2dfx_corona_preset_picker_open = false;
@@ -30434,6 +32336,7 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
             }
             if layout.type_2dfx.is_some_and(|rect| rect.contains(mouse)) {
                 if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                    dff.dff_2dfx_pending_add_position = None;
                     dff.dff_2dfx_type_picker_open = true;
                     dff.dff_2dfx_corona_preset_picker_open = false;
                     dff.dff_2dfx_type_picker_search.clear();
@@ -30548,6 +32451,136 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                 return true;
             }
             // Material rows.
+            if layout
+                .vehicle_convert
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                convert_editing_dff_to_vehicle(app);
+                return true;
+            }
+            if layout
+                .vehicle_validate
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let (issues, name, generated_collision) = match app.editing.asset.as_ref() {
+                    Some(EditingAsset::Dff(dff)) => (
+                        vehicle_validation_issues(&dff.raw),
+                        dff.name.clone(),
+                        dff.vehicle_collision_override.is_some(),
+                    ),
+                    _ => return true,
+                };
+                let has_collision = generated_collision
+                    || editing_dff_source_bytes(app, &name).is_some_and(|source| {
+                        parse_embedded_vehicle_collision(&source, &name).is_some()
+                    });
+                let errors = issues
+                    .iter()
+                    .filter(|issue| issue.severity == VehicleValidationSeverity::Error)
+                    .count();
+                let warnings = issues.len().saturating_sub(errors) + usize::from(!has_collision);
+                app.status_message = if errors == 0 && warnings == 0 {
+                    "Vehicle validation passed with no issues".to_string()
+                } else {
+                    format!(
+                        "Vehicle validation: {errors} error{}, {warnings} warning{}{}",
+                        if errors == 1 { "" } else { "s" },
+                        if warnings == 1 { "" } else { "s" },
+                        if has_collision {
+                            ""
+                        } else {
+                            " (embedded collision missing)"
+                        }
+                    )
+                };
+                return true;
+            }
+            if let Some(list) = layout.vehicle_frame_list
+                && list.contains(mouse)
+            {
+                if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                    let visible = layout.vehicle_frame_visible.max(1);
+                    let max_start = dff.raw.frames.len().saturating_sub(visible);
+                    let start = (dff.vehicle_frame_scroll.floor().max(0.0) as usize).min(max_start);
+                    let row = ((mouse.y - list.y) / DFF_LIGHT_ROW_H).floor().max(0.0) as usize;
+                    if start + row < dff.raw.frames.len() {
+                        dff.selected_vehicle_frame = start + row;
+                    }
+                }
+                return true;
+            }
+            if layout
+                .vehicle_add_dummy
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                    dff.vehicle_dummy_preset_picker_open = true;
+                    dff.vehicle_material_preset_picker_open = false;
+                }
+                return true;
+            }
+            if layout
+                .vehicle_parent_component
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if parent_selected_component_to_vehicle_dummy(app) {
+                    commit_editing_history(app, "Parent Vehicle Component", before);
+                    refresh_editing_dff_preview(app);
+                }
+                return true;
+            }
+            if layout
+                .vehicle_position_dummy
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let before = editing_history_snapshot(app);
+                if position_selected_vehicle_dummy_from_selection(app) {
+                    commit_editing_history(app, "Position Vehicle Dummy", before);
+                    refresh_editing_dff_preview(app);
+                }
+                return true;
+            }
+            if layout
+                .vehicle_generate_collision
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                generate_editing_vehicle_collision(app);
+                return true;
+            }
+            if layout
+                .vehicle_generate_vlo
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                generate_editing_vehicle_vlo(app);
+                return true;
+            }
+            if layout
+                .vehicle_preview_lights
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                    dff.vehicle_preview.lights_on = !dff.vehicle_preview.lights_on;
+                }
+                refresh_editing_dff_preview(app);
+                app.status_message = match app.editing.asset.as_ref() {
+                    Some(EditingAsset::Dff(dff)) if dff.vehicle_preview.lights_on => {
+                        "Vehicle light preview enabled".to_string()
+                    }
+                    _ => "Vehicle light preview disabled".to_string(),
+                };
+                return true;
+            }
+            if layout
+                .vehicle_material_preset
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                if let Some(EditingAsset::Dff(dff)) = app.editing.asset.as_mut() {
+                    dff.vehicle_material_preset_picker_open = true;
+                    dff.vehicle_dummy_preset_picker_open = false;
+                }
+                return true;
+            }
             if let Some(list) = layout.material_list {
                 if list.contains(mouse) {
                     app.editing.nested_scroll_focus = Some(EditingNestedScrollFocus::DffMaterials);
@@ -31182,6 +33215,84 @@ pub(crate) fn handle_editing_click(app: &mut AppState, mouse: Vec2) -> bool {
                     commit_editing_history(app, "Duplicate DFF Material", before);
                 }
                 return true;
+            }
+            if let Some(list) = layout.internal_component_list
+                && list.contains(mouse)
+            {
+                let selected = match app.editing.asset.as_ref() {
+                    Some(EditingAsset::Dff(dff)) => {
+                        let visible = layout.internal_component_visible.max(1);
+                        let start = (dff.internal_component_scroll.floor().max(0.0) as usize)
+                            .min(dff.raw.components.len().saturating_sub(visible));
+                        let row = ((mouse.y - list.y) / DFF_LIGHT_ROW_H).floor() as usize;
+                        (start + row < dff.raw.components.len()).then_some(start + row)
+                    }
+                    _ => None,
+                };
+                if let Some(index) = selected {
+                    select_dff_internal_component(app, index);
+                }
+                return true;
+            }
+            if layout
+                .select_internal_element
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                let selected = match app.editing.asset.as_ref() {
+                    Some(EditingAsset::Dff(dff)) => selected_dff_internal_component(dff),
+                    _ => None,
+                };
+                if let Some(index) = selected {
+                    select_dff_internal_component(app, index);
+                } else {
+                    app.status_message = "Select an internal element first".to_string();
+                }
+                return true;
+            }
+            if layout
+                .separate_internal_element
+                .is_some_and(|rect| rect.contains(mouse))
+            {
+                open_dff_internal_element_dialog(app);
+                return true;
+            }
+            for (rect, target, label) in [
+                (
+                    layout.internal_pivot_selection,
+                    InternalPivotTarget::Selection,
+                    "Internal Pivot to Selection",
+                ),
+                (
+                    layout.internal_pivot_bounds,
+                    InternalPivotTarget::Bounds,
+                    "Internal Pivot to Bounds",
+                ),
+                (
+                    layout.internal_pivot_origin,
+                    InternalPivotTarget::Origin,
+                    "Internal Pivot to Origin",
+                ),
+            ] {
+                if rect.is_some_and(|rect| rect.contains(mouse)) {
+                    let before = editing_history_snapshot(app);
+                    if set_dff_internal_pivot(app, target) {
+                        commit_editing_history(app, label, before);
+                        refresh_editing_dff_preview(app);
+                    }
+                    return true;
+                }
+            }
+            if let Some(rotate) = layout.internal_pivot_rotate {
+                for (index, rect) in rotate.into_iter().enumerate() {
+                    if rect.contains(mouse) {
+                        let before = editing_history_snapshot(app);
+                        if rotate_dff_internal_pivot(app, index / 2, index % 2 == 1) {
+                            commit_editing_history(app, "Rotate Internal Pivot", before);
+                            refresh_editing_dff_preview(app);
+                        }
+                        return true;
+                    }
+                }
             }
             if layout
                 .separate_faces
@@ -34070,6 +36181,24 @@ fn dff_mesh_tooltip(label: &str) -> &'static str {
         "Separate from Object" => {
             "Move the selected faces into a new DFF while leaving the remaining faces here."
         }
+        "Select Internal Element" => {
+            "Select every face belonging to the highlighted same-DFF component."
+        }
+        "Separate Internal Element" => {
+            "Keep the selected faces in this DFF but give them an independent atomic, frame, and pivot."
+        }
+        "Pivot: Selection" => {
+            "Move only the internal element's pivot to the current geometry selection without moving its vertices."
+        }
+        "Pivot: Element" => {
+            "Move only the internal element's pivot to its own bounds center without moving its vertices."
+        }
+        "Pivot: Origin" => {
+            "Move only the internal element's pivot to object origin without moving its vertices."
+        }
+        "Rotate Internal Pivot" => {
+            "Rotate the internal element's local pivot axes by 90 degrees without moving its geometry."
+        }
         "Split Material Limit" => {
             "Split this DFF into co-located elements with at most 152 materials each, preserving collision on the original."
         }
@@ -34255,6 +36384,24 @@ fn editor_tooltip(key: &str) -> &'static str {
         "dff.cutter_clear" => "Remove the active boolean cutter without changing more geometry.",
         "dff.cutter_resize" => "Resize the cutter along this axis.",
         "dff.generate_lod" => "Generate a lower-detail model from this DFF.",
+        "dff.vehicle_convert" => {
+            "Create a GTA:SA vehicle frame scaffold from this ordinary DFF, including chassis and wheel dummies."
+        }
+        "dff.vehicle_validate" => {
+            "Check required vehicle frames, hierarchy, chassis geometry, chassis_vlo, and paired light markers."
+        }
+        "dff.vehicle_dummy" => {
+            "Add, select, position, or parent geometry to a stock GTA:SA vehicle frame."
+        }
+        "dff.vehicle_collision" => {
+            "Generate stock-style embedded vehicle collision using a curved shell and component-marked spheres."
+        }
+        "dff.vehicle_vlo" => {
+            "Generate or replace the embedded chassis_vlo low-detail vehicle component."
+        }
+        "dff.vehicle_material" => {
+            "Assign a stock GTA:SA vehicle paint, side-specific light, timed light, or strobe marker to this material."
+        }
         "dff.optimize" => {
             "Open repair and optimization options for the DFF geometry and materials."
         }
@@ -34435,6 +36582,14 @@ fn draw_dff_editor_tooltips(font: &Font, layout: &DffPanelLayout) {
     tip!(cutter_clear, "dff.cutter_clear");
     tips!(cutter_resize, "dff.cutter_resize");
     tip!(generate_lod, "dff.generate_lod");
+    tip!(vehicle_convert, "dff.vehicle_convert");
+    tip!(vehicle_validate, "dff.vehicle_validate");
+    tip!(vehicle_add_dummy, "dff.vehicle_dummy");
+    tip!(vehicle_parent_component, "dff.vehicle_dummy");
+    tip!(vehicle_position_dummy, "dff.vehicle_dummy");
+    tip!(vehicle_generate_collision, "dff.vehicle_collision");
+    tip!(vehicle_generate_vlo, "dff.vehicle_vlo");
+    tip!(vehicle_material_preset, "dff.vehicle_material");
     tip!(optimize_dff, "dff.optimize");
     tip!(pair_txd, "dff.pair_txd");
     draw_editor_tooltip(font, layout.generate_collision, "dff.generate_collision");
@@ -34617,23 +36772,35 @@ pub(crate) fn dff_section_header_button(
 
 /// Draw a compact Blender-style icon tab. Rotated text is difficult to read
 /// with the editor font, so category names are surfaced in a hover tooltip.
-fn dff_side_tab_button(rect: Rect, icon: &Texture2D, active: bool) -> bool {
+fn dff_side_tab_button(rect: Rect, icon: &Texture2D, active: bool, available: bool) -> bool {
     let mouse: Vec2 = mouse_position().into();
     let hovered = !scrollbar_hover_suppressed() && rect.contains(mouse);
-    let bg = if active {
+    let bg = if !available {
+        Color::new(0.035, 0.040, 0.046, 0.96)
+    } else if active {
         ui_surface_active()
     } else if hovered {
         ui_surface_hover()
     } else {
         ui_surface()
     };
-    let border = if active { ui_accent() } else { ui_border() };
+    let border = if active && available {
+        ui_accent()
+    } else {
+        ui_border()
+    };
     draw_rrect_bordered(rect.x, rect.y, rect.w, rect.h, 6.0, 1.0, bg, border);
     draw_texture_ex(
         icon,
         rect.x + (rect.w - 18.0) * 0.5,
         rect.y + (rect.h - 18.0) * 0.5,
-        if active { WHITE } else { ui_dim() },
+        if active && available {
+            WHITE
+        } else if available {
+            ui_dim()
+        } else {
+            Color::new(0.25, 0.28, 0.31, 1.0)
+        },
         DrawTextureParams {
             dest_size: Some(vec2(18.0, 18.0)),
             ..Default::default()
@@ -34810,10 +36977,24 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             1 => &app.icons.texture,
             2 => &app.icons.vertex,
             3 => &app.icons.face,
+            5 => &app.icons.cube,
             _ => &app.icons.tool,
         };
-        if dff_side_tab_button(*rect, icon, dff.panel_tab.min(DFF_TAB_COUNT - 1) == index) {
-            hovered_tab = Some((*rect, DFF_TAB_TITLES[index]));
+        let available = index != 5 || dff_looks_like_vehicle(&dff.raw);
+        if dff_side_tab_button(
+            *rect,
+            icon,
+            dff.panel_tab.min(DFF_TAB_COUNT - 1) == index,
+            available,
+        ) {
+            hovered_tab = Some((
+                *rect,
+                if index == 5 && !available {
+                    "Vehicle · Click to convert this DFF"
+                } else {
+                    DFF_TAB_TITLES[index]
+                },
+            ));
         }
     }
 
@@ -35195,6 +37376,263 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
             header.y + DFF_SEC_HEADER_H + 20.0,
             14,
             ui_muted(),
+        );
+    }
+
+    if let Some(rect) = layout.vehicle_convert {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.duplicate,
+            "Convert This DFF to a Vehicle",
+            false,
+            false,
+        );
+    }
+    if let Some(rect) = layout.vehicle_validate {
+        let issues = vehicle_validation_issues(&dff.raw);
+        let errors = issues
+            .iter()
+            .filter(|issue| issue.severity == VehicleValidationSeverity::Error)
+            .count();
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.select,
+            if issues.is_empty() {
+                "Validate Vehicle · Passed"
+            } else if errors > 0 {
+                "Validate Vehicle · Errors"
+            } else {
+                "Validate Vehicle · Warnings"
+            },
+            issues.is_empty(),
+            false,
+        );
+        for (issue, row) in issues.iter().zip(&layout.vehicle_validation_rows) {
+            let color = match issue.severity {
+                VehicleValidationSeverity::Error => RED,
+                VehicleValidationSeverity::Warning => ORANGE,
+            };
+            draw_rrect(row.x, row.y, row.w, row.h - 3.0, 5.0, ui_surface());
+            ui_text_size(
+                &app.ui_font,
+                match issue.severity {
+                    VehicleValidationSeverity::Error => "ERROR",
+                    VehicleValidationSeverity::Warning => "WARN",
+                },
+                row.x + 8.0,
+                row.y + 20.0,
+                12,
+                color,
+            );
+            ui_text_size(
+                &app.ui_font,
+                &ellipsize_width(&issue.message, 14, row.w - 64.0),
+                row.x + 58.0,
+                row.y + 20.0,
+                14,
+                WHITE,
+            );
+        }
+    }
+
+    if let Some(list) = layout.vehicle_frame_list {
+        let visible = layout.vehicle_frame_visible.max(1);
+        let max_start = dff.raw.frames.len().saturating_sub(visible);
+        let start = (dff.vehicle_frame_scroll.floor().max(0.0) as usize).min(max_start);
+        if dff.raw.frames.is_empty() {
+            ui_text_size(
+                &app.ui_font,
+                "No frames yet — add a preset dummy to create the hierarchy.",
+                list.x + 8.0,
+                list.y + 21.0,
+                14,
+                ui_muted(),
+            );
+        }
+        for row in 0..visible.min(dff.raw.frames.len()) {
+            let index = start + row;
+            let Some(frame) = dff.raw.frames.get(index) else {
+                break;
+            };
+            let rect = Rect::new(
+                list.x,
+                list.y + row as f32 * DFF_LIGHT_ROW_H,
+                list.w,
+                DFF_LIGHT_ROW_H - 3.0,
+            );
+            let selected = index == dff.selected_vehicle_frame;
+            if selected || rect.contains(mouse) {
+                draw_rrect(
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    rect.h,
+                    5.0,
+                    if selected {
+                        ui_surface_active()
+                    } else {
+                        ui_surface_hover()
+                    },
+                );
+            }
+            let parent = (frame.parent >= 0)
+                .then(|| dff.raw.frames.get(frame.parent as usize))
+                .flatten()
+                .map(|parent| parent.name.as_str())
+                .unwrap_or("root");
+            ui_text(
+                &app.ui_font,
+                &ellipsize_width(&frame.name, 15, rect.w - 170.0),
+                rect.x + 8.0,
+                rect.y + 20.0,
+                if selected { ui_accent() } else { WHITE },
+            );
+            ui_text_size(
+                &app.ui_font,
+                &ellipsize_width(&format!("parent: {parent}"), 13, 150.0),
+                rect.x + rect.w - 156.0,
+                rect.y + 20.0,
+                13,
+                ui_muted(),
+            );
+        }
+    }
+    if let Some(rect) = layout.vehicle_add_dummy {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.duplicate,
+            "Add Preset Dummy...",
+            dff.vehicle_dummy_preset_picker_open,
+            false,
+        );
+    }
+    if let Some(rect) = layout.vehicle_parent_component {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.select,
+            "Parent Component",
+            false,
+            false,
+        );
+    }
+    if let Some(rect) = layout.vehicle_position_dummy {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.move_tool,
+            "Move Selected Dummy to Geometry Selection",
+            false,
+            false,
+        );
+    }
+    if let Some(rect) = layout.vehicle_generate_collision {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.cube,
+            if dff.vehicle_collision_override.is_some() {
+                "Regenerate Stock-Style Vehicle Collision"
+            } else {
+                "Generate Stock-Style Vehicle Collision"
+            },
+            dff.vehicle_collision_override.is_some(),
+            false,
+        );
+    }
+    if let Some(rect) = layout.vehicle_generate_vlo {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.cube,
+            if dff
+                .raw
+                .components
+                .iter()
+                .any(|component| lower(&component.name).contains("_vlo"))
+            {
+                "Regenerate chassis_vlo Vehicle LOD"
+            } else {
+                "Generate chassis_vlo Vehicle LOD"
+            },
+            false,
+            false,
+        );
+    }
+
+    // Vehicle paint is a preview override: keep the GTA marker materials in
+    // the DFF while showing the colors players will actually see in game.
+    if let Some(colors) = layout.vehicle_preview_colors {
+        for (slot, bars) in colors.iter().enumerate() {
+            let color = if slot == 0 {
+                dff.vehicle_preview.body_a
+            } else {
+                dff.vehicle_preview.body_b
+            };
+            ui_text_size(
+                &app.ui_font,
+                if slot == 0 {
+                    "Vehicle Body A"
+                } else {
+                    "Vehicle Body B"
+                },
+                bars[0].x,
+                bars[0].y - 8.0,
+                14,
+                ui_dim(),
+            );
+            for (channel, (label, tint, value)) in [
+                ("R", RED, color.x),
+                ("G", GREEN, color.y),
+                ("B", BLUE, color.z),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let rect = bars[channel];
+                ui_text(
+                    &app.ui_font,
+                    label,
+                    rect.x + 5.0,
+                    rect.y + rect.h - 6.0,
+                    WHITE,
+                );
+                let slider = Rect::new(rect.x + 22.0, rect.y, rect.w - 66.0, rect.h);
+                draw_color_channel_slider(slider, tint, value.clamp(0.0, 1.0), 1.0);
+                ui_text_size(
+                    &app.ui_font,
+                    &format!("{:.0}", value.clamp(0.0, 1.0) * 255.0),
+                    rect.x + rect.w - 36.0,
+                    rect.y + rect.h - 6.0,
+                    14,
+                    ui_muted(),
+                );
+            }
+        }
+    }
+    if let Some(rect) = layout.vehicle_preview_lights {
+        text_button(
+            &app.ui_font,
+            rect,
+            if dff.vehicle_preview.lights_on {
+                "Vehicle Lights: On"
+            } else {
+                "Vehicle Lights: Off"
+            },
+            dff.vehicle_preview.lights_on,
+        );
+    }
+    if let Some(rect) = layout.vehicle_material_preset {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.texture,
+            "Set Vehicle / Light Material Preset...",
+            dff.vehicle_material_preset_picker_open,
+            false,
         );
     }
 
@@ -36276,6 +38714,119 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         );
         draw_dff_mesh_tooltip(&app.ui_font, rect, "Duplicate Material");
     }
+    if let Some(list) = layout.internal_component_list {
+        let visible = layout.internal_component_visible.max(1);
+        let start = (dff.internal_component_scroll.floor().max(0.0) as usize)
+            .min(dff.raw.components.len().saturating_sub(visible));
+        if dff.raw.components.is_empty() {
+            ui_text_size(
+                &app.ui_font,
+                "No internal elements yet",
+                list.x + 8.0,
+                list.y + 21.0,
+                14,
+                ui_muted(),
+            );
+        }
+        for row in 0..visible.min(dff.raw.components.len()) {
+            let index = start + row;
+            let component = &dff.raw.components[index];
+            let rect = Rect::new(
+                list.x,
+                list.y + row as f32 * DFF_LIGHT_ROW_H,
+                list.w,
+                DFF_LIGHT_ROW_H - 3.0,
+            );
+            let selected = Some(index) == selected_dff_internal_component(dff);
+            if selected || rect.contains(mouse_position().into()) {
+                draw_rrect(
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    rect.h,
+                    5.0,
+                    if selected {
+                        ui_surface_active()
+                    } else {
+                        ui_surface_hover()
+                    },
+                );
+            }
+            let frame = component
+                .frame_index
+                .and_then(|frame| dff.raw.frames.get(frame))
+                .map(|frame| frame.name.as_str())
+                .unwrap_or("unframed");
+            ui_text(
+                &app.ui_font,
+                &ellipsize_width(&component.name, 15, rect.w - 128.0),
+                rect.x + 8.0,
+                rect.y + 20.0,
+                if selected { ui_accent() } else { WHITE },
+            );
+            ui_text_size(
+                &app.ui_font,
+                &ellipsize_width(
+                    &format!(
+                        "{} faces · {frame}",
+                        component.tri_end.saturating_sub(component.tri_start)
+                    ),
+                    12,
+                    120.0,
+                ),
+                rect.x + rect.w - 124.0,
+                rect.y + 20.0,
+                12,
+                ui_muted(),
+            );
+        }
+    }
+    if let Some(rect) = layout.select_internal_element {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.select,
+            "Select Element",
+            false,
+            dff.raw.components.is_empty(),
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Select Internal Element");
+    }
+    if let Some(rect) = layout.separate_internal_element {
+        editing_action_button(
+            &app.ui_font,
+            rect,
+            &app.icons.duplicate,
+            "Separate Internal",
+            false,
+            dff_selected_face_set(dff).is_empty(),
+        );
+        draw_dff_mesh_tooltip(&app.ui_font, rect, "Separate Internal Element");
+    }
+    for (rect, label) in [
+        (layout.internal_pivot_selection, "Pivot: Selection"),
+        (layout.internal_pivot_bounds, "Pivot: Element"),
+        (layout.internal_pivot_origin, "Pivot: Origin"),
+    ] {
+        if let Some(rect) = rect {
+            editing_action_button(
+                &app.ui_font,
+                rect,
+                &app.icons.move_tool,
+                label,
+                false,
+                dff.raw.components.is_empty(),
+            );
+            draw_dff_mesh_tooltip(&app.ui_font, rect, label);
+        }
+    }
+    if let Some(rotate) = layout.internal_pivot_rotate {
+        for (index, rect) in rotate.into_iter().enumerate() {
+            let label = ["X−", "X+", "Y−", "Y+", "Z−", "Z+"][index];
+            text_button(&app.ui_font, rect, label, false);
+            draw_dff_mesh_tooltip(&app.ui_font, rect, "Rotate Internal Pivot");
+        }
+    }
     if let Some(rect) = layout.separate_faces {
         editing_action_button(
             &app.ui_font,
@@ -36462,6 +39013,8 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
         || dff.dff_2dfx_type_picker_open
         || dff.dff_2dfx_corona_preset_picker_open
         || dff.dff_2dfx_payload_editor_open
+        || dff.vehicle_material_preset_picker_open
+        || dff.vehicle_dummy_preset_picker_open
         || dff.collision_material_picker_open;
     if !panel_popup_open {
         draw_dff_editor_tooltips(&app.ui_font, &layout);
@@ -36472,9 +39025,108 @@ fn draw_dff_asset(app: &AppState, right: Rect, dff: &EditingDffState) {
     draw_dff_2dfx_corona_preset_popup(app, dff);
     draw_dff_2dfx_payload_editor_popup(app, dff);
     draw_dff_collision_material_picker(app, dff);
+    draw_dff_vehicle_preset_popup(app, dff);
     if let Some((rect, label)) = hovered_tab {
         draw_text_tooltip(&app.ui_font, rect, label);
     }
+}
+
+fn draw_dff_vehicle_preset_popup(app: &AppState, dff: &EditingDffState) {
+    let (title, material_mode, count) = if dff.vehicle_material_preset_picker_open {
+        (
+            "Vehicle Material Presets",
+            true,
+            VEHICLE_MATERIAL_PRESETS.len(),
+        )
+    } else if dff.vehicle_dummy_preset_picker_open {
+        ("Vehicle Dummy Presets", false, VEHICLE_DUMMY_PRESETS.len())
+    } else {
+        return;
+    };
+    draw_rectangle(
+        0.0,
+        TOP_H,
+        screen_width(),
+        screen_height() - TOP_H - STATUS_H,
+        Color::new(0.0, 0.0, 0.0, 0.42),
+    );
+    let popup = editing_vehicle_preset_dialog_rect();
+    draw_rrect_bordered(
+        popup.x,
+        popup.y,
+        popup.w,
+        popup.h,
+        10.0,
+        1.0,
+        Color::new(0.030, 0.036, 0.046, 0.99),
+        ui_accent(),
+    );
+    ui_text_bold(title, popup.x + 24.0, popup.y + 34.0, 19, WHITE);
+    let mouse: Vec2 = mouse_position().into();
+    for index in 0..count {
+        let rect = editing_vehicle_preset_option_rect(index, count);
+        let hovered = rect.contains(mouse);
+        draw_rrect_bordered(
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            5.0,
+            1.0,
+            if hovered {
+                ui_surface_hover()
+            } else {
+                ui_surface()
+            },
+            if hovered { ui_accent() } else { ui_border() },
+        );
+        if material_mode {
+            let preset = VEHICLE_MATERIAL_PRESETS[index];
+            let swatch = Rect::new(rect.x + 5.0, rect.y + 5.0, 17.0, 17.0);
+            draw_rrect_bordered(
+                swatch.x,
+                swatch.y,
+                swatch.w,
+                swatch.h,
+                3.0,
+                1.0,
+                Color::from_rgba(preset.rgb[0], preset.rgb[1], preset.rgb[2], 255),
+                WHITE,
+            );
+            ui_text_size(
+                &app.ui_font,
+                &ellipsize_width(preset.label, 14, rect.w - 34.0),
+                rect.x + 28.0,
+                rect.y + 19.0,
+                14,
+                WHITE,
+            );
+        } else {
+            let preset = VEHICLE_DUMMY_PRESETS[index];
+            ui_text_size(
+                &app.ui_font,
+                &ellipsize_width(preset.label, 14, rect.w * 0.48),
+                rect.x + 8.0,
+                rect.y + 19.0,
+                14,
+                WHITE,
+            );
+            ui_text_size(
+                &app.ui_font,
+                &ellipsize_width(preset.name, 13, rect.w * 0.48),
+                rect.x + rect.w * 0.52,
+                rect.y + 19.0,
+                13,
+                ui_accent(),
+            );
+        }
+    }
+    text_button(
+        &app.ui_font,
+        editing_vehicle_preset_close_rect(),
+        "Close",
+        false,
+    );
 }
 
 fn draw_dff_2dfx_corona_preset_popup(app: &AppState, dff: &EditingDffState) {
@@ -38073,6 +40725,485 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vehicle_customization_is_offered_only_for_marker_materials() {
+        let ordinary = RawMesh {
+            materials: vec![RawMaterial {
+                color: neutral_vertex_color(),
+                ..default_dff_material()
+            }],
+            ..RawMesh::default()
+        };
+        let vehicle = RawMesh {
+            materials: vec![RawMaterial {
+                color: V3 {
+                    x: 60.0 / 255.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                ..default_dff_material()
+            }],
+            ..RawMesh::default()
+        };
+
+        assert!(!dff_looks_like_vehicle(&ordinary));
+        assert!(dff_looks_like_vehicle(&vehicle));
+    }
+
+    #[test]
+    fn vehicle_customization_recognizes_stock_frame_hierarchies() {
+        let raw = RawMesh {
+            frames: vec![identity_vehicle_frame(
+                "wheel_rf_dummy".to_string(),
+                -1,
+                V3::default(),
+            )],
+            ..RawMesh::default()
+        };
+
+        assert!(dff_looks_like_vehicle(&raw));
+    }
+
+    #[test]
+    fn vehicle_material_presets_keep_distinct_sa_light_markers() {
+        let marker = |label: &str| {
+            VEHICLE_MATERIAL_PRESETS
+                .iter()
+                .find(|preset| preset.label == label)
+                .expect("vehicle material preset")
+                .rgb
+        };
+
+        assert_eq!(marker("Headlight Front Left"), [255, 175, 0]);
+        assert_eq!(marker("Headlight Front Right"), [0, 255, 200]);
+        assert_eq!(marker("Taillight Rear Left"), [185, 255, 0]);
+        assert_eq!(marker("Taillight Rear Right"), [255, 60, 0]);
+        assert_ne!(marker("Indicator Front Left"), marker("Brake Left"));
+        assert_eq!(marker("Night Only Light"), [0, 16, 255]);
+    }
+
+    #[test]
+    fn vehicle_dummy_presets_cover_core_car_hierarchy() {
+        let names = VEHICLE_DUMMY_PRESETS
+            .iter()
+            .map(|preset| preset.name)
+            .collect::<BTreeSet<_>>();
+
+        for expected in [
+            "chassis_dummy",
+            "wheel_lf_dummy",
+            "wheel_rf_dummy",
+            "wheel_lb_dummy",
+            "wheel_rb_dummy",
+            "door_lf_dummy",
+            "door_rf_dummy",
+            "bump_front_dummy",
+            "bump_rear_dummy",
+            "bonnet_dummy",
+            "boot_dummy",
+            "engine",
+            "headlights",
+            "taillights",
+        ] {
+            assert!(names.contains(expected), "missing {expected}");
+        }
+        assert!(vehicle_dummy_uses_chassis_parent("door_lf_dummy"));
+        assert!(!vehicle_dummy_uses_chassis_parent("wheel_lf_dummy"));
+    }
+
+    #[test]
+    fn vehicle_tools_live_on_the_dedicated_sixth_tab() {
+        assert_eq!(DFF_TAB_TITLES[5], "Vehicle");
+        assert_eq!(DffSection::VehicleSetup.tab(), 5);
+        assert_ne!(DffSection::Materials.tab(), DffSection::VehicleSetup.tab());
+    }
+
+    #[test]
+    fn vehicle_validator_reports_required_car_frames_and_vlo() {
+        let issues = vehicle_validation_issues(&RawMesh::default());
+        let messages = issues
+            .iter()
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(messages.contains(&"Missing chassis_dummy"));
+        assert!(messages.contains(&"No recognized car or bike wheel dummy layout"));
+        assert!(messages.contains(&"Missing chassis_vlo vehicle low-detail model"));
+    }
+
+    #[test]
+    fn vehicle_validator_accepts_a_complete_core_hierarchy() {
+        let frame = |name: &str, parent: i32| {
+            identity_vehicle_frame(name.to_string(), parent, V3::default())
+        };
+        let raw = RawMesh {
+            vertices: vec![
+                V3::default(),
+                V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+            ],
+            triangles: vec![Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 0,
+            }],
+            materials: vec![RawMaterial {
+                color: V3 {
+                    x: 60.0 / 255.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                ..RawMaterial::default()
+            }],
+            frames: vec![
+                frame("testcar", -1),
+                frame("chassis_dummy", 0),
+                frame("chassis", 1),
+                frame("wheel_lf_dummy", 0),
+                frame("wheel_rf_dummy", 0),
+                frame("wheel_lb_dummy", 0),
+                frame("wheel_rb_dummy", 0),
+                frame("chassis_vlo", 0),
+            ],
+            components: vec![
+                RawMeshComponent {
+                    name: "chassis".to_string(),
+                    frame_index: Some(2),
+                    vertex_start: 0,
+                    vertex_end: 3,
+                    tri_start: 0,
+                    tri_end: 1,
+                    breakable: None,
+                },
+                RawMeshComponent {
+                    name: "chassis_vlo".to_string(),
+                    frame_index: Some(7),
+                    vertex_start: 0,
+                    vertex_end: 3,
+                    tri_start: 0,
+                    tri_end: 1,
+                    breakable: None,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        assert!(
+            vehicle_validation_issues(&raw)
+                .iter()
+                .all(|issue| issue.severity != VehicleValidationSeverity::Error)
+        );
+    }
+
+    #[test]
+    fn replacing_vehicle_vlo_keeps_high_detail_component_ranges_valid() {
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3::default(),
+                V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 3.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 2.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 5,
+                    material: 0,
+                },
+            ],
+            components: vec![
+                RawMeshComponent {
+                    name: "chassis".to_string(),
+                    vertex_start: 0,
+                    vertex_end: 3,
+                    tri_start: 0,
+                    tri_end: 1,
+                    ..RawMeshComponent::default()
+                },
+                RawMeshComponent {
+                    name: "chassis_vlo".to_string(),
+                    vertex_start: 3,
+                    vertex_end: 6,
+                    tri_start: 1,
+                    tri_end: 2,
+                    ..RawMeshComponent::default()
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        remove_existing_vehicle_vlo(&mut raw);
+
+        assert_eq!(raw.triangles.len(), 1);
+        assert_eq!(raw.vertices.len(), 3);
+        assert_eq!(raw.components.len(), 1);
+        assert_eq!(raw.components[0].tri_start, 0);
+        assert_eq!(raw.components[0].tri_end, 1);
+        assert_eq!(raw.components[0].vertex_start, 0);
+        assert_eq!(raw.components[0].vertex_end, 3);
+    }
+
+    #[test]
+    fn installed_chassis_vlo_round_trips_as_an_embedded_vehicle_component() {
+        let triangle = Tri {
+            a: 0,
+            b: 1,
+            c: 2,
+            material: 0,
+        };
+        let vertices = vec![
+            V3::default(),
+            V3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            V3 {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+        ];
+        let mut raw = RawMesh {
+            vertices: vertices.clone(),
+            triangles: vec![triangle],
+            frames: vec![
+                identity_vehicle_frame("testcar".to_string(), -1, V3::default()),
+                identity_vehicle_frame("chassis_dummy".to_string(), 0, V3::default()),
+                identity_vehicle_frame("chassis".to_string(), 1, V3::default()),
+            ],
+            components: vec![RawMeshComponent {
+                name: "chassis".to_string(),
+                frame_index: Some(2),
+                vertex_start: 0,
+                vertex_end: 3,
+                tri_start: 0,
+                tri_end: 1,
+                breakable: None,
+            }],
+            ..RawMesh::default()
+        };
+        let vlo = RawMesh {
+            vertices,
+            triangles: vec![triangle],
+            ..RawMesh::default()
+        };
+
+        install_vehicle_vlo(&mut raw, &vlo);
+        let reparsed = parse_dff_mesh(&write_normalized_dff(&raw, "testcar").unwrap());
+
+        let component = reparsed
+            .components
+            .iter()
+            .find(|component| component.name == "chassis_vlo")
+            .expect("chassis_vlo component");
+        let frame = component
+            .frame_index
+            .and_then(|index| reparsed.frames.get(index))
+            .expect("chassis_vlo frame");
+        assert_eq!(frame.name, "chassis_vlo");
+        assert_eq!(frame.parent, 0);
+    }
+
+    #[test]
+    fn selected_faces_separate_into_a_same_dff_internal_element() {
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3::default(),
+                V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 3.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 4.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 3.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 5,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+
+        let result =
+            separate_raw_internal_element(&mut raw, &BTreeSet::from([1]), "wheel_rf", "testcar")
+                .unwrap();
+
+        assert_eq!(raw.components.len(), 2);
+        assert_eq!(raw.components[0].tri_start..raw.components[0].tri_end, 0..1);
+        assert_eq!(raw.components[1].tri_start..raw.components[1].tri_end, 1..2);
+        assert_eq!(raw.components[1].name, "wheel_rf");
+        assert_eq!(result.component_index, 1);
+        assert_eq!(result.faces, 1..2);
+        assert_eq!(raw.frames[result.frame_index].parent, 0);
+        assert!((raw.frames[result.frame_index].pos.x - 3.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn internal_pivot_position_and_axes_round_trip_without_moving_geometry() {
+        let mut raw = RawMesh {
+            vertices: vec![
+                V3::default(),
+                V3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 3.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 4.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 3.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+            ],
+            triangles: vec![
+                Tri {
+                    a: 0,
+                    b: 1,
+                    c: 2,
+                    material: 0,
+                },
+                Tri {
+                    a: 3,
+                    b: 4,
+                    c: 5,
+                    material: 0,
+                },
+            ],
+            ..RawMesh::default()
+        };
+        let expected = raw.vertices.clone();
+        let result =
+            separate_raw_internal_element(&mut raw, &BTreeSet::from([1]), "wheel_rf", "testcar")
+                .unwrap();
+        let frame = &mut raw.frames[result.frame_index];
+        frame.pos = V3 {
+            x: 9.0,
+            y: -2.0,
+            z: 1.0,
+        };
+        frame.right = V3 {
+            x: 0.0,
+            y: 1.0,
+            z: 0.0,
+        };
+        frame.up = V3 {
+            x: -1.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        frame.at = V3 {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        };
+
+        let parsed = parse_dff_mesh(&write_normalized_dff(&raw, "testcar").unwrap());
+
+        for vertex in expected {
+            assert!(parsed.vertices.iter().any(|candidate| {
+                (candidate.x - vertex.x).abs() < 0.001
+                    && (candidate.y - vertex.y).abs() < 0.001
+                    && (candidate.z - vertex.z).abs() < 0.001
+            }));
+        }
+        assert!(
+            parsed
+                .components
+                .iter()
+                .any(|component| component.name == "wheel_rf")
+        );
+    }
+
+    #[test]
+    fn internal_element_names_are_renderware_safe() {
+        assert_eq!(
+            sanitize_internal_element_name(" Front Right Wheel! "),
+            "Front_Right_Wheel"
+        );
+        assert!(sanitize_internal_element_name("abcdefghijklmnopqrstuvwxyz").len() <= 23);
+    }
+
+    #[test]
     fn two_edge_bridge_uses_shortest_total_connectors_without_a_bow_tie() {
         let points = [
             Vec3::new(0.0, 0.0, 0.0),
@@ -38973,6 +42104,12 @@ mod tests {
             "Merge by Distance",
             "Duplicate Material",
             "Delete Mat Faces",
+            "Select Internal Element",
+            "Separate Internal Element",
+            "Pivot: Selection",
+            "Pivot: Element",
+            "Pivot: Origin",
+            "Rotate Internal Pivot",
             "Separate from Object",
             "Split Material Limit",
             "Pivot to Selection",
@@ -39354,6 +42491,12 @@ mod tests {
             "dff.cutter_clear",
             "dff.cutter_resize",
             "dff.generate_lod",
+            "dff.vehicle_convert",
+            "dff.vehicle_validate",
+            "dff.vehicle_dummy",
+            "dff.vehicle_collision",
+            "dff.vehicle_vlo",
+            "dff.vehicle_material",
             "dff.optimize",
             "dff.pair_txd",
             "dff.generate_collision",
@@ -41218,6 +44361,47 @@ mod tests {
     }
 
     #[test]
+    fn new_2dfx_prefers_selected_effect_position_over_selected_face() {
+        let selected_position = V3 {
+            x: 12.5,
+            y: -3.0,
+            z: 7.25,
+        };
+        let raw = RawMesh {
+            vertices: vec![
+                V3::default(),
+                V3 {
+                    x: 3.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                V3 {
+                    x: 0.0,
+                    y: 3.0,
+                    z: 0.0,
+                },
+            ],
+            triangles: vec![Tri {
+                a: 0,
+                b: 1,
+                c: 2,
+                material: 0,
+            }],
+            effects_2dfx: vec![Dff2dEffect {
+                position: selected_position,
+                effect_id: 0,
+                payload: Vec::new(),
+            }],
+            ..RawMesh::default()
+        };
+
+        assert_eq!(
+            dff_2dfx_spawn_position(&raw, Some(0), Some(0)),
+            selected_position
+        );
+    }
+
+    #[test]
     fn road_sign_fields_encode_font_blanks_and_attribute_bits() {
         let mut payload = dff_2dfx_default_payload(7);
         assert_eq!(payload.len(), 88);
@@ -41563,6 +44747,7 @@ mod tests {
                 material_index: 0,
                 component: 0,
                 texture: 0,
+                lightmap_texture: 0,
                 texture_width: 0,
                 texture_height: 0,
                 texture_name: "lamp".to_string(),
@@ -41597,6 +44782,7 @@ mod tests {
                         z: 1.0,
                     },
                     uv: V2::default(),
+                    lightmap_uv: V2::default(),
                     color: day_color,
                     day_color,
                     night_color,

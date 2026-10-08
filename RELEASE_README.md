@@ -103,9 +103,11 @@ the MTA Tool Kit workflow and uses its own shared DFF/TXD code, so DragonFF and
 the separate Tool Kit add-on are not required. RRW Material Tools remains
 optional for advanced material authoring.
 
-Eagle checks `BLENDER_PATH` first, then `blender` on `PATH`, followed by common
-installation locations. If multiple Blender versions are installed, set
-`BLENDER_PATH` to the exact executable.
+Eagle checks the Blender install directory configured in **Preferences** first,
+then `BLENDER_PATH`, `blender` on `PATH`, and common installation locations. If
+multiple Blender versions are installed, choose its install directory in
+Preferences or set `BLENDER_PATH` to the executable. Preferences can also scan
+the common install locations and present every detected version for selection.
 
 Drag a saved `.blend` file onto an open Eagle map, or use **Import Blender**.
 The setup prompt controls visual chunk size, mesh splitting, and origin
@@ -150,3 +152,11 @@ details.
 ## License
 
 Eagle Editor is distributed under the GNU General Public License v3.0.
+
+## New in v0.1.8
+
+Open standard MTA map resources, register placement files through **Scene → Placement files…**, and create or reassign Eagle zones. Save modes preserve map destinations and unsupported XML data. **Default SA Map** in the Project Manager loads the installed game's exterior world for temporary preview; saving is disabled in this standalone mode.
+
+DFF Editing adds a dedicated Vehicle tab with hierarchy validation, material/dummy presets, embedded VLO and collision generation, plus same-DFF internal element and pivot tools. Preferences adds Blender installation selection/search and a Plugins tab. Material plugins are separate installs; no material plugin is bundled.
+
+See the [v0.1.8 release notes](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases/tag/v0.1.8) and [wiki](https://github.com/BlueEagle12/MTA-Eagle-Editor/wiki) for details.

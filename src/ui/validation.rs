@@ -20,7 +20,7 @@ fn validation_category_label(category: ValidationActionCategory) -> &'static str
     match category {
         ValidationActionCategory::Review => "Review",
         ValidationActionCategory::Repair => "Repair",
-        ValidationActionCategory::Optimize => "Project Assets",
+        ValidationActionCategory::Optimize => "Map Optimization",
         ValidationActionCategory::Collision => "Collision Setup",
     }
 }

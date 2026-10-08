@@ -34,3 +34,6 @@ pub(crate) use water_panel::*;
 
 pub(crate) mod panel_layout;
 pub(crate) use panel_layout::*;
+
+pub(crate) mod map_files;
+pub(crate) use map_files::*;

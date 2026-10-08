@@ -62,4 +62,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" release/github-upload/*.zip release/github-upload/*.tar.gz release/github-upload/SHA256SUMS.txt --generate-notes --verify-tag
+        run: |
+          awk -v tag="${GITHUB_REF_NAME}" '/^## / { if (found) exit; if ($2 == tag) { found=1; next } } found { print }' CHANGELOG.md > release/notes.md
+          test -s release/notes.md
+          gh release create "${GITHUB_REF_NAME}" release/github-upload/*.zip release/github-upload/*.tar.gz release/github-upload/SHA256SUMS.txt --title "${GITHUB_REF_NAME}" --notes-file release/notes.md --verify-tag

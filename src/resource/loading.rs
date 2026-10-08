@@ -140,6 +140,7 @@ pub(crate) fn compile_render_mesh(
             textures,
             texture_enabled,
         );
+        register_material_preview(texture, &tex_name, texture_files, textures);
         let (texture_width, texture_height) = if texture == 0 {
             (0, 0)
         } else {
@@ -182,7 +183,9 @@ pub(crate) fn compile_render_mesh(
                             .is_some_and(|alpha| *alpha < 0.98)
                     })
                 }));
-        let transparency = if material_alpha < 0.98 || has_vertex_alpha {
+        let transparency = if let Some(mode) = material_preview_transparency(texture) {
+            mode
+        } else if material_alpha < 0.98 || has_vertex_alpha {
             TransparencyMode::Blend
         } else {
             texture_transparency
@@ -242,6 +245,12 @@ pub(crate) fn compile_render_mesh(
                     pos: p,
                     normal: n,
                     uv,
+                    lightmap_uv: raw
+                        .secondary_uvs
+                        .first()
+                        .and_then(|uvs| uvs.get(i))
+                        .copied()
+                        .unwrap_or(V2 { u: 0.0, v: 0.0 }),
                     color: day_color,
                     day_color,
                     night_color,
@@ -253,6 +262,23 @@ pub(crate) fn compile_render_mesh(
                 });
             }
         }
+        let lightmap_key = format!("@lightmap:{}", lower(&tex_name));
+        let has_lightmap_uvs = raw
+            .secondary_uvs
+            .first()
+            .is_some_and(|uvs| uvs.len() == raw.vertices.len());
+        let lightmap_texture = if has_lightmap_uvs && texture_files.contains_key(&lightmap_key) {
+            load_texture_cached(
+                &lightmap_key,
+                None,
+                texture_files,
+                txd_textures,
+                textures,
+                texture_enabled,
+            )
+        } else {
+            0
+        };
         let mut part = RenderPart {
             list: 0,
             vbo: 0,
@@ -260,6 +286,7 @@ pub(crate) fn compile_render_mesh(
             material_index: mat,
             component,
             texture,
+            lightmap_texture,
             texture_width,
             texture_height,
             texture_name: tex_name,
@@ -330,9 +357,6 @@ fn color_marker_eq(color: V3, r: u8, g: u8, b: u8) -> bool {
 /// indicator lights). GTA:SA uses these purely to identify which texture is
 /// which light — they are not meant to tint the surface.
 fn is_vehicle_light_marker(color: V3) -> bool {
-    if color_marker_eq(color, 0, 255, 255) || color_marker_eq(color, 255, 0, 255) {
-        return true;
-    }
     let warm_left = [
         (255, 175, 0),
         (185, 255, 0),
@@ -375,7 +399,7 @@ fn is_vehicle_light_marker(color: V3) -> bool {
         || color_marker_eq(color, 0, 16, 255)
 }
 
-fn vehicle_material_role(material: RawMaterial) -> Option<VehicleMaterialRole> {
+pub(crate) fn vehicle_material_role(material: RawMaterial) -> Option<VehicleMaterialRole> {
     let color = material.color;
     if color_marker_eq(color, 60, 255, 0) {
         Some(VehicleMaterialRole::BodyA)
@@ -762,9 +786,31 @@ impl LoadJob {
         icons: IconSet,
         source: LoadSceneSource,
     ) -> LoadJob {
+        let attr_re = Regex::new(r#"([A-Za-z_][A-Za-z0-9_]*)="([^"]*)""#).unwrap();
+        let scene = load_scene_source_with_source(&options.root, &attr_re, source);
+        Self::new_with_scene(options, ui_font, icons, source, scene)
+    }
+
+    pub(crate) fn new_default_map(options: Options, icons: IconSet) -> Result<LoadJob, String> {
+        let scene = super::sa_map::load_default_sa_scene(&load_gta_sa_dir_preference())?;
+        Ok(Self::new_with_scene(
+            options,
+            Font::default(),
+            icons,
+            LoadSceneSource::Saved,
+            scene,
+        ))
+    }
+
+    fn new_with_scene(
+        options: Options,
+        ui_font: Font,
+        icons: IconSet,
+        source: LoadSceneSource,
+        scene: super::sa_map::SaScene,
+    ) -> LoadJob {
         let t0 = Instant::now();
         let root = options.root.clone();
-        let attr_re = Regex::new(r#"([A-Za-z_][A-Za-z0-9_]*)="([^"]*)""#).unwrap();
         let (
             zones,
             defs,
@@ -773,7 +819,7 @@ impl LoadJob {
             lights,
             eagle_zone_offsets,
             loaded_wip,
-        ) = load_scene_source_with_source(&root, &attr_re, source);
+        ) = scene;
         let texture_files = collect_scene_texture_files(&root, source);
         // Translation speed belongs to this window and is intentionally not
         // loaded from the shared preferences file.
@@ -782,7 +828,11 @@ impl LoadJob {
         let physics_root_properties = load_physics_root_properties(&gta_sa_dir);
         let bake_settings = load_bake_settings_preference();
         let vertex_paint = load_vertex_paint_settings_preference();
-        let water_planes = load_water_dat_for_source(&root, source);
+        let water_planes = if options.launch_mode == LaunchMode::DefaultMap {
+            load_water_dat(&gta_sa_dir.join("data").join("water.dat"))
+        } else {
+            load_water_dat_for_source(&root, source)
+        };
         let cull_zones = load_cull_zones_for_source(&root, source);
         let timecyc = load_timecyc_state();
         let custom_vehicle_dictionaries = load_custom_vehicle_dictionary_preferences();
@@ -1018,37 +1068,38 @@ impl LoadJob {
         // fast_vbo (default) uses world_cells; the display-list scene_cells are
         // only consulted when fast_vbo is off. Building both doubled end-of-load
         // GPU work for no benefit.
-        let (scene_cells, world_cells, lod_scene_cells, lod_world_cells) = if options.fast_vbo {
-            (
-                Vec::new(),
-                build_world_cells(
-                    world_source,
-                    &defs,
-                    &meshes,
-                    options.vbo_immediate,
-                    &lod_ids,
-                    false,
-                    ambient_lift,
-                ),
-                Vec::new(),
-                build_world_cells(
-                    world_source,
-                    &defs,
-                    &meshes,
-                    options.vbo_immediate,
-                    &lod_ids,
-                    true,
-                    ambient_lift,
-                ),
-            )
-        } else {
-            (
-                build_scene_cells(world_source, &defs, &meshes, &lod_ids, false, ambient_lift),
-                Vec::new(),
-                build_scene_cells(world_source, &defs, &meshes, &lod_ids, true, ambient_lift),
-                Vec::new(),
-            )
-        };
+        let (scene_cells, world_cells, lod_scene_cells, lod_world_cells) =
+            if options.fast_vbo || has_material_previews() {
+                (
+                    Vec::new(),
+                    build_world_cells(
+                        world_source,
+                        &defs,
+                        &meshes,
+                        options.vbo_immediate,
+                        &lod_ids,
+                        false,
+                        ambient_lift,
+                    ),
+                    Vec::new(),
+                    build_world_cells(
+                        world_source,
+                        &defs,
+                        &meshes,
+                        options.vbo_immediate,
+                        &lod_ids,
+                        true,
+                        ambient_lift,
+                    ),
+                )
+            } else {
+                (
+                    build_scene_cells(world_source, &defs, &meshes, &lod_ids, false, ambient_lift),
+                    Vec::new(),
+                    build_scene_cells(world_source, &defs, &meshes, &lod_ids, true, ambient_lift),
+                    Vec::new(),
+                )
+            };
 
         let outliner_labels = build_outliner_label_slots(placements.len());
         let expanded_groups = BTreeSet::new();
@@ -1078,6 +1129,9 @@ impl LoadJob {
             definitions: defs,
             readonly_definition_ids,
             zones,
+            map_documents: crate::resource::mta_maps::documents_for_source(&root, source),
+            placement_destination: None,
+            map_dialog: None,
             eagle_zone_offsets,
             meshes,
             collisions,
@@ -1262,6 +1316,7 @@ impl LoadJob {
             asset_optimization_scope: AssetOptimizationScope::default(),
             asset_optimization_menu_open: false,
             navigation_menu_open: false,
+            file_actions_menu_open: false,
             purge_unused_job: None,
             img_archive_rebalance_job: None,
             object_bounds_fix_job: None,
@@ -1376,7 +1431,11 @@ impl LoadJob {
         }
         app.saved_snapshot = Some(saved_content_snapshot(&app));
         app.autosave_dirty_snapshot = Some(autosave_dirty_snapshot(&app));
-        if source == LoadSceneSource::Autosave {
+        if app.options.launch_mode == LaunchMode::DefaultMap {
+            app.status_message =
+                "Default SA map loaded. Changes are temporary; saving is not supported yet."
+                    .to_string();
+        } else if source == LoadSceneSource::Autosave {
             app.status_message =
                 "Recovery copy restored. Save writes it into the resource; Save WIP keeps a separate working copy."
                     .to_string();
@@ -1538,37 +1597,38 @@ pub(crate) async fn load_app_with_source(
     let lod_ids = collect_lod_ids(world_source);
     let all_lod_ids = collect_lod_ids(&placements);
     // Only build the cell set the active render path will draw (see finish()).
-    let (scene_cells, world_cells, lod_scene_cells, lod_world_cells) = if options.fast_vbo {
-        (
-            Vec::new(),
-            build_world_cells(
-                world_source,
-                &defs,
-                &meshes,
-                options.vbo_immediate,
-                &lod_ids,
-                false,
-                ambient_lift,
-            ),
-            Vec::new(),
-            build_world_cells(
-                world_source,
-                &defs,
-                &meshes,
-                options.vbo_immediate,
-                &lod_ids,
-                true,
-                ambient_lift,
-            ),
-        )
-    } else {
-        (
-            build_scene_cells(world_source, &defs, &meshes, &lod_ids, false, ambient_lift),
-            Vec::new(),
-            build_scene_cells(world_source, &defs, &meshes, &lod_ids, true, ambient_lift),
-            Vec::new(),
-        )
-    };
+    let (scene_cells, world_cells, lod_scene_cells, lod_world_cells) =
+        if options.fast_vbo || has_material_previews() {
+            (
+                Vec::new(),
+                build_world_cells(
+                    world_source,
+                    &defs,
+                    &meshes,
+                    options.vbo_immediate,
+                    &lod_ids,
+                    false,
+                    ambient_lift,
+                ),
+                Vec::new(),
+                build_world_cells(
+                    world_source,
+                    &defs,
+                    &meshes,
+                    options.vbo_immediate,
+                    &lod_ids,
+                    true,
+                    ambient_lift,
+                ),
+            )
+        } else {
+            (
+                build_scene_cells(world_source, &defs, &meshes, &lod_ids, false, ambient_lift),
+                Vec::new(),
+                build_scene_cells(world_source, &defs, &meshes, &lod_ids, true, ambient_lift),
+                Vec::new(),
+            )
+        };
 
     let outliner_labels = build_outliner_label_slots(placements.len());
     let expanded_groups = BTreeSet::new();
@@ -1607,6 +1667,9 @@ pub(crate) async fn load_app_with_source(
         definitions: defs,
         readonly_definition_ids,
         zones,
+        map_documents: crate::resource::mta_maps::documents_for_source(&root, source),
+        placement_destination: None,
+        map_dialog: None,
         eagle_zone_offsets,
         meshes,
         collisions,
@@ -1791,6 +1854,7 @@ pub(crate) async fn load_app_with_source(
         asset_optimization_scope: AssetOptimizationScope::default(),
         asset_optimization_menu_open: false,
         navigation_menu_open: false,
+        file_actions_menu_open: false,
         purge_unused_job: None,
         img_archive_rebalance_job: None,
         object_bounds_fix_job: None,

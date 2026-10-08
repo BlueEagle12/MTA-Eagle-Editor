@@ -1163,21 +1163,14 @@ pub(crate) fn draw_import_asset_dialog(app: &AppState) {
     draw_dialog_button(&app.ui_font, layout.cancel, "Cancel", false);
 }
 
-pub(crate) fn draw_preferences_dialog(app: &AppState) {
-    let Some(dialog) = app.preferences_dialog.as_ref() else {
-        return;
-    };
-    draw_modal_backdrop();
-    let rect = preferences_dialog_rect();
-    draw_panel_rect(&app.ui_font, rect, Some("Preferences"));
-    ui_text(
-        &app.ui_font,
-        "GTA:SA Install Directory",
-        rect.x + 24.0,
-        rect.y + 78.0,
-        ui_dim(),
-    );
-    let input = preferences_input_rect();
+fn draw_preferences_path_input(
+    app: &AppState,
+    dialog: &PreferencesDialog,
+    field: PreferencesPathField,
+    value: &str,
+    input: Rect,
+) {
+    let active = dialog.active_path_field == field;
     draw_rrect_bordered(
         input.x,
         input.y,
@@ -1186,16 +1179,19 @@ pub(crate) fn draw_preferences_dialog(app: &AppState) {
         7.0,
         1.0,
         Color::new(0.055, 0.064, 0.078, 1.0),
-        ui_accent(),
+        if active { ui_accent() } else { ui_border() },
     );
     let max_chars = ((input.w - 20.0) / 8.5).max(1.0) as usize;
-    let cursor = clamp_char_boundary(&dialog.gta_sa_dir, dialog.cursor);
-    let cursor_char = dialog.gta_sa_dir[..cursor].chars().count();
-    let total_chars = dialog.gta_sa_dir.chars().count();
+    let cursor = if active {
+        clamp_char_boundary(value, dialog.cursor)
+    } else {
+        0
+    };
+    let cursor_char = value[..cursor].chars().count();
+    let total_chars = value.chars().count();
     let start_char = cursor_char.saturating_sub(max_chars.saturating_sub(1));
     let end_char = (start_char + max_chars).min(total_chars);
-    let visible: String = dialog
-        .gta_sa_dir
+    let visible: String = value
         .chars()
         .skip(start_char)
         .take(end_char - start_char)
@@ -1206,16 +1202,20 @@ pub(crate) fn draw_preferences_dialog(app: &AppState) {
         .collect();
     let text_x = input.x + 10.0;
     draw_visible_text_selection(
-        &dialog.gta_sa_dir,
+        value,
         cursor,
-        dialog.selection_anchor,
+        if active {
+            dialog.selection_anchor
+        } else {
+            None
+        },
         start_char,
         &visible,
         text_x,
         input,
     );
     ui_text(&app.ui_font, &visible, text_x, input.y + 21.0, WHITE);
-    if (get_time() * 2.0) as i32 % 2 == 0 {
+    if active && (get_time() * 2.0) as i32 % 2 == 0 {
         let caret_x = text_x + ui_text_width(&caret_prefix, 16).round();
         draw_line(
             caret_x,
@@ -1226,35 +1226,125 @@ pub(crate) fn draw_preferences_dialog(app: &AppState) {
             WHITE,
         );
     }
-    let ide_count = app.readonly_definition_ids.len();
-    let has_models = app.gta_sa_dir.join("models").is_dir();
-    let has_ide = app.gta_sa_dir.join("data").join("maps").is_dir();
-    let status = if has_models && has_ide {
-        format!("{ide_count} fallback IDE definition(s) loaded")
-    } else {
-        "Folder should contain data/maps and models".to_string()
+}
+
+pub(crate) fn draw_preferences_dialog(app: &AppState) {
+    let Some(dialog) = app.preferences_dialog.as_ref() else {
+        return;
     };
-    ui_text(
-        &app.ui_font,
-        &status,
-        rect.x + 24.0,
-        rect.y + 160.0,
-        ui_muted(),
-    );
-    ui_text(
-        &app.ui_font,
-        "Enter saves   Esc cancels   Reload the resource after changing this path",
-        rect.x + 24.0,
-        rect.y + 188.0,
-        ui_muted(),
-    );
-    draw_preferences_viewport_section(app, dialog, rect);
-    draw_dialog_button(
-        &app.ui_font,
-        preferences_cleanup_autosaves_rect(),
-        "Clean Up Autosaves",
-        app.autosave_cleanup_rx.is_none() && app.autosave_rx.is_none(),
-    );
+    draw_modal_backdrop();
+    let rect = preferences_dialog_rect();
+    draw_panel_rect(&app.ui_font, rect, Some("Preferences"));
+    for (tab, label) in [
+        (PreferencesTab::General, "General"),
+        (PreferencesTab::Viewport, "Viewport"),
+        (PreferencesTab::Plugins, "Plugins"),
+    ] {
+        draw_dialog_button(
+            &app.ui_font,
+            preferences_tab_rect(tab),
+            label,
+            dialog.tab == tab,
+        );
+    }
+    match dialog.tab {
+        PreferencesTab::General => {
+            ui_text(
+                &app.ui_font,
+                "GTA:SA Install Directory",
+                rect.x + 24.0,
+                rect.y + 122.0,
+                ui_dim(),
+            );
+            draw_preferences_path_input(
+                app,
+                dialog,
+                PreferencesPathField::GtaSa,
+                &dialog.gta_sa_dir,
+                preferences_input_rect(),
+            );
+            let gta_path = PathBuf::from(dialog.gta_sa_dir.trim());
+            let ide_count = app.readonly_definition_ids.len();
+            let has_models = gta_path.join("models").is_dir();
+            let has_ide = gta_path.join("data").join("maps").is_dir();
+            let status = if has_models && has_ide {
+                format!("{ide_count} fallback IDE definition(s) loaded")
+            } else {
+                "Folder should contain data/maps and models".to_string()
+            };
+            ui_text(
+                &app.ui_font,
+                &status,
+                rect.x + 24.0,
+                rect.y + 191.0,
+                ui_muted(),
+            );
+            ui_text(
+                &app.ui_font,
+                "Blender Install Directory (optional)",
+                rect.x + 24.0,
+                rect.y + 220.0,
+                ui_dim(),
+            );
+            draw_preferences_path_input(
+                app,
+                dialog,
+                PreferencesPathField::Blender,
+                &dialog.blender_install_dir,
+                preferences_blender_input_rect(),
+            );
+            draw_dialog_button(
+                &app.ui_font,
+                preferences_blender_search_rect(),
+                "Search for Blender install",
+                true,
+            );
+            let blender_status = if let Some(message) = dialog.blender_search_message.as_ref() {
+                message.clone()
+            } else if dialog.blender_install_dir.trim().is_empty() {
+                "Leave blank to use BLENDER_PATH and automatic discovery".to_string()
+            } else if blender_executable_in_install_dir(Path::new(
+                dialog.blender_install_dir.trim(),
+            ))
+            .is_some()
+            {
+                "Blender executable found".to_string()
+            } else {
+                "Folder should contain the Blender executable".to_string()
+            };
+            ui_text(
+                &app.ui_font,
+                &blender_status,
+                rect.x + 24.0,
+                rect.y + 295.0,
+                ui_muted(),
+            );
+            ui_text(
+                &app.ui_font,
+                "Enter saves   Esc cancels   Reload the resource after changing the GTA:SA path",
+                rect.x + 24.0,
+                rect.y + 324.0,
+                ui_muted(),
+            );
+            draw_dialog_button(
+                &app.ui_font,
+                preferences_cleanup_autosaves_rect(),
+                "Clean Up Autosaves",
+                app.autosave_cleanup_rx.is_none() && app.autosave_rx.is_none(),
+            );
+        }
+        PreferencesTab::Viewport => draw_preferences_viewport_section(app, dialog, rect),
+        PreferencesTab::Plugins => draw_preferences_plugins_section(app, dialog),
+    }
+    if let Some(error) = &dialog.error {
+        ui_text(
+            &app.ui_font,
+            &ellipsize_width(error, 16, rect.w - 48.0),
+            rect.x + 24.0,
+            rect.y + rect.h - 72.0,
+            Color::new(1.0, 0.45, 0.35, 1.0),
+        );
+    }
     draw_dialog_button(
         &app.ui_font,
         Rect::new(rect.x + rect.w - 216.0, rect.y + rect.h - 50.0, 88.0, 32.0),
@@ -1267,6 +1357,258 @@ pub(crate) fn draw_preferences_dialog(app: &AppState) {
         "Cancel",
         false,
     );
+    if !dialog.blender_install_candidates.is_empty() {
+        let count = dialog.blender_install_candidates.len();
+        let chooser = preferences_blender_candidate_dialog_rect(count);
+        draw_rrect(
+            chooser.x + 3.0,
+            chooser.y + 4.0,
+            chooser.w,
+            chooser.h,
+            10.0,
+            Color::new(0.0, 0.0, 0.0, 0.38),
+        );
+        draw_panel_rect(&app.ui_font, chooser, Some("Select Blender Installation"));
+        let start = dialog.blender_candidate_scroll;
+        let visible = count.min(BLENDER_CANDIDATE_VISIBLE_ROWS);
+        for slot in 0..visible {
+            let Some(path) = dialog.blender_install_candidates.get(start + slot) else {
+                break;
+            };
+            let row = preferences_blender_candidate_row_rect(count, slot);
+            let hovered = row.contains(mouse_position().into());
+            draw_rrect_bordered(
+                row.x,
+                row.y,
+                row.w,
+                row.h,
+                7.0,
+                1.0,
+                if hovered {
+                    ui_surface_hover()
+                } else {
+                    ui_surface()
+                },
+                if hovered { ui_accent() } else { ui_border() },
+            );
+            ui_text(
+                &app.ui_font,
+                &ellipsize_width(&path.to_string_lossy(), 16, row.w - 20.0),
+                row.x + 10.0,
+                row.y + 21.0,
+                WHITE,
+            );
+        }
+        if count > BLENDER_CANDIDATE_VISIBLE_ROWS {
+            ui_text(
+                &app.ui_font,
+                &format!(
+                    "Showing {}–{} of {} • scroll for more",
+                    start + 1,
+                    (start + visible).min(count),
+                    count
+                ),
+                chooser.x + 18.0,
+                chooser.y + chooser.h - 20.0,
+                ui_muted(),
+            );
+        }
+        draw_dialog_button(
+            &app.ui_font,
+            preferences_blender_candidate_cancel_rect(count),
+            "Cancel",
+            false,
+        );
+    }
+}
+
+pub(crate) fn preferences_plugin_detail_lines(dialog: &PreferencesDialog) -> Vec<String> {
+    let Some(plugin) = dialog
+        .selected_plugin
+        .and_then(|index| dialog.plugins.get(index))
+    else {
+        return Vec::new();
+    };
+    let mut details = vec![
+        plugin.name.clone(),
+        format!("ID: {}", plugin.id),
+        format!(
+            "Status: {}",
+            if plugin.enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+        ),
+    ];
+    if let Some(error) = &plugin.error {
+        details.push(format!("Unavailable: {error}"));
+    }
+    details.extend(plugin.details.iter().cloned());
+    details.push(format!("Location: {}", plugin.folder.display()));
+    let width = (preferences_plugin_details_rect().w - 28.0).max(1.0);
+    details
+        .iter()
+        .flat_map(|text| wrap_text_width(text, 16, width))
+        .flat_map(|line| {
+            // Folder paths and manifest IDs can contain no spaces. Keep every
+            // character readable within the details pane instead of clipping.
+            let mut lines = Vec::new();
+            let mut current = String::new();
+            for ch in line.chars() {
+                let mut next = current.clone();
+                next.push(ch);
+                if !current.is_empty() && ui_text_width(&next, 16) > width {
+                    lines.push(std::mem::take(&mut current));
+                }
+                current.push(ch);
+            }
+            if !current.is_empty() {
+                lines.push(current);
+            }
+            lines
+        })
+        .collect()
+}
+
+fn draw_preferences_plugins_section(app: &AppState, dialog: &PreferencesDialog) {
+    let rect = preferences_dialog_rect();
+    ui_text(
+        &app.ui_font,
+        "Installed plugins",
+        rect.x + 24.0,
+        rect.y + 122.0,
+        WHITE,
+    );
+    let list = preferences_plugin_list_rect();
+    let details = preferences_plugin_details_rect();
+    for panel in [list, details] {
+        draw_rrect_bordered(
+            panel.x,
+            panel.y,
+            panel.w,
+            panel.h,
+            7.0,
+            1.0,
+            ui_surface(),
+            ui_border(),
+        );
+    }
+    begin_ui_clip(list);
+    if dialog.plugins.is_empty() {
+        ui_text(
+            &app.ui_font,
+            "No plugins installed",
+            list.x + 12.0,
+            list.y + 26.0,
+            ui_muted(),
+        );
+    }
+    for (index, plugin) in dialog.plugins.iter().enumerate() {
+        let row = preferences_plugin_row_rect(index, dialog.plugin_scroll);
+        if row.y + row.h < list.y || row.y > list.y + list.h {
+            continue;
+        }
+        let selected = dialog.selected_plugin == Some(index);
+        draw_rrect_bordered(
+            row.x,
+            row.y,
+            row.w,
+            row.h,
+            6.0,
+            1.0,
+            if selected {
+                ui_surface_hover()
+            } else {
+                ui_surface()
+            },
+            if selected { ui_accent() } else { ui_border() },
+        );
+        ui_text(
+            &app.ui_font,
+            &ellipsize_width(&plugin.name, 16, row.w - 20.0),
+            row.x + 8.0,
+            row.y + 21.0,
+            WHITE,
+        );
+        let state = if plugin.error.is_some() {
+            "Unavailable"
+        } else if plugin.enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        };
+        ui_text(
+            &app.ui_font,
+            &ellipsize_width(state, 16, row.w - 80.0),
+            row.x + 8.0,
+            row.y + 47.0,
+            ui_muted(),
+        );
+        draw_dialog_button(
+            &app.ui_font,
+            preferences_plugin_toggle_rect(index, dialog.plugin_scroll),
+            if plugin.enabled { "On" } else { "Off" },
+            plugin.enabled,
+        );
+    }
+    end_ui_clip();
+    begin_ui_clip(details);
+    let lines = preferences_plugin_detail_lines(dialog);
+    if lines.is_empty() {
+        ui_text(
+            &app.ui_font,
+            "Select a plugin to see its details",
+            details.x + 12.0,
+            details.y + 26.0,
+            ui_muted(),
+        );
+    }
+    for (index, line) in lines.iter().enumerate() {
+        ui_text(
+            &app.ui_font,
+            line,
+            details.x + 12.0,
+            details.y + 26.0 + index as f32 * 24.0 - dialog.plugin_details_scroll,
+            if index == 0 { WHITE } else { ui_dim() },
+        );
+    }
+    end_ui_clip();
+    draw_preferences_scrollbar(
+        list,
+        dialog.plugin_scroll,
+        (dialog.plugins.len() as f32 * PREFERENCES_PLUGIN_ROW_H - list.h).max(0.0),
+    );
+    draw_preferences_scrollbar(
+        details,
+        dialog.plugin_details_scroll,
+        (lines.len() as f32 * 24.0 + 20.0 - details.h).max(0.0),
+    );
+    ui_text(
+        &app.ui_font,
+        "Plugin changes take effect when you save.",
+        rect.x + 24.0,
+        rect.y + rect.h - 78.0,
+        ui_muted(),
+    );
+}
+
+fn draw_preferences_scrollbar(clip: Rect, scroll: f32, max_scroll: f32) {
+    if max_scroll <= 0.0 {
+        return;
+    }
+    let track = Rect::new(
+        clip.x + clip.w - 7.0,
+        clip.y + 4.0,
+        3.0,
+        (clip.h - 8.0).max(1.0),
+    );
+    draw_rrect(track.x, track.y, track.w, track.h, 1.5, ui_border());
+    let thumb_h = (track.h * clip.h / (clip.h + max_scroll))
+        .max(24.0)
+        .min(track.h);
+    let thumb_y = track.y + (track.h - thumb_h) * scroll / max_scroll;
+    draw_rrect(track.x, thumb_y, track.w, thumb_h, 1.5, ui_muted());
 }
 
 /// Read-only value chip sitting between a stepper's - and + buttons.
@@ -1293,30 +1635,37 @@ fn draw_preferences_value_chip(app: &AppState, rect: Rect, value: &str) {
 
 fn draw_preferences_stepper(
     app: &AppState,
+    scroll: f32,
     row: usize,
     label: &str,
     value: &str,
     can_decrease: bool,
     can_increase: bool,
 ) {
-    let (label_x, row_y) = preferences_row_origin(row);
+    let (label_x, row_y) = preferences_row_origin(row, scroll);
     ui_text(&app.ui_font, label, label_x, row_y + 20.0, ui_dim());
-    let (minus, chip, plus) = preferences_stepper_rects(row);
+    let (minus, chip, plus) = preferences_stepper_rects(row, scroll);
     draw_dialog_button(&app.ui_font, minus, "-", can_decrease);
     draw_preferences_value_chip(app, chip, value);
     draw_dialog_button(&app.ui_font, plus, "+", can_increase);
 }
 
 fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog, rect: Rect) {
+    let scroll = dialog
+        .viewport_scroll
+        .clamp(0.0, preferences_viewport_max_scroll());
+    let clip = preferences_viewport_clip_rect();
+    begin_ui_clip(clip);
     ui_text(
         &app.ui_font,
         "Viewport",
         rect.x + 24.0,
-        rect.y + 224.0,
+        rect.y + 122.0 - scroll,
         WHITE,
     );
     draw_preferences_stepper(
         app,
+        scroll,
         0,
         "Gimbal Size",
         &format!("{:.2}x", dialog.gizmo_scale),
@@ -1325,6 +1674,7 @@ fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog,
     );
     draw_preferences_stepper(
         app,
+        scroll,
         1,
         "World Camera Speed",
         &format!("{:.0}", dialog.camera_speed),
@@ -1333,6 +1683,7 @@ fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog,
     );
     draw_preferences_stepper(
         app,
+        scroll,
         2,
         "Vehicle Camera Speed",
         &format!("{:.0}", dialog.vehicle_camera_speed),
@@ -1341,6 +1692,7 @@ fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog,
     );
     draw_preferences_stepper(
         app,
+        scroll,
         3,
         "Editing Camera Speed",
         &format!("{:.0}", dialog.editing_camera_speed),
@@ -1349,13 +1701,14 @@ fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog,
     );
     draw_preferences_stepper(
         app,
+        scroll,
         4,
         "Camera Rotation Speed",
         &format!("{:.2}x", dialog.camera_rotation_speed),
         dialog.camera_rotation_speed > MIN_CAMERA_ROTATION_SPEED,
         dialog.camera_rotation_speed < MAX_CAMERA_ROTATION_SPEED,
     );
-    let (label_x, msaa_y) = preferences_row_origin(PREFERENCES_MSAA_ROW);
+    let (label_x, msaa_y) = preferences_row_origin(PREFERENCES_MSAA_ROW, scroll);
     ui_text(
         &app.ui_font,
         "Anti-aliasing",
@@ -1365,7 +1718,7 @@ fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog,
     );
     draw_dialog_button(
         &app.ui_font,
-        preferences_msaa_rect(),
+        preferences_msaa_rect(scroll),
         msaa_samples_label(dialog.msaa_samples),
         clamp_msaa_samples(dialog.msaa_samples) != 1,
     );
@@ -1380,6 +1733,7 @@ fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog,
     }
     draw_preferences_stepper(
         app,
+        scroll,
         PREFERENCES_DRAW_DISTANCE_ROW,
         "Draw Distance",
         &if dialog.draw_distance_percent == 0 {
@@ -1390,6 +1744,18 @@ fn draw_preferences_viewport_section(app: &AppState, dialog: &PreferencesDialog,
         dialog.draw_distance_percent > 0,
         dialog.draw_distance_percent < MAX_DRAW_DISTANCE_PERCENT,
     );
+    end_ui_clip();
+
+    let max_scroll = preferences_viewport_max_scroll();
+    if max_scroll > 0.0 {
+        let track = Rect::new(clip.x + clip.w - 8.0, clip.y + 4.0, 4.0, clip.h - 8.0);
+        draw_rrect(track.x, track.y, track.w, track.h, 2.0, ui_border());
+        let thumb_h = (track.h * clip.h / (clip.h + max_scroll))
+            .max(24.0)
+            .min(track.h);
+        let thumb_y = track.y + (track.h - thumb_h) * scroll / max_scroll;
+        draw_rrect(track.x, thumb_y, track.w, thumb_h, 2.0, ui_muted());
+    }
 }
 
 pub(crate) fn draw_dff_replace_choice_dialog(app: &AppState) {
@@ -2820,6 +3186,7 @@ pub(crate) fn draw_dff_texture_duplicate_dialog(app: &AppState) {
     draw_modal_backdrop();
     let layout = dff_texture_duplicate_dialog_layout();
     let separating = dialog.action == DffTextureNameAction::SeparateGeometry;
+    let separating_internal = dialog.action == DffTextureNameAction::SeparateInternalElement;
     let renaming = matches!(
         dialog.action,
         DffTextureNameAction::RenameDff | DffTextureNameAction::RenameTxd
@@ -2829,6 +3196,8 @@ pub(crate) fn draw_dff_texture_duplicate_dialog(app: &AppState) {
         layout.rect,
         Some(if separating {
             "Separate from Object"
+        } else if separating_internal {
+            "Separate to Internal Element"
         } else if renaming {
             "Rename Texture"
         } else {
@@ -2840,6 +3209,11 @@ pub(crate) fn draw_dff_texture_duplicate_dialog(app: &AppState) {
         &if separating {
             format!(
                 "Move the selected faces out of '{}' into a separate map object.",
+                dialog.source_texture
+            )
+        } else if separating_internal {
+            format!(
+                "Keep the selected faces inside '{}' as a separately pivoted internal element.",
                 dialog.source_texture
             )
         } else if renaming {
@@ -2861,6 +3235,8 @@ pub(crate) fn draw_dff_texture_duplicate_dialog(app: &AppState) {
         &app.ui_font,
         if separating {
             "New object/DFF name (letters, numbers, underscores, and hyphens):"
+        } else if separating_internal {
+            "Internal element/frame name (letters, numbers, underscores, and hyphens):"
         } else if renaming {
             "New texture name (the TXD and all affected DFFs are staged together):"
         } else {
@@ -2921,7 +3297,7 @@ pub(crate) fn draw_dff_texture_duplicate_dialog(app: &AppState) {
     draw_dialog_button(
         &app.ui_font,
         layout.duplicate,
-        if separating {
+        if separating || separating_internal {
             "Separate"
         } else if renaming {
             "Rename"

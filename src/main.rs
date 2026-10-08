@@ -320,7 +320,7 @@ static PHYSICS_ROOT_SPECS: [PhysicsRootSpec; 18] = [
         PhysicsRootProperties::new(30.0, 50.0, 0.99, 0.05, 50.0),
     ),
 ];
-const EAGLE_DEFINITION_FLAGS: [&str; 16] = [
+const EAGLE_DEFINITION_FLAGS: [&str; 17] = [
     "is_road",
     "draw_last",
     "additive",
@@ -337,14 +337,16 @@ const EAGLE_DEFINITION_FLAGS: [&str; 16] = [
     "disable_backface_culling",
     "is_breakable_statue",
     "disable_collisions",
+    "follow_camera",
 ];
-const EAGLE_PLACEMENT_OVERRIDE_FLAGS: [&str; 6] = [
+const EAGLE_PLACEMENT_OVERRIDE_FLAGS: [&str; 7] = [
     "double_sided",
     "disable_collisions",
     "breakable",
     "unbreakable",
     "frozen",
     "no_stream",
+    "follow_camera",
 ];
 
 mod app_icon {
@@ -353,6 +355,7 @@ mod app_icon {
 
 mod app;
 mod assets;
+use assets::material_plugins::*;
 mod blender_import;
 mod blender_native;
 mod col;
@@ -374,8 +377,23 @@ use lighting::bake::*;
 use lighting::vertex::*;
 use render::{radar::*, runtime::*, scene::*};
 use resource::{
-    archive_rebalance::*, classify::*, collision_safety::*, cull::*, files::*, loading::*,
-    lod_audit::*, material_classes::*, missing_texture_review::*, race::*, save::*, validation::*,
+    archive_rebalance::*,
+    classify::*,
+    collision_safety::*,
+    cull::*,
+    files::*,
+    loading::*,
+    lod_audit::*,
+    material_classes::*,
+    missing_texture_review::*,
+    race::*,
+    sa_map::{
+        is_default_world_placement, remove_default_world_element, restore_default_world_element,
+        selected_editable_indices, selection_has_default_world, turn_world_into_placement,
+        world_conversion_rect,
+    },
+    save::*,
+    validation::*,
     water::*,
 };
 use ui::*;
@@ -406,12 +424,13 @@ struct Options {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LaunchMode {
     Project,
+    DefaultMap,
     Editor,
 }
 
 fn launch_initial_tab(mode: LaunchMode) -> AppTab {
     match mode {
-        LaunchMode::Project => AppTab::Preview,
+        LaunchMode::Project | LaunchMode::DefaultMap => AppTab::Preview,
         LaunchMode::Editor => AppTab::Editing,
     }
 }
@@ -701,6 +720,24 @@ struct VehicleMaterialPreview {
     lights_on: bool,
 }
 
+impl Default for VehicleMaterialPreview {
+    fn default() -> Self {
+        Self {
+            body_a: V3 {
+                x: 0.075,
+                y: 0.255,
+                z: 0.640,
+            },
+            body_b: V3 {
+                x: 0.035,
+                y: 0.135,
+                z: 0.360,
+            },
+            lights_on: false,
+        }
+    }
+}
+
 #[derive(Clone, Default, PartialEq)]
 struct RawMesh {
     vertices: Vec<V3>,
@@ -890,6 +927,7 @@ struct Vertex {
     pos: V3,
     normal: V3,
     uv: V2,
+    lightmap_uv: V2,
     color: V3,
     day_color: V3,
     night_color: V3,
@@ -923,6 +961,7 @@ struct RenderPart {
     /// Index into `RenderMesh::components`.
     component: usize,
     texture: u32,
+    lightmap_texture: u32,
     texture_width: u16,
     texture_height: u16,
     texture_name: String,
@@ -1165,7 +1204,7 @@ fn display_vertex_color(color: V3, ambient: V3, material_color: V3, material_amb
 }
 
 fn rebuild_render_part_list_with_lift(part: &mut RenderPart, ambient_lift: V3) {
-    let mut packed = Vec::<f32>::with_capacity(part.cpu_vertices.len() * 12);
+    let mut packed = Vec::<f32>::with_capacity(part.cpu_vertices.len() * 14);
     for vertex in &part.cpu_vertices {
         let alpha = part.alpha * vertex.alpha;
         let color = display_vertex_color(
@@ -1187,6 +1226,8 @@ fn rebuild_render_part_list_with_lift(part: &mut RenderPart, ambient_lift: V3) {
             vertex.pos.x,
             vertex.pos.y,
             vertex.pos.z,
+            vertex.lightmap_uv.u,
+            vertex.lightmap_uv.v,
         ]);
     }
     unsafe {
@@ -1211,6 +1252,7 @@ fn rebuild_render_part_list_with_lift(part: &mut RenderPart, ambient_lift: V3) {
             return;
         }
         gl::NewList(part.list, gl::COMPILE);
+        set_lightmap_texture(part.lightmap_texture);
         if part.texture != 0 {
             gl::Enable(gl::TEXTURE_2D);
             gl::BindTexture(gl::TEXTURE_2D, part.texture);
@@ -1229,11 +1271,13 @@ fn rebuild_render_part_list_with_lift(part: &mut RenderPart, ambient_lift: V3) {
             gl::Color4f(color.x, color.y, color.z, alpha);
             gl::Normal3f(vertex.normal.x, vertex.normal.y, vertex.normal.z);
             gl::TexCoord2f(vertex.uv.u, vertex.uv.v);
+            gl::MultiTexCoord2f(gl::TEXTURE1, vertex.lightmap_uv.u, vertex.lightmap_uv.v);
             gl::Vertex3f(vertex.pos.x, vertex.pos.y, vertex.pos.z);
         }
         gl::End();
         gl::BindTexture(gl::TEXTURE_2D, 0);
         gl::Disable(gl::TEXTURE_2D);
+        set_lightmap_texture(0);
         gl::EndList();
     }
 }
@@ -1850,22 +1894,24 @@ struct SceneCell {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct WorldVertex {
     uv: [f32; 2],
+    lightmap_uv: [f32; 2],
     normal: [f32; 3],
     shaded_rgba: [u8; 4],
     unshaded_rgba: [u8; 4],
     position: [f32; 3],
 }
 
-const _: () = assert!(std::mem::size_of::<WorldVertex>() == 40);
+const _: () = assert!(std::mem::size_of::<WorldVertex>() == 48);
 const _: () = assert!(std::mem::align_of::<WorldVertex>() == 4);
 const _: () = assert!(std::mem::offset_of!(WorldVertex, uv) == 0);
-const _: () = assert!(std::mem::offset_of!(WorldVertex, normal) == 8);
-const _: () = assert!(std::mem::offset_of!(WorldVertex, shaded_rgba) == 20);
-const _: () = assert!(std::mem::offset_of!(WorldVertex, unshaded_rgba) == 24);
-const _: () = assert!(std::mem::offset_of!(WorldVertex, position) == 28);
+const _: () = assert!(std::mem::offset_of!(WorldVertex, normal) == 16);
+const _: () = assert!(std::mem::offset_of!(WorldVertex, shaded_rgba) == 28);
+const _: () = assert!(std::mem::offset_of!(WorldVertex, unshaded_rgba) == 32);
+const _: () = assert!(std::mem::offset_of!(WorldVertex, position) == 36);
 
 struct WorldBatch {
     texture: u32,
+    lightmap_texture: u32,
     use_lighting: bool,
     double_sided: bool,
     transparency: TransparencyMode,
@@ -1968,7 +2014,7 @@ struct WorldCell {
     batches: Vec<WorldBatch>,
 }
 
-type WorldBatchKey = (u32, bool, bool, TransparencyMode);
+type WorldBatchKey = (u32, u32, bool, bool, TransparencyMode);
 
 struct WorldBatchBuild {
     data: Vec<WorldVertex>,
@@ -2374,6 +2420,8 @@ enum Race2dPointDrag {
 
 #[derive(Clone)]
 struct SavedContentSnapshot {
+    zones: Vec<String>,
+    map_documents: Vec<crate::resource::mta_maps::MapDocument>,
     placements: Vec<Placement>,
     definitions: HashMap<String, Definition>,
     readonly_definition_ids: HashSet<String>,
@@ -2442,6 +2490,8 @@ struct RaceHistorySnapshot {
 
 #[derive(Clone, PartialEq)]
 struct WorldHistorySnapshot {
+    zones: Vec<String>,
+    map_documents: Vec<crate::resource::mta_maps::MapDocument>,
     placements: Vec<Placement>,
     definitions: HashMap<String, Definition>,
     readonly_definition_ids: HashSet<String>,
@@ -2461,6 +2511,23 @@ struct WorldHistorySnapshot {
 #[derive(Clone, PartialEq)]
 struct PlacementTransformHistorySnapshot {
     placements: Vec<(usize, Placement)>,
+}
+
+/// Local structural edits keep only changed/appended placements and explicitly
+/// tracked definitions. Visibility bits are compact and include recursive SA
+/// LOD removals without cloning the immutable game-world placement records.
+#[derive(Clone, PartialEq)]
+struct LocalWorldHistorySnapshot {
+    placement_count: usize,
+    placements: Vec<(usize, Placement)>,
+    element_states: Vec<ElementState>,
+    definitions: Vec<(String, Option<Definition>, bool)>,
+    zones: Vec<String>,
+    world_edits_document: Option<crate::resource::mta_maps::MapDocument>,
+    active_lod_ids: HashSet<String>,
+    selection: SelectionHistorySnapshot,
+    selected_col_face: Option<SelectedCollisionFace>,
+    selected_col_vertex: usize,
 }
 
 #[derive(Clone, PartialEq)]
@@ -2536,6 +2603,7 @@ enum UndoState {
     Lights(LightHistorySnapshot),
     Race(RaceHistorySnapshot),
     World(WorldHistorySnapshot),
+    LocalWorld(LocalWorldHistorySnapshot),
     PlacementTransforms(PlacementTransformHistorySnapshot),
     Selection(SelectionHistorySnapshot),
     Collision(CollisionHistorySnapshot),
@@ -2554,6 +2622,7 @@ enum ScopedHistorySnapshot {
     Lights(LightHistorySnapshot),
     Race(RaceHistorySnapshot),
     World(WorldHistorySnapshot),
+    LocalWorld(LocalWorldHistorySnapshot),
     PlacementTransforms(PlacementTransformHistorySnapshot),
     Collision(CollisionHistorySnapshot),
     Editing(EditingHistorySnapshot),
@@ -2880,7 +2949,7 @@ struct GroupRenameEdit {
     buffer: String,
     cursor: usize,
     selection_anchor: Option<usize>,
-    before: WorldHistorySnapshot,
+    before: LocalWorldHistorySnapshot,
 }
 
 /// What a race-name text edit targets.
@@ -3160,8 +3229,32 @@ struct ImportAssetDialog {
     cursor: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreferencesPathField {
+    GtaSa,
+    Blender,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreferencesTab {
+    General,
+    Viewport,
+    Plugins,
+}
+
 struct PreferencesDialog {
+    tab: PreferencesTab,
+    plugins: Vec<MaterialPluginInfo>,
+    selected_plugin: Option<usize>,
+    plugin_scroll: f32,
+    plugin_details_scroll: f32,
+    error: Option<String>,
     gta_sa_dir: String,
+    blender_install_dir: String,
+    blender_install_candidates: Vec<PathBuf>,
+    blender_candidate_scroll: usize,
+    blender_search_message: Option<String>,
+    active_path_field: PreferencesPathField,
     /// Pending viewport values. They are staged here rather than applied live so
     /// Cancel discards them along with the path edit.
     gizmo_scale: f32,
@@ -3174,6 +3267,8 @@ struct PreferencesDialog {
     /// MSAA as it was when the dialog opened, so "needs a restart" can be
     /// detected without re-reading preferences.txt every frame.
     msaa_samples_saved: i32,
+    /// Vertical scroll within the Viewport tab.
+    viewport_scroll: f32,
     cursor: usize,
     selection_anchor: Option<usize>,
 }
@@ -3355,6 +3450,7 @@ enum DffTextureNameAction {
     RenameDff,
     RenameTxd,
     SeparateGeometry,
+    SeparateInternalElement,
 }
 
 struct DffTextureDuplicateDialog {
@@ -3484,6 +3580,7 @@ struct EditingDffOpenModel {
     preview_mesh: Option<RenderMesh>,
     txd_context: Option<String>,
     txd_source_label: String,
+    vehicle_collision_override: Option<Vec<u8>>,
     dirty: bool,
     selected_face: Option<usize>,
     selected_faces: BTreeSet<usize>,
@@ -3502,6 +3599,19 @@ struct EditingDffState {
     txd_context: Option<String>,
     txd_source_label: String,
     material_thumbnails: Vec<Option<Texture2D>>,
+    /// Preview-only GTA vehicle paint and light state. The authored marker
+    /// colours remain untouched so the exported DFF is still customizable by
+    /// GTA/MTA at runtime.
+    vehicle_preview: VehicleMaterialPreview,
+    vehicle_material_preset_picker_open: bool,
+    vehicle_dummy_preset_picker_open: bool,
+    selected_vehicle_frame: usize,
+    vehicle_frame_scroll: f32,
+    selected_internal_component: usize,
+    internal_component_scroll: f32,
+    /// Serialized COL payload to install into the vehicle collision plug-in
+    /// when this DFF is staged.
+    vehicle_collision_override: Option<Vec<u8>>,
     uv_editor: DffUvEditorState,
     selected_material: usize,
     selected_breakable_group: usize,
@@ -3546,6 +3656,8 @@ struct EditingDffState {
     dff_2dfx_type_picker_open: bool,
     dff_2dfx_type_picker_search: String,
     dff_2dfx_type_picker_scroll: f32,
+    /// Position copied from the selected effect when Add 2DFX opens its type picker.
+    dff_2dfx_pending_add_position: Option<V3>,
     dff_2dfx_corona_preset_picker_open: bool,
     dff_2dfx_payload_editor_open: bool,
     dff_2dfx_payload_hex: String,
@@ -4327,6 +4439,7 @@ struct ProjectPicker {
     project_roots_dialog: bool,
     project_scroll_row: usize,
     project_scroll_drag: bool,
+    launcher_focus: usize,
     status: String,
 }
 
@@ -4660,7 +4773,7 @@ enum ConfirmAction {
     SetPhysicsRoot {
         model_id: u16,
         conversion_indices: Vec<usize>,
-        before: WorldHistorySnapshot,
+        before: LocalWorldHistorySnapshot,
     },
 }
 
@@ -4718,6 +4831,9 @@ struct AppState {
     definitions: HashMap<String, Definition>,
     readonly_definition_ids: HashSet<String>,
     zones: Vec<String>,
+    map_documents: Vec<crate::resource::mta_maps::MapDocument>,
+    placement_destination: Option<String>,
+    map_dialog: Option<crate::ui::map_files::MapDialog>,
     eagle_zone_offsets: EagleZoneOffsets,
     meshes: HashMap<String, RenderMesh>,
     collisions: HashMap<String, CollisionMesh>,
@@ -4904,6 +5020,7 @@ struct AppState {
     asset_optimization_scope: AssetOptimizationScope,
     asset_optimization_menu_open: bool,
     navigation_menu_open: bool,
+    file_actions_menu_open: bool,
     purge_unused_job: Option<PurgeUnusedJob>,
     img_archive_rebalance_job: Option<ImgArchiveRebalanceJob>,
     object_bounds_fix_job: Option<ObjectBoundsFixJob>,
@@ -5478,17 +5595,11 @@ async fn main() {
                     if !app.quit_after_persist {
                         if has_unsaved_changes(app) {
                             if app.confirm_dialog.is_none() {
-                                app.confirm_dialog = Some(ConfirmDialog {
-                                    action: ConfirmAction::Quit,
-                                    title: "Unsaved Changes".to_string(),
-                                    body: "Save a WIP snapshot before exiting?".to_string(),
-                                    detail:
-                                        "Save WIP keeps map/light XML outside the resource; COL byte edits need resource Save."
-                                            .to_string(),
-                                    primary_label: "Save WIP".to_string(),
-                                    secondary_label: Some("Discard".to_string()),
-                                    secondary_action: None,
-                                });
+                                app.confirm_dialog = Some(scene_unsaved_changes_dialog(
+                                    app,
+                                    ConfirmAction::Quit,
+                                    UnsavedChangesDestination::Exit,
+                                ));
                             }
                         } else {
                             app.quit_after_persist = true;
@@ -5510,13 +5621,22 @@ async fn main() {
             RuntimeState::Loading(job_slot) => {
                 if let Some(mut job) = job_slot.take() {
                     let done = job.step();
-                    draw_loading_resource(&job.root, job.progress());
+                    let label = if job.options.launch_mode == LaunchMode::DefaultMap {
+                        Path::new("Default SA Map")
+                    } else {
+                        &job.root
+                    };
+                    draw_loading_resource(label, job.progress());
                     if done {
                         let root = job.root.clone();
                         let source = job.source;
                         let mut app = job.finish();
-                        save_recent_project(&root);
-                        if source == LoadSceneSource::Saved {
+                        if app.options.launch_mode == LaunchMode::Project {
+                            save_recent_project(&root);
+                        }
+                        if source == LoadSceneSource::Saved
+                            && app.options.launch_mode != LaunchMode::DefaultMap
+                        {
                             maybe_prompt_autosave_restore(&mut app);
                         }
                         runtime = RuntimeState::Editor(app);
@@ -5661,6 +5781,7 @@ async fn main() {
                     persist_project_session(app, viewport);
                     let mut options = app.options.clone();
                     options.root = root.clone();
+                    options.launch_mode = LaunchMode::Project;
                     let icons = app.icons.clone();
                     release_loaded_resource(app);
                     app.load_job = Some(LoadJob::new_with_source(
@@ -5678,6 +5799,7 @@ async fn main() {
                 if !editor_text_input_active(app)
                     && app.load_dialog.is_none()
                     && app.import_asset_dialog.is_none()
+                    && app.map_dialog.is_none()
                     && app.preferences_dialog.is_none()
                     && app.save_as_dialog.is_none()
                     && app.dff_picker_rx.is_none()
@@ -5727,6 +5849,7 @@ async fn main() {
                     draw_panel(app, viewport);
                     draw_load_dialog(app);
                     draw_import_asset_dialog(app);
+                    draw_map_files_dialog(app);
                     draw_preferences_dialog(app);
                     draw_save_as_dialog(app);
                     draw_dff_replace_choice_dialog(app);
@@ -5783,5 +5906,24 @@ async fn main() {
         }
         macroquad::miniquad::window::schedule_update();
         next_frame().await;
+    }
+}
+
+/// Fixed-function UV1 modulation matches the MTA lightmap shader. Always
+/// restore unit zero for the editor's existing texture paths.
+fn set_lightmap_texture(texture: u32) {
+    unsafe {
+        gl::ActiveTexture(gl::TEXTURE1);
+        if texture != 0 {
+            gl::Enable(gl::TEXTURE_2D);
+            gl::BindTexture(gl::TEXTURE_2D, texture);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+            gl::TexEnvi(gl::TEXTURE_ENV, gl::TEXTURE_ENV_MODE, gl::MODULATE as i32);
+        } else {
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+            gl::Disable(gl::TEXTURE_2D);
+        }
+        gl::ActiveTexture(gl::TEXTURE0);
     }
 }

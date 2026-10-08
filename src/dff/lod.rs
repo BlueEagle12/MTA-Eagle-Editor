@@ -75,7 +75,6 @@ struct LodGenerationRequest {
     source_zone: String,
     source_dff_name: String,
     source_txd_name: Option<String>,
-    replaced_lod_parent: Option<String>,
     replaced_lod_index: Option<usize>,
     project_root: PathBuf,
     reserved_stems: Arc<BTreeSet<String>>,
@@ -98,7 +97,6 @@ pub(crate) struct LodGenerationResult {
     source_zone: String,
     source_dff_name: String,
     source_txd_name: Option<String>,
-    replaced_lod_parent: Option<String>,
     replaced_lod_index: Option<usize>,
     source_triangles: usize,
     source_vertices: usize,
@@ -1210,9 +1208,16 @@ fn simplify_lod_mesh_with_retry(source: &RawMesh) -> Result<(RawMesh, usize), St
     ))
 }
 
+/// Build the single low-detail mesh embedded in a GTA vehicle as
+/// `chassis_vlo`. Unlike the scene LOD workflow this returns geometry for the
+/// same DFF rather than creating a separate map asset and TXD.
+pub(crate) fn simplify_vehicle_vlo_mesh(source: &RawMesh) -> Result<RawMesh, String> {
+    simplify_lod_mesh_with_retry(source).map(|(raw, _)| raw)
+}
+
 #[cfg(test)]
 fn simplify_lod_mesh(source: &RawMesh) -> Result<RawMesh, String> {
-    simplify_lod_mesh_with_retry(source).map(|(raw, _)| raw)
+    simplify_vehicle_vlo_mesh(source)
 }
 
 fn lower_power_of_two(value: u32) -> u32 {
@@ -1595,6 +1600,42 @@ struct LodAtlasSet {
     tiled: BTreeSet<String>,
 }
 
+/// A generated atlas is a fully baked LOD texture and therefore owns one DFF
+/// material. Source material properties are useful while deciding alpha/opaque
+/// packing, but they must not leave duplicate atlas material slots behind.
+fn merge_packed_lod_materials(raw: &mut RawMesh, atlas_names: &BTreeSet<String>) -> usize {
+    let slots = raw.materials.len().max(raw.material_textures.len());
+    let mut first_by_texture = HashMap::<String, usize>::new();
+    let mut remap = (0..slots).collect::<Vec<_>>();
+    let mut merged = 0;
+    for index in 0..slots {
+        let texture = raw
+            .material_textures
+            .get(index)
+            .map(|name| lower(name.trim()))
+            .unwrap_or_default();
+        if !atlas_names.contains(&texture) {
+            continue;
+        }
+        if let Some(first) = first_by_texture.get(&texture).copied() {
+            remap[index] = first;
+            merged += 1;
+        } else {
+            first_by_texture.insert(texture, index);
+        }
+    }
+    if merged == 0 {
+        return 0;
+    }
+    for triangle in &mut raw.triangles {
+        if let Some(target) = remap.get(triangle.material as usize) {
+            triangle.material = *target as u16;
+        }
+    }
+    dff_remove_unused_materials(raw);
+    merged
+}
+
 fn remap_raw_for_atlases(
     raw: &mut RawMesh,
     textures: &[DecodedLodTexture],
@@ -1888,8 +1929,18 @@ fn remap_raw_for_atlases(
     raw.material_animations.clear();
     raw.uv_anim_dictionaries.clear();
     raw.uv_animations.clear();
+    let atlas_names = atlases
+        .iter()
+        .map(|atlas| lower(&atlas.name))
+        .collect::<BTreeSet<_>>();
     generated.extend(atlases);
     validate_atlas_layout(&source, raw, &generated, &material_uv_scales)?;
+
+    // Atlas remapping deliberately starts from the source material indices so
+    // each source UV transform can be applied independently. Once those UVs
+    // are baked, the atlas itself owns one material regardless of differences
+    // between its source slots. Standalone tiled textures are not included.
+    merge_packed_lod_materials(raw, &atlas_names);
 
     let alpha_atlas_names = generated
         .iter()
@@ -2153,7 +2204,6 @@ fn generate_lod(request: LodGenerationRequest) -> Result<LodGenerationResult, St
         source_zone: request.source_zone,
         source_dff_name: request.source_dff_name,
         source_txd_name: request.source_txd_name,
-        replaced_lod_parent: request.replaced_lod_parent,
         replaced_lod_index: request.replaced_lod_index,
         source_triangles,
         source_vertices,
@@ -2469,24 +2519,6 @@ fn existing_lod_with_live_ids<'a>(
     .then_some(parent)
 }
 
-fn partition_existing_lod_indices(
-    placements: &[Placement],
-    states: &[ElementState],
-    indices: Vec<usize>,
-) -> (Vec<usize>, Vec<(usize, String)>) {
-    let live_ids = live_placement_ids(placements, states);
-    let mut ready = Vec::new();
-    let mut skipped = Vec::new();
-    for index in indices {
-        if let Some(parent) = existing_lod_with_live_ids(placements, index, &live_ids) {
-            skipped.push((index, parent.to_string()));
-        } else {
-            ready.push(index);
-        }
-    }
-    (ready, skipped)
-}
-
 fn all_indices_have_existing_lods(
     placements: &[Placement],
     states: &[ElementState],
@@ -2499,8 +2531,37 @@ fn all_indices_have_existing_lods(
             .all(|index| existing_lod_with_live_ids(placements, *index, &live_ids).is_some())
 }
 
+/// Expand a selection to every live scene instance of each selected element
+/// id. LOD generation is an element-ID-level operation: choosing one placement
+/// of a model must update its other placements too.
+fn all_live_instances_of_indices_in(
+    placements: &[Placement],
+    states: &[ElementState],
+    indices: &[usize],
+) -> Vec<usize> {
+    let selected_ids = indices
+        .iter()
+        .filter_map(|index| placements.get(*index))
+        .map(|placement| lower(&placement.id))
+        .collect::<HashSet<_>>();
+    placements
+        .iter()
+        .enumerate()
+        .filter(|(index, placement)| {
+            !states.get(*index).is_some_and(|state| state.deleted)
+                && selected_ids.contains(&lower(&placement.id))
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn all_live_instances_of_indices(app: &AppState, indices: &[usize]) -> Vec<usize> {
+    all_live_instances_of_indices_in(&app.placements, &app.element_states, indices)
+}
+
 pub(crate) fn selected_models_all_have_lods(app: &AppState) -> bool {
-    let indices = selected_live_indices_in_selection_order(app);
+    let selected = selected_live_indices_in_selection_order(app);
+    let indices = all_live_instances_of_indices(app, &selected);
     all_indices_have_existing_lods(&app.placements, &app.element_states, &indices)
 }
 
@@ -2512,32 +2573,7 @@ fn existing_lod_index_for_parent(
     if parent.eq_ignore_ascii_case("self") {
         return None;
     }
-    app.placements
-        .iter()
-        .enumerate()
-        .find(|(index, placement)| {
-            *index != source_index
-                && placement.id.eq_ignore_ascii_case(parent)
-                && !app
-                    .element_states
-                    .get(*index)
-                    .is_some_and(|state| state.deleted)
-        })
-        .map(|(index, _)| index)
-}
-
-fn lod_parent_is_still_used(
-    placements: &[Placement],
-    states: &[ElementState],
-    parent: &str,
-) -> bool {
-    placements.iter().enumerate().any(|(index, placement)| {
-        !states.get(index).is_some_and(|state| state.deleted)
-            && placement
-                .attrs
-                .get("lodParent")
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case(parent))
-    })
+    lod_target_for_source(&app.placements, &app.element_states, source_index, parent)
 }
 
 fn placement_lod_size(app: &AppState, index: usize) -> f32 {
@@ -2659,13 +2695,13 @@ pub(crate) fn continue_lod_batch_dialog(app: &mut AppState) {
         app.lod_batch_dialog = Some(dialog);
         return;
     };
-    let indices = dialog
+    let filtered_indices = dialog
         .candidates
         .iter()
         .filter(|candidate| lod_batch_candidate_included(candidate, minimum_size, dialog.mode))
         .map(|candidate| candidate.placement_index)
         .collect::<Vec<_>>();
-    if indices.is_empty() {
+    if filtered_indices.is_empty() {
         app.status_message = if dialog.mode == LodBatchMode::GenerateSelection {
             "No selected elements meet the minimum size and existing-LOD filters.".to_string()
         } else {
@@ -2674,6 +2710,9 @@ pub(crate) fn continue_lod_batch_dialog(app: &mut AppState) {
         app.lod_batch_dialog = Some(dialog);
         return;
     }
+    // The size filter chooses element ids. Once an id qualifies, update every
+    // live instance of it, even if its individual scale differs.
+    let indices = all_live_instances_of_indices(app, &filtered_indices);
     match dialog.mode {
         LodBatchMode::GenerateSelection | LodBatchMode::GenerateSceneMissing => {
             start_selected_element_lod_generation(app, indices)
@@ -2688,12 +2727,18 @@ pub(crate) fn request_selected_element_lod(app: &mut AppState) {
             "LOD generation cannot start while another asset writer is running.".to_string();
         return;
     }
-    let selected_indices = selected_live_indices_in_selection_order(app);
-    if selected_indices.is_empty() {
+    let selected = selected_live_indices_in_selection_order(app);
+    if selected.is_empty() {
         app.status_message = "Select a live element before generating an LOD.".to_string();
         return;
     }
-    if all_indices_have_existing_lods(&app.placements, &app.element_states, &selected_indices) {
+    let selected_indices = all_live_instances_of_indices(app, &selected);
+    let live_ids = live_placement_ids(&app.placements, &app.element_states);
+    let existing_count = selected_indices
+        .iter()
+        .filter(|index| existing_lod_with_live_ids(&app.placements, **index, &live_ids).is_some())
+        .count();
+    if existing_count > 0 {
         let count = selected_indices.len();
         app.confirm_dialog = Some(ConfirmDialog {
             action: ConfirmAction::RegenerateLods(selected_indices),
@@ -2701,9 +2746,11 @@ pub(crate) fn request_selected_element_lod(app: &mut AppState) {
             body: if count == 1 {
                 "The selected model already has an assigned LOD. Regenerate it?".to_string()
             } else {
-                format!("All {count} selected models already have assigned LODs. Regenerate them?")
+                format!(
+                    "Generate new LODs for all {count} live instances? {existing_count} existing LOD assignment(s) will be replaced."
+                )
             },
-            detail: "Each successful result will replace its model's LOD assignment. An old LOD element is removed only when no live model still uses it.".to_string(),
+            detail: "Every live instance of each selected element ID is included. Each detail/LOD pair receives a matching unique ID, and replaced LOD elements are removed when their exact pair is no longer used.".to_string(),
             primary_label: "Regenerate LODs".to_string(),
             secondary_label: None,
             secondary_action: None,
@@ -2792,6 +2839,27 @@ fn lod_target_for_source(
     })
 }
 
+/// Whether a specific LOD placement (rather than merely another placement
+/// sharing its id) is still the resolved target of a live detail element.
+fn lod_target_is_still_used(
+    placements: &[Placement],
+    states: &[ElementState],
+    target_index: usize,
+) -> bool {
+    let Some(target) = placements.get(target_index) else {
+        return false;
+    };
+    !states.get(target_index).is_some_and(|state| state.deleted)
+        && placements.iter().enumerate().any(|(source_index, source)| {
+            !states.get(source_index).is_some_and(|state| state.deleted)
+                && source.attrs.get("lodParent").is_some_and(|parent| {
+                    parent.trim().eq_ignore_ascii_case(&target.id)
+                        && lod_target_for_source(placements, states, source_index, &target.id)
+                            == Some(target_index)
+                })
+        })
+}
+
 pub(crate) fn request_lod_target_regeneration(app: &mut AppState, lod_index: usize) {
     if writer_is_busy(app) {
         app.status_message =
@@ -2853,15 +2921,18 @@ pub(crate) fn request_lod_target_regeneration(app: &mut AppState, lod_index: usi
 }
 
 fn start_selected_element_lod_generation(app: &mut AppState, selected_indices: Vec<usize>) {
-    let total = selected_indices.len();
-    let (indices, existing_lods) =
-        partition_existing_lod_indices(&app.placements, &app.element_states, selected_indices);
-    start_selected_element_lod_jobs(app, indices, existing_lods, total, false);
+    let indices = all_live_instances_of_indices(app, &selected_indices);
+    let total = indices.len();
+    let replace_existing = indices.iter().any(|index| {
+        existing_lod_for_placement(&app.placements, &app.element_states, *index).is_some()
+    });
+    start_selected_element_lod_jobs(app, indices, Vec::new(), total, replace_existing);
 }
 
 fn start_selected_element_lod_regeneration(app: &mut AppState, selected_indices: Vec<usize>) {
-    let total = selected_indices.len();
-    start_selected_element_lod_jobs(app, selected_indices, Vec::new(), total, true);
+    let indices = all_live_instances_of_indices(app, &selected_indices);
+    let total = indices.len();
+    start_selected_element_lod_jobs(app, indices, Vec::new(), total, true);
 }
 
 fn start_mass_element_lod_regeneration(app: &mut AppState, indices: Vec<usize>) {
@@ -2952,7 +3023,6 @@ fn start_selected_element_lod_jobs(
             source_zone: placement.zone.clone(),
             source_dff_name: placement.dff.clone(),
             source_txd_name,
-            replaced_lod_parent,
             replaced_lod_index,
             project_root: app.root.clone(),
             reserved_stems: Arc::clone(&reserved_stems),
@@ -3013,7 +3083,6 @@ pub(crate) fn request_editing_dff_lod(app: &mut AppState) {
         source_zone,
         source_dff_name: source_name,
         source_txd_name,
-        replaced_lod_parent: None,
         replaced_lod_index: None,
         project_root: app.root.clone(),
         reserved_stems: Arc::new(reserved_lod_stems(app)),
@@ -3261,7 +3330,11 @@ fn attach_lod_result(
         lod.id = result.stem.clone();
         lod.dff = result.stem.clone();
         lod.attrs.remove("lodParent");
-        lod.attrs.remove("uniqueID");
+        // Pair every generated LOD explicitly with its detail placement. This
+        // keeps repeated scene instances unambiguous for regeneration, repair,
+        // lighting, and removal operations.
+        let unique_id = next_scene_unique_id(&app.placements).to_string();
+        lod.attrs.insert("uniqueID".to_string(), unique_id.clone());
         sync_placement_attrs(&mut lod);
         app.placements.push(lod);
         app.element_states.push(ElementState::default());
@@ -3270,13 +3343,11 @@ fn attach_lod_result(
             detail
                 .attrs
                 .insert("lodParent".to_string(), result.stem.clone());
+            detail.attrs.insert("uniqueID".to_string(), unique_id);
         }
-        if let (Some(old_parent), Some(old_index)) = (
-            result.replaced_lod_parent.as_deref(),
-            result.replaced_lod_index,
-        ) {
+        if let Some(old_index) = result.replaced_lod_index {
             let still_used =
-                lod_parent_is_still_used(&app.placements, &app.element_states, old_parent);
+                lod_target_is_still_used(&app.placements, &app.element_states, old_index);
             if !still_used && let Some(state) = app.element_states.get_mut(old_index) {
                 state.deleted = true;
             }
@@ -3642,7 +3713,6 @@ mod tests {
             source_zone: "mansion".to_string(),
             source_dff_name: "man_grnd2.dff".to_string(),
             source_txd_name: Some("man_grnds_kb.txd".to_string()),
-            replaced_lod_parent: None,
             replaced_lod_index: None,
             project_root: root,
             reserved_stems: Arc::new(BTreeSet::new()),
@@ -3710,19 +3780,25 @@ mod tests {
     }
 
     #[test]
-    fn multi_selection_partitions_existing_lods_without_blocking_unassigned_assets() {
+    fn selected_element_ids_expand_to_every_live_instance() {
         let placements = vec![
-            lod_test_placement("assigned", Some("lod_assigned")),
-            lod_test_placement("unassigned", None),
-            lod_test_placement("lod_assigned", None),
-            lod_test_placement("broken", Some("missing_lod")),
+            lod_test_placement("tower", None),
+            lod_test_placement("road", None),
+            lod_test_placement("TOWER", None),
+            lod_test_placement("tower", None),
+            lod_test_placement("tree", None),
         ];
-        let states = vec![ElementState::default(); placements.len()];
+        let mut states = vec![ElementState::default(); placements.len()];
+        states[3].deleted = true;
 
-        let (ready, skipped) = partition_existing_lod_indices(&placements, &states, vec![0, 1, 3]);
-
-        assert_eq!(ready, vec![1, 3]);
-        assert_eq!(skipped, vec![(0, "lod_assigned".to_string())]);
+        assert_eq!(
+            all_live_instances_of_indices_in(&placements, &states, &[0]),
+            vec![0, 2]
+        );
+        assert_eq!(
+            all_live_instances_of_indices_in(&placements, &states, &[1, 0]),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]
@@ -3775,23 +3851,34 @@ mod tests {
     }
 
     #[test]
-    fn old_lod_is_retained_until_no_live_model_uses_it() {
-        let placements = vec![
-            lod_test_placement("first", Some("shared_lod")),
-            lod_test_placement("second", Some("shared_lod")),
-            lod_test_placement("shared_lod", None),
+    fn repeated_old_lods_are_tracked_by_exact_unique_id_pair() {
+        let with_uid = |id: &str, parent: Option<&str>, uid: &str| {
+            let mut placement = lod_test_placement(id, parent);
+            placement
+                .attrs
+                .insert("uniqueID".to_string(), uid.to_string());
+            placement
+        };
+        let mut placements = vec![
+            with_uid("detail", Some("shared_lod"), "101"),
+            with_uid("detail", Some("shared_lod"), "102"),
+            with_uid("shared_lod", None, "101"),
+            with_uid("shared_lod", None, "102"),
         ];
-        let mut states = vec![ElementState::default(); placements.len()];
+        let states = vec![ElementState::default(); placements.len()];
 
-        assert!(lod_parent_is_still_used(&placements, &states, "shared_lod"));
-        states[0].deleted = true;
-        assert!(lod_parent_is_still_used(&placements, &states, "shared_lod"));
-        states[1].deleted = true;
-        assert!(!lod_parent_is_still_used(
-            &placements,
-            &states,
-            "shared_lod"
-        ));
+        assert!(lod_target_is_still_used(&placements, &states, 2));
+        assert!(lod_target_is_still_used(&placements, &states, 3));
+
+        placements[0]
+            .attrs
+            .insert("lodParent".to_string(), "new_lod".to_string());
+        placements[0]
+            .attrs
+            .insert("uniqueID".to_string(), "201".to_string());
+
+        assert!(!lod_target_is_still_used(&placements, &states, 2));
+        assert!(lod_target_is_still_used(&placements, &states, 3));
     }
 
     #[test]
@@ -4266,6 +4353,10 @@ mod tests {
     fn repeated_uvs_are_baked_into_atlas_space() {
         let mut raw = grid_mesh(2);
         raw.material_textures.push("second".to_string());
+        let first_material = default_dff_material();
+        let mut second_material = first_material;
+        second_material.ambient += 0.25;
+        raw.materials = vec![first_material, second_material];
         raw.triangles[0].material = 1;
         raw.uvs[0].u = 2.0;
         let textures = vec![
@@ -4283,11 +4374,6 @@ mod tests {
             },
         ];
         assert!(atlas_is_possible(&raw, &textures));
-        let source_materials = raw
-            .triangles
-            .iter()
-            .map(|triangle| triangle.material)
-            .collect::<Vec<_>>();
         let atlases = remap_raw_for_atlases(&mut raw, &textures).unwrap().textures;
         assert_eq!(atlases.len(), 1);
         // Two 4x4 sources need no more than the smallest sheet.
@@ -4295,12 +4381,16 @@ mod tests {
             (atlases[0].width, atlases[0].height),
             (LOD_MIN_ATLAS_DIMENSION, LOD_MIN_ATLAS_DIMENSION)
         );
-        assert_eq!(
-            raw.triangles
+        assert_eq!(raw.material_textures, vec![atlases[0].name.clone()]);
+        assert_eq!(raw.materials, vec![first_material]);
+        assert!(raw.triangles.iter().all(|triangle| triangle.material == 0));
+        let reparsed = parse_dff_mesh(&write_normalized_dff(&raw, "lod_grid").unwrap());
+        assert_eq!(reparsed.material_textures, raw.material_textures);
+        assert!(
+            reparsed
+                .triangles
                 .iter()
-                .map(|triangle| triangle.material)
-                .collect::<Vec<_>>(),
-            source_materials
+                .all(|triangle| triangle.material == 0)
         );
         assert!(
             raw.uvs
@@ -4961,7 +5051,6 @@ mod tests {
             source_zone: "test".to_string(),
             source_dff_name: "shared.dff".to_string(),
             source_txd_name: None,
-            replaced_lod_parent: None,
             replaced_lod_index: None,
             project_root: project_root.clone(),
             reserved_stems: Arc::clone(&reserved_stems),
@@ -5023,7 +5112,6 @@ mod tests {
                 source_zone: String::new(),
                 source_dff_name: "repeated_model.dff".to_string(),
                 source_txd_name: None,
-                replaced_lod_parent: None,
                 replaced_lod_index: None,
                 project_root: PathBuf::new(),
                 reserved_stems: Arc::clone(&reserved_stems),

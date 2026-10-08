@@ -638,6 +638,64 @@ pub(crate) fn dff_remove_unused_vertices(raw: &mut RawMesh) -> usize {
     compact_vertices(raw, &keep)
 }
 
+fn dff_material_identity(raw: &RawMesh, index: usize) -> (String, [i64; 7]) {
+    let texture = raw
+        .material_textures
+        .get(index)
+        .map(|name| lower(name.trim()))
+        .unwrap_or_default();
+    let material = raw
+        .materials
+        .get(index)
+        .copied()
+        .unwrap_or_else(default_dff_material);
+    // Animated materials are keyed by slot, so never fold two slots that
+    // carry different animation name lists together.
+    let animation = raw
+        .material_animations
+        .get(index)
+        .map(|anim| anim.names.join("\u{1}"))
+        .unwrap_or_default();
+    (
+        format!("{texture}\u{0}{animation}"),
+        [
+            quantize(material.color.x),
+            quantize(material.color.y),
+            quantize(material.color.z),
+            quantize(material.alpha),
+            quantize(material.ambient),
+            quantize(material.diffuse),
+            quantize(material.specular),
+        ],
+    )
+}
+
+/// Count material slots that can be folded into an earlier identical slot.
+/// This is the read-only counterpart to [`dff_merge_duplicate_materials`] and
+/// lets Validation report the same issue that the optimizer can safely fix.
+pub(crate) fn dff_duplicate_material_count(raw: &RawMesh) -> usize {
+    let slots = raw.materials.len().max(raw.material_textures.len());
+    let mut seen = BTreeSet::new();
+    (0..slots)
+        .filter(|index| !seen.insert(dff_material_identity(raw, *index)))
+        .count()
+}
+
+/// Count non-empty texture names referenced by more than one material slot,
+/// regardless of surface properties. This is intentionally broader than the
+/// safe duplicate-material check: generated LOD atlases must have exactly one
+/// material per packed sheet even when their source slots differed slightly.
+pub(crate) fn dff_repeated_texture_material_count(raw: &RawMesh) -> usize {
+    let slots = raw.materials.len().max(raw.material_textures.len());
+    let mut seen = BTreeSet::new();
+    (0..slots)
+        .filter_map(|index| raw.material_textures.get(index))
+        .map(|name| lower(name.trim()))
+        .filter(|name| !name.is_empty())
+        .filter(|name| !seen.insert(name.clone()))
+        .count()
+}
+
 /// Collapse material slots whose texture name and every material value match,
 /// pointing their triangles at the first slot that used those values.
 pub(crate) fn dff_merge_duplicate_materials(raw: &mut RawMesh) -> usize {
@@ -649,35 +707,7 @@ pub(crate) fn dff_merge_duplicate_materials(raw: &mut RawMesh) -> usize {
     let mut remap = (0..slots).collect::<Vec<_>>();
     let mut merged = 0;
     for index in 0..slots {
-        let texture = raw
-            .material_textures
-            .get(index)
-            .map(|name| lower(name.trim()))
-            .unwrap_or_default();
-        let material = raw
-            .materials
-            .get(index)
-            .copied()
-            .unwrap_or_else(default_dff_material);
-        // Animated materials are keyed by slot, so never fold two slots that
-        // carry different animation name lists together.
-        let animation = raw
-            .material_animations
-            .get(index)
-            .map(|anim| anim.names.join("\u{1}"))
-            .unwrap_or_default();
-        let key = (
-            format!("{texture}\u{0}{animation}"),
-            [
-                quantize(material.color.x),
-                quantize(material.color.y),
-                quantize(material.color.z),
-                quantize(material.alpha),
-                quantize(material.ambient),
-                quantize(material.diffuse),
-                quantize(material.specular),
-            ],
-        );
+        let key = dff_material_identity(raw, index);
         match first_seen.get(&key) {
             Some(target) => {
                 remap[index] = *target;
@@ -1156,6 +1186,29 @@ mod tests {
         assert_eq!(dff_remove_unused_materials(&mut raw), 1);
         assert_eq!(raw.materials.len(), 2);
         assert_eq!(raw.material_textures, vec!["glass", "wall"]);
+    }
+
+    #[test]
+    fn duplicate_material_count_matches_safe_merge_rules() {
+        let mut raw = glass_before_wall();
+        raw.materials.push(raw.materials[1]);
+        raw.material_textures.push("WALL".to_string());
+        raw.material_animations.push(DffMaterialAnim::default());
+
+        assert_eq!(dff_duplicate_material_count(&raw), 1);
+        assert_eq!(dff_merge_duplicate_materials(&mut raw), 1);
+        assert_eq!(dff_remove_unused_materials(&mut raw), 1);
+        assert_eq!(raw.material_textures, vec!["glass", "wall"]);
+    }
+
+    #[test]
+    fn same_texture_with_different_properties_is_not_redundant() {
+        let mut raw = glass_before_wall();
+        raw.material_textures[1] = raw.material_textures[0].clone();
+
+        assert_eq!(dff_duplicate_material_count(&raw), 0);
+        assert_eq!(dff_repeated_texture_material_count(&raw), 1);
+        assert_eq!(dff_merge_duplicate_materials(&mut raw), 0);
     }
 
     #[test]

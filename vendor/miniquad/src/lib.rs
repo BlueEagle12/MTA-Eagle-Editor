@@ -356,7 +356,7 @@ pub mod window {
     }
     pub fn dropped_file_count() -> usize {
         let d = native_display().lock().unwrap();
-        d.dropped_files.bytes.len()
+        d.dropped_files.paths.len().max(d.dropped_files.bytes.len())
     }
     pub fn dropped_file_bytes(index: usize) -> Option<Vec<u8>> {
         let d = native_display().lock().unwrap();

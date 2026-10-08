@@ -589,6 +589,7 @@ pub(crate) fn draw_world_cell_set(
     immediate: bool,
     color_mode: WorldVertexColorMode,
     vertex_budget: usize,
+    part_budget: usize,
     drawn_placements: &mut usize,
     drawn_parts: &mut usize,
     drawn_vertices: &mut usize,
@@ -617,12 +618,18 @@ pub(crate) fn draw_world_cell_set(
         });
     }
     let sort_started = diagnostics.then(Instant::now);
+    let remaining_parts = part_budget.saturating_sub(*drawn_parts);
     let remaining_vertices = vertex_budget.saturating_sub(*drawn_vertices);
     if order
         .iter()
         .map(|(_, index)| cells[*index].vertices)
         .sum::<usize>()
         > remaining_vertices
+        || order
+            .iter()
+            .map(|(_, index)| cells[*index].parts)
+            .sum::<usize>()
+            > remaining_parts
     {
         sort_visible_cells_nearest_first(&mut order);
     }
@@ -645,6 +652,9 @@ pub(crate) fn draw_world_cell_set(
         }
         for &(_, idx) in &order {
             let cell = &cells[idx];
+            if *drawn_parts + cell.parts > part_budget {
+                continue;
+            }
             if *drawn_vertices + cell.vertices > vertex_budget {
                 if *drawn_vertices > 0 {
                     break;
@@ -748,6 +758,7 @@ fn draw_world_cell_classification_set(
     draw_distance_percent: u16,
     frustum: &[Plane; 6],
     vertex_budget: usize,
+    part_budget: usize,
     classes: &TextureMaterialClasses,
     fallback_material: u8,
     drawn_placements: &mut usize,
@@ -775,12 +786,18 @@ fn draw_world_cell_classification_set(
         });
     }
     let sort_started = diagnostics.then(Instant::now);
+    let remaining_parts = part_budget.saturating_sub(*drawn_parts);
     let remaining_vertices = vertex_budget.saturating_sub(*drawn_vertices);
     if order
         .iter()
         .map(|(_, index)| cells[*index].vertices)
         .sum::<usize>()
         > remaining_vertices
+        || order
+            .iter()
+            .map(|(_, index)| cells[*index].parts)
+            .sum::<usize>()
+            > remaining_parts
     {
         sort_visible_cells_nearest_first(&mut order);
     }
@@ -798,6 +815,11 @@ fn draw_world_cell_classification_set(
         gl::EnableClientState(gl::VERTEX_ARRAY);
         gl::DisableClientState(gl::NORMAL_ARRAY);
         gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::ClientActiveTexture(gl::TEXTURE1);
+        gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::ClientActiveTexture(gl::TEXTURE0);
+        reset_material_preview();
+        set_lightmap_texture(0);
         gl::DisableClientState(gl::COLOR_ARRAY);
         gl::Disable(gl::TEXTURE_2D);
         gl::Disable(gl::LIGHTING);
@@ -808,6 +830,9 @@ fn draw_world_cell_classification_set(
 
         for &(_, index) in &order {
             let cell = &cells[index];
+            if *drawn_parts + cell.parts > part_budget {
+                continue;
+            }
             if *drawn_vertices + cell.vertices > vertex_budget {
                 if *drawn_vertices > 0 {
                     break;
@@ -883,6 +908,7 @@ struct WorldDrawState {
     double_sided: Option<bool>,
     use_lighting: Option<bool>,
     texture: Option<u32>,
+    lightmap_texture: Option<u32>,
     vbo: u32,
     diagnostics: bool,
     draw_calls: usize,
@@ -904,6 +930,7 @@ impl WorldDrawState {
             double_sided: None,
             use_lighting: None,
             texture: None,
+            lightmap_texture: None,
             vbo: 0,
             diagnostics,
             draw_calls: 0,
@@ -969,6 +996,23 @@ impl WorldDrawState {
                 }
             }
 
+            let lightmap_texture = if self.color_mode == WorldVertexColorMode::Shaded {
+                batch.lightmap_texture
+            } else {
+                0
+            };
+            if self.lightmap_texture != Some(lightmap_texture) {
+                set_lightmap_texture(lightmap_texture);
+                self.lightmap_texture = Some(lightmap_texture);
+                if self.diagnostics {
+                    self.state_changes += 1;
+                }
+            }
+            if self.color_mode == WorldVertexColorMode::Shaded {
+                bind_material_preview(batch.texture, lightmap_texture);
+            } else {
+                reset_material_preview();
+            }
             let (local_first_vertex, vertices) = segment
                 .map(|segment| (segment.first_vertex, segment.vertices))
                 .unwrap_or((0, batch.vertices));
@@ -1022,6 +1066,15 @@ unsafe fn bind_world_vbo(vbo: u32, color_mode: WorldVertexColorMode) {
             stride,
             std::mem::offset_of!(WorldVertex, uv) as *const c_void,
         );
+        gl::ClientActiveTexture(gl::TEXTURE1);
+        gl::EnableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::TexCoordPointer(
+            2,
+            gl::FLOAT,
+            stride,
+            std::mem::offset_of!(WorldVertex, lightmap_uv) as *const c_void,
+        );
+        gl::ClientActiveTexture(gl::TEXTURE0);
         gl::NormalPointer(
             gl::FLOAT,
             stride,
@@ -1070,6 +1123,7 @@ unsafe fn draw_world_batch_immediate(
         gl::Begin(gl::TRIANGLES);
         for v in &batch.data[first..end] {
             gl::TexCoord2f(v.uv[0], v.uv[1]);
+            gl::MultiTexCoord2f(gl::TEXTURE1, v.lightmap_uv[0], v.lightmap_uv[1]);
             gl::Normal3f(v.normal[0], v.normal[1], v.normal[2]);
             let color = match color_mode {
                 WorldVertexColorMode::Shaded => v.shaded_rgba,
@@ -1136,7 +1190,9 @@ fn set_transparency_state(transparency: TransparencyMode) {
 fn draw_render_part_buffer(part: &RenderPart) {
     unsafe {
         if part.vbo == 0 {
+            bind_material_preview(part.texture, part.lightmap_texture);
             gl::CallList(part.list);
+            reset_material_preview();
             return;
         }
         if part.texture != 0 {
@@ -1145,13 +1201,24 @@ fn draw_render_part_buffer(part: &RenderPart) {
         } else {
             gl::Disable(gl::TEXTURE_2D);
         }
-        let stride = (12 * std::mem::size_of::<f32>()) as i32;
+        set_lightmap_texture(part.lightmap_texture);
+        bind_material_preview(part.texture, part.lightmap_texture);
+        let stride = (14 * std::mem::size_of::<f32>()) as i32;
         gl::BindBuffer(gl::ARRAY_BUFFER, part.vbo);
         gl::EnableClientState(gl::VERTEX_ARRAY);
         gl::EnableClientState(gl::NORMAL_ARRAY);
         gl::EnableClientState(gl::TEXTURE_COORD_ARRAY);
         gl::EnableClientState(gl::COLOR_ARRAY);
         gl::TexCoordPointer(2, gl::FLOAT, stride, std::ptr::null());
+        gl::ClientActiveTexture(gl::TEXTURE1);
+        gl::EnableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::TexCoordPointer(
+            2,
+            gl::FLOAT,
+            stride,
+            (12 * std::mem::size_of::<f32>()) as *const c_void,
+        );
+        gl::ClientActiveTexture(gl::TEXTURE0);
         gl::NormalPointer(
             gl::FLOAT,
             stride,
@@ -1172,6 +1239,11 @@ fn draw_render_part_buffer(part: &RenderPart) {
         gl::DrawArrays(gl::TRIANGLES, 0, part.vertices as i32);
         gl::DisableClientState(gl::COLOR_ARRAY);
         gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::ClientActiveTexture(gl::TEXTURE1);
+        gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::ClientActiveTexture(gl::TEXTURE0);
+        reset_material_preview();
+        set_lightmap_texture(0);
         gl::DisableClientState(gl::NORMAL_ARRAY);
         gl::DisableClientState(gl::VERTEX_ARRAY);
         gl::BindBuffer(gl::ARRAY_BUFFER, 0);
@@ -1253,6 +1325,123 @@ pub(crate) fn draw_scene_cell_set(
         });
     }
     recycle_visible_cell_scratch(order);
+}
+
+/// Scenery explicitly marked as a background is drawn before world geometry.
+/// follow_camera makes its placement position an offset from the camera.
+pub(crate) fn placement_is_background_scenery(placement: &Placement) -> bool {
+    placement.tag == "scenery"
+        && placement.attrs.get("background").is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
+}
+
+fn background_scenery_matrix(
+    placement: &Placement,
+    definitions: &HashMap<String, Definition>,
+    camera: Vec3,
+) -> Mat4 {
+    let relative = placement_follows_camera(placement, definitions);
+    if relative {
+        Mat4::from_translation(camera) * placement_matrix(placement)
+    } else {
+        placement_matrix(placement)
+    }
+}
+
+fn draw_background_scenery(app: &AppState) -> (usize, usize, usize) {
+    let mut placements = 0;
+    let mut parts = 0;
+    let mut vertices = 0;
+    unsafe {
+        gl::PushAttrib(gl::ALL_ATTRIB_BITS);
+    }
+    for (index, placement) in app.placements.iter().enumerate() {
+        if !placement_is_background_scenery(placement) || !is_visible_element(app, index) {
+            continue;
+        }
+        let Some(mesh) = element_mesh(app, placement) else {
+            continue;
+        };
+        let mut order: Vec<_> = (0..mesh.parts.len()).collect();
+        // Halo sky layers are authored in dome/planets/ring/cloud order.
+        // Preserve DFF face order instead of sorting them by world distance.
+        order.sort_by_key(|index| {
+            mesh.parts[*index]
+                .face_indices
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+        unsafe {
+            gl::Disable(gl::DEPTH_TEST);
+            gl::Disable(gl::FOG);
+            gl::Disable(gl::LIGHTING);
+            if placement_disable_backface_culling(placement, &app.definitions) {
+                gl::Disable(gl::CULL_FACE);
+            } else {
+                gl::Enable(gl::CULL_FACE);
+            }
+            gl::PushMatrix();
+            gl::MultMatrixf(
+                background_scenery_matrix(placement, &app.definitions, app.camera.pos)
+                    .to_cols_array()
+                    .as_ptr(),
+            );
+            for index in order {
+                let part = &mesh.parts[index];
+                set_transparency_state(part.transparency);
+                gl::DepthMask(gl::FALSE);
+                draw_render_part_immediate(part, placement_alpha(placement), V3::default());
+                parts += 1;
+                vertices += part.vertices;
+            }
+            gl::PopMatrix();
+        }
+        placements += 1;
+    }
+    unsafe {
+        gl::PopAttrib();
+    }
+    (placements, parts, vertices)
+}
+
+fn draw_camera_following_placements(app: &AppState) -> (usize, usize, usize) {
+    let mut placements = 0;
+    let mut parts = 0;
+    let mut vertices = 0;
+    for (index, placement) in app.placements.iter().enumerate() {
+        if placement_is_background_scenery(placement)
+            || !placement_follows_camera(placement, &app.definitions)
+            || !is_visible_element(app, index)
+        {
+            continue;
+        }
+        let Some(mesh) = element_mesh(app, placement) else {
+            continue;
+        };
+        unsafe {
+            gl::PushMatrix();
+            gl::Translatef(app.camera.pos.x, app.camera.pos.y, app.camera.pos.z);
+        }
+        let (p, v) = draw_placement_render_mesh(
+            placement,
+            mesh,
+            placement_disable_backface_culling(placement, &app.definitions),
+            scene_ambient_lift_from_timecyc(&app.timecyc),
+        );
+        unsafe {
+            gl::PopMatrix();
+        }
+        placements += 1;
+        parts += p;
+        vertices += v;
+    }
+    (placements, parts, vertices)
 }
 
 pub(crate) fn draw_placement_render_mesh(
@@ -1444,7 +1633,7 @@ fn draw_render_part_view_mode(
                     classification[3],
                 );
                 if part.vbo != 0 {
-                    let stride = (12 * std::mem::size_of::<f32>()) as i32;
+                    let stride = (14 * std::mem::size_of::<f32>()) as i32;
                     gl::BindBuffer(gl::ARRAY_BUFFER, part.vbo);
                     gl::EnableClientState(gl::VERTEX_ARRAY);
                     gl::VertexPointer(
@@ -1539,6 +1728,11 @@ fn draw_preview_view_mode_scene(
 ) -> (usize, usize, usize) {
     let mut visible = Vec::<(f32, usize)>::new();
     for (index, placement) in app.placements.iter().enumerate() {
+        if placement_is_background_scenery(placement)
+            || placement_follows_camera(placement, &app.definitions)
+        {
+            continue;
+        }
         if app
             .element_states
             .get(index)
@@ -1792,6 +1986,11 @@ fn draw_lod_audit_scene(
     };
     let mut visible = Vec::<(f32, usize)>::new();
     for (index, placement) in app.placements.iter().enumerate() {
+        if placement_is_background_scenery(placement)
+            || placement_follows_camera(placement, &app.definitions)
+        {
+            continue;
+        }
         if !is_visible_element(app, index)
             || !lod_audit_placement_visible(app, result, index, camera)
         {
@@ -1853,6 +2052,8 @@ fn draw_render_part_immediate(part: &RenderPart, alpha: f32, ambient_lift: V3) {
         } else {
             gl::Disable(gl::TEXTURE_2D);
         }
+        set_lightmap_texture(part.lightmap_texture);
+        bind_material_preview(part.texture, part.lightmap_texture);
         gl::Begin(gl::TRIANGLES);
         for vertex in &part.cpu_vertices {
             let color = display_vertex_color(
@@ -1864,9 +2065,12 @@ fn draw_render_part_immediate(part: &RenderPart, alpha: f32, ambient_lift: V3) {
             gl::Color4f(color.x, color.y, color.z, alpha * part.alpha * vertex.alpha);
             gl::Normal3f(vertex.normal.x, vertex.normal.y, vertex.normal.z);
             gl::TexCoord2f(vertex.uv.u, vertex.uv.v);
+            gl::MultiTexCoord2f(gl::TEXTURE1, vertex.lightmap_uv.u, vertex.lightmap_uv.v);
             gl::Vertex3f(vertex.pos.x, vertex.pos.y, vertex.pos.z);
         }
         gl::End();
+        reset_material_preview();
+        set_lightmap_texture(0);
     }
 }
 
@@ -1980,12 +2184,19 @@ pub(crate) fn build_scene_cells(
     want_lod: bool,
     ambient_lift: V3,
 ) -> Vec<SceneCell> {
+    // Animated plugin uniforms must be applied at draw time, not recorded into scene lists.
+    if has_material_previews() {
+        return Vec::new();
+    }
     const CELL_SIZE: f32 = 384.0;
     // Bucket placements by cell first. A display list must be compiled
     // start-to-finish before another is opened (only one gl::NewList may be
     // open at a time), so we cannot interleave NewList calls across cells.
     let mut buckets = HashMap::<(i32, i32), Vec<usize>>::new();
     for (i, p) in placements.iter().enumerate() {
+        if placement_is_background_scenery(p) || placement_follows_camera(p, definitions) {
+            continue;
+        }
         if placement_is_lod(p, lod_ids) != want_lod {
             continue;
         }
@@ -2124,6 +2335,14 @@ pub(crate) fn build_world_cells_for_keys(
     // bounds transient vertex memory to the largest cell/tier bucket instead.
     let mut bucket_members = HashMap::<(WorldCellKey, WorldDrawDistanceTier), Vec<usize>>::new();
     for (index, p) in placements.iter().enumerate() {
+        // Reject unrelated cells before allocating mesh/LOD keys or looking up
+        // attributes. Local edits must not resolve every model on a heavy map.
+        if !world_cell_key_is_selected(p.pos, selected_keys) {
+            continue;
+        }
+        if placement_is_background_scenery(p) || placement_follows_camera(p, definitions) {
+            continue;
+        }
         if element_states.is_some_and(|states| {
             states
                 .get(index)
@@ -2135,9 +2354,6 @@ pub(crate) fn build_world_cells_for_keys(
             continue;
         }
         let cell_key = world_cell_key(p.pos);
-        if !world_cell_key_is_selected(p.pos, selected_keys) {
-            continue;
-        }
         let mesh_key = placement_mesh_key(p, definitions);
         if !meshes.contains_key(&mesh_key) {
             continue;
@@ -2203,7 +2419,13 @@ pub(crate) fn build_world_cells_for_keys(
                     1
                 };
                 cell.vertices += part.cpu_vertices.len() * pass_count;
-                let key = (part.texture, part.use_lighting, double_sided, transparency);
+                let key = (
+                    part.texture,
+                    part.lightmap_texture,
+                    part.use_lighting,
+                    double_sided,
+                    transparency,
+                );
                 let mut part_data = Vec::with_capacity(part.cpu_vertices.len());
                 let mut part_min = Vec3::splat(f32::MAX);
                 let mut part_max = Vec3::splat(f32::MIN);
@@ -2221,6 +2443,7 @@ pub(crate) fn build_world_cells_for_keys(
                     let vertex_alpha = alpha * part.alpha * v.alpha;
                     part_data.push(WorldVertex {
                         uv: [v.uv.u, v.uv.v],
+                        lightmap_uv: [v.lightmap_uv.u, v.lightmap_uv.v],
                         normal: [normal.x, normal.y, normal.z],
                         shaded_rgba: pack_world_rgba(display_color, vertex_alpha),
                         unshaded_rgba: pack_world_rgba(
@@ -2298,19 +2521,20 @@ pub(crate) fn build_world_cells_for_keys(
             .filter(|(_, (data, _, _))| !data.is_empty())
             .collect::<Vec<_>>();
         groups.sort_by_key(|(key, _)| {
-            let (texture, use_lighting, double_sided, transparency) = *key;
+            let (texture, lightmap_texture, use_lighting, double_sided, transparency) = *key;
             (
                 transparency == TransparencyMode::Blend,
                 double_sided,
                 use_lighting,
                 texture,
+                lightmap_texture,
             )
         });
         let combined_len: usize = groups.iter().map(|(_, (data, _, _))| data.len()).sum();
         let mut next_vertex = 0usize;
         let mut batches = Vec::with_capacity(groups.len());
         for (
-            (texture, use_lighting, double_sided, transparency),
+            (texture, lightmap_texture, use_lighting, double_sided, transparency),
             (data, blend_segments, classification_segments),
         ) in groups
         {
@@ -2319,6 +2543,7 @@ pub(crate) fn build_world_cells_for_keys(
             next_vertex = next_vertex.saturating_add(vertices);
             batches.push(WorldBatch {
                 texture,
+                lightmap_texture,
                 use_lighting,
                 double_sided,
                 transparency,
@@ -4722,6 +4947,11 @@ unsafe fn draw_world_dff_pointlight_pass(
         }
         gl::DisableClientState(gl::COLOR_ARRAY);
         gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::ClientActiveTexture(gl::TEXTURE1);
+        gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::ClientActiveTexture(gl::TEXTURE0);
+        reset_material_preview();
+        set_lightmap_texture(0);
         gl::DisableClientState(gl::NORMAL_ARRAY);
         gl::DisableClientState(gl::VERTEX_ARRAY);
         gl::BindBuffer(gl::ARRAY_BUFFER, 0);
@@ -5737,6 +5967,8 @@ fn transform_uv(uv: V2, matrix: [f32; 6]) -> V2 {
 
 fn draw_editing_part_dynamic(part: &RenderPart, matrix: Option<[f32; 6]>, ambient_lift: V3) {
     unsafe {
+        set_lightmap_texture(part.lightmap_texture);
+        bind_material_preview(part.texture, part.lightmap_texture);
         gl::Begin(gl::TRIANGLES);
         for vertex in &part.cpu_vertices {
             let uv = matrix.map_or(vertex.uv, |matrix| transform_uv(vertex.uv, matrix));
@@ -5752,9 +5984,12 @@ fn draw_editing_part_dynamic(part: &RenderPart, matrix: Option<[f32; 6]>, ambien
             gl::Color4f(color.x, color.y, color.z, alpha);
             gl::Normal3f(vertex.normal.x, vertex.normal.y, vertex.normal.z);
             gl::TexCoord2f(uv.u, uv.v);
+            gl::MultiTexCoord2f(gl::TEXTURE1, vertex.lightmap_uv.u, vertex.lightmap_uv.v);
             gl::Vertex3f(vertex.pos.x, vertex.pos.y, vertex.pos.z);
         }
         gl::End();
+        reset_material_preview();
+        set_lightmap_texture(0);
     }
 }
 
@@ -6537,6 +6772,20 @@ pub(crate) unsafe fn apply_sa_timecyc_color_filter(
         }
         gl::CopyTexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, source_x, source_y, width, height);
 
+        // Blended foliage can lower framebuffer alpha even over a solid sky.
+        // The color filter uses scene RGB; its strength must come only from
+        // the authored pass alpha, or those edges receive less postFX and
+        // acquire dark outlines.
+        gl::TexEnvi(gl::TEXTURE_ENV, gl::TEXTURE_ENV_MODE, gl::COMBINE as i32);
+        gl::TexEnvi(gl::TEXTURE_ENV, gl::COMBINE_RGB, gl::MODULATE as i32);
+        gl::TexEnvi(gl::TEXTURE_ENV, gl::SOURCE0_RGB, gl::TEXTURE as i32);
+        gl::TexEnvi(gl::TEXTURE_ENV, gl::SOURCE1_RGB, gl::PRIMARY_COLOR as i32);
+        gl::TexEnvi(gl::TEXTURE_ENV, gl::OPERAND0_RGB, gl::SRC_COLOR as i32);
+        gl::TexEnvi(gl::TEXTURE_ENV, gl::OPERAND1_RGB, gl::SRC_COLOR as i32);
+        gl::TexEnvi(gl::TEXTURE_ENV, gl::COMBINE_ALPHA, gl::REPLACE as i32);
+        gl::TexEnvi(gl::TEXTURE_ENV, gl::SOURCE0_ALPHA, gl::PRIMARY_COLOR as i32);
+        gl::TexEnvi(gl::TEXTURE_ENV, gl::OPERAND0_ALPHA, gl::SRC_ALPHA as i32);
+
         gl::Disable(gl::DEPTH_TEST);
         gl::Disable(gl::LIGHTING);
         gl::Enable(gl::TEXTURE_2D);
@@ -6699,6 +6948,7 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
         gl::LoadMatrixf(projection.to_cols_array().as_ptr());
         gl::MatrixMode(gl::MODELVIEW);
         gl::LoadMatrixf(scene_view.to_cols_array().as_ptr());
+        set_material_preview_view(scene_view.inverse());
         configure_viewport_light(app, &timecyc_sample);
         gl::Materialfv(
             gl::FRONT_AND_BACK,
@@ -6717,6 +6967,11 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
         gl::DisableClientState(gl::VERTEX_ARRAY);
         gl::DisableClientState(gl::NORMAL_ARRAY);
         gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::ClientActiveTexture(gl::TEXTURE1);
+        gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+        gl::ClientActiveTexture(gl::TEXTURE0);
+        reset_material_preview();
+        set_lightmap_texture(0);
     }
 
     if app.active_tab == AppTab::Collisions {
@@ -6741,6 +6996,13 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
         draw_vehicle_preview(app);
         reset_gl_for_ui();
         return;
+    }
+
+    if app.viewport_render_mode != ViewportRenderMode::CollisionClassification {
+        let (placements, parts, vertices) = draw_background_scenery(app);
+        app.last_drawn_placements += placements;
+        app.last_drawn_parts += parts;
+        app.last_drawn_vertices += vertices;
     }
 
     // Only the part budget forces us off the fast VBO path; the vertex budget is
@@ -6774,7 +7036,11 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
     let draw_lod = mode != LodMode::DetailOnly && !app.lod_world_cells.is_empty()
         || mode != LodMode::DetailOnly && !app.lod_scene_cells.is_empty();
 
-    if app.options.fast_vbo && !app.options.vbo_immediate && !part_budgeted {
+    let plugin_classification = has_material_previews()
+        && app.viewport_render_mode == ViewportRenderMode::CollisionClassification;
+    if (app.options.fast_vbo && !app.options.vbo_immediate && !part_budgeted)
+        || plugin_classification
+    {
         update_world_cell_residency(
             &mut app.world_cells,
             &mut app.lod_world_cells,
@@ -6794,7 +7060,9 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
         unsafe {
             gl::Disable(gl::FOG);
         }
-        if app.options.fast_vbo && !part_budgeted && !app.world_cells.is_empty() {
+        if ((app.options.fast_vbo && !part_budgeted) || has_material_previews())
+            && !app.world_cells.is_empty()
+        {
             let mut placements = 0;
             let mut parts = 0;
             let mut vertices = 0;
@@ -6807,9 +7075,10 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
                         far,
                         app.options.draw_distance_percent,
                         &frustum,
-                        app.options.vbo_immediate,
+                        app.options.vbo_immediate || !app.options.fast_vbo || part_budgeted,
                         WorldVertexColorMode::Unshaded,
                         vertex_budget,
+                        app.options.part_budget,
                         &mut placements,
                         &mut parts,
                         &mut vertices,
@@ -6822,9 +7091,10 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
                             lod_far,
                             app.options.draw_distance_percent,
                             &frustum,
-                            app.options.vbo_immediate,
+                            app.options.vbo_immediate || !app.options.fast_vbo || part_budgeted,
                             WorldVertexColorMode::Unshaded,
                             vertex_budget,
+                            app.options.part_budget,
                             &mut placements,
                             &mut parts,
                             &mut vertices,
@@ -6840,6 +7110,7 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
                         app.options.draw_distance_percent,
                         &frustum,
                         vertex_budget,
+                        app.options.part_budget,
                         &app.material_classes,
                         app.collision_generation_fallback_material,
                         &mut placements,
@@ -6855,6 +7126,7 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
                             app.options.draw_distance_percent,
                             &frustum,
                             vertex_budget,
+                            app.options.part_budget,
                             &app.material_classes,
                             app.collision_generation_fallback_material,
                             &mut placements,
@@ -6873,6 +7145,11 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
                 gl::BindTexture(gl::TEXTURE_2D, 0);
                 gl::DisableClientState(gl::COLOR_ARRAY);
                 gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+                gl::ClientActiveTexture(gl::TEXTURE1);
+                gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+                gl::ClientActiveTexture(gl::TEXTURE0);
+                reset_material_preview();
+                set_lightmap_texture(0);
                 gl::DisableClientState(gl::NORMAL_ARRAY);
                 gl::DisableClientState(gl::VERTEX_ARRAY);
             }
@@ -6891,17 +7168,23 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
             app.last_drawn_parts = parts;
             app.last_drawn_vertices = vertices;
         }
+        let (dp, dpa, dv) = draw_camera_following_placements(app);
+        app.last_drawn_placements += dp;
+        app.last_drawn_parts += dpa;
+        app.last_drawn_vertices += dv;
         draw_global_transform_bounds(app);
         draw_editor_outlines(app);
         reset_gl_for_ui();
         return;
     }
 
-    if app.options.fast_vbo && !part_budgeted && !app.world_cells.is_empty() {
+    if ((app.options.fast_vbo && !part_budgeted) || has_material_previews())
+        && !app.world_cells.is_empty()
+    {
         let mut dp = 0usize;
         let mut dpa = 0usize;
         let mut dv = 0usize;
-        let immediate = app.options.vbo_immediate;
+        let immediate = app.options.vbo_immediate || !app.options.fast_vbo || part_budgeted;
         let vbud = vertex_budget;
         draw_world_cell_set(
             &app.world_cells,
@@ -6913,6 +7196,7 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
             immediate,
             WorldVertexColorMode::Shaded,
             vbud,
+            app.options.part_budget,
             &mut dp,
             &mut dpa,
             &mut dv,
@@ -6928,6 +7212,7 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
                 immediate,
                 WorldVertexColorMode::Shaded,
                 vbud,
+                app.options.part_budget,
                 &mut dp,
                 &mut dpa,
                 &mut dv,
@@ -6942,6 +7227,11 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
             gl::Disable(gl::TEXTURE_2D);
             gl::DisableClientState(gl::COLOR_ARRAY);
             gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+            gl::ClientActiveTexture(gl::TEXTURE1);
+            gl::DisableClientState(gl::TEXTURE_COORD_ARRAY);
+            gl::ClientActiveTexture(gl::TEXTURE0);
+            reset_material_preview();
+            set_lightmap_texture(0);
             gl::DisableClientState(gl::NORMAL_ARRAY);
             gl::DisableClientState(gl::VERTEX_ARRAY);
             let (local_dp, local_dpa, local_dv) = draw_selected_local_lod(app, &frustum, lod_near);
@@ -6963,6 +7253,10 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
             );
             draw_viewport_water_planes(app, &frustum, cam, far);
             draw_placement_2dfx_overlay(app, &visible_2dfx);
+            let (dp, dpa, dv) = draw_camera_following_placements(app);
+            app.last_drawn_placements += dp;
+            app.last_drawn_parts += dpa;
+            app.last_drawn_vertices += dv;
             draw_global_transform_bounds(app);
             apply_sa_timecyc_color_filter(app, viewport, &timecyc_sample);
             draw_race_markers(app);
@@ -7029,6 +7323,10 @@ pub(crate) fn draw_scene(app: &mut AppState, viewport: Rect) {
     );
     draw_viewport_water_planes(app, &frustum, cam, far);
     draw_placement_2dfx_overlay(app, &visible_2dfx);
+    let (dp, dpa, dv) = draw_camera_following_placements(app);
+    app.last_drawn_placements += dp;
+    app.last_drawn_parts += dpa;
+    app.last_drawn_vertices += dv;
     draw_global_transform_bounds(app);
     unsafe { apply_sa_timecyc_color_filter(app, viewport, &timecyc_sample) };
     draw_race_markers(app);
@@ -7480,13 +7778,13 @@ mod tests {
 
     #[test]
     fn packed_world_vertex_layout_matches_client_array_offsets() {
-        assert_eq!(std::mem::size_of::<WorldVertex>(), 40);
+        assert_eq!(std::mem::size_of::<WorldVertex>(), 48);
         assert_eq!(std::mem::align_of::<WorldVertex>(), 4);
         assert_eq!(std::mem::offset_of!(WorldVertex, uv), 0);
-        assert_eq!(std::mem::offset_of!(WorldVertex, normal), 8);
-        assert_eq!(std::mem::offset_of!(WorldVertex, shaded_rgba), 20);
-        assert_eq!(std::mem::offset_of!(WorldVertex, unshaded_rgba), 24);
-        assert_eq!(std::mem::offset_of!(WorldVertex, position), 28);
+        assert_eq!(std::mem::offset_of!(WorldVertex, normal), 16);
+        assert_eq!(std::mem::offset_of!(WorldVertex, shaded_rgba), 28);
+        assert_eq!(std::mem::offset_of!(WorldVertex, unshaded_rgba), 32);
+        assert_eq!(std::mem::offset_of!(WorldVertex, position), 36);
     }
 
     #[test]
@@ -7608,6 +7906,37 @@ mod tests {
             pos: V3::default(),
             rot: V3::default(),
         }
+    }
+
+    #[test]
+    fn background_scenery_follows_camera_without_parallax() {
+        let mut sky = draw_distance_test_placement("scenery");
+        sky.attrs.insert("background".into(), "true".into());
+        sky.attrs.insert("flags".into(), "51".into());
+        sky.pos = V3 {
+            x: 2.0,
+            y: 3.0,
+            z: 4.0,
+        };
+        let a = Vec3::new(10.0, 20.0, 30.0);
+        let b = Vec3::new(-300.0, 150.0, 700.0);
+        let vertex = Vec3::new(45.0, -50.0, 100.0);
+        assert!(placement_is_background_scenery(&sky));
+        let relative_a =
+            background_scenery_matrix(&sky, &HashMap::new(), a).transform_point3(vertex) - a;
+        let relative_b =
+            background_scenery_matrix(&sky, &HashMap::new(), b).transform_point3(vertex) - b;
+        assert!((relative_a - relative_b).length() < 0.0001);
+        sky.attrs.remove("flags");
+        assert_eq!(
+            background_scenery_matrix(&sky, &HashMap::new(), a),
+            placement_matrix(&sky)
+        );
+        sky.tag = "object".into();
+        assert!(!placement_is_background_scenery(&sky));
+        sky.tag = "scenery".into();
+        sky.attrs.clear();
+        assert!(!placement_is_background_scenery(&sky));
     }
 
     fn draw_distance_test_definition(attrs: &[(&str, &str)]) -> Definition {

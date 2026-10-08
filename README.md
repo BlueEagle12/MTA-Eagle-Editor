@@ -2,7 +2,7 @@
 
 **A native 3D world and asset editor for Multi Theft Auto: San Andreas.**
 
-[![Release](https://img.shields.io/badge/release-v0.1.7-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.8-2563eb)](https://github.com/BlueEagle12/MTA-Eagle-Editor/releases)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-4b5563)](#download)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green)](LICENSE)
 
@@ -66,8 +66,8 @@ code-signed. Verify the archive checksum below before choosing **Run anyway**.
 The Linux build requires an x86-64 desktop with X11 and OpenGL drivers.
 
 ```bash
-tar -xzf EagleEditor-v0.1.7-linux-x86_64.tar.gz
-cd EagleEditor-v0.1.7-linux-x86_64
+tar -xzf EagleEditor-v0.1.8-linux-x86_64.tar.gz
+cd EagleEditor-v0.1.8-linux-x86_64
 chmod +x EagleEditor
 ./EagleEditor
 ```
@@ -78,6 +78,11 @@ directly from the command line on either platform:
 ```text
 EagleEditor "/path/to/resource"
 ```
+
+Choose **Default SA Map** in the Project Manager to load the original exterior
+world, including streamed map objects and water, from your configured SA
+installation. Changes in this mode are temporary; Save, Save WIP, Save As, and
+autosave are disabled until support for preserving map changes is added.
 
 On first start, Eagle asks for the GTA: San Andreas installation folder and
 verifies it by checking for `models/gta3.img`. The selected path is stored in
@@ -147,6 +152,38 @@ does not need to be listed in `meta.xml` and is not read by the runtime loader.
 `.light_mapper_wip/latest/`. A normal **Save** promotes the current work into
 the resource and removes that snapshot.
 
+### Changing Eagle zones
+
+Click an element's **Zone** button or open **Scene → Placement files…**. Choose a
+zone and click **Assign** to move the selected elements. Enter a plain zone name
+and click **Add / Register** to create a zone; click its row to use it for new
+objects. Zone changes and zone creation support undo and redo.
+
+Each editable model definition is stored once, in the zone containing the most
+undeleted instances of that model. Hidden instances count. On a tie, the current
+owner stays; if it is no longer a candidate, the first zone alphabetically wins.
+Unused definitions stay in their current zone. Saving removes the definition
+from its previous zone file when ownership changes. Standard MTA `.map` files
+do not own Eagle definitions.
+
+### Standard MTA:SA map files
+
+Projects can open standard MTA resources as well as Eagle zone projects. Eagle
+loads `.map` files declared with `<map src="..." />` in `meta.xml`. Maps listed
+only as `<file>` are not automatically loaded.
+
+Use **Scene → Placement files…**, or click the selected element's Zone/Map line,
+to register an existing or new project-relative map path such as `maps/main.map`.
+Registration is saved in `eagleMaps.json` and leaves `meta.xml` unchanged, so
+maps loaded by custom scripts can keep their existing loading method.
+
+Click a destination to choose where new objects go. **Assign** moves selected
+objects to that file. Standard maps use numeric GTA:SA model IDs; custom Eagle
+model names use zone maps. **Save**, **Save As**, **Save WIP**, and autosave retain
+map destinations. Saving preserves map metadata, comments, unsupported elements
+(such as vehicles), and nested element data. Registered files must stay within
+the project folder. GTA:SA assets still require a configured game installation.
+
 ## Viewport controls
 
 | Input | Action |
@@ -167,9 +204,12 @@ into Eagle Editor, and Eagle's shared RenderWare code owns mesh slicing, DFF
 serialization, TXD generation, IMG packing, definitions, and map placements.
 RRW Material Tools remains optional for advanced material authoring.
 
-Eagle checks the `BLENDER_PATH` environment variable first, then `blender` on
-`PATH`, followed by common installation locations. If more than one Blender
-version is installed, set `BLENDER_PATH` to the exact executable to use.
+Eagle checks the Blender install directory configured in **Preferences** first,
+then the `BLENDER_PATH` environment variable, `blender` on `PATH`, and common
+installation locations. If more than one Blender version is installed, choose
+its install directory in Preferences or set `BLENDER_PATH` to the executable.
+Preferences can search the common install locations and lets you choose among
+every Blender installation it finds.
 
 After creating or opening an Eagle map, drag a saved `.blend` file onto the
 editor window (or use **Import Blender**). A setup prompt lets you choose visual
@@ -216,3 +256,71 @@ The complete documentation is maintained in the
 Eagle Editor is distributed under the [GNU General Public License v3.0](LICENSE).
 Bundled third-party components and trademarks are described in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+### Resource-owned UV1 lightmaps
+
+A map declares `eagleLightMaps.xml` and stores its PNG atlases in its own `lightmaps/` folder:
+
+```xml
+<eagleLightMaps uvSet="1">
+  <lightmap texture="terrain_lm00" file="lightmaps/terrain/lm_00.png" />
+</eagleLightMaps>
+```
+
+Texture paths are relative to the opened map resource. The MTA lightmap loader
+reads this descriptor and creates textures using `:mapResource/file` paths.
+DFF diffuse coordinates use UV0;
+the first secondary stream is UV1. Shaded world rendering and DFF previews
+multiply the atlas using UV1, while unshaded texture mode shows diffuse only.
+Each diffuse material/atlas pair needs a unique texture alias in its TXD.
+Use neutral BSP prelight so lighting is not multiplied twice. The existing DFF
+import/export pipeline preserves secondary UV streams through saves.
+
+
+### Material shader plugins
+
+Shader-only plugins use the `eagle-material-v1` API. Install a plugin folder in
+`plugins/` beside the executable, in Eagle's config directory, or in the source
+checkout's `plugins/` folder. Config plugins take precedence. Each folder
+contains `plugin.json`, a compatibility GLSL vertex shader and a fragment shader;
+there are no native libraries or scripts to execute.
+
+A map binds material aliases through `eagleMaterials.xml`:
+
+```xml
+<eagleMaterials version="1" plugin="example-materials">
+  <material texture="terrain_lm00" file="materials/terrain.json"
+            lightmap="lightmaps/terrain/lm_00.png" />
+</eagleMaterials>
+```
+
+Material JSON declares its plugin ID, named map-local samplers, float4 uniform
+values and optional generated fragment snippet. The plugin manifest declares
+the sampler/uniform names and shader files. Cubemap samplers declare six PNG
+faces in DDS +X/-X/+Y/-Y/+Z/-Z order. A 2D sampler may declare a `mipmaps`
+array of map-local images, ordered from the full-size level down, to preserve
+authored detail fades rather than generating new mipmaps. The host supplies `Time`, `CameraToWorld`,
+`FogEnabled`, and each binding's UV1 lightmap, and preserves vertex prelight.
+Resource and plugin paths must remain inside their owning folder. Material
+framebuffer blending takes precedence over a fallback bitmap's alpha classification,
+so additive black placeholders remain transparent rather than becoming cutouts.
+
+Material plugins are installed separately; no material plugin is bundled with
+the public release. Use **Preferences → Plugins** to inspect installed plugins,
+read validation errors, and enable or disable them. Save preferences to apply
+changes. Unshaded texture mode continues to show the diffuse texture.
+
+## Background scenery
+
+Eagle `<scenery background="true" flags="follow_camera" ... />` placements
+preview as a sky background. Their position is a camera-relative offset;
+rotation and scale keep their usual meaning. Backgrounds draw before world
+geometry, without fog, depth writes, distance culling, or static batching,
+and preserve authored DFF material order. Omit `follow_camera` for a fixed
+background placement. Ordinary scenery continues to render in world space.
+Eagle Loader's Follow Camera flag translates objects, buildings and scenery
+with the camera. Enable it in the model or placement Flags panel; the preview
+supports named `follow_camera`, numeric `51`, and direct `followCamera="true"`
+attributes. A placement's explicit `followCamera="false"` overrides a model
+flag. Rotation remains authored and position acts as a camera offset. Followers
+render dynamically instead of being baked into static world cells. Camera following uses Eagle Loader's flag directly.

@@ -42,7 +42,11 @@ fn plan_instance_lod_removal(
     let target_indices: HashSet<usize> = placements
         .iter()
         .enumerate()
-        .filter(|(idx, placement)| live_in_snapshot(states, *idx) && placement.id == target_id)
+        .filter(|(idx, placement)| {
+            live_in_snapshot(states, *idx)
+                && !is_default_world_placement(placement)
+                && placement.id == target_id
+        })
         .map(|(idx, _)| idx)
         .collect();
     let mut selection = InstanceLodRemovalSelection {
@@ -165,6 +169,9 @@ fn build_instance_lod_removal_result(
         }
     }
     for idx in &selection.lod_indices {
+        if is_default_world_placement(&after.placements[*idx]) {
+            continue;
+        }
         if let Some(state) = after.element_states.get_mut(*idx) {
             state.deleted = true;
         }
@@ -1344,11 +1351,15 @@ pub(crate) fn selected_live_indices_in_selection_order(app: &AppState) -> Vec<us
     let mut ordered = Vec::new();
     let mut seen = BTreeSet::new();
     for idx in app.selected_element_order.iter().copied() {
-        if app.selected_elements.contains(&idx) && is_live_element(app, idx) && seen.insert(idx) {
+        if app.selected_elements.contains(&idx)
+            && is_live_element(app, idx)
+            && !is_default_world_placement(&app.placements[idx])
+            && seen.insert(idx)
+        {
             ordered.push(idx);
         }
     }
-    for idx in selected_live_indices(app) {
+    for idx in selected_editable_indices(app) {
         if seen.insert(idx) {
             ordered.push(idx);
         }
@@ -1373,13 +1384,13 @@ pub(crate) fn selected_live_elements_are_self_lod(app: &AppState) -> bool {
 /// If the full selection is already self-LOD, remove the value from every
 /// selected element; otherwise assign it to every selected element.
 pub(crate) fn toggle_self_lod_for_selection(app: &mut AppState) {
-    let selected = selected_live_indices(app);
+    let selected = selected_editable_indices(app);
     if selected.is_empty() {
         app.status_message = "Select at least one live element".to_string();
         return;
     }
     let enable = !selected_live_elements_are_self_lod(app);
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, selected.iter().copied(), []);
     for idx in &selected {
         if let Some(placement) = app.placements.get_mut(*idx) {
             set_optional_attr(
@@ -1389,8 +1400,7 @@ pub(crate) fn toggle_self_lod_for_selection(app: &mut AppState) {
             );
         }
     }
-    rebuild_render_cells(app);
-    commit_world_history(
+    commit_local_world_history(
         app,
         if enable {
             "Assign Self LOD"
@@ -1535,7 +1545,7 @@ pub(crate) fn assign_lod_parent_from_selection(app: &mut AppState) {
         app.status_message = "LOD parent needs an ID".to_string();
         return;
     }
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, selected_editable_indices(app), []);
 
     // When several LODs share this name, `lodParent` alone can't say which LOD
     // instance a child belongs to. Pair them with a shared, scene-unique
@@ -1575,8 +1585,7 @@ pub(crate) fn assign_lod_parent_from_selection(app: &mut AppState) {
         app.status_message = "Select at least one child after the LOD parent".to_string();
         return;
     }
-    rebuild_render_cells(app);
-    commit_world_history(app, "Assign LOD", before);
+    commit_local_world_history(app, "Assign LOD", before);
     app.status_message = format!("Assigned {parent_id} as LOD parent for {assigned} element(s)");
 }
 
@@ -1588,14 +1597,17 @@ fn v3_dist_sq(a: V3, b: V3) -> f32 {
 }
 
 /// One past the largest integer `uniqueID` currently in the scene, or 1 if none.
-fn next_scene_unique_id(placements: &[Placement]) -> u64 {
-    placements
+pub(crate) fn next_scene_unique_id(placements: &[Placement]) -> u64 {
+    let used = placements
         .iter()
         .filter_map(|p| p.attrs.get("uniqueID"))
         .filter_map(|v| v.trim().parse::<u64>().ok())
-        .max()
-        .map(|m| m + 1)
-        .unwrap_or(1)
+        .collect::<BTreeSet<_>>();
+    used.iter()
+        .next_back()
+        .and_then(|maximum| maximum.checked_add(1))
+        .or_else(|| (1..).find(|candidate| !used.contains(candidate)))
+        .unwrap_or(0)
 }
 
 /// Number of placements sharing an id (case-insensitive); >1 means the LOD name
@@ -1893,6 +1905,9 @@ fn fix_lod_types_in(placements: &mut [Placement], states: &[ElementState]) -> us
         let Some(lod) = placements.get_mut(index) else {
             continue;
         };
+        if is_default_world_placement(lod) {
+            continue;
+        }
         if !lod.tag.eq_ignore_ascii_case(desired_type) {
             lod.tag = desired_type.to_string();
             changed += 1;
@@ -2047,6 +2062,9 @@ pub(crate) fn remove_orphan_lods(app: &mut AppState) -> usize {
     let indices = orphan_lod_indices(&app.placements, &app.element_states);
     let mut removed = 0usize;
     for index in indices {
+        if is_default_world_placement(&app.placements[index]) {
+            continue;
+        }
         let Some(state) = app.element_states.get_mut(index) else {
             continue;
         };
@@ -2288,7 +2306,9 @@ fn clear_all_lods_in_world(
     let mut cleared = 0usize;
     let mut removed = 0usize;
     for (index, placement) in placements.iter_mut().enumerate() {
-        if states.get(index).is_some_and(|state| state.deleted) {
+        if is_default_world_placement(placement)
+            || states.get(index).is_some_and(|state| state.deleted)
+        {
             continue;
         }
         if placement.attrs.remove("lodParent").is_some() {
@@ -2635,6 +2655,11 @@ pub(crate) fn fix_repeated_lod_unique_ids(app: &mut AppState) -> usize {
                     uid
                 });
 
+            if is_default_world_placement(&app.placements[lod_idx])
+                || is_default_world_placement(&app.placements[detail_idx])
+            {
+                continue;
+            }
             set_optional_attr(&mut app.placements[lod_idx].attrs, "uniqueID", uid.clone());
             set_optional_attr(&mut app.placements[detail_idx].attrs, "uniqueID", uid);
             consumed.insert(lod_idx);
@@ -2888,35 +2913,88 @@ const TOOLBAR_IMPORT_BLENDER: usize = 14;
 const TOOLBAR_PREFERENCES: usize = 15;
 const TOOLBAR_IMPORT_ASSET: usize = 16;
 
+const FILE_ACTION_CONTROLS: [(usize, f32); 7] = [
+    (TOOLBAR_LOAD, 70.0),
+    (TOOLBAR_SAVE_AS, 92.0),
+    (TOOLBAR_SAVE_WIP, 104.0),
+    (TOOLBAR_GENERATE_TXD, 120.0),
+    (TOOLBAR_IMPORT_BLENDER, 136.0),
+    (TOOLBAR_PREFERENCES, 118.0),
+    (TOOLBAR_IMPORT_ASSET, 150.0),
+];
+const FILE_ACTION_GAP: f32 = 8.0;
+const FILE_ACTION_SCREEN_MARGIN: f32 = 18.0;
+
+fn compact_file_actions_for_width(screen_w: f32) -> bool {
+    let start_x = file_save_rect().x + file_save_rect().w + 10.0;
+    let desired_width: f32 = FILE_ACTION_CONTROLS.iter().map(|(_, width)| *width).sum();
+    let gaps = FILE_ACTION_GAP * FILE_ACTION_CONTROLS.len().saturating_sub(1) as f32;
+    screen_w - start_x - FILE_ACTION_SCREEN_MARGIN < desired_width + gaps
+}
+
+pub(crate) fn compact_file_actions() -> bool {
+    compact_file_actions_for_width(screen_width())
+}
+
+#[cfg(test)]
+mod file_action_toolbar_tests {
+    use super::compact_file_actions_for_width;
+
+    #[test]
+    fn compact_menu_replaces_controls_before_they_need_to_shrink() {
+        assert!(compact_file_actions_for_width(640.0));
+        assert!(compact_file_actions_for_width(1337.0));
+        assert!(!compact_file_actions_for_width(1338.0));
+        assert!(!compact_file_actions_for_width(1600.0));
+    }
+}
+
+pub(crate) fn file_actions_overflow_rect() -> Rect {
+    let x = file_save_rect().x + file_save_rect().w + 10.0;
+    let available = (screen_width() - x - FILE_ACTION_SCREEN_MARGIN).max(1.0);
+    Rect::new(x, 18.0, available.min(140.0), 36.0)
+}
+
+pub(crate) fn file_action_menu_row_rect(row: usize) -> Rect {
+    let button = file_actions_overflow_rect();
+    let width = 196.0_f32.min((screen_width() - 12.0).max(1.0));
+    let x = (button.x + button.w - width).clamp(6.0, (screen_width() - width - 6.0).max(6.0));
+    Rect::new(
+        x,
+        button.y + button.h + 8.0 + row as f32 * 34.0,
+        width,
+        30.0,
+    )
+}
+
+pub(crate) fn file_actions_menu_bounds() -> Rect {
+    let first = file_action_menu_row_rect(0);
+    Rect::new(
+        first.x - 5.0,
+        first.y - 5.0,
+        first.w + 10.0,
+        FILE_ACTION_MENU_LABELS.len() as f32 * 34.0 + 6.0,
+    )
+}
+
 fn toolbar_control_rect(control: usize) -> Rect {
     // File/project actions live in the top row. Transform actions have their
     // own strip below workspace navigation, so this row never fights the
     // project identity for horizontal space.
     let start_x = file_save_rect().x + file_save_rect().w + 10.0;
     let available = (screen_width() - start_x - 18.0).max(1.0);
-    let gap = 8.0;
-    let controls = [
-        (TOOLBAR_LOAD, 70.0),
-        (TOOLBAR_SAVE_AS, 92.0),
-        (TOOLBAR_SAVE_WIP, 104.0),
-        (TOOLBAR_GENERATE_TXD, 120.0),
-        (TOOLBAR_PREFERENCES, 118.0),
-        // Noto Sans renders "Import new asset" at about 131px at 16px.
-        // Leave the same 9px inset used by text buttons on both sides so the
-        // full label is visible whenever the toolbar has its preferred width.
-        (TOOLBAR_IMPORT_ASSET, 150.0),
-    ];
-    let visible_count = controls.len();
-    let gap_total = gap * visible_count.saturating_sub(1) as f32;
-    let desired_total: f32 = controls.iter().map(|(_, width)| *width).sum();
-    let scale = ((available - gap_total).max(1.0) / desired_total).min(1.0);
+    if compact_file_actions() {
+        return Rect::new(0.0, 0.0, 0.0, 0.0);
+    }
+    let gap_total = FILE_ACTION_GAP * FILE_ACTION_CONTROLS.len().saturating_sub(1) as f32;
+    let desired_total: f32 = FILE_ACTION_CONTROLS.iter().map(|(_, width)| *width).sum();
+    debug_assert!(available >= desired_total + gap_total);
     let mut x = start_x;
-    for (id, desired_w) in controls {
-        let width = desired_w * scale;
+    for (id, width) in FILE_ACTION_CONTROLS {
         if id == control {
             return Rect::new(x, 18.0, width, 36.0);
         }
-        x += width + gap;
+        x += width + FILE_ACTION_GAP;
     }
     Rect::new(0.0, 0.0, 0.0, 0.0)
 }
@@ -2965,7 +3043,7 @@ pub(crate) fn generate_txd_button_rect() -> Rect {
     toolbar_control_rect(TOOLBAR_GENERATE_TXD)
 }
 
-pub(crate) const SHOW_BLENDER_IMPORT: bool = false;
+pub(crate) const SHOW_BLENDER_IMPORT: bool = true;
 
 /// Tooltips are queued while controls are drawn, then flushed after dialogs
 /// and menus. Macroquad uses draw order for layering, so this is the UI
@@ -3064,7 +3142,33 @@ pub(crate) fn toolbar_contains(mouse: Vec2) -> bool {
         || (SHOW_BLENDER_IMPORT && import_blender_button_rect().contains(mouse))
         || preferences_button_rect().contains(mouse)
         || import_asset_button_rect().contains(mouse)
+        || (compact_file_actions() && file_actions_overflow_rect().contains(mouse))
         || transform_space_rect().contains(mouse)
+}
+
+pub(crate) const FILE_ACTION_MENU_LABELS: [&str; 7] = [
+    "Load resource",
+    "Save As",
+    "Save WIP",
+    "Build TXD",
+    "Import Blender",
+    "Preferences",
+    "Import new asset",
+];
+
+fn run_file_action(app: &mut AppState, row: usize) {
+    match row {
+        0 => open_load_picker(app),
+        1 => open_save_as_dialog(app),
+        2 => {
+            save_wip_scene(app);
+        }
+        3 => open_generate_txd_folder_picker(app),
+        4 => open_blender_import_dialog(app),
+        5 => open_preferences_dialog(app),
+        6 => open_import_new_asset_picker(app),
+        _ => {}
+    }
 }
 
 pub(crate) fn app_tab_label(tab: AppTab) -> &'static str {
@@ -3122,7 +3226,7 @@ pub(crate) fn app_tabs_for_mode(mode: LaunchMode) -> Vec<AppTab> {
         AppTab::Race,
     ];
     tabs.into_iter()
-        .filter(|tab| mode == LaunchMode::Project || !matches!(tab, AppTab::Preview | AppTab::Bake))
+        .filter(|tab| mode != LaunchMode::Editor || !matches!(tab, AppTab::Preview | AppTab::Bake))
         .collect()
 }
 
@@ -3219,6 +3323,9 @@ pub(crate) fn handle_tab_click(app: &mut AppState, mouse: Vec2) -> bool {
     }
     if more_tabs_rect(app).contains(mouse) {
         app.navigation_menu_open = !app.navigation_menu_open;
+        if app.navigation_menu_open {
+            app.file_actions_menu_open = false;
+        }
         return true;
     }
     if app.navigation_menu_open {
@@ -3535,10 +3642,37 @@ pub(crate) fn toolbar_primary_button(font: &Font, rect: Rect, label: &str) {
 }
 
 pub(crate) fn handle_toolbar_click(app: &mut AppState, mouse: Vec2) -> bool {
-    if !toolbar_contains(mouse) {
+    if !compact_file_actions() {
+        app.file_actions_menu_open = false;
+    }
+    let open_file_menu = compact_file_actions() && app.file_actions_menu_open;
+    if !toolbar_contains(mouse) && !(open_file_menu && file_actions_menu_bounds().contains(mouse)) {
+        if open_file_menu && is_mouse_button_pressed(MouseButton::Left) {
+            app.file_actions_menu_open = false;
+            return true;
+        }
         return false;
     }
     if !is_mouse_button_pressed(MouseButton::Left) {
+        return true;
+    }
+    if compact_file_actions() && file_actions_overflow_rect().contains(mouse) {
+        app.file_actions_menu_open = !app.file_actions_menu_open;
+        if app.file_actions_menu_open {
+            app.navigation_menu_open = false;
+        }
+        return true;
+    }
+    if open_file_menu {
+        for row in 0..FILE_ACTION_MENU_LABELS.len() {
+            if file_action_menu_row_rect(row).contains(mouse) {
+                app.file_actions_menu_open = false;
+                run_file_action(app, row);
+                return true;
+            }
+        }
+        // Consume padding clicks in the popup instead of passing them through
+        // to viewport tools underneath it.
         return true;
     }
     let has_selection = has_active_selection(app);
@@ -5016,6 +5150,17 @@ pub(crate) fn pick_scene_geometry_point(
     mouse: Vec2,
 ) -> Option<(usize, Vec3)> {
     let (origin, dir) = viewport_ray(app, viewport, mouse)?;
+    trace_scene_geometry(app, origin, dir, f32::MAX)
+}
+
+/// Trace visible scene triangles, returning the nearest hit in world space.
+pub(crate) fn trace_scene_geometry(
+    app: &AppState,
+    origin: Vec3,
+    dir: Vec3,
+    max_distance: f32,
+) -> Option<(usize, Vec3)> {
+    let dir = dir.try_normalize()?;
     let mut best: Option<(usize, Vec3, f32)> = None;
     for (idx, state) in app.element_states.iter().enumerate() {
         if state.deleted || state.hidden {
@@ -5042,7 +5187,10 @@ pub(crate) fn pick_scene_geometry_point(
         };
         let world = model.transform_point3(local_origin + local_dir * local_t);
         let world_t = (world - origin).dot(dir);
-        if world_t >= 0.0 && best.as_ref().is_none_or(|(_, _, t)| world_t < *t) {
+        if world_t >= 0.0
+            && world_t <= max_distance
+            && best.as_ref().is_none_or(|(_, _, t)| world_t < *t)
+        {
             best = Some((idx, world, world_t));
         }
     }
@@ -5248,7 +5396,17 @@ pub(crate) fn start_group_rename(app: &mut AppState, group: &str) {
         buffer: group.to_string(),
         cursor: group.len(),
         selection_anchor: None,
-        before: world_history_snapshot(app),
+        before: local_world_history_snapshot(
+            app,
+            app.placements
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    !is_default_world_placement(p) && placement_group(p) == Some(group)
+                })
+                .map(|(index, _)| index),
+            [],
+        ),
     });
     app.outliner_search_active = false;
     drain_text_input();
@@ -5276,7 +5434,12 @@ pub(crate) fn apply_group_rename(app: &mut AppState) {
     }
     let mut changed = 0usize;
     for placement in &mut app.placements {
-        if placement_group(placement) == Some(edit.original.as_str()) {
+        if is_default_world_placement(placement) {
+            continue;
+        }
+        if !is_default_world_placement(placement)
+            && placement_group(placement) == Some(edit.original.as_str())
+        {
             placement
                 .attrs
                 .insert(EDITOR_GROUP_ATTR.to_string(), new_name.clone());
@@ -5293,9 +5456,7 @@ pub(crate) fn apply_group_rename(app: &mut AppState) {
     if app.expanded_groups.remove(&edit.original) {
         app.expanded_groups.insert(new_name.clone());
     }
-    invalidate_outliner_labels(app);
-    rebuild_outliner_filter(app);
-    commit_world_history(app, "Rename Group", edit.before);
+    commit_local_world_history(app, "Rename Group", edit.before);
     app.status_message = format!("Renamed group to {new_name} ({changed} assets)");
 }
 
@@ -5311,12 +5472,12 @@ pub(crate) fn next_asset_group_name(app: &AppState) -> String {
 }
 
 pub(crate) fn assign_selected_to_group(app: &mut AppState) {
-    let indices = selected_live_indices(app);
+    let indices = selected_editable_indices(app);
     if indices.is_empty() {
         app.status_message = "No assets selected for grouping".to_string();
         return;
     }
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, indices.iter().copied(), []);
     let group = app
         .selected_group
         .clone()
@@ -5335,19 +5496,17 @@ pub(crate) fn assign_selected_to_group(app: &mut AppState) {
         }
     }
     app.selected_group = Some(group.clone());
-    invalidate_outliner_labels(app);
-    rebuild_outliner_filter(app);
-    commit_world_history(app, "Assign Group", before);
+    commit_local_world_history(app, "Assign Group", before);
     app.status_message = format!("Assigned {} asset(s) to {group}", indices.len());
 }
 
 pub(crate) fn clear_selected_group(app: &mut AppState) {
-    let indices = selected_live_indices(app);
+    let indices = selected_editable_indices(app);
     if indices.is_empty() {
         app.status_message = "No assets selected".to_string();
         return;
     }
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, indices.iter().copied(), []);
     let mut changed = 0usize;
     for idx in &indices {
         if let Some(placement) = app.placements.get_mut(*idx) {
@@ -5357,10 +5516,8 @@ pub(crate) fn clear_selected_group(app: &mut AppState) {
         }
     }
     app.selected_group = None;
-    invalidate_outliner_labels(app);
-    rebuild_outliner_filter(app);
     if changed > 0 {
-        commit_world_history(app, "Clear Group", before);
+        commit_local_world_history(app, "Clear Group", before);
     }
     app.status_message = format!("Cleared group from {changed} asset(s)");
 }
@@ -6904,11 +7061,10 @@ pub(crate) fn mark_texture_elements_double_sided(
     indices: Vec<usize>,
     texture_name: &str,
 ) {
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, indices.iter().copied(), []);
     let changed = mark_placements_double_sided(&mut app.placements, &indices);
     if changed > 0 {
-        rebuild_render_cells(app);
-        commit_world_history(app, "Mark Texture Elements Double Sided", before);
+        commit_local_world_history(app, "Mark Texture Elements Double Sided", before);
     }
     app.status_message = format!(
         "Marked {changed} element{} referencing texture '{}' as double sided",
@@ -6923,6 +7079,9 @@ fn mark_placements_double_sided(placements: &mut [Placement], indices: &[usize])
         let Some(placement) = placements.get_mut(index) else {
             continue;
         };
+        if is_default_world_placement(placement) {
+            continue;
+        }
         if placement_override_flag_enabled(placement, "double_sided") {
             continue;
         }
@@ -6982,11 +7141,11 @@ fn duplicate_placement(source: &Placement) -> Placement {
 }
 
 pub(crate) fn duplicate_selected(app: &mut AppState) {
-    let indices = selected_live_indices(app);
+    let indices = selected_editable_indices(app);
     if indices.is_empty() {
         return;
     }
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, [], []);
     let mut new_selection = BTreeSet::new();
     for idx in indices {
         let Some(source) = app.placements.get(idx) else {
@@ -7002,9 +7161,7 @@ pub(crate) fn duplicate_selected(app: &mut AppState) {
     }
     app.selected_elements = new_selection;
     app.selected_element_order = app.selected_elements.iter().copied().collect();
-    rebuild_outliner_filter(app);
-    rebuild_render_cells(app);
-    commit_world_history(app, "Duplicate", before);
+    commit_local_world_history(app, "Duplicate", before);
 }
 
 #[cfg(test)]
@@ -7080,7 +7237,7 @@ pub(crate) fn delete_elements_by_index(
     if indices.is_empty() {
         return;
     }
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, [], []);
     let mut changed = false;
     let mut delete_indices = indices;
     if delete_lods {
@@ -7089,6 +7246,16 @@ pub(crate) fn delete_elements_by_index(
     delete_indices.sort_unstable();
     delete_indices.dedup();
     for idx in delete_indices {
+        if app
+            .placements
+            .get(idx)
+            .is_some_and(is_default_world_placement)
+            && !app.element_states.get(idx).is_some_and(|s| s.deleted)
+        {
+            remove_default_world_element(app, idx);
+            changed = true;
+            continue;
+        }
         if let Some(state) = app.element_states.get_mut(idx) {
             if state.deleted {
                 continue;
@@ -7098,8 +7265,7 @@ pub(crate) fn delete_elements_by_index(
         }
     }
     if changed {
-        rebuild_render_cells(app);
-        commit_world_history(
+        commit_local_world_history(
             app,
             if delete_lods {
                 "Delete with LOD"
@@ -7116,7 +7282,12 @@ pub(crate) fn delete_selected(app: &mut AppState) {
     if indices.is_empty() {
         return;
     }
-    let lod_indices = assigned_lod_indices_for_delete(app, &indices);
+    let editable: Vec<_> = indices
+        .iter()
+        .copied()
+        .filter(|&i| !is_default_world_placement(&app.placements[i]))
+        .collect();
+    let lod_indices = assigned_lod_indices_for_delete(app, &editable);
     if !lod_indices.is_empty() {
         let primary_label = if lod_indices.len() == 1 {
             "Delete LOD"
@@ -7168,9 +7339,18 @@ pub(crate) fn restore_selected(app: &mut AppState) {
     if indices.is_empty() {
         return;
     }
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, [], []);
     let mut changed = false;
     for idx in indices {
+        if app
+            .placements
+            .get(idx)
+            .is_some_and(is_default_world_placement)
+        {
+            restore_default_world_element(app, idx);
+            changed = true;
+            continue;
+        }
         if let Some(state) = app.element_states.get_mut(idx) {
             if !state.deleted {
                 continue;
@@ -7180,8 +7360,7 @@ pub(crate) fn restore_selected(app: &mut AppState) {
         }
     }
     if changed {
-        rebuild_render_cells(app);
-        commit_world_history(app, "Restore", before);
+        commit_local_world_history(app, "Restore", before);
     }
 }
 
@@ -7190,7 +7369,7 @@ pub(crate) fn hide_selected(app: &mut AppState) {
     if indices.is_empty() {
         return;
     }
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, [], []);
     let mut changed = 0usize;
     for idx in indices {
         if let Some(state) = app.element_states.get_mut(idx) {
@@ -7202,8 +7381,7 @@ pub(crate) fn hide_selected(app: &mut AppState) {
         }
     }
     if changed > 0 {
-        rebuild_render_cells(app);
-        commit_world_history(app, "Hide", before);
+        commit_local_world_history(app, "Hide", before);
     }
     app.status_message = format!("Hidden {changed} asset(s)");
 }
@@ -7213,7 +7391,7 @@ pub(crate) fn unhide_selected(app: &mut AppState) {
     if indices.is_empty() {
         return;
     }
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, [], []);
     let mut changed = 0usize;
     for idx in indices {
         if let Some(state) = app.element_states.get_mut(idx) {
@@ -7225,8 +7403,7 @@ pub(crate) fn unhide_selected(app: &mut AppState) {
         }
     }
     if changed > 0 {
-        rebuild_render_cells(app);
-        commit_world_history(app, "Unhide", before);
+        commit_local_world_history(app, "Unhide", before);
     }
     app.status_message = format!("Unhidden {changed} asset(s)");
 }
@@ -7237,7 +7414,7 @@ pub(crate) fn hide_everything_but_selected(app: &mut AppState) {
         app.status_message = "No visible selection to isolate".to_string();
         return;
     }
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, [], []);
     let mut changed = 0usize;
     for (idx, state) in app.element_states.iter_mut().enumerate() {
         if state.deleted || keep.contains(&idx) || state.hidden {
@@ -7247,14 +7424,13 @@ pub(crate) fn hide_everything_but_selected(app: &mut AppState) {
         changed += 1;
     }
     if changed > 0 {
-        rebuild_render_cells(app);
-        commit_world_history(app, "Hide Everything But Selection", before);
+        commit_local_world_history(app, "Hide Everything But Selection", before);
     }
     app.status_message = format!("Isolated {} asset(s); hidden {changed}", keep.len());
 }
 
 pub(crate) fn unhide_all(app: &mut AppState) {
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, [], []);
     let mut changed = 0usize;
     for state in &mut app.element_states {
         if state.hidden {
@@ -7263,8 +7439,7 @@ pub(crate) fn unhide_all(app: &mut AppState) {
         }
     }
     if changed > 0 {
-        rebuild_render_cells(app);
-        commit_world_history(app, "Unhide All", before);
+        commit_local_world_history(app, "Unhide All", before);
     }
     app.status_message = format!("Unhidden {changed} asset(s)");
 }

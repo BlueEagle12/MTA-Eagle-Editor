@@ -2081,8 +2081,11 @@ pub(crate) fn load_scene_source_with_source(
     let autosave_root = autosave_root_path(root);
     let scene_root = match source {
         LoadSceneSource::Autosave => {
-            if autosave_root.join("eagleZones.txt").is_file()
-                && autosave_root.join("zones").is_dir()
+            if (autosave_root.join("eagleZones.txt").is_file()
+                && autosave_root.join("zones").is_dir())
+                || autosave_root
+                    .join(crate::resource::mta_maps::REGISTRY)
+                    .is_file()
             {
                 &autosave_root
             } else {
@@ -2090,7 +2093,9 @@ pub(crate) fn load_scene_source_with_source(
             }
         }
         LoadSceneSource::Saved => {
-            if wip_root.join("eagleZones.txt").is_file() && wip_root.join("zones").is_dir() {
+            if (wip_root.join("eagleZones.txt").is_file() && wip_root.join("zones").is_dir())
+                || wip_root.join(crate::resource::mta_maps::REGISTRY).is_file()
+            {
                 &wip_root
             } else {
                 root
@@ -2098,11 +2103,21 @@ pub(crate) fn load_scene_source_with_source(
         }
     };
     let loaded_wip = scene_root == wip_root.as_path();
-    let (zones, eagle_zone_offsets) = parse_eagle_zones(scene_root);
+    let (mut zones, eagle_zone_offsets) = parse_eagle_zones(scene_root);
     let mut defs = parse_definitions(scene_root, &zones, attr_re);
     let gta_defs = load_gta_sa_definitions(&load_gta_sa_dir_preference());
     let readonly_definition_ids = merge_gta_sa_definitions(&mut defs, gta_defs);
-    let placements = parse_placements(scene_root, &zones, &defs, attr_re);
+    let mut placements = parse_placements(scene_root, &zones, &defs, attr_re);
+    for doc in crate::resource::mta_maps::load_documents(root, scene_root) {
+        zones.push(crate::resource::mta_maps::map_zone(&doc.path));
+        placements.extend(crate::resource::mta_maps::placements(&doc, &defs));
+    }
+    crate::resource::zones::rehome_definitions(
+        &mut defs,
+        &readonly_definition_ids,
+        &placements,
+        &[],
+    );
     let light_path = match source {
         LoadSceneSource::Autosave if autosave_light_list_path(root).is_file() => {
             autosave_light_list_path(root)
@@ -2565,33 +2580,55 @@ pub(crate) fn parse_gta_sa_ide_line(line: &str, section: &str) -> Option<Definit
     if cleaned.is_empty() {
         return None;
     }
-    let parts: Vec<_> = cleaned
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect();
-    if parts.len() < 3 {
+    let parts: Vec<_> = cleaned.split(',').map(str::trim).collect();
+    let timed = match section {
+        "objs" => false,
+        "tobj" => true,
+        _ => return None,
+    };
+    let time_fields = if timed { 2 } else { 0 };
+    // SA: id, model, txd, distance, flags [, timeOn, timeOff].
+    // Older IDE rows insert an object count followed by 1–3 distances.
+    let (distance_index, flags_index) = if parts.len() == 5 + time_fields {
+        (3, 4)
+    } else {
+        let count = parts.get(3)?.parse::<usize>().ok()?;
+        if !(1..=3).contains(&count) || parts.len() != 5 + count + time_fields {
+            return None;
+        }
+        (4, 4 + count)
+    };
+    let id = parts[0].parse::<u32>().ok()?.to_string();
+    if parts[1].is_empty() || parts[2].is_empty() {
         return None;
     }
-    let id = parts[0].parse::<i32>().ok()?.to_string();
-    let model = parts[1].to_string();
-    let txd = parts[2].to_string();
+    for distance in &parts[distance_index..flags_index] {
+        let distance = distance.parse::<f32>().ok()?;
+        if !distance.is_finite() || distance < 0.0 {
+            return None;
+        }
+    }
+    let flags = u32::try_from(parse_model_flag_number(parts[flags_index])?).ok()?;
     let mut attrs = BTreeMap::new();
     attrs.insert("id".to_string(), id.clone());
-    attrs.insert("dff".to_string(), model.clone());
-    attrs.insert("txd".to_string(), txd);
+    attrs.insert("dff".to_string(), parts[1].to_string());
+    attrs.insert("txd".to_string(), parts[2].to_string());
     attrs.insert("source".to_string(), "GTA:SA".to_string());
     attrs.insert("zone".to_string(), "GTA:SA".to_string());
-    if section == "tobj" {
-        if parts.len() >= 7 {
-            attrs.insert("timeIn".to_string(), parts[3].to_string());
-            attrs.insert("timeOut".to_string(), parts[4].to_string());
-            attrs.insert("drawDistance".to_string(), parts[5].to_string());
-            attrs.insert("gtaFlags".to_string(), parts[6].to_string());
+    attrs.insert(
+        "drawDistance".to_string(),
+        parts[distance_index].to_string(),
+    );
+    // Keep the complete native mask, including bits without editor controls.
+    attrs.insert("gtaFlags".to_string(), flags.to_string());
+    if timed {
+        let time_on = parts[flags_index + 1].parse::<u8>().ok()?;
+        let time_off = parts[flags_index + 2].parse::<u8>().ok()?;
+        if time_on > 24 || time_off > 24 {
+            return None;
         }
-    } else if parts.len() >= 5 {
-        attrs.insert("drawDistance".to_string(), parts[3].to_string());
-        attrs.insert("gtaFlags".to_string(), parts[4].to_string());
+        attrs.insert("timeIn".to_string(), time_on.to_string());
+        attrs.insert("timeOut".to_string(), time_off.to_string());
     }
     Some(Definition {
         id,
@@ -3745,6 +3782,141 @@ mod tests {
             zone: "test".to_string(),
             attrs,
         }
+    }
+
+    #[test]
+    fn sa_ide_combined_mask_reaches_double_sided_rendering() {
+        let def = parse_gta_sa_ide_line("100, fence, generic, 150, 2097341", "objs").unwrap();
+        // 0x2000bd: double-sided, road, draw-last, additive, no-shadows, plus
+        // unknown bits 4/5. Preserve the latter without mistaking them for IDs.
+        assert_eq!(def.attrs["gtaFlags"], "2097341");
+        for flag in [
+            "disable_backface_culling",
+            "is_road",
+            "draw_last",
+            "additive",
+            "dont_receive_shadows",
+        ] {
+            assert!(definition_flag_enabled(&def, flag), "{flag}");
+        }
+        assert!(!definition_flag_enabled(&def, "no_zbuffer_write"));
+        let placement = Placement {
+            id: def.id.clone(),
+            dff: "fence".into(),
+            zone: "test".into(),
+            tag: "building".into(),
+            attrs: BTreeMap::new(),
+            pos: V3::default(),
+            rot: V3::default(),
+        };
+        let defs = HashMap::from([(def.id.clone(), def)]);
+        assert!(placement_disable_backface_culling(&placement, &defs));
+    }
+
+    #[test]
+    fn sa_ide_masks_are_not_eagle_bit_indices() {
+        for mask in [0u32, 1, 2, 3, 4, 8, 21, 64, 128, 2097152, u32::MAX] {
+            let def =
+                parse_gta_sa_ide_line(&format!("100, model, txd, 150, {mask}"), "objs").unwrap();
+            for bit in 0..32 {
+                if let Some(flag) = model_flag_bit_name(bit) {
+                    assert_eq!(
+                        definition_flag_enabled(&def, flag),
+                        mask & (1 << bit) != 0,
+                        "mask {mask}, bit {bit}, flag {flag}"
+                    );
+                }
+            }
+            assert!(!definition_flag_enabled(&def, "disable_collisions"));
+        }
+    }
+
+    #[test]
+    fn sa_timed_ide_reads_distance_flags_then_hours() {
+        let def = parse_gta_sa_ide_line("9885, sfw_nitlite1, sfwngtlites, 900, 140, 21, 6", "tobj")
+            .unwrap();
+        assert_eq!(def.attrs["drawDistance"], "900");
+        assert_eq!(def.attrs["gtaFlags"], "140");
+        assert_eq!(def.attrs["timeIn"], "21");
+        assert_eq!(def.attrs["timeOut"], "6");
+        assert!(definition_flag_enabled(&def, "draw_last"));
+        assert!(definition_flag_enabled(&def, "additive"));
+        assert!(definition_flag_enabled(&def, "dont_receive_shadows"));
+        assert!(!definition_flag_enabled(&def, "disable_backface_culling"));
+    }
+
+    #[test]
+    fn sa_ide_legacy_object_counts_do_not_shift_flags() {
+        for (section, line) in [
+            ("objs", "100, model, txd, 1, 150, 2097156"),
+            ("objs", "100, model, txd, 2, 150, 300, 2097156"),
+            ("objs", "100, model, txd, 3, 150, 300, 450, 2097156"),
+            ("tobj", "100, model, txd, 1, 150, 2097156, 21, 6"),
+            ("tobj", "100, model, txd, 2, 150, 300, 2097156, 21, 6"),
+            ("tobj", "100, model, txd, 3, 150, 300, 450, 2097156, 21, 6"),
+        ] {
+            let def = parse_gta_sa_ide_line(line, section).unwrap();
+            assert_eq!(def.attrs["drawDistance"], "150");
+            assert_eq!(def.attrs["gtaFlags"], "2097156");
+            assert!(definition_flag_enabled(&def, "disable_backface_culling"));
+            assert!(definition_flag_enabled(&def, "draw_last"));
+            if section == "tobj" {
+                assert_eq!(def.attrs["timeIn"], "21");
+                assert_eq!(def.attrs["timeOut"], "6");
+            }
+        }
+        let hex = parse_gta_sa_ide_line("100, model, txd, 150, 0x200004", "objs").unwrap();
+        assert_eq!(hex.attrs["gtaFlags"], "2097156");
+    }
+
+    #[test]
+    fn sa_ide_rejects_malformed_rows_instead_of_shifting_columns() {
+        for line in [
+            "100, model, txd",
+            "100, , txd, 150, 4",
+            "100, model, txd, NaN, 4",
+            "100, model, txd, 2, 150, 4",
+            "100, model, txd, 150, 4294967296",
+        ] {
+            assert!(parse_gta_sa_ide_line(line, "objs").is_none(), "{line}");
+        }
+        assert!(parse_gta_sa_ide_line("100, model, txd, 150, 4, 25, 6", "tobj").is_none());
+    }
+
+    #[test]
+    fn sa_flag_override_can_disable_native_bit_and_survives_merge() {
+        let native = parse_gta_sa_ide_line("100, fence, generic, 150, 2097284", "objs").unwrap();
+        let mut override_def = native.clone();
+        override_def
+            .attrs
+            .insert("__override".into(), "true".into());
+        set_definition_flag(&mut override_def, "disable_backface_culling", false);
+        assert!(!definition_flag_enabled(
+            &override_def,
+            "disable_backface_culling"
+        ));
+        assert!(definition_flag_enabled(&override_def, "draw_last"));
+        assert!(definition_flag_enabled(
+            &override_def,
+            "dont_receive_shadows"
+        ));
+        assert_eq!(override_def.attrs["gtaFlags"], native.attrs["gtaFlags"]);
+        let mut defs = HashMap::from([("100".into(), override_def)]);
+        merge_gta_sa_definitions(&mut defs, HashMap::from([("100".into(), native)]));
+        assert!(!definition_flag_enabled(
+            &defs["100"],
+            "disable_backface_culling"
+        ));
+        assert!(definition_flag_enabled(&defs["100"], "draw_last"));
+        set_definition_flag(
+            defs.get_mut("100").unwrap(),
+            "disable_backface_culling",
+            true,
+        );
+        assert!(definition_flag_enabled(
+            &defs["100"],
+            "disable_backface_culling"
+        ));
     }
 
     #[test]

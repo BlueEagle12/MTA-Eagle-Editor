@@ -258,11 +258,16 @@ pub(crate) fn import_new_asset(
     );
 
     let zone = app
-        .placements
-        .get(app.selected)
-        .map(|placement| placement.zone.clone())
+        .placement_destination
+        .clone()
+        .or_else(|| app.placements.get(app.selected).map(|p| p.zone.clone()))
         .or_else(|| app.zones.first().cloned())
         .unwrap_or_else(|| "default".to_string());
+    let zone = if crate::resource::mta_maps::map_path(&zone).is_some() {
+        "default".to_string()
+    } else {
+        zone
+    };
     let mut attrs = BTreeMap::new();
     attrs.insert("id".to_string(), id.to_string());
     attrs.insert("dff".to_string(), stem.to_string());
@@ -297,7 +302,9 @@ pub(crate) fn import_new_asset(
             readonly: false,
             lod: false,
         };
+        let previous_destination = app.placement_destination.replace(entry.zone.clone());
         place_asset_from_browser_at(app, &entry, position);
+        app.placement_destination = previous_destination;
         app.status_message = format!("Imported and placed {id}");
         app.placements.get(app.selected).cloned()
     } else {
@@ -961,18 +968,42 @@ pub(crate) fn asset_browser_thumbnail(app: &mut AppState, entry: &AssetBrowserEn
     texture
 }
 
+fn asset_browser_mesh_identity(
+    entry: &AssetBrowserEntry,
+    definitions: &HashMap<String, Definition>,
+) -> (String, Option<String>) {
+    // Browser entries can outlive definition edits. Use the same identity as
+    // placement_mesh_key, rather than uploading under a stale browser key.
+    if let Some(definition) = definitions.get(&entry.id) {
+        (
+            asset_key_opt(definition.attrs.get("dff"), &definition.id, ".dff"),
+            definition_txd_name_from_attrs(definition).map(ToOwned::to_owned),
+        )
+    } else {
+        (
+            asset_key(&entry.dff, ".dff"),
+            (!entry.txd.trim().is_empty()).then(|| entry.txd.trim().to_string()),
+        )
+    }
+}
+
 pub(crate) fn ensure_asset_browser_mesh_loaded(
     app: &mut AppState,
     entry: &AssetBrowserEntry,
 ) -> bool {
-    let txd_scope = (!entry.txd.trim().is_empty()).then_some(entry.txd.as_str());
-    let mesh_key = mesh_key_from_dff_txd(&entry.dff, txd_scope);
-    if app.meshes.contains_key(&mesh_key) {
+    let (dff, txd) = asset_browser_mesh_identity(entry, &app.definitions);
+    let txd_scope = txd.as_deref();
+    let mesh_key = mesh_key_from_dff_txd(&dff, txd_scope);
+    if app
+        .meshes
+        .get(&mesh_key)
+        .is_some_and(|mesh| !mesh.parts.is_empty())
+    {
         return true;
     }
-    let source = asset_browser_dff_source(app, &entry.dff);
+    let source = asset_browser_dff_source(app, &dff);
     let Some(source) = source else {
-        app.status_message = format!("Could not resolve DFF {}", entry.dff);
+        app.status_message = format!("Could not resolve DFF {dff}");
         return false;
     };
     let raw = parse_dff_mesh(&read_img_entry(&source));
@@ -989,23 +1020,58 @@ pub(crate) fn ensure_asset_browser_mesh_loaded(
         app.options.textures,
         ambient_lift,
     ) else {
-        app.status_message = format!("DFF {} has no renderable geometry", entry.dff);
+        app.status_message = format!("DFF {dff} has no renderable geometry");
         return false;
     };
-    app.meshes.insert(mesh_key, mesh);
+    if mesh.parts.is_empty() {
+        app.status_message = format!("DFF {dff} could not create any render parts");
+        return false;
+    }
+    replace_render_mesh(&mut app.meshes, mesh_key, mesh);
     true
 }
 
 pub(crate) fn asset_place_position(app: &AppState) -> V3 {
     let (forward, _) = camera_vectors(&app.camera);
-    let distance = if forward.z < -0.01 {
-        ((0.0 - app.camera.pos.z) / forward.z).clamp(96.0, 1200.0)
+    asset_surface_position(app, app.camera.pos, forward)
+}
+
+fn asset_surface_position(app: &AppState, origin: Vec3, direction: Vec3) -> V3 {
+    from_mq(asset_surface_point(
+        origin,
+        direction,
+        |origin, direction, range| {
+            trace_scene_geometry(app, origin, direction, range).map(|(_, point)| point)
+        },
+    ))
+}
+
+fn asset_surface_point(
+    origin: Vec3,
+    direction: Vec3,
+    mut trace: impl FnMut(Vec3, Vec3, f32) -> Option<Vec3>,
+) -> Vec3 {
+    const TRACE_DISTANCE: f32 = 16000.0;
+    if let Some(point) = trace(origin, direction, TRACE_DISTANCE) {
+        return point;
+    }
+
+    // Aim at the editor ground plane when it is in front of the camera.
+    // Looking level or up instead uses a nearby point ahead, then traces down
+    // so roofs and elevated terrain still take precedence over the grid.
+    let ground_distance = if direction.z.abs() > 0.00001 {
+        -origin.z / direction.z
+    } else {
+        -1.0
+    };
+    let distance = if ground_distance > 0.0 && ground_distance <= TRACE_DISTANCE {
+        ground_distance
     } else {
         360.0
     };
-    let mut pos = app.camera.pos + forward * distance;
-    pos.z = 0.0;
-    from_mq(pos)
+    let ahead = origin + direction * distance;
+    let down_origin = vec3(ahead.x, ahead.y, origin.z.max(ahead.z).max(0.0) + 1.0);
+    trace(down_origin, -Vec3::Z, TRACE_DISTANCE).unwrap_or_else(|| vec3(ahead.x, ahead.y, 0.0))
 }
 
 pub(crate) fn place_asset_from_browser(app: &mut AppState, entry: &AssetBrowserEntry) {
@@ -1020,11 +1086,11 @@ pub(crate) fn place_asset_from_browser_at(app: &mut AppState, entry: &AssetBrows
     let Some(def) = app.definitions.get(&entry.id).cloned() else {
         return;
     };
-    let before = world_history_snapshot(app);
+    let before = local_world_history_snapshot(app, [], [entry.id.clone()]);
     let zone = app
-        .placements
-        .get(app.selected)
-        .map(|placement| placement.zone.clone())
+        .placement_destination
+        .clone()
+        .or_else(|| app.placements.get(app.selected).map(|p| p.zone.clone()))
         .or_else(|| app.zones.first().cloned())
         .unwrap_or_else(|| {
             if entry.readonly {
@@ -1033,7 +1099,11 @@ pub(crate) fn place_asset_from_browser_at(app: &mut AppState, entry: &AssetBrows
                 entry.zone.clone()
             }
         });
-    if entry.readonly {
+    if crate::resource::mta_maps::map_path(&zone).is_some() && entry.id.parse::<u32>().is_err() {
+        app.status_message = "Custom models require an Eagle zone destination".into();
+        return;
+    }
+    if entry.readonly && crate::resource::mta_maps::map_path(&zone).is_none() {
         let mut local_def = def.clone();
         local_def.zone = zone.clone();
         local_def.attrs.insert("zone".to_string(), zone.clone());
@@ -1046,7 +1116,7 @@ pub(crate) fn place_asset_from_browser_at(app: &mut AppState, entry: &AssetBrows
     }
     let mut placement = Placement {
         id: entry.id.clone(),
-        dff: entry.dff.clone(),
+        dff: asset_key_opt(def.attrs.get("dff"), &def.id, ".dff"),
         zone,
         tag: "object".to_string(),
         attrs: BTreeMap::new(),
@@ -1063,9 +1133,7 @@ pub(crate) fn place_asset_from_browser_at(app: &mut AppState, entry: &AssetBrows
     app.selected_elements.insert(idx);
     app.selected_element_order.clear();
     app.selected_element_order.push(idx);
-    rebuild_outliner_filter(app);
-    rebuild_render_cells(app);
-    commit_world_history(app, "Place Asset", before);
+    commit_local_world_history(app, "Place Asset", before);
     app.status_message = format!("Placed {}", entry.id);
 }
 
@@ -1077,17 +1145,8 @@ pub(crate) fn asset_browser_drag_position(
     if !viewport.contains(mouse) || asset_browser_rect(app).contains(mouse) {
         return None;
     }
-    if let Some((_, point)) = pick_scene_geometry_point(app, viewport, mouse) {
-        return Some(from_mq(point));
-    }
     let (origin, direction) = viewport_ray(app, viewport, mouse)?;
-    if direction.z.abs() > 0.00001 {
-        let t = -origin.z / direction.z;
-        if t > 0.0 {
-            return Some(from_mq(origin + direction * t));
-        }
-    }
-    Some(from_mq(origin + direction * 360.0))
+    Some(asset_surface_position(app, origin, direction))
 }
 
 pub(crate) fn update_asset_browser_drag(app: &mut AppState, mouse: Vec2) -> bool {
@@ -1777,6 +1836,93 @@ pub(crate) fn draw_asset_browser(app: &mut AppState) {
 #[cfg(test)]
 mod import_asset_tests {
     use super::*;
+
+    #[test]
+    fn asset_placement_hits_the_surface_in_front_of_the_camera() {
+        let origin = vec3(0.0, 0.0, 20.0);
+        let wall = [
+            vec3(-50.0, 40.0, 0.0),
+            vec3(50.0, 40.0, 0.0),
+            vec3(0.0, 40.0, 100.0),
+        ];
+        let point = asset_surface_point(origin, Vec3::Y, |start, dir, range| {
+            ray_triangle(start, dir, wall[0], wall[1], wall[2])
+                .filter(|t| *t <= range)
+                .map(|t| start + dir * t)
+        });
+        assert!(point.distance(vec3(0.0, 40.0, 20.0)) < 0.001);
+    }
+
+    #[test]
+    fn asset_placement_traces_down_to_elevated_ground_when_looking_level() {
+        let deck = [
+            vec3(-1000.0, -1000.0, 12.0),
+            vec3(1000.0, -1000.0, 12.0),
+            vec3(0.0, 1000.0, 12.0),
+        ];
+        let point = asset_surface_point(vec3(0.0, 0.0, 20.0), Vec3::Y, |start, dir, range| {
+            ray_triangle(start, dir, deck[0], deck[1], deck[2])
+                .filter(|t| *t <= range)
+                .map(|t| start + dir * t)
+        });
+        assert!(point.distance(vec3(0.0, 360.0, 12.0)) < 0.001);
+    }
+
+    #[test]
+    fn asset_placement_empty_scene_uses_ground_without_clamping_near_hits() {
+        let origin = vec3(0.0, 0.0, 10.0);
+        let down = vec3(0.0, 1.0, -1.0).normalize();
+        let point = asset_surface_point(origin, down, |_, _, _| None);
+        assert!(point.distance(vec3(0.0, 10.0, 0.0)) < 0.001);
+        let up = vec3(0.0, 1.0, 1.0).normalize();
+        let point = asset_surface_point(origin, up, |_, _, _| None);
+        assert_eq!(point.z, 0.0);
+        assert!(point.y > 0.0);
+    }
+
+    #[test]
+    fn browser_first_load_uses_current_sa_definition_for_render_lookup() {
+        let entry = AssetBrowserEntry {
+            id: "100".into(),
+            dff: "old_model".into(),
+            txd: "old_textures".into(),
+            zone: "GTA:SA".into(),
+            category: "Other".into(),
+            readonly: true,
+            lod: false,
+        };
+        for attrs in [
+            BTreeMap::from([
+                ("dff".into(), " fence ".into()),
+                ("txd".into(), " generic ".into()),
+            ]),
+            BTreeMap::from([("dff".into(), " ".into()), ("txd".into(), " ".into())]),
+        ] {
+            let definitions = HashMap::from([(
+                entry.id.clone(),
+                Definition {
+                    id: entry.id.clone(),
+                    zone: entry.zone.clone(),
+                    attrs,
+                },
+            )]);
+            let placement = Placement {
+                id: entry.id.clone(),
+                dff: entry.dff.clone(),
+                zone: "default".into(),
+                tag: "object".into(),
+                attrs: BTreeMap::new(),
+                pos: V3::default(),
+                rot: V3::default(),
+            };
+            let (dff, txd) = asset_browser_mesh_identity(&entry, &definitions);
+            assert_eq!(
+                mesh_key_from_dff_txd(&dff, txd.as_deref()),
+                placement_mesh_key(&placement, &definitions),
+            );
+            assert_ne!(dff, "old_model.dff");
+        }
+    }
 
     #[test]
     fn automatic_texture_folder_prefers_textures_then_dff_name() {

@@ -1,6 +1,6 @@
 [package]
 name = "eagle-editor"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.85"
 description = "Native 3D world and asset editor for Multi Theft Auto: San Andreas"
@@ -11,6 +11,7 @@ keywords = ["mta", "renderware", "editor", "gta-sa"]
 categories = ["graphics", "game-development"]
 
 [dependencies]
+quick-xml = "0.39.4"
 macroquad = "0.4.15"
 image = { version = "0.25.8", default-features = false, features = ["png", "gif", "jpeg", "bmp", "tga"] }
 regex = "1.12.2"

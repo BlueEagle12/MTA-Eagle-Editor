@@ -1616,7 +1616,48 @@ pub(crate) fn inspector_field_value(app: &AppState, field: InspectorField) -> St
     }
 }
 
-fn inspector_history_snapshot(app: &AppState) -> ScopedHistorySnapshot {
+fn inspector_field_edits_local_placement(field: InspectorField) -> bool {
+    matches!(
+        field,
+        InspectorField::ElementPosX
+            | InspectorField::ElementPosY
+            | InspectorField::ElementPosZ
+            | InspectorField::ElementRotX
+            | InspectorField::ElementRotY
+            | InspectorField::ElementRotZ
+            | InspectorField::ElementScale
+            | InspectorField::ElementAlpha
+            | InspectorField::ElementDimension
+            | InspectorField::ElementInterior
+            | InspectorField::ElementUniqueId
+    )
+}
+
+fn inspector_history_snapshot(app: &AppState, field: InspectorField) -> ScopedHistorySnapshot {
+    // These fields cannot change definitions, placement membership, or LOD
+    // relationships. Undo only needs the edited placements, even on an SA map.
+    if app.active_tab == AppTab::Preview && inspector_field_edits_local_placement(field) {
+        return ScopedHistorySnapshot::PlacementTransforms(placement_transform_history_snapshot(
+            app,
+            selected_editable_indices(app),
+        ));
+    }
+    if app.active_tab == AppTab::Preview && field != InspectorField::ElementId {
+        let ids = selected_definition_ids(app);
+        let indices = if field == InspectorField::DefinitionDff
+            || (inspector_field_is_physics(field) && app.physics_scope == PhysicsScope::Global)
+        {
+            app.placements
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| ids.contains(&p.id) && !is_default_world_placement(p))
+                .map(|(index, _)| index)
+                .collect()
+        } else {
+            selected_editable_indices(app)
+        };
+        return ScopedHistorySnapshot::LocalWorld(local_world_history_snapshot(app, indices, ids));
+    }
     match app.active_tab {
         AppTab::Water => ScopedHistorySnapshot::Water(water_history_snapshot(app)),
         AppTab::Cull => ScopedHistorySnapshot::Cull(cull_history_snapshot(app)),
@@ -1638,7 +1679,7 @@ pub(crate) fn start_inspector_edit(app: &mut AppState, field: InspectorField) {
         buffer,
         cursor,
         selection_anchor: None,
-        before: inspector_history_snapshot(app),
+        before: inspector_history_snapshot(app, field),
     });
 }
 
@@ -1836,7 +1877,7 @@ fn close_native_model_dropdown(app: &mut AppState) {
 }
 
 fn apply_native_model_dropdown_value(app: &mut AppState, value: String) {
-    let before = ScopedHistorySnapshot::World(world_history_snapshot(app));
+    let before = inspector_history_snapshot(app, InspectorField::DefinitionNativeModel);
     app.inspector_edit = Some(InspectorEdit {
         field: InspectorField::DefinitionNativeModel,
         cursor: value.len(),
@@ -2088,6 +2129,9 @@ fn set_element_type_for_indices(
         let Some(placement) = placements.get_mut(idx) else {
             continue;
         };
+        if is_default_world_placement(placement) {
+            continue;
+        }
         if placement.tag != element_type {
             placement.tag = element_type.to_string();
             changed += 1;
@@ -2103,7 +2147,7 @@ fn selected_definitions_include_readonly(app: &AppState) -> bool {
 }
 
 fn selected_zone_for_definition(app: &AppState, id: &str) -> String {
-    for idx in selected_live_indices(app) {
+    for idx in selected_editable_indices(app) {
         if let Some(placement) = app.placements.get(idx) {
             if placement.id == id {
                 return placement.zone.clone();
@@ -2193,7 +2237,7 @@ fn apply_physics_root_attrs(
 
 fn physics_conversion_indices(app: &AppState) -> Vec<usize> {
     match app.physics_scope {
-        PhysicsScope::PerObject => selected_live_indices(app)
+        PhysicsScope::PerObject => selected_editable_indices(app)
             .into_iter()
             .filter(|index| {
                 app.placements
@@ -2218,11 +2262,15 @@ fn physics_conversion_indices(app: &AppState) -> Vec<usize> {
 }
 
 fn convert_physics_elements_to_objects(app: &mut AppState, indices: &[usize]) -> usize {
+    let before = placement_transform_history_snapshot(app, indices.iter().copied());
     let mut converted = 0usize;
     for index in indices.iter().copied() {
         let Some(placement) = app.placements.get_mut(index) else {
             continue;
         };
+        if is_default_world_placement(placement) {
+            continue;
+        }
         if !placement.tag.eq_ignore_ascii_case("object") {
             placement.tag = "object".to_string();
             converted += 1;
@@ -2232,7 +2280,7 @@ fn convert_physics_elements_to_objects(app: &mut AppState, indices: &[usize]) ->
         invalidate_outliner_labels(app);
         invalidate_validation_cache(app);
         rebuild_outliner_filter(app);
-        rebuild_render_cells(app);
+        rebuild_render_cells_for_placement_transforms(app, &before);
     }
     converted
 }
@@ -2251,7 +2299,7 @@ fn physics_conversion_detail(app: &AppState, count: usize) -> String {
 fn set_selected_physics_root_with_before(
     app: &mut AppState,
     model_id: Option<u16>,
-    before: WorldHistorySnapshot,
+    before: LocalWorldHistorySnapshot,
 ) {
     if app.physics_scope == PhysicsScope::PerObject && model_id.is_some() {
         app.status_message =
@@ -2296,7 +2344,7 @@ fn set_selected_physics_root_with_before(
             changed
         }
         PhysicsScope::PerObject => {
-            let indices = selected_live_indices(app);
+            let indices = selected_editable_indices(app);
             if indices.is_empty() {
                 app.status_message = "Select an element first".to_string();
                 return;
@@ -2306,6 +2354,9 @@ fn set_selected_physics_root_with_before(
                 let Some(placement) = app.placements.get_mut(idx) else {
                     continue;
                 };
+                if is_default_world_placement(placement) {
+                    continue;
+                }
                 changed +=
                     apply_physics_root_attrs(&mut placement.attrs, model_id, properties.clone());
             }
@@ -2313,7 +2364,7 @@ fn set_selected_physics_root_with_before(
         }
     };
     let _ = changed;
-    commit_world_history(app, "Set Physics Root", before);
+    commit_local_world_history(app, "Set Physics Root", before);
     app.status_message = match model_id {
         Some(model_id) => format!(
             "{} physics root: {}",
@@ -2328,12 +2379,19 @@ fn set_selected_physics_root_with_before(
 }
 
 fn request_set_selected_physics_root(app: &mut AppState, model_id: Option<u16>) {
-    let before = world_history_snapshot(app);
+    let conversion_indices = model_id.map_or_else(Vec::new, |_| physics_conversion_indices(app));
+    let before = local_world_history_snapshot(
+        app,
+        selected_editable_indices(app)
+            .into_iter()
+            .chain(conversion_indices.iter().copied())
+            .collect::<BTreeSet<_>>(),
+        selected_definition_ids(app),
+    );
     if app.physics_scope == PhysicsScope::PerObject && model_id.is_some() {
         set_selected_physics_root_with_before(app, model_id, before);
         return;
     }
-    let conversion_indices = model_id.map_or_else(Vec::new, |_| physics_conversion_indices(app));
     if let Some(model_id) = model_id
         && !conversion_indices.is_empty()
     {
@@ -2415,6 +2473,15 @@ pub(crate) fn mark_definition_override_attr(def: &mut Definition, key: &str) {
 }
 
 pub(crate) fn make_definition_override_writable(app: &mut AppState, id: &str, zone: String) {
+    let zone = if crate::resource::mta_maps::map_path(&zone).is_some() {
+        app.zones
+            .iter()
+            .find(|z| crate::resource::mta_maps::map_path(z).is_none())
+            .cloned()
+            .unwrap_or_else(|| "default".into())
+    } else {
+        zone
+    };
     if !app.readonly_definition_ids.remove(id)
         && app.definitions.get(id).is_some_and(is_override_definition)
     {
@@ -2501,9 +2568,9 @@ fn apply_definition_override_flag(
         }
     }
     if changed > 0 {
-        invalidate_outliner_labels(app);
-        rebuild_outliner_filter(app);
-        rebuild_render_cells(app);
+        if !matches!(&before, ScopedHistorySnapshot::LocalWorld(_)) {
+            rebuild_render_cells(app);
+        }
         commit_scoped_history(app, "Definition Override Flag", before);
         app.status_message = format!("Updated {changed} override flag(s)");
     }
@@ -2515,7 +2582,7 @@ fn select_same_id_as_active(app: &mut AppState) {
         return;
     };
     let id = active.id.clone();
-    let before = world_history_snapshot(app);
+    let before = selection_history_snapshot(app);
     app.selected_elements.clear();
     app.selected_element_order.clear();
     for (idx, placement) in app.placements.iter().enumerate() {
@@ -2537,7 +2604,7 @@ fn select_same_id_as_active(app: &mut AppState) {
         "Selected {} instance(s) of {id}",
         app.selected_elements.len()
     );
-    commit_world_history(app, "Select Same ID", before);
+    commit_selection_history(app, "Select Same ID", before);
 }
 
 pub(crate) fn element_replace_target_ids(app: &AppState, query: &str) -> Vec<String> {
@@ -2551,7 +2618,7 @@ pub(crate) fn element_replace_target_ids(app: &AppState, query: &str) -> Vec<Str
 }
 
 fn open_element_replace_with_dialog(app: &mut AppState) {
-    let source_indices = selected_live_indices(app);
+    let source_indices = selected_editable_indices(app);
     if source_indices.is_empty() {
         app.status_message = "Select one or more live elements first".to_string();
         return;
@@ -2597,6 +2664,9 @@ fn replace_elements_with_id(app: &mut AppState, target: &str, source_indices: &[
         let Some(placement) = app.placements.get_mut(index) else {
             continue;
         };
+        if is_default_world_placement(placement) {
+            continue;
+        }
         if placement.id.eq_ignore_ascii_case(&target_id) {
             continue;
         }
@@ -2623,6 +2693,9 @@ fn replace_elements_with_id(app: &mut AppState, target: &str, source_indices: &[
         }
     }
     for placement in &mut app.placements {
+        if is_default_world_placement(placement) {
+            continue;
+        }
         if placement.attrs.get("lodParent").is_some_and(|parent| {
             retired_ids
                 .iter()
@@ -2649,6 +2722,11 @@ fn replace_elements_with_id(app: &mut AppState, target: &str, source_indices: &[
 }
 
 pub(crate) fn apply_inspector_edit(app: &mut AppState) {
+    if selection_has_default_world(app) {
+        app.inspector_edit = None;
+        app.status_message = "Default SA world elements are locked; use Turn into placement".into();
+        return;
+    }
     let Some(edit) = app.inspector_edit.take() else {
         return;
     };
@@ -2676,10 +2754,13 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
                 app.status_message = "Transform values must be finite numbers".to_string();
                 return;
             };
-            for idx in selected_live_indices(app) {
+            for idx in selected_editable_indices(app) {
                 let Some(p) = app.placements.get_mut(idx) else {
                     continue;
                 };
+                if is_default_world_placement(p) {
+                    continue;
+                }
                 match edit.field {
                     InspectorField::ElementPosX => p.pos.x = parsed,
                     InspectorField::ElementPosY => p.pos.y = parsed,
@@ -2698,10 +2779,13 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
                 app.status_message = "Dimension must be a whole number from 0 to 65535".to_string();
                 return;
             };
-            for idx in selected_live_indices(app) {
+            for idx in selected_editable_indices(app) {
                 let Some(p) = app.placements.get_mut(idx) else {
                     continue;
                 };
+                if is_default_world_placement(p) {
+                    continue;
+                }
                 p.attrs
                     .insert("dimension".to_string(), dimension.to_string());
             }
@@ -2711,27 +2795,36 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
                 app.status_message = "Interior must be a whole number from 0 to 255".to_string();
                 return;
             };
-            for idx in selected_live_indices(app) {
+            for idx in selected_editable_indices(app) {
                 let Some(p) = app.placements.get_mut(idx) else {
                     continue;
                 };
+                if is_default_world_placement(p) {
+                    continue;
+                }
                 p.attrs.insert("interior".to_string(), interior.to_string());
             }
         }
         InspectorField::ElementLodParent => {
-            for idx in selected_live_indices(app) {
+            for idx in selected_editable_indices(app) {
                 let Some(p) = app.placements.get_mut(idx) else {
                     continue;
                 };
+                if is_default_world_placement(p) {
+                    continue;
+                }
                 set_optional_attr(&mut p.attrs, "lodParent", value.clone());
                 rebuild = true;
             }
         }
         InspectorField::ElementUniqueId => {
-            for idx in selected_live_indices(app) {
+            for idx in selected_editable_indices(app) {
                 let Some(p) = app.placements.get_mut(idx) else {
                     continue;
                 };
+                if is_default_world_placement(p) {
+                    continue;
+                }
                 set_optional_attr(&mut p.attrs, "uniqueID", value.clone());
             }
         }
@@ -2741,18 +2834,24 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
                     app.status_message = "Alpha must be 0-255".to_string();
                     return;
                 };
-                for idx in selected_live_indices(app) {
+                for idx in selected_editable_indices(app) {
                     let Some(p) = app.placements.get_mut(idx) else {
                         continue;
                     };
+                    if is_default_world_placement(p) {
+                        continue;
+                    }
                     p.attrs.insert("alpha".to_string(), alpha.to_string());
                     rebuild = true;
                 }
             } else {
-                for idx in selected_live_indices(app) {
+                for idx in selected_editable_indices(app) {
                     let Some(p) = app.placements.get_mut(idx) else {
                         continue;
                     };
+                    if is_default_world_placement(p) {
+                        continue;
+                    }
                     p.attrs.remove("alpha");
                     rebuild = true;
                 }
@@ -2768,18 +2867,24 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
                     app.status_message = "Scale must be greater than 0".to_string();
                     return;
                 }
-                for idx in selected_live_indices(app) {
+                for idx in selected_editable_indices(app) {
                     let Some(p) = app.placements.get_mut(idx) else {
                         continue;
                     };
+                    if is_default_world_placement(p) {
+                        continue;
+                    }
                     p.attrs.insert("scale".to_string(), fmt_f32(scale, 3));
                     rebuild = true;
                 }
             } else {
-                for idx in selected_live_indices(app) {
+                for idx in selected_editable_indices(app) {
                     let Some(p) = app.placements.get_mut(idx) else {
                         continue;
                     };
+                    if is_default_world_placement(p) {
+                        continue;
+                    }
                     p.attrs.remove("scale");
                     rebuild = true;
                 }
@@ -2899,10 +3004,13 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
                     }
                 }
                 PhysicsScope::PerObject => {
-                    for idx in selected_live_indices(app) {
+                    for idx in selected_editable_indices(app) {
                         let Some(placement) = app.placements.get_mut(idx) else {
                             continue;
                         };
+                        if is_default_world_placement(placement) {
+                            continue;
+                        }
                         set_optional_attr(&mut placement.attrs, key, normalized.clone());
                     }
                 }
@@ -2923,6 +3031,9 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
                     mark_definition_override_attr(def, "dff");
                 }
                 for placement in &mut app.placements {
+                    if is_default_world_placement(placement) {
+                        continue;
+                    }
                     if placement.id == id {
                         placement.dff = dff_value.clone();
                     }
@@ -3715,9 +3826,13 @@ pub(crate) fn apply_inspector_edit(app: &mut AppState) {
         }
     }
     if rebuild {
-        invalidate_outliner_labels(app);
-        rebuild_outliner_filter(app);
-        rebuild_render_cells(app);
+        if let ScopedHistorySnapshot::PlacementTransforms(before) = &edit.before {
+            rebuild_render_cells_for_placement_transforms(app, before);
+        } else if !matches!(&edit.before, ScopedHistorySnapshot::LocalWorld(_)) {
+            invalidate_outliner_labels(app);
+            rebuild_outliner_filter(app);
+            rebuild_render_cells(app);
+        }
     }
     commit_scoped_history(app, "Inspector Edit", edit.before);
 }
@@ -3778,7 +3893,7 @@ pub(crate) fn request_element_id_rename(
     let Some(selected_idx) = app.placements.get(app.selected).map(|_| app.selected) else {
         return;
     };
-    let selected_indices = selected_live_indices(app);
+    let selected_indices = selected_editable_indices(app);
     let selected_ids: BTreeSet<_> = selected_indices
         .iter()
         .filter_map(|idx| app.placements.get(*idx).map(|placement| &placement.id))
@@ -3859,6 +3974,9 @@ pub(crate) fn apply_element_id_rename(app: &mut AppState, mode: ElementIdRenameM
             app.definitions.remove(&old_id);
             app.definitions.insert(new_id.clone(), new_def);
             for placement in &mut app.placements {
+                if is_default_world_placement(placement) {
+                    continue;
+                }
                 if placement.id == old_id {
                     placement.id = new_id.clone();
                     placement.dff = new_id.clone();
@@ -3872,6 +3990,9 @@ pub(crate) fn apply_element_id_rename(app: &mut AppState, mode: ElementIdRenameM
             app.definitions.remove(&old_id);
             app.definitions.insert(new_id.clone(), new_def);
             for placement in &mut app.placements {
+                if is_default_world_placement(placement) {
+                    continue;
+                }
                 if placement.id == old_id {
                     placement.id = new_id.clone();
                     placement.dff = old_id.clone();
@@ -3887,6 +4008,9 @@ pub(crate) fn apply_element_id_rename(app: &mut AppState, mode: ElementIdRenameM
                 let Some(placement) = app.placements.get_mut(idx) else {
                     continue;
                 };
+                if is_default_world_placement(placement) {
+                    continue;
+                }
                 placement.id = new_id.clone();
                 placement.dff = old_id.clone();
                 sync_placement_attrs(placement);
@@ -3894,6 +4018,9 @@ pub(crate) fn apply_element_id_rename(app: &mut AppState, mode: ElementIdRenameM
         }
     }
     for placement in &mut app.placements {
+        if is_default_world_placement(placement) {
+            continue;
+        }
         if placement
             .attrs
             .get("lodParent")
@@ -4834,12 +4961,17 @@ pub(crate) fn load_dialog_rect() -> Rect {
     save_as_dialog_rect()
 }
 
-pub(crate) const PREFERENCES_DIALOG_H: f32 = 646.0;
+pub(crate) const PREFERENCES_DIALOG_H: f32 = 712.0;
 /// First row of the Viewport section, relative to the dialog's top edge.
-const PREFERENCES_VIEWPORT_ROW_Y: f32 = 246.0;
+const PREFERENCES_VIEWPORT_ROW_Y: f32 = 142.0;
 const PREFERENCES_VIEWPORT_ROW_GAP: f32 = 44.0;
 const PREFERENCES_STEP_W: f32 = 32.0;
 const PREFERENCES_VALUE_W: f32 = 104.0;
+const PREFERENCES_VIEWPORT_TOP: f32 = 110.0;
+const PREFERENCES_VIEWPORT_BOTTOM_PADDING: f32 = 66.0;
+const PREFERENCES_VIEWPORT_CONTENT_BOTTOM: f32 = PREFERENCES_VIEWPORT_ROW_Y
+    + PREFERENCES_DRAW_DISTANCE_ROW as f32 * PREFERENCES_VIEWPORT_ROW_GAP
+    + 30.0;
 
 pub(crate) fn preferences_dialog_rect() -> Rect {
     let w = 760.0_f32.min(screen_width() - 80.0);
@@ -4852,25 +4984,142 @@ pub(crate) fn preferences_dialog_rect() -> Rect {
     )
 }
 
+pub(crate) fn preferences_tab_rect(tab: PreferencesTab) -> Rect {
+    let rect = preferences_dialog_rect();
+    let index = match tab {
+        PreferencesTab::General => 0,
+        PreferencesTab::Viewport => 1,
+        PreferencesTab::Plugins => 2,
+    };
+    let width = (rect.w - 60.0) / 3.0;
+    Rect::new(
+        rect.x + 24.0 + index as f32 * (width + 6.0),
+        rect.y + 54.0,
+        width,
+        32.0,
+    )
+}
+
+pub(crate) fn preferences_plugin_list_rect() -> Rect {
+    let rect = preferences_dialog_rect();
+    Rect::new(
+        rect.x + 24.0,
+        rect.y + 136.0,
+        (rect.w - 60.0) * 0.4,
+        (rect.h - 232.0).max(1.0),
+    )
+}
+
+pub(crate) fn preferences_plugin_details_rect() -> Rect {
+    let rect = preferences_dialog_rect();
+    let list = preferences_plugin_list_rect();
+    Rect::new(
+        list.x + list.w + 12.0,
+        list.y,
+        rect.w - list.w - 60.0,
+        list.h,
+    )
+}
+
+pub(crate) const PREFERENCES_PLUGIN_ROW_H: f32 = 66.0;
+
+pub(crate) fn preferences_plugin_row_rect(index: usize, scroll: f32) -> Rect {
+    let list = preferences_plugin_list_rect();
+    Rect::new(
+        list.x + 4.0,
+        list.y + index as f32 * PREFERENCES_PLUGIN_ROW_H - scroll + 4.0,
+        list.w - 8.0,
+        PREFERENCES_PLUGIN_ROW_H - 6.0,
+    )
+}
+
+pub(crate) fn preferences_plugin_toggle_rect(index: usize, scroll: f32) -> Rect {
+    let row = preferences_plugin_row_rect(index, scroll);
+    Rect::new(row.x + row.w - 62.0, row.y + 28.0, 54.0, 26.0)
+}
+
 pub(crate) fn preferences_input_rect() -> Rect {
     let rect = preferences_dialog_rect();
-    Rect::new(rect.x + 24.0, rect.y + 98.0, rect.w - 48.0, 32.0)
+    Rect::new(rect.x + 24.0, rect.y + 138.0, rect.w - 48.0, 32.0)
+}
+
+pub(crate) fn preferences_blender_input_rect() -> Rect {
+    let rect = preferences_dialog_rect();
+    Rect::new(rect.x + 24.0, rect.y + 236.0, rect.w - 272.0, 32.0)
+}
+
+pub(crate) fn preferences_blender_search_rect() -> Rect {
+    let rect = preferences_dialog_rect();
+    Rect::new(rect.x + rect.w - 236.0, rect.y + 236.0, 212.0, 32.0)
+}
+
+pub(crate) const BLENDER_CANDIDATE_VISIBLE_ROWS: usize = 8;
+
+pub(crate) fn preferences_blender_candidate_dialog_rect(candidate_count: usize) -> Rect {
+    let rows = candidate_count.min(BLENDER_CANDIDATE_VISIBLE_ROWS).max(1);
+    let w = 680.0_f32.min(screen_width() - 60.0);
+    let h = 92.0 + rows as f32 * 38.0;
+    Rect::new(
+        (screen_width() - w) * 0.5,
+        (screen_height() - h) * 0.5,
+        w,
+        h,
+    )
+}
+
+pub(crate) fn preferences_blender_candidate_row_rect(candidate_count: usize, slot: usize) -> Rect {
+    let dialog = preferences_blender_candidate_dialog_rect(candidate_count);
+    Rect::new(
+        dialog.x + 18.0,
+        dialog.y + 50.0 + slot as f32 * 38.0,
+        dialog.w - 36.0,
+        32.0,
+    )
+}
+
+pub(crate) fn preferences_blender_candidate_cancel_rect(candidate_count: usize) -> Rect {
+    let dialog = preferences_blender_candidate_dialog_rect(candidate_count);
+    Rect::new(
+        dialog.x + dialog.w - 106.0,
+        dialog.y + dialog.h - 42.0,
+        88.0,
+        30.0,
+    )
+}
+
+pub(crate) fn preferences_viewport_clip_rect() -> Rect {
+    preferences_viewport_clip_rect_for(preferences_dialog_rect())
+}
+
+fn preferences_viewport_clip_rect_for(dialog: Rect) -> Rect {
+    let top = dialog.y + PREFERENCES_VIEWPORT_TOP;
+    let bottom = dialog.y + dialog.h - PREFERENCES_VIEWPORT_BOTTOM_PADDING;
+    Rect::new(dialog.x + 1.0, top, dialog.w - 2.0, (bottom - top).max(1.0))
+}
+
+pub(crate) fn preferences_viewport_max_scroll() -> f32 {
+    preferences_viewport_max_scroll_for(preferences_dialog_rect())
+}
+
+fn preferences_viewport_max_scroll_for(dialog: Rect) -> f32 {
+    let visible_bottom = dialog.h - PREFERENCES_VIEWPORT_BOTTOM_PADDING;
+    (PREFERENCES_VIEWPORT_CONTENT_BOTTOM - visible_bottom).max(0.0)
 }
 
 /// Row `row` of the Viewport section: the label sits at the left, the control
 /// group is right-aligned. Returns (label_x, row_y).
-pub(crate) fn preferences_row_origin(row: usize) -> (f32, f32) {
+pub(crate) fn preferences_row_origin(row: usize, scroll: f32) -> (f32, f32) {
     let rect = preferences_dialog_rect();
     (
         rect.x + 24.0,
-        rect.y + PREFERENCES_VIEWPORT_ROW_Y + row as f32 * PREFERENCES_VIEWPORT_ROW_GAP,
+        rect.y + PREFERENCES_VIEWPORT_ROW_Y + row as f32 * PREFERENCES_VIEWPORT_ROW_GAP - scroll,
     )
 }
 
 /// Stepper for row `row`: (minus, value, plus).
-pub(crate) fn preferences_stepper_rects(row: usize) -> (Rect, Rect, Rect) {
+pub(crate) fn preferences_stepper_rects(row: usize, scroll: f32) -> (Rect, Rect, Rect) {
     let rect = preferences_dialog_rect();
-    let (_, y) = preferences_row_origin(row);
+    let (_, y) = preferences_row_origin(row, scroll);
     let right = rect.x + rect.w - 24.0;
     let plus = Rect::new(right - PREFERENCES_STEP_W, y, PREFERENCES_STEP_W, 30.0);
     let value = Rect::new(
@@ -4888,35 +5137,35 @@ pub(crate) fn preferences_stepper_rects(row: usize) -> (Rect, Rect, Rect) {
     (minus, value, plus)
 }
 
-pub(crate) fn preferences_gizmo_scale_rects() -> (Rect, Rect, Rect) {
-    preferences_stepper_rects(0)
+pub(crate) fn preferences_gizmo_scale_rects(scroll: f32) -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(0, scroll)
 }
 
-pub(crate) fn preferences_camera_speed_rects() -> (Rect, Rect, Rect) {
-    preferences_stepper_rects(1)
+pub(crate) fn preferences_camera_speed_rects(scroll: f32) -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(1, scroll)
 }
 
-pub(crate) fn preferences_vehicle_camera_speed_rects() -> (Rect, Rect, Rect) {
-    preferences_stepper_rects(2)
+pub(crate) fn preferences_vehicle_camera_speed_rects(scroll: f32) -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(2, scroll)
 }
 
-pub(crate) fn preferences_editing_camera_speed_rects() -> (Rect, Rect, Rect) {
-    preferences_stepper_rects(3)
+pub(crate) fn preferences_editing_camera_speed_rects(scroll: f32) -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(3, scroll)
 }
 
-pub(crate) fn preferences_camera_rotation_speed_rects() -> (Rect, Rect, Rect) {
-    preferences_stepper_rects(4)
+pub(crate) fn preferences_camera_rotation_speed_rects(scroll: f32) -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(4, scroll)
 }
 
 pub(crate) const PREFERENCES_MSAA_ROW: usize = 5;
 pub(crate) const PREFERENCES_DRAW_DISTANCE_ROW: usize = 6;
 
-pub(crate) fn preferences_draw_distance_rects() -> (Rect, Rect, Rect) {
-    preferences_stepper_rects(PREFERENCES_DRAW_DISTANCE_ROW)
+pub(crate) fn preferences_draw_distance_rects(scroll: f32) -> (Rect, Rect, Rect) {
+    preferences_stepper_rects(PREFERENCES_DRAW_DISTANCE_ROW, scroll)
 }
 
-pub(crate) fn preferences_msaa_rect() -> Rect {
-    let (_, value, plus) = preferences_stepper_rects(PREFERENCES_MSAA_ROW);
+pub(crate) fn preferences_msaa_rect(scroll: f32) -> Rect {
+    let (_, value, plus) = preferences_stepper_rects(PREFERENCES_MSAA_ROW, scroll);
     Rect::new(value.x, value.y, value.w + 6.0 + plus.w, value.h)
 }
 
@@ -5187,27 +5436,32 @@ pub(crate) fn set_load_cursor_from_mouse(dialog: &mut LoadDialog, mouse_x: f32) 
 }
 
 pub(crate) fn set_preferences_cursor_from_mouse(dialog: &mut PreferencesDialog, mouse_x: f32) {
-    let rect = preferences_input_rect();
+    let (value, rect) = match dialog.active_path_field {
+        PreferencesPathField::GtaSa => (&dialog.gta_sa_dir, preferences_input_rect()),
+        PreferencesPathField::Blender => (
+            &dialog.blender_install_dir,
+            preferences_blender_input_rect(),
+        ),
+    };
     let local_x = (mouse_x - rect.x - 10.0).max(0.0);
-    let mut best = dialog.gta_sa_dir.len();
+    let mut best = value.len();
     let mut best_dist = f32::MAX;
     let Some(font) = FONT_REGULAR.get() else {
-        dialog.cursor = dialog.gta_sa_dir.len();
+        dialog.cursor = value.len();
         return;
     };
     let scale = 16.0 / font.raster_px;
     let mut width = 0.0;
-    for (idx, ch) in dialog
-        .gta_sa_dir
+    for (idx, ch) in value
         .char_indices()
-        .chain(std::iter::once((dialog.gta_sa_dir.len(), '\0')))
+        .chain(std::iter::once((value.len(), '\0')))
     {
         let dist = (width - local_x).abs();
         if dist < best_dist {
             best = idx;
             best_dist = dist;
         }
-        if idx < dialog.gta_sa_dir.len() {
+        if idx < value.len() {
             width += glyph_advance(font, ch, scale);
         }
     }
@@ -5215,17 +5469,61 @@ pub(crate) fn set_preferences_cursor_from_mouse(dialog: &mut PreferencesDialog, 
     dialog.selection_anchor = None;
 }
 
-pub(crate) fn save_preferences_dialog(app: &mut AppState, dialog: PreferencesDialog) {
+pub(crate) fn save_preferences_dialog(app: &mut AppState, mut dialog: PreferencesDialog) {
     let path = PathBuf::from(dialog.gta_sa_dir.trim());
-    if let Err(error) = validate_gta_sa_dir(&path) {
+    if path != app.gta_sa_dir
+        && let Err(error) = validate_gta_sa_dir(&path)
+    {
+        dialog.tab = PreferencesTab::General;
+        dialog.error = Some(error.clone());
         app.status_message = error;
         app.preferences_dialog = Some(dialog);
         return;
+    }
+    let blender_install_dir = if dialog.blender_install_dir.trim().is_empty() {
+        None
+    } else {
+        let path = PathBuf::from(dialog.blender_install_dir.trim());
+        if Some(path.clone()) != load_blender_install_dir_preference()
+            && let Err(error) = validate_blender_install_dir(&path)
+        {
+            dialog.tab = PreferencesTab::General;
+            dialog.error = Some(error.clone());
+            app.status_message = error;
+            app.preferences_dialog = Some(dialog);
+            return;
+        }
+        Some(path)
+    };
+    let saved_plugins = load_preferences();
+    let plugins_changed = dialog.plugins.iter().any(|plugin| {
+        saved_plugins
+            .get(&format!("plugin_{}_enabled", plugin.id))
+            .is_none_or(|value| value != "false")
+            != plugin.enabled
+    });
+    if let Err(error) = save_material_plugin_preferences(&dialog.plugins) {
+        dialog.error = Some(format!("Could not save plugin preferences: {error}"));
+        app.preferences_dialog = Some(dialog);
+        return;
+    }
+    if plugins_changed {
+        clear_material_plugins();
+        let textures: Vec<_> = app
+            .textures
+            .iter()
+            .filter(|(key, _)| !key.starts_with('@'))
+            .map(|(key, texture)| (key.rsplit('|').next().unwrap_or(key).to_string(), *texture))
+            .collect();
+        for (key, texture) in textures {
+            register_material_preview(texture, &key, &app.texture_files, &mut app.textures);
+        }
     }
     app.gta_sa_dir = path.clone();
     app.physics_root_properties = load_physics_root_properties(&path);
     app.physics_root_dropdown_open = false;
     save_gta_sa_dir_preference(&path);
+    save_blender_install_dir_preference(blender_install_dir.as_deref());
     invalidate_validation_cache(app);
 
     set_gizmo_scale(app, dialog.gizmo_scale);
@@ -5443,94 +5741,244 @@ pub(crate) fn update_preferences_dialog_input(app: &mut AppState, mouse: Vec2) -
         return false;
     }
     let rect = preferences_dialog_rect();
+    let candidate_count = app
+        .preferences_dialog
+        .as_ref()
+        .map_or(0, |dialog| dialog.blender_install_candidates.len());
+    if candidate_count > 0 {
+        let max_scroll = candidate_count.saturating_sub(BLENDER_CANDIDATE_VISIBLE_ROWS);
+        if let Some(dialog) = app.preferences_dialog.as_mut() {
+            dialog.blender_candidate_scroll = dialog.blender_candidate_scroll.min(max_scroll);
+            let (_, wheel_y) = mouse_wheel();
+            if wheel_y > 0.0 {
+                dialog.blender_candidate_scroll = dialog.blender_candidate_scroll.saturating_sub(1);
+            } else if wheel_y < 0.0 {
+                dialog.blender_candidate_scroll =
+                    (dialog.blender_candidate_scroll + 1).min(max_scroll);
+            }
+        }
+        if is_key_pressed(KeyCode::Escape) {
+            if let Some(dialog) = app.preferences_dialog.as_mut() {
+                dialog.blender_install_candidates.clear();
+            }
+            return true;
+        }
+        if is_mouse_button_pressed(MouseButton::Left) {
+            let scroll = app
+                .preferences_dialog
+                .as_ref()
+                .map_or(0, |dialog| dialog.blender_candidate_scroll);
+            for slot in 0..candidate_count.min(BLENDER_CANDIDATE_VISIBLE_ROWS) {
+                if preferences_blender_candidate_row_rect(candidate_count, slot).contains(mouse) {
+                    if let Some(dialog) = app.preferences_dialog.as_mut()
+                        && let Some(path) = dialog
+                            .blender_install_candidates
+                            .get(scroll + slot)
+                            .cloned()
+                    {
+                        dialog.blender_install_dir = path.to_string_lossy().to_string();
+                        dialog.active_path_field = PreferencesPathField::Blender;
+                        dialog.cursor = dialog.blender_install_dir.len();
+                        dialog.selection_anchor = None;
+                        dialog.blender_install_candidates.clear();
+                        dialog.blender_search_message =
+                            Some("Blender installation selected".to_string());
+                    }
+                    return true;
+                }
+            }
+            if preferences_blender_candidate_cancel_rect(candidate_count).contains(mouse)
+                || !preferences_blender_candidate_dialog_rect(candidate_count).contains(mouse)
+            {
+                if let Some(dialog) = app.preferences_dialog.as_mut() {
+                    dialog.blender_install_candidates.clear();
+                }
+            }
+        }
+        return true;
+    }
+    let tab = app.preferences_dialog.as_ref().unwrap().tab;
+    let viewport = preferences_viewport_clip_rect();
+    let max_scroll = preferences_viewport_max_scroll();
+    if let Some(dialog) = app.preferences_dialog.as_mut() {
+        let (_, wheel_y) = mouse_wheel();
+        if tab == PreferencesTab::Viewport {
+            dialog.viewport_scroll = dialog.viewport_scroll.clamp(0.0, max_scroll);
+            if viewport.contains(mouse) && wheel_y != 0.0 {
+                dialog.viewport_scroll =
+                    (dialog.viewport_scroll - wheel_y * 34.0).clamp(0.0, max_scroll);
+            }
+        } else if tab == PreferencesTab::Plugins {
+            let list = preferences_plugin_list_rect();
+            let max_scroll =
+                (dialog.plugins.len() as f32 * PREFERENCES_PLUGIN_ROW_H - list.h).max(0.0);
+            dialog.plugin_scroll = dialog.plugin_scroll.clamp(0.0, max_scroll);
+            if list.contains(mouse) {
+                dialog.plugin_scroll =
+                    (dialog.plugin_scroll - wheel_y * 34.0).clamp(0.0, max_scroll);
+            }
+            let details = preferences_plugin_details_rect();
+            let lines = preferences_plugin_detail_lines(dialog);
+            let max_scroll = (lines.len() as f32 * 24.0 + 20.0 - details.h).max(0.0);
+            dialog.plugin_details_scroll = dialog.plugin_details_scroll.clamp(0.0, max_scroll);
+            if details.contains(mouse) {
+                dialog.plugin_details_scroll =
+                    (dialog.plugin_details_scroll - wheel_y * 34.0).clamp(0.0, max_scroll);
+            }
+        }
+    }
+    let viewport_scroll = app
+        .preferences_dialog
+        .as_ref()
+        .map_or(0.0, |dialog| dialog.viewport_scroll);
     let save_rect = Rect::new(rect.x + rect.w - 216.0, rect.y + rect.h - 50.0, 88.0, 32.0);
     let cancel_rect = Rect::new(rect.x + rect.w - 116.0, rect.y + rect.h - 50.0, 88.0, 32.0);
     if is_mouse_button_pressed(MouseButton::Left) {
-        if preferences_input_rect().contains(mouse) {
+        for selected_tab in [
+            PreferencesTab::General,
+            PreferencesTab::Viewport,
+            PreferencesTab::Plugins,
+        ] {
+            if preferences_tab_rect(selected_tab).contains(mouse) {
+                let dialog = app.preferences_dialog.as_mut().unwrap();
+                dialog.tab = selected_tab;
+                dialog.selection_anchor = None;
+                drain_text_input();
+                return true;
+            }
+        }
+        if tab == PreferencesTab::Plugins && preferences_plugin_list_rect().contains(mouse) {
+            let dialog = app.preferences_dialog.as_mut().unwrap();
+            for index in 0..dialog.plugins.len() {
+                if preferences_plugin_row_rect(index, dialog.plugin_scroll).contains(mouse) {
+                    if dialog.selected_plugin != Some(index) {
+                        dialog.plugin_details_scroll = 0.0;
+                    }
+                    dialog.selected_plugin = Some(index);
+                    if preferences_plugin_toggle_rect(index, dialog.plugin_scroll).contains(mouse) {
+                        let plugin = &mut dialog.plugins[index];
+                        if plugin.enabled || plugin.error.is_none() {
+                            plugin.enabled = !plugin.enabled;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+
+        if tab == PreferencesTab::General && preferences_input_rect().contains(mouse) {
             if let Some(dialog) = app.preferences_dialog.as_mut() {
+                dialog.active_path_field = PreferencesPathField::GtaSa;
                 set_preferences_cursor_from_mouse(dialog, mouse.x);
             }
             return true;
         }
-        let (gizmo_minus, _, gizmo_plus) = preferences_gizmo_scale_rects();
-        let (speed_minus, _, speed_plus) = preferences_camera_speed_rects();
-        let (vehicle_speed_minus, _, vehicle_speed_plus) = preferences_vehicle_camera_speed_rects();
-        let (editing_speed_minus, _, editing_speed_plus) = preferences_editing_camera_speed_rects();
-        let (spin_minus, _, spin_plus) = preferences_camera_rotation_speed_rects();
-        let (draw_minus, _, draw_plus) = preferences_draw_distance_rects();
-        if let Some(dialog) = app.preferences_dialog.as_mut() {
-            if gizmo_minus.contains(mouse) {
-                let step = gizmo_scale_step(dialog.gizmo_scale, false);
-                dialog.gizmo_scale = clamp_gizmo_scale(dialog.gizmo_scale - step);
-                return true;
+        if tab == PreferencesTab::General && preferences_blender_input_rect().contains(mouse) {
+            if let Some(dialog) = app.preferences_dialog.as_mut() {
+                dialog.active_path_field = PreferencesPathField::Blender;
+                dialog.blender_search_message = None;
+                set_preferences_cursor_from_mouse(dialog, mouse.x);
             }
-            if gizmo_plus.contains(mouse) {
-                let step = gizmo_scale_step(dialog.gizmo_scale, true);
-                dialog.gizmo_scale = clamp_gizmo_scale(dialog.gizmo_scale + step);
-                return true;
+            return true;
+        }
+        if tab == PreferencesTab::General && preferences_blender_search_rect().contains(mouse) {
+            if let Some(dialog) = app.preferences_dialog.as_mut() {
+                dialog.blender_install_candidates = search_common_blender_install_dirs();
+                dialog.blender_candidate_scroll = 0;
+                dialog.blender_search_message = if dialog.blender_install_candidates.is_empty() {
+                    Some("No Blender installations were found in common locations".to_string())
+                } else {
+                    None
+                };
             }
-            if speed_minus.contains(mouse) {
-                dialog.camera_speed =
-                    clamp_camera_speed(dialog.camera_speed / CAMERA_SPEED_STEP_FACTOR);
-                return true;
-            }
-            if speed_plus.contains(mouse) {
-                dialog.camera_speed =
-                    clamp_camera_speed(dialog.camera_speed * CAMERA_SPEED_STEP_FACTOR);
-                return true;
-            }
-            if vehicle_speed_minus.contains(mouse) {
-                dialog.vehicle_camera_speed = clamp_detail_camera_speed(
-                    dialog.vehicle_camera_speed / CAMERA_SPEED_STEP_FACTOR,
-                );
-                return true;
-            }
-            if vehicle_speed_plus.contains(mouse) {
-                dialog.vehicle_camera_speed = clamp_detail_camera_speed(
-                    dialog.vehicle_camera_speed * CAMERA_SPEED_STEP_FACTOR,
-                );
-                return true;
-            }
-            if editing_speed_minus.contains(mouse) {
-                dialog.editing_camera_speed = clamp_editing_camera_speed(
-                    dialog.editing_camera_speed / CAMERA_SPEED_STEP_FACTOR,
-                );
-                return true;
-            }
-            if editing_speed_plus.contains(mouse) {
-                dialog.editing_camera_speed = clamp_editing_camera_speed(
-                    dialog.editing_camera_speed * CAMERA_SPEED_STEP_FACTOR,
-                );
-                return true;
-            }
-            if spin_minus.contains(mouse) {
-                dialog.camera_rotation_speed = clamp_camera_rotation_speed(
-                    dialog.camera_rotation_speed / CAMERA_SPEED_STEP_FACTOR,
-                );
-                return true;
-            }
-            if spin_plus.contains(mouse) {
-                dialog.camera_rotation_speed = clamp_camera_rotation_speed(
-                    dialog.camera_rotation_speed * CAMERA_SPEED_STEP_FACTOR,
-                );
-                return true;
-            }
-            if preferences_msaa_rect().contains(mouse) {
-                dialog.msaa_samples = next_msaa_samples(dialog.msaa_samples);
-                return true;
-            }
-            if draw_minus.contains(mouse) {
-                dialog.draw_distance_percent =
-                    clamp_draw_distance_percent(dialog.draw_distance_percent.saturating_sub(25));
-                return true;
-            }
-            if draw_plus.contains(mouse) {
-                dialog.draw_distance_percent =
-                    clamp_draw_distance_percent(dialog.draw_distance_percent.saturating_add(25));
-                return true;
+            return true;
+        }
+        if tab == PreferencesTab::Viewport && viewport.contains(mouse) {
+            let (gizmo_minus, _, gizmo_plus) = preferences_gizmo_scale_rects(viewport_scroll);
+            let (speed_minus, _, speed_plus) = preferences_camera_speed_rects(viewport_scroll);
+            let (vehicle_speed_minus, _, vehicle_speed_plus) =
+                preferences_vehicle_camera_speed_rects(viewport_scroll);
+            let (editing_speed_minus, _, editing_speed_plus) =
+                preferences_editing_camera_speed_rects(viewport_scroll);
+            let (spin_minus, _, spin_plus) =
+                preferences_camera_rotation_speed_rects(viewport_scroll);
+            let (draw_minus, _, draw_plus) = preferences_draw_distance_rects(viewport_scroll);
+            if let Some(dialog) = app.preferences_dialog.as_mut() {
+                if gizmo_minus.contains(mouse) {
+                    let step = gizmo_scale_step(dialog.gizmo_scale, false);
+                    dialog.gizmo_scale = clamp_gizmo_scale(dialog.gizmo_scale - step);
+                    return true;
+                }
+                if gizmo_plus.contains(mouse) {
+                    let step = gizmo_scale_step(dialog.gizmo_scale, true);
+                    dialog.gizmo_scale = clamp_gizmo_scale(dialog.gizmo_scale + step);
+                    return true;
+                }
+                if speed_minus.contains(mouse) {
+                    dialog.camera_speed =
+                        clamp_camera_speed(dialog.camera_speed / CAMERA_SPEED_STEP_FACTOR);
+                    return true;
+                }
+                if speed_plus.contains(mouse) {
+                    dialog.camera_speed =
+                        clamp_camera_speed(dialog.camera_speed * CAMERA_SPEED_STEP_FACTOR);
+                    return true;
+                }
+                if vehicle_speed_minus.contains(mouse) {
+                    dialog.vehicle_camera_speed = clamp_detail_camera_speed(
+                        dialog.vehicle_camera_speed / CAMERA_SPEED_STEP_FACTOR,
+                    );
+                    return true;
+                }
+                if vehicle_speed_plus.contains(mouse) {
+                    dialog.vehicle_camera_speed = clamp_detail_camera_speed(
+                        dialog.vehicle_camera_speed * CAMERA_SPEED_STEP_FACTOR,
+                    );
+                    return true;
+                }
+                if editing_speed_minus.contains(mouse) {
+                    dialog.editing_camera_speed = clamp_editing_camera_speed(
+                        dialog.editing_camera_speed / CAMERA_SPEED_STEP_FACTOR,
+                    );
+                    return true;
+                }
+                if editing_speed_plus.contains(mouse) {
+                    dialog.editing_camera_speed = clamp_editing_camera_speed(
+                        dialog.editing_camera_speed * CAMERA_SPEED_STEP_FACTOR,
+                    );
+                    return true;
+                }
+                if spin_minus.contains(mouse) {
+                    dialog.camera_rotation_speed = clamp_camera_rotation_speed(
+                        dialog.camera_rotation_speed / CAMERA_SPEED_STEP_FACTOR,
+                    );
+                    return true;
+                }
+                if spin_plus.contains(mouse) {
+                    dialog.camera_rotation_speed = clamp_camera_rotation_speed(
+                        dialog.camera_rotation_speed * CAMERA_SPEED_STEP_FACTOR,
+                    );
+                    return true;
+                }
+                if preferences_msaa_rect(viewport_scroll).contains(mouse) {
+                    dialog.msaa_samples = next_msaa_samples(dialog.msaa_samples);
+                    return true;
+                }
+                if draw_minus.contains(mouse) {
+                    dialog.draw_distance_percent = clamp_draw_distance_percent(
+                        dialog.draw_distance_percent.saturating_sub(25),
+                    );
+                    return true;
+                }
+                if draw_plus.contains(mouse) {
+                    dialog.draw_distance_percent = clamp_draw_distance_percent(
+                        dialog.draw_distance_percent.saturating_add(25),
+                    );
+                    return true;
+                }
             }
         }
-        if preferences_cleanup_autosaves_rect().contains(mouse) {
+        if tab == PreferencesTab::General && preferences_cleanup_autosaves_rect().contains(mouse) {
             app.confirm_dialog = Some(ConfirmDialog {
                 action: ConfirmAction::CleanupAutosaves,
                 title: "Delete Recovery Copies?".to_string(),
@@ -5563,76 +6011,70 @@ pub(crate) fn update_preferences_dialog_input(app: &mut AppState, mouse: Vec2) -
         }
         return true;
     }
+    if tab != PreferencesTab::General {
+        drain_text_input();
+        return true;
+    }
     if let Some(dialog) = app.preferences_dialog.as_mut() {
-        dialog.cursor = clamp_char_boundary(&dialog.gta_sa_dir, dialog.cursor);
-        if handle_text_clipboard_shortcuts(
-            &mut dialog.gta_sa_dir,
-            &mut dialog.cursor,
-            &mut dialog.selection_anchor,
-        ) {
+        let PreferencesDialog {
+            gta_sa_dir,
+            blender_install_dir,
+            active_path_field,
+            cursor,
+            selection_anchor,
+            ..
+        } = dialog;
+        let value = match active_path_field {
+            PreferencesPathField::GtaSa => gta_sa_dir,
+            PreferencesPathField::Blender => blender_install_dir,
+        };
+        *cursor = clamp_char_boundary(value, *cursor);
+        if handle_text_clipboard_shortcuts(value, cursor, selection_anchor) {
             drain_text_input();
             return true;
         }
         if is_key_pressed(KeyCode::Home) {
-            dialog.cursor = 0;
-            dialog.selection_anchor = None;
+            *cursor = 0;
+            *selection_anchor = None;
         }
         if is_key_pressed(KeyCode::End) {
-            dialog.cursor = dialog.gta_sa_dir.len();
-            dialog.selection_anchor = None;
+            *cursor = value.len();
+            *selection_anchor = None;
         }
         if is_key_pressed(KeyCode::Left) {
-            dialog.cursor = prev_char_boundary(&dialog.gta_sa_dir, dialog.cursor);
-            dialog.selection_anchor = None;
+            *cursor = prev_char_boundary(value, *cursor);
+            *selection_anchor = None;
         }
         if is_key_pressed(KeyCode::Right) {
-            dialog.cursor = next_char_boundary(&dialog.gta_sa_dir, dialog.cursor);
-            dialog.selection_anchor = None;
+            *cursor = next_char_boundary(value, *cursor);
+            *selection_anchor = None;
         }
         let ctrl_down = ctrl_down();
         if is_key_pressed(KeyCode::Backspace)
-            && !delete_text_selection(
-                &mut dialog.gta_sa_dir,
-                &mut dialog.cursor,
-                &mut dialog.selection_anchor,
-            )
-            && dialog.cursor > 0
+            && !delete_text_selection(value, cursor, selection_anchor)
+            && *cursor > 0
         {
             let prev = if ctrl_down {
-                prev_word_boundary(&dialog.gta_sa_dir, dialog.cursor)
+                prev_word_boundary(value, *cursor)
             } else {
-                prev_char_boundary(&dialog.gta_sa_dir, dialog.cursor)
+                prev_char_boundary(value, *cursor)
             };
-            dialog.gta_sa_dir.replace_range(prev..dialog.cursor, "");
-            dialog.cursor = prev;
+            value.replace_range(prev..*cursor, "");
+            *cursor = prev;
         }
         if is_key_pressed(KeyCode::Delete)
-            && !delete_text_selection(
-                &mut dialog.gta_sa_dir,
-                &mut dialog.cursor,
-                &mut dialog.selection_anchor,
-            )
-            && dialog.cursor < dialog.gta_sa_dir.len()
+            && !delete_text_selection(value, cursor, selection_anchor)
+            && *cursor < value.len()
         {
-            let next = next_char_boundary(&dialog.gta_sa_dir, dialog.cursor);
-            dialog.gta_sa_dir.replace_range(dialog.cursor..next, "");
+            let next = next_char_boundary(value, *cursor);
+            value.replace_range(*cursor..next, "");
         }
         while let Some(ch) = get_char_pressed() {
-            if handle_text_control_char(
-                &mut dialog.gta_sa_dir,
-                &mut dialog.cursor,
-                &mut dialog.selection_anchor,
-                ch,
-            ) {
+            if handle_text_control_char(value, cursor, selection_anchor, ch) {
                 continue;
             }
             if !ch.is_control() {
-                insert_text_at_cursor(
-                    &mut dialog.gta_sa_dir,
-                    &mut dialog.cursor,
-                    &mut dialog.selection_anchor,
-                    &ch.to_string(),
-                );
+                insert_text_at_cursor(value, cursor, selection_anchor, &ch.to_string());
             }
         }
     }
@@ -6922,7 +7364,15 @@ pub(crate) fn update_confirm_dialog_input(app: &mut AppState, mouse: Vec2) -> bo
         Some("primary") => {
             if let Some(mut dialog) = app.confirm_dialog.take() {
                 if dialog.primary_label == "Save WIP" {
-                    if save_wip_scene(app) {
+                    // A modal normally prevents new edits, but select Resource Save
+                    // defensively if pending COL writes appeared after this dialog
+                    // was constructed. Save WIP cannot preserve those bytes.
+                    let save_started = if app.pending_col_writes.is_empty() {
+                        save_wip_scene(app)
+                    } else {
+                        save_scene_before_action(app)
+                    };
+                    if save_started {
                         app.pending_after_manual_save = Some(dialog.action);
                     } else {
                         app.confirm_dialog = Some(dialog);
@@ -7144,14 +7594,19 @@ fn apply_dff_texture_duplicate_dialog(app: &mut AppState) {
     };
     let typed = dialog.buffer.trim();
     if typed.is_empty() {
-        app.status_message = if dialog.action == DffTextureNameAction::SeparateGeometry {
+        app.status_message = if dialog.action == DffTextureNameAction::SeparateInternalElement {
+            "Enter a name for the internal element".to_string()
+        } else if dialog.action == DffTextureNameAction::SeparateGeometry {
             "Enter a name for the separated object".to_string()
         } else {
             "Enter a new texture name".to_string()
         };
         return;
     }
-    let name = if dialog.action == DffTextureNameAction::SeparateGeometry {
+    let name = if matches!(
+        dialog.action,
+        DffTextureNameAction::SeparateGeometry | DffTextureNameAction::SeparateInternalElement
+    ) {
         typed.to_string()
     } else {
         sanitize_texture_name(typed)
@@ -7180,6 +7635,10 @@ fn apply_dff_texture_duplicate_dialog(app: &mut AppState) {
                 dff.name.eq_ignore_ascii_case(&source_texture)
                     && !dff_selected_face_set(dff).is_empty()
             }
+            (DffTextureNameAction::SeparateInternalElement, EditingAsset::Dff(dff)) => {
+                dff.name.eq_ignore_ascii_case(&source_texture)
+                    && !dff_selected_face_set(dff).is_empty()
+            }
             _ => false,
         });
     if !selection_matches {
@@ -7205,6 +7664,9 @@ fn apply_dff_texture_duplicate_dialog(app: &mut AppState) {
             editing_rename_selected_txd_texture(app, material, &name)
         }
         DffTextureNameAction::SeparateGeometry => start_dff_separation(app, &name),
+        DffTextureNameAction::SeparateInternalElement => {
+            separate_selected_dff_internal_element(app, &name)
+        }
     };
     if applied {
         app.dff_texture_duplicate_dialog = None;
@@ -7370,6 +7832,22 @@ pub(crate) fn update_dff_texture_view_dialog_input(app: &mut AppState, mouse: Ve
 }
 
 pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
+    if app.active_tab == AppTab::Preview
+        && app.properties_tab == PropertiesTab::Element
+        && selection_has_default_world(app)
+        && inspector_panel_content_rect().contains(mouse)
+    {
+        if is_mouse_button_pressed(MouseButton::Left) {
+            if world_copy_id_rect(app).contains(mouse) {
+                if let Some(p) = app.placements.get(app.selected) {
+                    copy_to_clipboard(app, "ID", p.id.clone());
+                }
+            } else if world_conversion_rect(app).contains(mouse) {
+                turn_world_into_placement(app);
+            }
+        }
+        return true;
+    }
     if app.active_tab == AppTab::Preview {
         for (slot, tab) in properties_tabs().into_iter().enumerate() {
             if properties_tab_rect(slot).contains(mouse) {
@@ -7732,7 +8210,7 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
                     Some(false) => "",
                 }
                 .to_string();
-                let before = ScopedHistorySnapshot::World(world_history_snapshot(app));
+                let before = inspector_history_snapshot(app, InspectorField::PhysicsSimulated);
                 if app.physics_scope == PhysicsScope::Global
                     && selected_definitions_include_readonly(app)
                 {
@@ -7768,7 +8246,11 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
                             .to_string();
                     return true;
                 }
-                let before = world_history_snapshot(app);
+                let before = local_world_history_snapshot(
+                    app,
+                    selected_editable_indices(app),
+                    selected_definition_ids(app),
+                );
                 let mut changed = 0usize;
                 match app.physics_scope {
                     PhysicsScope::Global => {
@@ -7785,10 +8267,13 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
                         }
                     }
                     PhysicsScope::PerObject => {
-                        for idx in selected_live_indices(app) {
+                        for idx in selected_editable_indices(app) {
                             let Some(placement) = app.placements.get_mut(idx) else {
                                 continue;
                             };
+                            if is_default_world_placement(placement) {
+                                continue;
+                            }
                             for key in PHYSICS_ATTR_KEYS {
                                 changed += usize::from(placement.attrs.remove(key).is_some());
                             }
@@ -7799,7 +8284,7 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
                     }
                 }
                 if changed > 0 {
-                    commit_world_history(app, "Clear Physics Values", before);
+                    commit_local_world_history(app, "Clear Physics Values", before);
                     app.status_message = format!(
                         "Cleared {changed} {} physics value(s)",
                         app.physics_scope.label()
@@ -7820,7 +8305,7 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
         let replace_col_enabled = replace_dff_enabled;
         let open_txd_enabled = selected_definition_id_and_txd(app).is_some();
         let find_missing_textures_enabled = selected_definition_has_missing_textures(app);
-        let blender_position_enabled = selected_live_indices(app).len() >= 2;
+        let blender_position_enabled = selected_editable_indices(app).len() >= 2;
         let assign_lod_enabled = selected_live_indices_in_selection_order(app).len() >= 2;
         if element_self_lod_rect(app).contains(mouse) {
             if is_mouse_button_pressed(MouseButton::Left) {
@@ -8033,15 +8518,13 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
         for (slot, element_type) in EAGLE_ELEMENT_TYPES.iter().enumerate() {
             if element_type_button_rect(app, slot).contains(mouse) {
                 if is_mouse_button_pressed(MouseButton::Left) {
-                    let before = world_history_snapshot(app);
-                    let indices = selected_live_indices(app);
+                    let before =
+                        local_world_history_snapshot(app, selected_editable_indices(app), []);
+                    let indices = selected_editable_indices(app);
                     let changed =
                         set_element_type_for_indices(&mut app.placements, &indices, element_type);
                     if changed > 0 {
-                        invalidate_outliner_labels(app);
-                        rebuild_outliner_filter(app);
-                        rebuild_render_cells(app);
-                        commit_world_history(app, "Element Type", before);
+                        commit_local_world_history(app, "Element Type", before);
                     }
                     app.status_message =
                         format!("Set {changed} selected element(s) to {}", element_type);
@@ -8052,7 +8535,11 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
         for (slot, flag) in EAGLE_DEFINITION_FLAGS.iter().enumerate() {
             if definition_flag_rect(app, slot).contains(mouse) {
                 if is_mouse_button_pressed(MouseButton::Left) {
-                    let before = ScopedHistorySnapshot::World(world_history_snapshot(app));
+                    let before = ScopedHistorySnapshot::LocalWorld(local_world_history_snapshot(
+                        app,
+                        [],
+                        selected_definition_ids(app),
+                    ));
                     let ids = selected_definition_ids(app);
                     let all_enabled = !ids.is_empty()
                         && ids.iter().all(|id| {
@@ -8090,7 +8577,6 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
                         }
                     }
                     if changed > 0 {
-                        rebuild_render_cells(app);
                         commit_scoped_history(app, "Definition Flag", before);
                         app.status_message = format!("Updated {changed} definition flag(s)");
                     }
@@ -8101,12 +8587,17 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
         for (slot, flag) in EAGLE_PLACEMENT_OVERRIDE_FLAGS.iter().enumerate() {
             if placement_override_flag_rect(app, slot).contains(mouse) {
                 if is_mouse_button_pressed(MouseButton::Left) {
-                    let before = world_history_snapshot(app);
-                    let indices = selected_live_indices(app);
+                    let before =
+                        local_world_history_snapshot(app, selected_editable_indices(app), []);
+                    let indices = selected_editable_indices(app);
                     let all_enabled = !indices.is_empty()
                         && indices.iter().all(|idx| {
                             app.placements.get(*idx).is_some_and(|placement| {
-                                placement_override_flag_enabled(placement, flag)
+                                if *flag == "follow_camera" {
+                                    placement_follows_camera(placement, &app.definitions)
+                                } else {
+                                    placement_override_flag_enabled(placement, flag)
+                                }
                             })
                         });
                     let target_enabled = !all_enabled;
@@ -8118,8 +8609,7 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
                         }
                     }
                     if changed > 0 {
-                        rebuild_render_cells(app);
-                        commit_world_history(app, "Placement Flag Override", before);
+                        commit_local_world_history(app, "Placement Flag Override", before);
                         app.status_message = format!("Updated {changed} placement override(s)");
                     }
                 }
@@ -8147,7 +8637,7 @@ pub(crate) fn handle_inspector_click(app: &mut AppState, mouse: Vec2) -> bool {
 }
 
 pub(crate) fn move_selected(app: &mut AppState, delta: Vec3) {
-    let indices = selected_live_indices(app);
+    let indices = selected_editable_indices(app);
     if indices.is_empty() {
         return;
     }
@@ -8715,6 +9205,9 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     if update_missing_col_dialog_input(app, mouse) {
         return;
     }
+    if update_map_files_input(app, mouse) {
+        return;
+    }
     if update_import_asset_dialog_input(app, mouse) {
         return;
     }
@@ -8873,9 +9366,7 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                 GizmoTarget::Element => {
                     if let ScopedHistorySnapshot::PlacementTransforms(before) = &drag.before {
                         rebuild_render_cells_for_placement_transforms(app, before);
-                    } else {
-                        // Alt-drag duplicates placements and is therefore a
-                        // structural edit rather than an in-place transform.
+                    } else if !matches!(&drag.before, ScopedHistorySnapshot::LocalWorld(_)) {
                         rebuild_render_cells(app);
                     }
                     commit_scoped_history(app, drag.label, drag.before);
@@ -9474,6 +9965,11 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     if app.navigation_menu_open && handle_tab_click(app, mouse) {
         return;
     }
+    // The compact file-actions menu overlays the tab strip and viewport, so
+    // it must receive clicks before controls visually underneath it.
+    if app.file_actions_menu_open && handle_toolbar_click(app, mouse) {
+        return;
+    }
     if handle_lights_click(app, mouse) {
         return;
     }
@@ -9571,7 +10067,6 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
     if is_key_pressed(KeyCode::L) && !ctrl_down {
         app.options.lod_mode = app.options.lod_mode.next();
         eprintln!("LOD mode: {}", app.options.lod_mode.label());
-        rebuild_render_cells(app);
     }
     if app.active_tab == AppTab::Lights
         && ctrl_down
@@ -9677,7 +10172,9 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                     AppTab::Race => {
                         ScopedHistorySnapshot::WorldRace(world_race_history_snapshot(app))
                     }
-                    _ => ScopedHistorySnapshot::World(world_history_snapshot(app)),
+                    _ => {
+                        ScopedHistorySnapshot::LocalWorld(local_world_history_snapshot(app, [], []))
+                    }
                 }
             } else {
                 match app.active_tab {
@@ -9690,7 +10187,7 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                     }
                     AppTab::Race => ScopedHistorySnapshot::Race(race_history_snapshot(app)),
                     _ => ScopedHistorySnapshot::PlacementTransforms(
-                        placement_transform_history_snapshot(app, selected_live_indices(app)),
+                        placement_transform_history_snapshot(app, selected_editable_indices(app)),
                     ),
                 }
             };
@@ -9992,7 +10489,7 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
             // current world selection before returning from those branches created
             // unrelated, invisible placement copies.
             if alt_down {
-                let indices = selected_live_indices(app);
+                let indices = selected_editable_indices(app);
                 let mut new_selection = BTreeSet::new();
                 for idx in indices {
                     let Some(source) = app.placements.get(idx) else {
@@ -10015,11 +10512,11 @@ pub(crate) fn update_editor_input(app: &mut AppState, viewport: Rect) {
                 }
             }
             if let Some(origin) = selection_origin(app) {
-                let element_start_positions = selected_live_indices(app)
+                let element_start_positions = selected_editable_indices(app)
                     .into_iter()
                     .filter_map(|idx| app.placements.get(idx).map(|p| (idx, p.pos)))
                     .collect::<Vec<_>>();
-                let element_start_rots = selected_live_indices(app)
+                let element_start_rots = selected_editable_indices(app)
                     .into_iter()
                     .filter_map(|idx| app.placements.get(idx).map(|p| (idx, p.rot)))
                     .collect::<Vec<_>>();
@@ -10382,6 +10879,9 @@ fn toggle_camera_mode(app: &mut AppState) {
 /// reaching the camera later in the same frame. Keep the focus test in one
 /// place so every custom edit box follows the same rule.
 pub(crate) fn editor_text_input_active(app: &AppState) -> bool {
+    if app.map_dialog.is_some() {
+        return true;
+    }
     let world_outliner_active = app.active_tab != AppTab::Editing
         && app.active_tab != AppTab::Race
         && left_sidebar_visible()
@@ -10591,6 +11091,29 @@ fn camera_translation_modifier(shift_down: bool, alt_down: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferences_viewport_scrolls_before_reaching_footer_on_short_windows() {
+        for height in [340.0, 440.0] {
+            let dialog = Rect::new(40.0, 20.0, 560.0, height);
+            let clip = preferences_viewport_clip_rect_for(dialog);
+            let max_scroll = preferences_viewport_max_scroll_for(dialog);
+
+            assert!(max_scroll > 0.0);
+            assert!(clip.y + clip.h <= dialog.y + dialog.h - 66.0);
+            assert!(clip.y + clip.h < dialog.y + dialog.h - 50.0);
+
+            let final_row_bottom = dialog.y + PREFERENCES_VIEWPORT_CONTENT_BOTTOM - max_scroll;
+            assert!((final_row_bottom - (clip.y + clip.h)).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn preferences_viewport_does_not_scroll_at_full_dialog_height() {
+        let dialog = Rect::new(40.0, 20.0, 760.0, PREFERENCES_DIALOG_H);
+
+        assert_eq!(preferences_viewport_max_scroll_for(dialog), 0.0);
+    }
 
     #[test]
     fn vehicle_freecam_translation_runs_at_half_speed() {
@@ -10815,5 +11338,36 @@ mod tests {
         assert_eq!(placements[0].tag, "object");
         assert_eq!(placements[1].tag, "scenery");
         assert_eq!(placements[2].tag, "object");
+    }
+}
+
+#[cfg(test)]
+mod default_world_lock_tests {
+    use super::*;
+    #[test]
+    fn bulk_element_type_edit_leaves_default_world_objects_locked() {
+        let world = Placement {
+            id: "1337".into(),
+            dff: "bin".into(),
+            zone: "sa".into(),
+            tag: "building".into(),
+            attrs: BTreeMap::from([
+                ("saIpl".into(), "sa".into()),
+                ("saInstance".into(), "0".into()),
+            ]),
+            pos: V3::default(),
+            rot: V3::default(),
+        };
+        let mut editable = world.clone();
+        editable.attrs.clear();
+        let mut placements = vec![world.clone(), editable];
+        assert_eq!(
+            set_element_type_for_indices(&mut placements, &[0, 1], "object"),
+            1
+        );
+        assert!(placements[0] == world);
+        set_placement_override_flag(&mut placements[0], "double_sided", true);
+        assert!(placements[0] == world);
+        assert_eq!(placements[1].tag, "object");
     }
 }
