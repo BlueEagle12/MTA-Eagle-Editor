@@ -8,7 +8,7 @@
 - Expanded DFF vehicle authoring with hierarchy validation, material and dummy presets, component parenting, body colors, embedded VLO generation, and vehicle collision generation.
 - Added same-DFF internal element separation and pivot tools, with improved 2DFX placement from the active selection.
 - Improved world edit and undo/redo performance by rebuilding affected render cells instead of the entire scene.
-- Added resource-owned UV1 lightmap previews and the shader-only material plugin host with discovery, validation, and enable/disable controls in Preferences. Material plugins are separate installs; the Halo plugin is not included.
+- Added resource-owned UV1 lightmap previews and the shader-only material plugin host with discovery, validation, and enable/disable controls in Preferences. Material plugins are separate installs.
 - Added background scenery and camera-follow flag previews; improved alpha texture mipmaps, native SA flags, material cleanup, and LOD handling.
 - Added Blender installation selection and search in Preferences, improved short-window preference scrolling, compact toolbar actions, project navigation, and placement on visible surfaces.
 - Fixed Windows drag-and-drop handling for long paths and save/recovery checks for pending binary edits.
